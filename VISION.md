@@ -60,7 +60,7 @@ This is what the engine looks like in production: a country of geniuses, each on
 
 **Provenance by construction.** Every claim in any output traces to a node. Every node's output traces to evidence. Every piece of evidence is timestamped, sourced, and inspectable. There is no path through the engine that produces a claim without a trail.
 
-**Conflicts are resolved by parents and audited by humans.** When two children of a node draw conflicting conclusions, the parent — and only the parent — owns the resolution. The parent picks a side or holds the disagreement open, and writes the decision into a conflict log. The log is retroactively reviewable; a human can override the parent's resolution at any time, and the override propagates.
+**Conflicts are resolved by parents and audited by humans.** When two children of a node draw conflicting conclusions, the parent owns the resolution. The parent picks a side or holds the disagreement open, and writes the decision into a conflict log. The log is retroactively reviewable; a human can override the parent's resolution at any time, and the override propagates.
 
 **The human is in the kernel, not the application.** The graph is collaborative between the agent society and a human architect. Override, injection, dispute, and re-decomposition are kernel primitives — available at every node, not bolted on by individual applications. The substrate is opinionated about leaving the human's voice intact across every refresh.
 
@@ -70,7 +70,7 @@ This is what the engine looks like in production: a country of geniuses, each on
 
 ## 5. The Engine, Concretely
 
-The engine is composed of nine loosely coupled layers. Most of the surface area is extension; the kernel is intentionally small.
+The engine is composed of eight loosely coupled layers. Most of the surface area is extension; the kernel is intentionally small.
 
 **Kernel.** The core runtime: process model for long-lived agents, scheduling, durable state, message bus, lifecycle management, fault tolerance. The kernel does not know what an "investment thesis" is or what a "molecule" is. It knows about graphs, agents, mandates, ticks, messages, files, and parent–child relationships.
 
@@ -83,8 +83,6 @@ The engine is composed of nine loosely coupled layers. Most of the surface area 
 **Data layer (MCP-native).** The interface to the world is MCP. News feeds, filings, market data, scientific journals, government feeds, satellite imagery, sensor streams, code repos, web search — every data-fetching tool an agent uses is exposed as an MCP server. The engine adds rate-limiting, deduplication, caching, and auth across MCP traffic at scale. The connector ecosystem is the MCP ecosystem; we contribute upstream rather than fork.
 
 **Execution and tool layer.** The substrate for action and computation, separate from data fetching. Sandboxed code interpreters, REPLs, simulators, headless browsers, statistical environments, retrieval indices, structured query engines. Agents reach for these the way humans reach for a calculator or a notebook; the engine ensures they are sandboxed, accounted for, and fast to start.
-
-**Hierarchy and conflict resolution.** The mechanism by which a parent agent receives its children's outputs, reconciles them, and produces its own. Parents notice when children disagree, pick a resolution (or hold the disagreement open), and write a conflict-log entry. Conflict logs are first-class objects: human-readable, queryable, and retroactively reviewable. Resolution policies are pluggable; the engine ships sane defaults.
 
 **Observability and audit.** Every action, every claim, every state transition is captured. The engine ships with an observability surface designed for *correctness in research*, not just system health: per-node calibration metrics, per-claim provenance graphs, per-agent track record over time, and full conflict-log replay.
 
