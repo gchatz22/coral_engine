@@ -8,6 +8,7 @@
 
 pub mod decision;
 pub mod evidence;
+pub mod fs;
 pub mod mandate;
 pub mod trigger;
 
