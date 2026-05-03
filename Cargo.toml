@@ -1,0 +1,20 @@
+[package]
+name = "jarvis_node"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.84"
+description = "Single-node runtime for the Jarvis Engine (bootstrap skeleton)."
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[lib]
+name = "jarvis_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "node-run"
+path = "src/bin/node_run.rs"
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
