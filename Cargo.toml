@@ -28,3 +28,7 @@ ulid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3"
+# `test-util` enables `tokio::time::pause`/`advance` and the `start_paused`
+# attribute on `#[tokio::test]`, used by the scheduler's deterministic
+# time-travel tests (JAR2-5).
+tokio = { version = "1", features = ["test-util"] }

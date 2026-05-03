@@ -10,7 +10,9 @@ pub mod decision;
 pub mod evidence;
 pub mod fs;
 pub mod mandate;
+pub mod scheduler;
 pub mod trigger;
+pub mod trigger_queue;
 
 pub(crate) mod duration_ms {
     //! Serialize/deserialize `std::time::Duration` as `u64` milliseconds.
