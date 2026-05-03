@@ -92,19 +92,53 @@ When prompted to work a ticket:
 - Work on a dedicated branch named after the ticket (e.g. `jar-123-short-slug`). Never commit ticket work directly to `main`.
 - Update the ticket status as work progresses (in progress → in review → done).
 - **Every ticket ends as a Pull Request.** When the change is ready, push the branch and open a PR whose description links the Linear ticket, restates the acceptance criteria, and includes the structured summary from rule 4. One ticket = one branch = one PR. No ticket is "done" until its PR is open and linked back to the ticket; merge happens only after maintainer review.
-- **Dependent tickets ship as stacked PRs.** When a ticket depends on another ticket that is still in review (not yet merged to `main`), branch off the dependency's branch — not `main` — and target the PR at that branch. Each PR in the stack stays small and reviewable on its own; the description must call out the stack order and the parent PR. As parents merge, rebase the children down so the stack collapses toward `main`. Do not bundle dependent tickets into one mega-PR to avoid stacking.
-- Deliver the change, open the PR, and then **stop**. Do not roll on to the next ticket. Wait for the maintainer's approval and the next prompt.
+- **Dependent tickets ship as stacked PRs, managed with Graphite.** See *Stacked PRs — use Graphite* below. When a ticket depends on another ticket still in review, the new branch goes on top of the dependency via `gt create`, not branched manually off `main`. Each PR in the stack stays small and reviewable on its own; the description must call out the stack order and the parent PR. Do not bundle dependent tickets into one mega-PR to avoid stacking.
+- Deliver the change, open the PR (or `gt submit` for a stack), and then **stop**. Do not roll on to the next ticket. Wait for the maintainer's approval and the next prompt.
 
 This staged loop — *plan → approve → one ticket → branch → PR → review → next ticket* — is the default. Skip it only when the maintainer explicitly says "just do it."
+
+### Stacked PRs — use Graphite
+
+When a ticket depends on another ticket that is still in review (not yet merged to `main`), the work goes on top of an open PR — a **stacked PR**. Manage all stacks with the **Graphite CLI (`gt`)**. Do not stack manually with `git checkout -b` and PR retargeting; do not click "Update branch" in the GitHub UI. Both create cascade-rebase work that Graphite avoids.
+
+**Why:** every merge to `main` rewrites commit SHAs (rebase-merge rewrites the committer; squash-merge collapses commits). Children's view of "what was the parent commit" diverges from `main` on every merge, producing spurious file-by-file conflicts. Graphite tracks the stack as metadata, runs the cascade-rebase automatically when a parent merges, and force-pushes children with `--force-with-lease`. We learned this the hard way; do not relearn it.
+
+**Setup (once):**
+- `brew install withgraphite/tap/graphite`
+- `gt auth --token <token>` (token from app.graphite.dev → Settings → CLI)
+- `gt init` inside the repo to register `main` as the trunk
+
+**Daily usage:**
+- Start a stacked branch on top of the current one: `gt create <branch-name> -m "<commit message>"`. Edits + commits proceed normally.
+- Push the whole stack and open one PR per branch: `gt submit --stack`. PR bases are wired to the right parent automatically.
+- After a parent PR merges to `main`: `gt sync` pulls trunk, rebases the rest of the stack, and force-pushes children.
+- Inspect the stack: `gt log` (current stack) or `gt log long` (full forest).
+
+**What not to do:**
+- Do not `git rebase` or `git push --force` by hand — `gt` owns those operations.
+- Do not click "Update branch" on a stacked PR in the GitHub UI — it creates a merge commit that Graphite then has to clean up.
+- Do not change a stacked PR's base via the GitHub UI — `gt sync` and `gt submit` keep bases correct.
+
+Graphite composes with worktrees: when running parallel agents, each worktree runs its own `gt` commands on the branch it owns.
 
 ### Parallel agents — use worktrees freely
 
 When multiple agents are working tickets concurrently, use **git worktrees** without asking. One worktree per agent per ticket keeps branches, build artifacts, and uncommitted state fully isolated, and avoids agents stomping each other's working tree.
 
-- Spin a worktree off `main` for each ticket: `git worktree add ../jarvis-<ticket-slug> -b <ticket-slug>`.
-- Do all the ticket's work — edits, `cargo build`, `cargo test`, commits, push, PR — inside that worktree.
-- Remove the worktree once the PR is merged: `git worktree remove ../jarvis-<ticket-slug>`.
+**Spawn a worktree per ticket:**
+- For a ticket branched off `main`: `git worktree add ../jarvis-<ticket-slug> -b <ticket-slug> main`.
+- For a stacked ticket on top of an open PR's branch: `git worktree add ../jarvis-<ticket-slug> -b <ticket-slug> <parent-branch>`.
+- Inside the new worktree, immediately register with Graphite: `gt track --parent <parent-branch>` (use `main` for unstacked).
+- Do all the ticket's work — edits, `cargo build`, `cargo test`, commits, `gt submit`/`gt submit --stack` — inside that worktree.
 - Worktrees are cheap. Prefer creating one over coordinating shared checkout state.
+
+**Clean up after a PR merges:**
+1. From the worktree: `gt sync` — pulls trunk, cascades the rest of the stack, and (if Graphite recognises the merge) drops the merged branch from the stack.
+2. Remove the worktree: `git worktree remove ../jarvis-<ticket-slug>`. Use `--force` only if there's intentional uncommitted state worth nuking.
+3. Delete the local branch if it lingers: `git branch -D <ticket-slug>`. ("Branch already merged" is fine — `-D` skips the safety check, which is correct here because the on-main commit has a different SHA than your local branch tip.)
+4. Delete the origin branch if it lingers: `git push origin --delete <ticket-slug>`. **Better:** enable repo Settings → General → Pull Requests → "Automatically delete head branches" so GitHub does this for every merged PR. Then this step is unneeded.
+
+**Audit at any time:** `git worktree list`, `git branch -vv | grep <prefix>`, `gt log long`. If you see a branch whose PR is closed/merged but whose worktree is still around, clean it.
 
 ### Linear setup note
 
@@ -119,4 +153,4 @@ The Linear MCP server must be configured for an agent to create tickets. If it i
 3. Tests with the change, runnable in one command.
 4. Summary at the end the maintainer can trust.
 5. Ideation/planning → `scratch/<topic>.md`.
-6. Features → Linear tickets under "Jarvis Engine" → wait → one ticket at a time → one PR per ticket.
+6. Features → Linear tickets under "Jarvis Engine" → wait → one ticket at a time → one PR per ticket → Graphite (`gt`) for stacks.
