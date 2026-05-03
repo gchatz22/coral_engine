@@ -1,4 +1,4 @@
-//! `PerAgentFs` — directory-backed per-agent filesystem.
+//! `AgentFs` — directory-backed per-agent filesystem.
 //!
 //! This module owns the on-disk representation of a single agent's state.
 //! The agent's working memory is **state-as-files** rather than a hidden
@@ -28,7 +28,7 @@
 //! what an audit tool indexes, what a human reviewer quotes. Each file is
 //! a *claim about the world*: "this drug is at risk of hold," "this code
 //! failed test X." Per `VISION.md` § 4 ("provenance by construction"),
-//! every output **must reference evidence**. [`PerAgentFs::persist_output`]
+//! every output **must reference evidence**. [`AgentFs::persist_output`]
 //! enforces this by rejecting an empty or unresolvable evidence vector
 //! (see [`FsError::EmptyEvidence`] and [`FsError::EvidenceNotFound`]).
 //! There is no path through the system that produces a claim without a
@@ -41,7 +41,7 @@
 //! Intermediate distillations. Half-baked reasoning. A draft of an output
 //! that isn't ready to publish. Per `VISION.md` § 4, this is how the
 //! agent thinks across wakeups instead of relying on a hidden context
-//! window. [`PerAgentFs::apply_ops`] writes here in response to
+//! window. [`AgentFs::apply_ops`] writes here in response to
 //! `RewriteFs` decisions and rejects any path that escapes
 //! `<root>/notes/` (see [`FsError::PathTraversal`] and
 //! [`FsError::PathOutsideNotes`]). Notes are **mutable** (the agent
@@ -62,7 +62,7 @@
 //! [`crate::evidence::EvidenceId::new`]. Three properties fall out:
 //!
 //! 1. **Dedup is automatic.** Two tool calls with the same `(tool, args,
-//!    result)` produce the same id, so [`PerAgentFs::record_evidence`] is
+//!    result)` produce the same id, so [`AgentFs::record_evidence`] is
 //!    idempotent and we never write the same record twice.
 //! 2. **Outputs that cite the same evidence id are demonstrably
 //!    grounded in the same primary source.** An audit tool walks
@@ -90,7 +90,7 @@
 //! Per `VISION.md` § 3, agents *idle and wake* — they don't normally
 //! exit. `Retire` is the explicit, intentional shutdown decision (see
 //! [`crate::decision::Decision::Retire`]). When emitted,
-//! [`PerAgentFs::persist_retirement`] writes `retirement.json` with the
+//! [`AgentFs::persist_retirement`] writes `retirement.json` with the
 //! reason and a UTC timestamp, then the loop exits cleanly. The file
 //! exists as a separate concept (rather than just "the loop returned")
 //! for three reasons:
@@ -141,7 +141,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
-/// Typed errors the `PerAgentFs` raises. The run loop (JAR2-8) matches on
+/// Typed errors the `AgentFs` raises. The run loop (JAR2-8) matches on
 /// these to distinguish provenance/traversal violations from real I/O
 /// failures, so adding variants is a breaking change for that consumer.
 #[derive(Debug, Error)]
@@ -189,11 +189,11 @@ struct RetirementRecord {
 /// Directory-backed per-agent filesystem. Cheap to clone — holds only the
 /// root path.
 #[derive(Debug, Clone)]
-pub struct PerAgentFs {
+pub struct AgentFs {
     root: PathBuf,
 }
 
-impl PerAgentFs {
+impl AgentFs {
     /// Initialize the layout under `root` and write `mandate.json` if it
     /// is not already present.
     ///
@@ -386,10 +386,10 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    fn fresh_fs() -> (TempDir, PerAgentFs, Mandate) {
+    fn fresh_fs() -> (TempDir, AgentFs, Mandate) {
         let tmp = TempDir::new().unwrap();
         let mandate = Mandate::new("research foo", Duration::from_millis(1000), Some(10));
-        let fs = PerAgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
         (tmp, fs, mandate)
     }
 
@@ -415,12 +415,12 @@ mod tests {
     fn open_is_idempotent_and_does_not_clobber_mandate() {
         let tmp = TempDir::new().unwrap();
         let original = Mandate::new("first", Duration::from_millis(500), None);
-        let _fs = PerAgentFs::open(tmp.path().to_path_buf(), &original).unwrap();
+        let _fs = AgentFs::open(tmp.path().to_path_buf(), &original).unwrap();
 
         // Re-open with a *different* mandate; the on-disk file must keep
         // the original.
         let other = Mandate::new("second", Duration::from_millis(999), Some(7));
-        let _fs2 = PerAgentFs::open(tmp.path().to_path_buf(), &other).unwrap();
+        let _fs2 = AgentFs::open(tmp.path().to_path_buf(), &other).unwrap();
 
         let bytes = std::fs::read(tmp.path().join("mandate.json")).unwrap();
         let back: Mandate = serde_json::from_slice(&bytes).unwrap();
