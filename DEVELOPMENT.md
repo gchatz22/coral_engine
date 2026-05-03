@@ -89,10 +89,22 @@ When prompted to work a ticket:
 
 - Re-read the ticket. Confirm the scope.
 - Apply rules 1–4 above (Rust, minimal diff, tests first, comprehensive summary).
+- Work on a dedicated branch named after the ticket (e.g. `jar-123-short-slug`). Never commit ticket work directly to `main`.
 - Update the ticket status as work progresses (in progress → in review → done).
-- Deliver the change and the summary, then **stop**. Do not roll on to the next ticket. Wait for the maintainer's approval and the next prompt.
+- **Every ticket ends as a Pull Request.** When the change is ready, push the branch and open a PR whose description links the Linear ticket, restates the acceptance criteria, and includes the structured summary from rule 4. One ticket = one branch = one PR. No ticket is "done" until its PR is open and linked back to the ticket; merge happens only after maintainer review.
+- **Dependent tickets ship as stacked PRs.** When a ticket depends on another ticket that is still in review (not yet merged to `main`), branch off the dependency's branch — not `main` — and target the PR at that branch. Each PR in the stack stays small and reviewable on its own; the description must call out the stack order and the parent PR. As parents merge, rebase the children down so the stack collapses toward `main`. Do not bundle dependent tickets into one mega-PR to avoid stacking.
+- Deliver the change, open the PR, and then **stop**. Do not roll on to the next ticket. Wait for the maintainer's approval and the next prompt.
 
-This staged loop — *plan → approve → one ticket → review → next ticket* — is the default. Skip it only when the maintainer explicitly says "just do it."
+This staged loop — *plan → approve → one ticket → branch → PR → review → next ticket* — is the default. Skip it only when the maintainer explicitly says "just do it."
+
+### Parallel agents — use worktrees freely
+
+When multiple agents are working tickets concurrently, use **git worktrees** without asking. One worktree per agent per ticket keeps branches, build artifacts, and uncommitted state fully isolated, and avoids agents stomping each other's working tree.
+
+- Spin a worktree off `main` for each ticket: `git worktree add ../jarvis-<ticket-slug> -b <ticket-slug>`.
+- Do all the ticket's work — edits, `cargo build`, `cargo test`, commits, push, PR — inside that worktree.
+- Remove the worktree once the PR is merged: `git worktree remove ../jarvis-<ticket-slug>`.
+- Worktrees are cheap. Prefer creating one over coordinating shared checkout state.
 
 ### Linear setup note
 
@@ -107,4 +119,4 @@ The Linear MCP server must be configured for an agent to create tickets. If it i
 3. Tests with the change, runnable in one command.
 4. Summary at the end the maintainer can trust.
 5. Ideation/planning → `scratch/<topic>.md`.
-6. Features → Linear tickets under "Jarvis Engine" → wait → one ticket at a time.
+6. Features → Linear tickets under "Jarvis Engine" → wait → one ticket at a time → one PR per ticket.
