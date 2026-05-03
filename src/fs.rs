@@ -1,24 +1,135 @@
 //! `PerAgentFs` — directory-backed per-agent filesystem.
 //!
-//! This module owns the on-disk representation of a single agent's state
-//! and enforces the provenance invariant from
-//! `scratch/minimal_node_backend.md` § 5: an `Output` cannot be persisted
-//! without referencing evidence records that already exist on disk.
+//! This module owns the on-disk representation of a single agent's state.
+//! The agent's working memory is **state-as-files** rather than a hidden
+//! context window (see `VISION.md` § 4: "every agent has a filesystem"),
+//! so this layout is the durable substrate the run loop reads and writes
+//! between wakeups.
 //!
-//! Layout under `<root>/`:
+//! # Schema
 //!
 //! ```text
-//! mandate.json                 # current mandate, written on first open
-//! outputs/<ulid>.json          # one per persisted Output
-//! evidence/<sha256>.json       # one per recorded EvidenceRecord
-//! notes/                       # free-form scratch — apply_ops writes here
-//! retirement.json              # written on retirement
+//! <root>/
+//!   mandate.json          — what the agent is told to do (current state)
+//!   outputs/<ulid>.json   — produced artifacts; the agent's public claims
+//!   evidence/<sha256>.json — raw record of every tool call; the provenance trail
+//!   notes/                — private working memory; scratchpad, intermediate reasoning
+//!   retirement.json       — terminal marker; agent has cleanly ended
 //! ```
 //!
-//! The bootstrap deliberately uses synchronous `std::fs`. The run loop
-//! ticket (JAR2-8) can wrap calls in `tokio::task::spawn_blocking` if it
-//! needs to. Versioning, snapshots, forks, and concurrent multi-writer
-//! safety are all out of scope (see ticket JAR2-4 "Out of scope").
+//! Each subdirectory is a deliberate split, not a filing convention.
+//! The walls between them encode load-bearing rules.
+//!
+//! # `outputs/` vs `notes/` — claims vs thinking
+//!
+//! This is the core split.
+//!
+//! **`outputs/`** are the agent's *deliverables* — what a parent reads,
+//! what an audit tool indexes, what a human reviewer quotes. Each file is
+//! a *claim about the world*: "this drug is at risk of hold," "this code
+//! failed test X." Per `VISION.md` § 4 ("provenance by construction"),
+//! every output **must reference evidence**. [`PerAgentFs::persist_output`]
+//! enforces this by rejecting an empty or unresolvable evidence vector
+//! (see [`FsError::EmptyEvidence`] and [`FsError::EvidenceNotFound`]).
+//! There is no path through the system that produces a claim without a
+//! trail. Outputs are also **immutable** — once written, the file at
+//! `outputs/<ulid>.json` does not change. A reader can quote it; a parent
+//! can pin its id; a human auditor can dispute it. To revise a claim, an
+//! agent emits a *new* output that supersedes the old one.
+//!
+//! **`notes/`** are the agent's *private working memory*. Scratchpad.
+//! Intermediate distillations. Half-baked reasoning. A draft of an output
+//! that isn't ready to publish. Per `VISION.md` § 4, this is how the
+//! agent thinks across wakeups instead of relying on a hidden context
+//! window. [`PerAgentFs::apply_ops`] writes here in response to
+//! `RewriteFs` decisions and rejects any path that escapes
+//! `<root>/notes/` (see [`FsError::PathTraversal`] and
+//! [`FsError::PathOutsideNotes`]). Notes are **mutable** (the agent
+//! rewrites them freely), **private** (parents do not read them by
+//! default), and have **no provenance requirement** (you can scribble
+//! whatever helps you reason).
+//!
+//! Conflating these would muddle "what I'm telling my parent" with "my
+//! scratchpad." A parent reading "draft 3, unsure" alongside "the drug
+//! failed phase 2" is going to make bad calls. The directory split is
+//! the wall.
+//!
+//! # `evidence/` — content-addressed by design
+//!
+//! Each `evidence/<sha256>.json` is the **raw record** of a tool call:
+//! tool name, args, result, timestamp. The id is
+//! `sha256(canonical_json(tool, args, result))`, computed once in
+//! [`crate::evidence::EvidenceId::new`]. Three properties fall out:
+//!
+//! 1. **Dedup is automatic.** Two tool calls with the same `(tool, args,
+//!    result)` produce the same id, so [`PerAgentFs::record_evidence`] is
+//!    idempotent and we never write the same record twice.
+//! 2. **Outputs that cite the same evidence id are demonstrably
+//!    grounded in the same primary source.** An audit tool walks
+//!    `evidence_ids` from each output to its file with no joins.
+//! 3. **Provenance is verifiable without trust.** An auditor recomputes
+//!    the hash and confirms the file matches.
+//!
+//! Evidence is upstream of thinking, not part of it. You don't edit
+//! evidence; it's what the world told you. Notes are how you reasoned
+//! about it.
+//!
+//! # `mandate.json`
+//!
+//! The standing instruction (text + idle period + max ticks). Persisted
+//! to disk so an agent restart picks up the latest mandate, not a stale
+//! one from initial config. Mutable over time once `MandateUpdate`
+//! triggers and `HumanOverride { EditMandate }` ops are wired (see
+//! `scratch/agent_runtime.md` § 11). Today it's a single file; a
+//! `mandate_history/` sidecar will likely accompany it when mandate-edit
+//! semantics land, so audit can see what changed when. Out of scope for
+//! the bootstrap.
+//!
+//! # `retirement.json` — the terminal marker
+//!
+//! Per `VISION.md` § 3, agents *idle and wake* — they don't normally
+//! exit. `Retire` is the explicit, intentional shutdown decision (see
+//! [`crate::decision::Decision::Retire`]). When emitted,
+//! [`PerAgentFs::persist_retirement`] writes `retirement.json` with the
+//! reason and a UTC timestamp, then the loop exits cleanly. The file
+//! exists as a separate concept (rather than just "the loop returned")
+//! for three reasons:
+//!
+//! 1. **Restart safety.** Anything trying to start an agent at this root
+//!    again sees `retirement.json` as a hard "no — this agent's life is
+//!    over." Without it, a crash-recovery loop could resurrect a finished
+//!    agent and start re-emitting outputs.
+//! 2. **Audit.** Why did this agent stop? "Mandate satisfied," "parent
+//!    retired me," "user retired me," "max_ticks reached." Important
+//!    context when reconstructing what the graph did weeks later.
+//! 3. **Distinguishing retirement from crash.** Crashed agent: loop
+//!    exited but no `retirement.json`. Cleanly retired agent: file
+//!    present. The orchestrator (when we have one) treats those very
+//!    differently.
+//!
+//! # What this layout deliberately does not include yet
+//!
+//! Each item is punted in `scratch/minimal_node_backend.md` § 6 with a
+//! reason; surfaced here so a reader knows the gaps are intentional:
+//!
+//! - **No conflict log.** When parents reconcile disagreeing children
+//!   (`VISION.md` § 4), the resolution will need somewhere to live —
+//!   likely `conflicts/<id>.json`. Bootstrap is single-node.
+//! - **No child handles.** Likewise out of scope for single-node.
+//! - **No mandate history.** Lands with mandate-edit semantics.
+//! - **No versioning / snapshots / forks.** The graph layer is supposed
+//!   to be time-scrubbable (`VISION.md` § 5); that needs an FS-layer
+//!   hook (probably copy-on-write or a `snapshots/` dir). Deferred.
+//! - **No mid-tick state.** By design, state lives in `notes/` between
+//!   ticks. If mid-tick state has to survive a crash, that's a separate
+//!   concern.
+//!
+//! # Implementation notes
+//!
+//! The bootstrap uses synchronous `std::fs`. The run loop ticket
+//! (JAR2-8) can wrap calls in `tokio::task::spawn_blocking` if it needs
+//! to. Concurrent multi-writer safety is out of scope: assume a single
+//! process owns the root.
 
 use crate::decision::FsOp;
 use crate::evidence::{EvidenceId, EvidenceRecord};
