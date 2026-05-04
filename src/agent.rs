@@ -105,6 +105,17 @@ impl<D: Decide> Agent<D> {
 
         let mut tick: u64 = 0;
         loop {
+            // `Mandate.max_ticks` is a safety cap on loop iterations.
+            // `None` means "run until `Retire`." Check before incrementing
+            // so the cap is the count of ticks actually performed: with
+            // `max_ticks = Some(N)`, exactly N ticks run before retirement.
+            if let Some(max) = cfg.max_ticks {
+                if tick >= max {
+                    let reason = format!("max_ticks ({}) reached", max);
+                    fs.persist_retirement(&reason)?;
+                    return Ok(RetireReason(reason));
+                }
+            }
             tick += 1;
             let span = info_span!("agent.tick", tick);
             let outcome = async {

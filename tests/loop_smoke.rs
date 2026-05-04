@@ -326,3 +326,44 @@ async fn call_tool_records_evidence_and_emit_output_consumes_it() {
         .collect();
     assert_eq!(entries.len(), 1);
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn max_ticks_caps_loop_iterations_and_writes_retirement() {
+    // Mandate caps the loop at exactly 2 ticks. Idle period is small so
+    // paused-time auto-advance drives both ticks via the deadline arm —
+    // no signals needed. The script holds exactly 2 Idle decisions and
+    // nothing else: if the cap fails to fire, the loop attempts a third
+    // tick, MockDecide returns "script exhausted", and run() bubbles an
+    // Err. So both behaviours are covered: the cap firing produces
+    // Ok(retired); the cap not firing produces Err.
+    let tmp = TempDir::new().expect("tempdir");
+    let mandate = Mandate::new("max-ticks-test", Duration::from_millis(50), Some(2));
+    let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).expect("open fs");
+
+    let script = vec![
+        Decision::Idle {
+            next_after: Duration::from_millis(50),
+        },
+        Decision::Idle {
+            next_after: Duration::from_millis(50),
+        },
+    ];
+    let agent = Agent::new(mandate, fs, MockDecide::new(script), registry_with_echo());
+
+    let handle = tokio::spawn(agent.run());
+    let RetireReason(reason) = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("agent did not retire in time")
+        .expect("join")
+        .expect("run ok");
+
+    assert!(
+        reason.contains("max_ticks"),
+        "expected max_ticks retirement reason, got: {reason}"
+    );
+    assert!(
+        reason.contains('2'),
+        "reason should mention the cap value: {reason}"
+    );
+    assert!(tmp.path().join("retirement.json").is_file());
+}
