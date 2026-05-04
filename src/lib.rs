@@ -6,6 +6,7 @@
 //! queue, the `Decide` trait, tool dispatch, and the run loop arrive in
 //! later tickets (JAR2-4+).
 
+pub mod agent;
 pub mod decision;
 pub mod evidence;
 pub mod fs;
