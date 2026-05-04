@@ -111,13 +111,30 @@ When a ticket depends on another ticket that is still in review (not yet merged 
 **Daily usage:**
 - Start a stacked branch on top of the current one: `gt create <branch-name> -m "<commit message>"`. Edits + commits proceed normally.
 - Push the whole stack and open one PR per branch: `gt submit --stack`. PR bases are wired to the right parent automatically.
-- After a parent PR merges to `main`: `gt sync` pulls trunk, rebases the rest of the stack, and force-pushes children.
+- After a parent PR merges to `main`: follow the cascade recipe below.
 - Inspect the stack: `gt log` (current stack) or `gt log long` (full forest).
 
+**Recipe: a parent PR just merged — cascade the children.**
+
+In a clean single-worktree setup `gt sync` does this end-to-end. When children live in separate worktrees (our normal mode), gt cannot touch a checked-out branch, so the recipe is four steps:
+
+1. **Remove the merged worktree first**, before any sync. If gt sees the merged branch still checked out, it refuses to clean it up and the cascade stalls. Use `--force` if `target/` build artifacts block removal:
+   ```
+   git worktree remove --force ../jarvis-<merged-slug>
+   git branch -D <merged-slug>
+   ```
+2. **`gt sync`** from any worktree (the main repo is fine). This pulls trunk, untracks the merged branch, and re-parents children onto trunk in metadata. It will *attempt* to restack each child but will skip ones that are checked out elsewhere — that's expected.
+3. **For each affected child worktree**, `cd` in and run `gt restack`. If a real merge conflict appears (typically `Cargo.toml` dep additions or `src/lib.rs` `pub mod` lines colliding), fix the file, `git add <file>`, `gt continue`.
+4. **Push:** `git push --force-with-lease origin <branch>` (or `gt submit --force` once the local state is clean).
+
 **What not to do:**
-- Do not `git rebase` or `git push --force` by hand — `gt` owns those operations.
+- Do not `git rebase` or `git push --force` by hand for routine cascades — `gt` owns those operations. The exception is the push step in the recipe above, where `git push --force-with-lease` is the cleanest tool.
 - Do not click "Update branch" on a stacked PR in the GitHub UI — it creates a merge commit that Graphite then has to clean up.
 - Do not change a stacked PR's base via the GitHub UI — `gt sync` and `gt submit` keep bases correct.
+
+**Two gotchas to know:**
+- **`gt submit` blocks with "fetched then tracked" warning.** If the local branch was rewritten (rebased, conflict-resolved) and the remote still has the old version, gt blocks the submit out of caution. `git push --force-with-lease` is fine here because you know exactly what changed; long-term `gt submit --force` is the gt-native equivalent.
+- **`gt` saying "no restack needed" can be misleading.** If the local branch is already on top of the right trunk tip but the remote PR still shows `[BEHIND]` on GitHub, gt is right that local is current — but you still need to push. The GitHub PR state is the signal, not gt's restack check.
 
 Graphite composes with worktrees: when running parallel agents, each worktree runs its own `gt` commands on the branch it owns.
 
