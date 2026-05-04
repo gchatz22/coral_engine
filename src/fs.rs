@@ -365,6 +365,20 @@ impl AgentFs {
     /// filenames (time-monotonic) and evidence uses sha256 (arbitrary but
     /// deterministic). A missing directory yields an empty list rather
     /// than an error so this is safe to call right after `open`.
+    ///
+    /// Scaling note: this enumerates every entry in `dir` and sorts the
+    /// full filename list, even though only the top `n` results are
+    /// returned. File *contents* are read lazily for the top `n` only,
+    /// so the cost is O(M) names + O(M log M) sort where M is the total
+    /// directory size. At bootstrap scale (M < 100, n = 8) this is
+    /// microseconds and irrelevant. A long-lived agent with thousands
+    /// of outputs/evidence records will want a real fix — most likely
+    /// an append-only `index.jsonl` per directory that lets us tail the
+    /// recent N without scanning. Bounded min-heap is a cheaper
+    /// intermediate (O(M log N), O(N) memory) but doesn't address the
+    /// underlying "scan a directory every wakeup" problem. Both
+    /// optimizations land alongside the FS-schema-evolution work that
+    /// snapshots/versioning will need anyway (`VISION.md` § 5).
     fn read_recent_json<T>(dir: &Path, n: usize) -> anyhow::Result<Vec<T>>
     where
         T: serde::de::DeserializeOwned,
