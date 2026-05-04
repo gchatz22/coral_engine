@@ -162,6 +162,35 @@ impl Decide for MockDecide {
 /// Eight is the value called out by the ticket; if it ever needs tuning,
 /// promote to a field on `Mandate` or a kernel config rather than passing
 /// it through this signature.
+///
+/// # Why a fixed window today (v1 vs v2)
+///
+/// This is bootstrap scaffolding, not the long-term shape of context
+/// assembly. The v2 design (tracked in JAR2-10, "context-assembly v2")
+/// splits context into two complementary paths:
+///
+/// 1. **Warm cache** — what `assemble_context` grows into. Small,
+///    mandate-shaped, assembled by the runtime each tick and passed
+///    unconditionally into `Decide::decide`: current mandate, triggers,
+///    last few outputs, tail of conflict log. Shrinks vs. today, but
+///    doesn't go to zero — re-discovering "what was I doing" via tool
+///    calls every tick burns latency and cost on context most ticks
+///    need anyway.
+///
+/// 2. **Self-directed retrieval** — tools the agent calls during
+///    `decide` (`read_file`, `list_dir`, eventually a semantic-search
+///    MCP server over the agent's own FS). The agent picks what to
+///    pull. This is the FS-as-RAG path VISION § 4–5 calls for and what
+///    `agent_runtime.md` § 6 means by "mandate-specific
+///    selection/distillation".
+///
+/// `RECENT_WINDOW = 8` is a placeholder for piece (1): small enough
+/// that the bundle stays cheap, big enough to be non-empty for the
+/// MockDecide-driven loop tests in JAR2-7/8. The real policy (window
+/// per mandate, time-vs-filename ordering, indexed reads, the
+/// warm-cache/tools cut line) is empirical and waits on real model
+/// latency + MCP roundtrip data, which we won't have until those
+/// tickets land.
 const RECENT_WINDOW: usize = 8;
 
 /// Read FS state and package a `ContextBundle` for the given triggers.
