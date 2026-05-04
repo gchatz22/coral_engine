@@ -306,6 +306,34 @@ impl AgentFs {
         Ok(())
     }
 
+    /// Return the most recent (up to) `n` `Output`s on disk.
+    ///
+    /// Order is deterministic: filenames under `outputs/` are ULIDs (which
+    /// sort lexically by creation time), so we sort filenames ascending,
+    /// take the last `n`, and return them in ascending filename order.
+    /// This lets the run loop hand a `Decide` implementation a stable
+    /// "recent history" window without needing wall-clock comparisons.
+    ///
+    /// Added for JAR2-6 (`assemble_context`); the bootstrap reads the full
+    /// directory and slices in memory because the corpus is small. A
+    /// follow-up can index or page if that ever stops being true.
+    pub fn list_recent_outputs(&self, n: usize) -> anyhow::Result<Vec<Output>> {
+        let dir = self.root.join("outputs");
+        Self::read_recent_json(&dir, n)
+    }
+
+    /// Return the most recent (up to) `n` `EvidenceRecord`s on disk.
+    ///
+    /// Order is deterministic: filenames under `evidence/` are sha256
+    /// hex digests, which carry no temporal meaning, so "recent" here is
+    /// purely lexical (ascending filename, last `n`). The bootstrap
+    /// `assemble_context` only needs determinism, not true recency, and
+    /// promoting evidence to a time-indexed store is out of scope.
+    pub fn list_recent_evidence(&self, n: usize) -> anyhow::Result<Vec<EvidenceRecord>> {
+        let dir = self.root.join("evidence");
+        Self::read_recent_json(&dir, n)
+    }
+
     /// Write `retirement.json` with the supplied reason and the current
     /// UTC timestamp. Overwrites any prior retirement record.
     pub fn persist_retirement(&self, reason: &str) -> anyhow::Result<()> {
@@ -328,6 +356,61 @@ impl AgentFs {
     fn ensure_dir(path: &Path) -> anyhow::Result<()> {
         fs::create_dir_all(path).map_err(|e| FsError::io(path, e))?;
         Ok(())
+    }
+
+    /// Read every regular `.json` file under `dir`, sort by filename
+    /// ascending, take the last `n`, and parse each into `T`.
+    ///
+    /// Filename sort is the stable ordering primitive — outputs use ULID
+    /// filenames (time-monotonic) and evidence uses sha256 (arbitrary but
+    /// deterministic). A missing directory yields an empty list rather
+    /// than an error so this is safe to call right after `open`.
+    ///
+    /// Scaling note: this enumerates every entry in `dir` and sorts the
+    /// full filename list, even though only the top `n` results are
+    /// returned. File *contents* are read lazily for the top `n` only,
+    /// so the cost is O(M) names + O(M log M) sort where M is the total
+    /// directory size. At bootstrap scale (M < 100, n = 8) this is
+    /// microseconds and irrelevant. A long-lived agent with thousands
+    /// of outputs/evidence records will want a real fix — most likely
+    /// an append-only `index.jsonl` per directory that lets us tail the
+    /// recent N without scanning. Bounded min-heap is a cheaper
+    /// intermediate (O(M log N), O(N) memory) but doesn't address the
+    /// underlying "scan a directory every wakeup" problem. Both
+    /// optimizations land alongside the FS-schema-evolution work that
+    /// snapshots/versioning will need anyway (`VISION.md` § 5).
+    fn read_recent_json<T>(dir: &Path, n: usize) -> anyhow::Result<Vec<T>>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        // Collect (filename, full path) for every regular .json entry. We
+        // sort by filename rather than by full path so the ordering is
+        // independent of the FS root location.
+        let mut entries: Vec<(std::ffi::OsString, PathBuf)> = Vec::new();
+        for entry in fs::read_dir(dir).map_err(|e| FsError::io(dir, e))? {
+            let entry = entry.map_err(|e| FsError::io(dir, e))?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            entries.push((entry.file_name(), path));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let start = entries.len().saturating_sub(n);
+        let mut out = Vec::with_capacity(entries.len() - start);
+        for (_, path) in entries.into_iter().skip(start) {
+            let bytes = fs::read(&path).map_err(|e| FsError::io(&path, e))?;
+            let value: T = serde_json::from_slice(&bytes)?;
+            out.push(value);
+        }
+        Ok(out)
     }
 
     /// Resolve `raw` against `<root>/notes/`. Paths must be relative,
@@ -606,6 +689,55 @@ mod tests {
         assert!(err.downcast_ref::<FsError>().is_some());
         // Pre-flight validation rejects the batch before any write.
         assert!(!tmp.path().join("notes").join("good.md").exists());
+    }
+
+    #[test]
+    fn list_recent_outputs_returns_window_in_filename_order() {
+        let (_tmp, fs, _m) = fresh_fs();
+        // Seed an evidence record we can attach to every output.
+        let id = fs
+            .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
+            .unwrap();
+
+        let mut all_ids = Vec::new();
+        for i in 0..10 {
+            let out = fs.persist_output(&format!("o-{i}"), &[id.clone()]).unwrap();
+            all_ids.push(out.id);
+        }
+
+        // Last 8.
+        let recent = fs.list_recent_outputs(8).unwrap();
+        assert_eq!(recent.len(), 8);
+
+        // Returned outputs are in ascending filename (= ULID) order.
+        let ids: Vec<_> = recent.iter().map(|o| o.id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted);
+
+        // n larger than available → all entries returned.
+        let all = fs.list_recent_outputs(100).unwrap();
+        assert_eq!(all.len(), 10);
+
+        // n = 0 → empty.
+        let none = fs.list_recent_outputs(0).unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn list_recent_evidence_returns_window_in_filename_order() {
+        let (_tmp, fs, _m) = fresh_fs();
+        for i in 0..10 {
+            fs.record_evidence(record("echo", json!({ "i": i }), json!({ "i": i })))
+                .unwrap();
+        }
+        let recent = fs.list_recent_evidence(8).unwrap();
+        assert_eq!(recent.len(), 8);
+
+        let ids: Vec<_> = recent.iter().map(|r| r.id.as_str().to_string()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "evidence not returned in filename order");
     }
 
     #[test]
