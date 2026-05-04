@@ -11,6 +11,7 @@ pub mod evidence;
 pub mod fs;
 pub mod mandate;
 pub mod scheduler;
+pub mod tools;
 pub mod trigger;
 pub mod trigger_queue;
 
