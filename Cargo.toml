@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "node-run"
 path = "src/bin/node_run.rs"
 
+[[bin]]
+name = "compute-evidence-id"
+path = "src/bin/compute_evidence_id.rs"
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
