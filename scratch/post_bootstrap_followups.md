@@ -1,6 +1,6 @@
-## Post-bootstrap follow-ups
+## Post-bootstrap follow-ups — Group A
 
-*Status: planning surface. Ideas surfaced by the JAR2-1 bootstrap (PRs #1–#11) that did not make the cut for the bootstrap itself but are now reasonable next moves. Each entry has motivation, scope, dependencies, sizing, and open questions. Read in dependency order — Group A items can ship anytime; Group B is a prerequisite for any real-scale agent; Group C are strategic forks that need their own design rounds before tickets.*
+*Status: planning surface. Ideas surfaced by the JAR2-1 bootstrap (PRs #1–#11) that did not make the cut for the bootstrap itself but are now reasonable next moves. Each entry has motivation, scope, dependencies, sizing, and open questions. This file holds Group A only — items that are independent and shippable anytime — so they can be worked in isolation. Group B (real-scale prerequisites) and Group C (strategic forks) live in `scratch/post_bootstrap_followups_later.md`.*
 
 *Read order: `VISION.md` § 4–5, `scratch/agent_runtime.md`, `scratch/minimal_node_backend.md`, then this.*
 
@@ -32,25 +32,23 @@ These do not depend on each other or on any architectural decision still open. P
 
 **Scope.**
 - A new `src/decide_llm.rs` (or a sibling crate if we adopt the workspace approach raised in our earlier crate-naming conversation).
-- An `LlmDecide` struct holding model config + a client.
-- Prompt assembly from `ContextBundle`: render the mandate, recent triggers, recent outputs, and recent evidence into a structured prompt; emit a `Decision` via tool-use / structured output.
-- Schema validation: the model's output must parse into `Decision`. On parse failure, retry once with a corrective system message; on second failure, return `Err`.
+- A small `ModelClient` trait — our own thin model-agnostic abstraction — with two implementations from day one: Anthropic and Cohere. VISION §4 ("open kernel, sovereign default") wants vendor-substitutable, and the maintainer wants both vendors live off the bat. Trait surface stays minimal: `complete(messages, tools, options) -> Response`; vendor-specific knobs live behind the impl.
+- An `LlmDecide` struct holding model config + a `Box<dyn ModelClient>`.
+- Prompt assembly from `ContextBundle`: render the mandate, recent triggers, recent outputs, and recent evidence into a structured prompt; emit a `Decision` via **tool use** (one tool per `Decision` variant, or a single `emit_decision` tool with a tagged-union schema — pick whichever is more reliable in prompt iteration).
+- Schema validation: the model's tool-use payload must parse into `Decision`. On parse failure, retry once with a corrective system message; on second failure, return `Err` (which the agent-health policy below treats as an inference-retry exhaustion).
+- **Synthetic-trigger correction loop.** When the model emits a `Decision` we cannot satisfy at apply-time (e.g. `CallTool` for an unregistered tool, or `EmitOutput` whose evidence does not resolve), the runtime injects a corrective synthetic `Trigger` describing the failure into the queue and continues; the next tick gives the model a chance to self-correct. This counts toward an inference-retry budget (see agent-health below).
+- **Agent health / retry policy.** Both inference failures (parse/transport/rate-limit-after-backoff) and tool-call failures (see A2) feed a per-tick retry budget. When the budget is exhausted on a tick, the agent transitions to an `Unhealthy` state, that tick aborts, and a `health.json` records the failing decision, the retry trail, and the last error. **The run loop does not halt** — the agent stays subscribed to its trigger queue. The next trigger wakes it normally; if that tick completes without exhausting retries, the agent flips back to `Healthy` and the prior `health.json` is archived (kept for audit, e.g. moved to `health/<timestamp>.json`). If it fails again, `health.json` updates and the agent stays `Unhealthy`. `retirement.json` is *not* written by this path — health is orthogonal to retirement. This shape is shared between A1 and A2 and should be a small `health` module, not duplicated.
 - Cost + latency accounting per call (rough; real metering is its own ticket).
-- A new feature flag or build profile to keep `LlmDecide` optional so the test suite stays free of network calls.
+- A feature flag or build profile to keep `LlmDecide` optional so the test suite stays free of network calls.
 
-**Choice points.**
-- **Vendor abstraction.** Direct Anthropic SDK vs. a model-agnostic abstraction (e.g. our own thin layer, or a crate like `genai`). VISION §4 ("open kernel, sovereign default") wants vendor-substitutable. The minimum-viable answer is a small `ModelClient` trait this ticket defines, with one implementation for Anthropic. A second implementation lands when we need open-weight support.
-- **Structured output mechanism.** Tool-use vs. JSON mode vs. constrained generation. Tool-use is the most robust for typed enums today on Anthropic.
-- **Caching.** Anthropic prompt caching could halve cost for the always-static parts (mandate, system prompt). Worth wiring in v1.
+**Decided.**
+- **Caching: drop from v1.** Anthropic prompt caching and Cohere's caching story are vendor-shaped differently and a model-agnostic abstraction is not worth blocking the ticket on. File a follow-up to revisit once both impls are live and we have real cost data to motivate the abstraction's shape.
+- **Default models.** Cost-optimized: `claude-haiku-4-5` for the Anthropic path, `command-a` for the Cohere path. Both flag-overridable. Larger models are an explicit per-mandate opt-in.
+- **Test isolation.** Recorded-response fixtures (VCR-style) for CI; a small live-test target gated behind an env var for occasional verification against both vendors.
 
-**Dependencies.** None on the bootstrap. Pulls in a real HTTP client (`reqwest`), an SDK (`anthropic-sdk` or hand-rolled), and possibly `tokio-util`.
+**Dependencies.** None on the bootstrap. Pulls in a real HTTP client (`reqwest`); SDKs hand-rolled against the trait (avoids dragging in two vendor SDKs with their own dep trees).
 
-**Sizing.** ~2 weeks of focused work for a credible v1, including prompt iteration. Sub-tickets: model client trait + Anthropic impl, prompt template, tool-use Decision schema, retry/validation harness, cost accounting hooks, integration test against a recorded fixture.
-
-**Open questions.**
-- Which model is the default for the bootstrap mandate ("the smallest correct decision per tick")? Likely `claude-sonnet-4-6` for a mix of cost and reliability; flag-overridable.
-- How do we test without burning real API calls? Recorded-response fixtures (VCR-style) for CI; a small live-test target gated behind an env var for occasional verification.
-- When the model emits a `Decision` we cannot satisfy (e.g. CallTool for a tool not registered), do we retry, error, or auto-emit a corrective synthetic Trigger?
+**Sizing.** ~2 weeks of focused work for a credible v1 including prompt iteration. Sub-tickets: `ModelClient` trait + Anthropic impl, Cohere impl, prompt template, tool-use `Decision` schema, retry/validation + synthetic-trigger correction, agent-health module (shared with A2), cost accounting hooks, integration tests against recorded fixtures for both vendors.
 
 ---
 
@@ -64,19 +62,18 @@ These do not depend on each other or on any architectural decision still open. P
 - Wire the `ToolRegistry::register` path so an MCP server's advertised tools show up automatically — possibly a `ToolRegistry::register_mcp_server(...)` helper that introspects via `tools/list`.
 - Smoke fixture using a trivial MCP server (`@modelcontextprotocol/server-everything` is a good first target).
 
-**Choice points.**
-- **Rust MCP client crate.** `rmcp` exists and is the official Rust SDK; check its maturity. Otherwise hand-rolled (small surface).
-- **One MCP server per tool vs. one per agent.** `agent_runtime.md` §11.6 flags MCP traffic multiplexing across siblings as a kernel concern; that's a later ticket. For now, one server per agent is fine.
-- **Process supervision.** What happens when an MCP server crashes mid-tool-call? Restart vs. surface as a tool error. Bootstrap-grade: surface as error, don't restart.
+**Decided.**
+- **Topology: one MCP server per agent for now.** `agent_runtime.md` §11.6 flags multiplexing across siblings as a kernel concern; this ticket explicitly punts that. **Follow-up to revisit:** a single shared server pool with per-agent multiplexing once we have multi-agent traffic — file when C2 (parent–child) lands so we have real load to design against.
+- **Auth.** Env-var based for the bootstrap; real secret manager is a later ticket.
+- **Schema trust.** Trust the MCP server's advertised tool schemas; no in-engine re-validation.
+- **Streaming.** Punt to a follow-up. `Tool::call` stays single-shot; if the first server we try requires streaming, that becomes its own ticket rather than expanding this one.
+- **Rust MCP client.** Use `rmcp` (the official Rust SDK). Hand-rolled is the fallback only if we hit a blocker during implementation.
+- **Process supervision.** When an MCP server crashes mid-call: surface as a tool error and let the retry policy below handle it; do not auto-restart at bootstrap stage.
+- **Retry + agent health.** Failed tool calls retry up to a configurable max (start with 3). On exhaustion the call surfaces as a tool error and trips the same agent-health path A1 defines: agent transitions to `Unhealthy`, the tick aborts, `health.json` records the failing call and retry trail. The run loop keeps running; a subsequent successful tick flips the agent back to `Healthy`. The retry+health module is shared between A1 (inference) and A2 (tool calls) — implement it once.
 
-**Dependencies.** None on the bootstrap. Composes with A1 — once an LLM is asking for tools, we want real ones to give it.
+**Dependencies.** None on the bootstrap. Composes with A1 — once an LLM is asking for tools, we want real ones to give it, and the two share the agent-health module.
 
-**Sizing.** ~1 week for the client + registry plumbing + one server smoke. Sub-tickets: MCP client integration, `McpTool` impl, registry registration helper, smoke fixture against `server-everything`.
-
-**Open questions.**
-- Authentication / secrets for MCP servers that need them (e.g. a Slack or GitHub MCP). Probably env-var based for the bootstrap, real secret manager later.
-- Schema validation: do we trust the MCP server's tool schemas, or run them through a validator?
-- Streaming tool results — MCP supports them; our `Tool::call` returns once. Punt to a follow-up unless the first server we try requires it.
+**Sizing.** ~1 week for the client + registry plumbing + one server smoke. Sub-tickets: MCP client integration, `McpTool` impl, registry registration helper, retry policy wiring (calls into the shared health module), smoke fixture against `server-everything`.
 
 ---
 
@@ -98,113 +95,16 @@ These do not depend on each other or on any architectural decision still open. P
 
 ---
 
-## Group B — Prerequisite for real-scale agents
-
-### B1. Per-directory `index.jsonl` for `outputs/` and `evidence/`
-
-**Why.** `AgentFs::list_recent_outputs` / `list_recent_evidence` (used by `assemble_context` every tick) currently `read_dir` the entire directory, sort all filenames, take the last N. Documented in the rustdoc on `read_recent_json`. At bootstrap scale (M < 100, N = 8) this is microseconds and irrelevant. A long-lived agent with thousands of outputs and tens of thousands of evidence records will spend real wall-time scanning every wakeup.
-
-**Scope.**
-- An append-only `outputs/index.jsonl` (and `evidence/index.jsonl`) recording `{filename, created_at}` per write.
-- Update the write path: `persist_output` and `record_evidence` append to the index in the same operation that writes the file. Atomicity: write file first, then append to index (so a crash leaves index lagging, never ahead — easier to repair than dangling index entries).
-- Update the read path: `list_recent_outputs` / `list_recent_evidence` tail the index instead of `read_dir`.
-- Repair / verification path: a `--verify-index` mode (or a separate binary) that walks the directory and reconstructs/checks the index.
-
-**Choice points.**
-- **Index format.** JSONL is the obvious match. Sqlite is overkill here; both `outputs/` and `evidence/` are write-once (no updates, no deletes). JSONL append + tail is fine.
-- **What to record per entry.** At minimum `{filename}`. Adding `created_at` lets us answer "recent by time" if filename ordering is ever insufficient (today filenames are time-monotonic ULIDs / sha256, so filename-order = creation-order; that may not always hold).
-- **Index sync semantics.** Per-write `write + fsync + index-append + fsync` is durable but slow. Per-write `write + index-append` then occasional `fsync` is the realistic default; a verifier reconciles after a crash.
-
-**Dependencies.** None. Self-contained FS-layer change. Composes with future snapshots/forks (C3) since the index is a natural snapshot artifact.
-
-**Sizing.** ~3–4 days. Sub-tickets: index data type + writer, integrate into `persist_output` / `record_evidence`, integrate into list helpers, verifier.
-
-**Open questions.**
-- Should `apply_ops` (which writes under `notes/`) also have an index? Probably no — notes are mutable, not append-only, and the loop never lists them.
-- Atomicity story across the two writes (file + index) — does fsync matter at bootstrap stage? Probably not; the index is reconstructable from the directory.
-
----
-
-## Group C — Strategic forks (need design before tickets)
-
-These are big enough that filing tickets without a design round would lock in answers we should debate first. Each warrants its own `scratch/<topic>.md`.
-
-### C1. Mid-tick state durability — Temporal vs. custom substrate
-
-**Why.** Today: a crash mid-tick loses the in-memory `TriggerQueue`. The FS survives because it's on disk, and `agent_runtime.md` §5 names the FS as the source of truth for working memory. But the queue, the scheduler cursor, and any partially-applied decision are not durable. For a continuously running fleet of millions of subagents (`VISION.md` §7), this is unacceptable — process restarts must resume cleanly, not lose in-flight work.
-
-**Two paths, both serious.**
-
-- **Adopt Temporal as the durability substrate** (this is what `scratch/agent_runtime.md` reaches for). Each agent becomes a long-lived Temporal workflow; signals replace mpsc; activities replace direct tool calls. We get durable execution, replayable history, signal/timer composition, and a worker pool for free. The cost: a Temporal cluster (or Temporal Cloud) becomes operational dependency, and the Rust SDK is alpha-grade.
-- **Build a custom substrate.** Persist the trigger queue + scheduler cursor + tick metadata to a sidecar `state.json` (or sqlite) in the agent root, snapshot per-tick. On restart, replay from the last snapshot. Lighter operationally, but we own the durability story and the clock-skew, replay, and idempotency edge cases.
-
-**What this design doc would resolve.**
-- The forking decision above.
-- If Temporal: minimum production-quality version of the Rust SDK, or contribute upstream first?
-- If custom: snapshot cadence (per-tick, per-N-ticks, on-decision-boundary), storage layout, replay semantics for activities that are not idempotent (tool calls especially).
-- Either way: how does mandate-update / human-override interact with mid-tick state?
-
-**Dependencies.** This is a precondition for C2 (parent–child topology — child handles must be durable) and C3 (snapshots — durability is the substrate snapshots ride on).
-
-**Sizing.** Design doc is ~1 week. Implementation is months either way and worth a Project, not a parent issue.
-
----
-
-### C2. Parent–child topology
-
-**Why.** Every node currently runs alone. The whole point of the engine (`VISION.md` §3) is graphs of agents reconciling outputs from children. Bootstrap explicitly punted this (`scratch/minimal_node_backend.md` §0 locked B1 — single node, no graph).
-
-**Scope (rough — needs design).**
-- Spawn primitive: `SpawnChild { mandate, ... }` decision variant, plus a runtime that creates the child agent's FS, registers a parent–child edge, and starts the child.
-- `ChildOutput` trigger variant the parent receives when a child emits an output upward.
-- Reconciliation: parent's Decide sees child outputs as part of `ContextBundle`, can emit `ReconcileChildren { ... }` or its own `EmitOutput`.
-- Conflict log: when children disagree, parent's reconciliation decision is recorded as a `conflicts/<id>.json` (FS schema extension; flagged in `scratch/minimal_node_backend.md` §6 as deferred).
-- Child lifecycle: parent can retire / replace / fork a child. These are kernel primitives, not application-level (`VISION.md` §4: "the human is in the kernel").
-
-**What this design doc would resolve.**
-- Decision enum extensions (`SpawnChild`, `ReconcileChildren`, `RetireChild`, `ReplaceChild`).
-- Trigger enum extensions (`ChildOutput`, possibly `ChildRetired`).
-- FS schema additions (`children/<id>` index, `conflicts/<id>.json`).
-- The reconciliation contract — what exactly does the parent's Decide see? Just child output texts, or output texts plus their evidence trails plus their own intermediate state?
-- ID scheme — `agent_runtime.md` §3 sketched `{graph_id}/{node_id}`; needs concrete design.
-
-**Dependencies.** **Hard dependency on C1** — child handles must survive parent restart.
-
-**Sizing.** Multi-month. Almost certainly a Linear Project, not a parent issue.
-
----
-
-### C3. Snapshot / fork of an agent's FS
-
-**Why.** `VISION.md` §5 says the graph layer is "versioned and time-scrubbable. A snapshot is a complete description of a research process — durable, replicable, forkable, and inclusive of every agent's filesystem." That requires snapshotting a single agent's FS as a primitive — copy-on-write or content-addressed.
-
-**Scope (rough — needs design).**
-- A `snapshots/` directory or sibling tree per agent that captures the FS state at a point in time.
-- Copy-on-write semantics: `outputs/` and `evidence/` are append-only so snapshotting is cheap (just record the current file list); `notes/` is mutable so requires a real copy.
-- Fork primitive: produce a new agent root that starts from a snapshot and diverges. Useful for "what if this child had reconciled differently" replay.
-- Time-scrubbable read API: given a snapshot id and a path, return the file as it existed at that snapshot.
-
-**Dependencies.**
-- B1 (index) makes snapshotting easy — the index *is* most of the snapshot for append-only directories.
-- C1 (durability) — snapshots are useful only if the substrate beneath them is durable.
-
-**Sizing.** Real ticket-able once B1 lands. Rough order: design doc, FS-layer extensions, fork primitive, time-scrub reader, integration with the eventual graph layer.
-
-**Open questions.** Does the snapshot include or exclude `retirement.json`? Does forking a retired agent restart it from before retirement?
-
----
-
 ## Minor cleanups (no tickets needed; folded into the next nearby change)
 
 - **`node-run` trigger feeder** silently `break`s if the queue receiver is gone. Acceptable for a smoke binary; a real long-lived runner will want a typed shutdown channel.
-- **`node-run print_tree`** re-reads each subdirectory eagerly with no `--max-entries` flag. Fine for fixtures; pathological agents would want elision (same family of FS-scale problems as B1).
+- **`node-run print_tree`** re-reads each subdirectory eagerly with no `--max-entries` flag. Fine for fixtures; pathological agents would want elision (same family of FS-scale problems as B1 in `post_bootstrap_followups_later.md`).
 - **Wrong-arg-count exit** in `node-run` uses `std::process::exit(2)` from inside a sync helper, skipping destructor cleanup of the (not-yet-built) tokio runtime. Fine because no resources held; would graduate to a typed error if the binary grew.
 
 ---
 
 ## Decision needed before filing tickets
 
-For each item above, you'll want to decide:
-1. **Linear shape.** Single ticket vs. parent issue with sub-issues vs. Project. My read: A3 is a single ticket; A1, A2, B1 are parent issues; C1, C2, C3 are Projects (each preceded by its own scratch doc).
-2. **Order.** Group A in any order. Group B before any real-scale demo. Group C requires C1 first, then C2, then C3.
+1. **Linear shape.** Single ticket vs. parent issue with sub-issues vs. Project. My read: A3 is a single ticket; A1 and A2 are parent issues (each has 5+ sub-tickets identified in the Sizing sections).
+2. **Order within Group A.** Any order is defensible since all three are independent. A3 is the cheapest unblock and prevents fixture rot, so a natural sequence is A3 → A1 / A2 in parallel (they share the agent-health module, so coordinate or land that piece first under whichever ships first).
 3. **Crate boundaries.** Do A1 and A2 ship in the same `jarvis_node` crate, or do they motivate the workspace split we discussed earlier (`jarvis_node` core + `jarvis_decide_llm` + `jarvis_mcp` extensions)? My read: defer the workspace until A1 lands and we feel actual compile-time pain or a real second consumer.
