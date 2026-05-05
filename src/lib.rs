@@ -10,6 +10,7 @@ pub mod agent;
 pub mod decision;
 pub mod evidence;
 pub mod fs;
+pub mod health;
 pub mod mandate;
 pub mod scheduler;
 pub mod tools;
