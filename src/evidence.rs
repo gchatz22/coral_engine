@@ -6,6 +6,22 @@
 //! cryptographic probability. Determinism comes from sorting object keys
 //! during serialization, so two records that round-trip through serde
 //! into different in-memory key orderings still hash the same.
+//!
+//! The full `result` is in the hash by design, not by accident. Content
+//! addressing on the whole triple is what lets identical calls dedup,
+//! conflicts surface, and provenance chains stay tamper-evident — hashing
+//! only `(tool, args)` would let two calls with the same inputs but
+//! different outputs collide in the evidence store and silently corrupt
+//! the chain. The cost is bounded: the id is computed once at capture
+//! time inside `EvidenceRecord::new`, stored on the record, and never
+//! recomputed on read. With sha256 at ~2 GB/s on hardware-accelerated
+//! CPUs and a comparable O(size) cost for the canonical-JSON walk,
+//! encoding plus hashing runs in microseconds for typical KB-sized
+//! results and milliseconds for MB-sized ones — orders of magnitude
+//! under the I/O that produced the result. If a profile ever points at
+//! this path, the cheapest mitigation is streaming the canonical
+//! encoder directly into `Sha256::update` instead of buffering the full
+//! output first.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
