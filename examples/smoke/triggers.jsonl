@@ -1,0 +1,3 @@
+# One external trigger to exercise the signal arm of the run loop. Pushed
+# with zero delay so it's visible to the agent's first tick.
+{"delay_ms": 0, "trigger": {"type": "external", "kind": "kickoff", "payload": {}}}
