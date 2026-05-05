@@ -2,7 +2,7 @@
 name = "jarvis_node"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.84"
+rust-version = "1.88"
 description = "Single-node runtime for the Jarvis Engine (bootstrap skeleton)."
 license = "Apache-2.0 OR MIT"
 publish = false
@@ -15,12 +15,9 @@ path = "src/lib.rs"
 name = "node-run"
 path = "src/bin/node_run.rs"
 
-[features]
-# Default build is network-free: no `reqwest`, no live model adapters.
-# JAR2-14 lands the `ModelClient` trait + a hand-rolled Anthropic impl
-# behind this opt-in feature so `cargo test` stays hermetic by default.
-default = []
-llm-anthropic = ["dep:reqwest"]
+[[bin]]
+name = "compute-evidence-id"
+path = "src/bin/compute_evidence_id.rs"
 
 [dependencies]
 anyhow = "1"
@@ -28,6 +25,7 @@ async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+rmcp = { version = "1.6.0", optional = true, features = ["client", "server", "transport-child-process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -35,6 +33,22 @@ thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 tracing = "0.1"
 ulid = { version = "1", features = ["serde"] }
+
+[features]
+# Default build is network-free: no `reqwest`, no live model adapters.
+# JAR2-14 lands the `ModelClient` trait + a hand-rolled Anthropic impl
+# behind the `llm-anthropic` feature so `cargo test` stays hermetic by
+# default. JAR2-22 added the `mcp` feature on the same opt-in pattern.
+default = []
+llm-anthropic = ["dep:reqwest"]
+mcp = ["dep:rmcp"]
+
+# Clippy 1.88 promoted a handful of style lints (notably `uninlined_format_args`)
+# that fire on patterns the 1.84 toolchain accepted. Allowing them keeps the
+# pre-bump source untouched per JAR2-22's "smallest correct diff" rule;
+# revisit once we have a reason to broadly modernize formatting.
+[lints.clippy]
+uninlined_format_args = "allow"
 
 [dev-dependencies]
 tempfile = "3"
