@@ -20,8 +20,11 @@
 //! `emit_output` entry's declared evidence ids are listed alongside the
 //! immediately preceding `call_tool`, so a reviewer can eyeball whether the
 //! fixture's static hash still matches what `EvidenceId::new` would produce
-//! today. The `--from-file` parser is best-effort: it tolerates lines whose
-//! shape it doesn't recognize.
+//! today. The `--from-file` parser tolerates lines whose JSON *shape* it
+//! doesn't recognize (unknown `type` discriminators, extra fields), but it
+//! does **not** tolerate invalid JSON: a malformed line aborts the walk so
+//! drift in the fixture format is surfaced immediately rather than silently
+//! skipped.
 
 use std::fs;
 use std::path::Path;
@@ -93,11 +96,11 @@ fn single(tool: &str, args_json: &str, result_json: &str) -> Result<()> {
 /// Mode 2: walk a `decisions.jsonl` and pair each `emit_output`'s declared
 /// evidence ids with the immediately preceding `call_tool` for audit.
 ///
-/// Best-effort: we match on the `type` discriminator over a generic
-/// `serde_json::Value` rather than deserializing into the crate's `Decision`
-/// enum, so a fixture with extra fields, unknown variants, or even a typo
-/// elsewhere doesn't abort the whole walk. Lines that don't parse as JSON
-/// surface as warnings on stderr.
+/// We match on the `type` discriminator over a generic `serde_json::Value`
+/// rather than deserializing into the crate's `Decision` enum, so a fixture
+/// with extra fields or unknown variants doesn't abort the walk. Invalid
+/// JSON, however, is a hard failure: an audit tool that silently skipped
+/// malformed lines could miss exactly the kind of drift it exists to catch.
 fn audit_file(path: &Path) -> Result<()> {
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
@@ -113,17 +116,8 @@ fn audit_file(path: &Path) -> Result<()> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let value: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!(
-                    "compute-evidence-id: skipping line {} of {}: {e}",
-                    i + 1,
-                    path.display()
-                );
-                continue;
-            }
-        };
+        let value: serde_json::Value = serde_json::from_str(line)
+            .with_context(|| format!("parsing line {} of {}", i + 1, path.display()))?;
         let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match kind {
             "call_tool" => {
@@ -180,6 +174,7 @@ fn audit_file(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::Write;
 
     /// Static drift detection: the smoke fixture
     /// (`examples/smoke/decisions.jsonl`) embeds this hex. If
@@ -196,5 +191,48 @@ mod tests {
             id.as_str(),
             "1d6a153a69d110156ca44ed281f859ca09d9875747e3ed16b9964c52632fd96e"
         );
+    }
+
+    /// `--from-file` must hard-fail on a malformed JSON line, naming the
+    /// offending line number and path. An audit tool that silently skipped
+    /// such lines would defeat its own purpose.
+    #[test]
+    fn audit_file_hard_fails_on_invalid_json() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            tmp,
+            r#"{{"type":"call_tool","name":"echo","args":{{"hello":"smoke"}}}}"#
+        )
+        .unwrap();
+        writeln!(tmp, "this is not json").unwrap();
+        writeln!(tmp, r#"{{"type":"emit_output","evidence":["abc"]}}"#).unwrap();
+
+        let err = audit_file(tmp.path()).expect_err("expected hard fail on invalid JSON");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("parsing line 2"),
+            "error should name the offending line: {chain}"
+        );
+        assert!(
+            chain.contains(&tmp.path().display().to_string()),
+            "error should name the offending file: {chain}"
+        );
+    }
+
+    /// Blank lines and `#`-comments are still skipped silently — they're not
+    /// the kind of "drift" the strict mode is meant to catch.
+    #[test]
+    fn audit_file_tolerates_blank_and_comment_lines() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "# header comment").unwrap();
+        writeln!(tmp).unwrap();
+        writeln!(
+            tmp,
+            r#"{{"type":"call_tool","name":"echo","args":{{"hello":"smoke"}}}}"#
+        )
+        .unwrap();
+        writeln!(tmp, r#"{{"type":"emit_output","evidence":["abc"]}}"#).unwrap();
+
+        audit_file(tmp.path()).expect("blank/comment lines should not be a hard failure");
     }
 }
