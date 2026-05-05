@@ -15,11 +15,19 @@ path = "src/lib.rs"
 name = "node-run"
 path = "src/bin/node_run.rs"
 
+[features]
+# Default build is network-free: no `reqwest`, no live model adapters.
+# JAR2-14 lands the `ModelClient` trait + a hand-rolled Anthropic impl
+# behind this opt-in feature so `cargo test` stays hermetic by default.
+default = []
+llm-anthropic = ["dep:reqwest"]
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

@@ -11,6 +11,7 @@ pub mod decision;
 pub mod evidence;
 pub mod fs;
 pub mod mandate;
+pub mod model_client;
 pub mod scheduler;
 pub mod tools;
 pub mod trigger;
