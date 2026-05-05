@@ -20,13 +20,24 @@
 //!
 //! ```text
 //! <root>/
-//!   health.json                           — current incident (Unhealthy only)
+//!   health.json                           — current state (always present)
 //!   health/<ISO-8601-timestamp>.json      — archived prior incidents
 //! ```
 //!
-//! `health.json` is removed when state flips to `Healthy`. Archive
-//! filenames use the `transitioned_at` timestamp of the incident being
-//! archived, so audit can reconstruct the order in which failures
+//! `health.json` is **always present** once a tracker has been opened on a
+//! root, regardless of whether the agent is Healthy or Unhealthy. The
+//! file's `state` discriminator (`"Healthy"` / `"Unhealthy"`) carries the
+//! semantic meaning — its mere existence does not. On recovery the prior
+//! Unhealthy incident is copied to `health/<transitioned_at>.json` and the
+//! live file is overwritten with a Healthy record (rather than removed),
+//! so external observers see a continuous file timeline.
+//!
+//! For Healthy records, `since` is the timestamp of the *transition into
+//! the current Healthy run* (initial `open` of a fresh root, or recovery
+//! from Unhealthy). It is **not** updated on each successful tick — that
+//! would mean per-tick disk churn at a target of millions of subagents.
+//! Archive filenames use the `transitioned_at` timestamp of the incident
+//! being archived, so audit can reconstruct the order in which failures
 //! happened.
 //!
 //! # Atomic writes
@@ -154,12 +165,16 @@ pub struct HealthIncident {
     pub transitioned_at: DateTime<Utc>,
 }
 
-/// Current health state. `Healthy` is the default; `Unhealthy` carries the
-/// active incident so a reader does not need to peek at `health.json`
-/// separately.
+/// Current health state. Both variants carry a `since` timestamp so a
+/// reader can tell when the agent entered its current state without
+/// peeking at `health.json` separately. `Healthy.since` is the time of
+/// the most recent transition into Healthy (initial `open`, or recovery
+/// from Unhealthy), not the time of the last successful tick.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HealthState {
-    Healthy,
+    Healthy {
+        since: DateTime<Utc>,
+    },
     Unhealthy {
         since: DateTime<Utc>,
         incident: HealthIncident,
@@ -169,16 +184,23 @@ pub enum HealthState {
 /// On-disk envelope for `health.json`. Versioned so a future schema bump
 /// is cheap. Kept private to the module — readers go through
 /// `HealthTracker::state()`, not direct serde.
+///
+/// `incident` is required iff `state == Unhealthy`. We model it as
+/// `Option` for serde convenience and validate the invariant at parse
+/// time so a malformed Unhealthy record is rejected rather than silently
+/// promoted to Healthy.
 #[derive(Debug, Serialize, Deserialize)]
 struct HealthRecord {
     version: u32,
     state: RecordState,
     since: DateTime<Utc>,
-    incident: HealthIncident,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    incident: Option<HealthIncident>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum RecordState {
+    Healthy,
     Unhealthy,
 }
 
@@ -196,31 +218,56 @@ pub struct HealthTracker {
 
 impl HealthTracker {
     /// Open a tracker rooted at `root`. If `<root>/health.json` exists it
-    /// is rehydrated as the starting `Unhealthy` state — restart-safe so
-    /// we do not silently flip Unhealthy agents to Healthy.
-    pub fn open(root: &Path, budget: RetryBudget) -> Result<Self, HealthError> {
+    /// is rehydrated faithfully (Healthy or Unhealthy) — restart-safe so
+    /// we do not silently flip Unhealthy agents to Healthy. If the file
+    /// does **not** exist, a fresh Healthy record is written with
+    /// `since = now`, so `health.json` is present from the moment the
+    /// tracker is opened.
+    ///
+    /// `now` is injected rather than read from `Utc::now()` so callers
+    /// can pin the timestamp deterministically (matches the existing
+    /// pattern where `transition_to_unhealthy` derives its `since` from
+    /// `incident.transitioned_at`).
+    pub fn open(root: &Path, budget: RetryBudget, now: DateTime<Utc>) -> Result<Self, HealthError> {
         let live = root.join(HEALTH_FILE);
-        let state = if live.exists() {
+        let mut tracker = Self {
+            root: root.to_path_buf(),
+            budget,
+            state: HealthState::Healthy { since: now },
+            inference_used: 0,
+            tool_used: 0,
+        };
+
+        if live.exists() {
             let bytes = fs::read(&live).map_err(|e| HealthError::io(&live, e))?;
             let record: HealthRecord = serde_json::from_slice(&bytes)?;
             if record.version != SCHEMA_VERSION {
                 return Err(HealthError::UnsupportedVersion(record.version));
             }
-            HealthState::Unhealthy {
-                since: record.since,
-                incident: record.incident,
-            }
+            tracker.state = match record.state {
+                RecordState::Healthy => HealthState::Healthy {
+                    since: record.since,
+                },
+                RecordState::Unhealthy => {
+                    let incident = record.incident.ok_or_else(|| {
+                        HealthError::Serde(serde_json::Error::io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Unhealthy record missing `incident`",
+                        )))
+                    })?;
+                    HealthState::Unhealthy {
+                        since: record.since,
+                        incident,
+                    }
+                }
+            };
         } else {
-            HealthState::Healthy
-        };
+            // File absent: write the initial Healthy record so the
+            // file-always-present invariant holds from `open` onward.
+            tracker.write_healthy(now)?;
+        }
 
-        Ok(Self {
-            root: root.to_path_buf(),
-            budget,
-            state,
-            inference_used: 0,
-            tool_used: 0,
-        })
+        Ok(tracker)
     }
 
     /// Borrow the current state.
@@ -269,14 +316,16 @@ impl HealthTracker {
     /// Mark the agent `Unhealthy` and persist `incident` to
     /// `health.json`. If the agent is already `Unhealthy`, the existing
     /// `health.json` is updated in place — the prior incident is **not**
-    /// archived (archival happens on recovery).
+    /// archived (archival happens on recovery). If the agent was Healthy,
+    /// the Healthy record on disk is overwritten with the Unhealthy one;
+    /// no archive is produced since there is no prior incident to record.
     pub fn transition_to_unhealthy(&mut self, incident: HealthIncident) -> Result<(), HealthError> {
         let since = incident.transitioned_at;
         let record = HealthRecord {
             version: SCHEMA_VERSION,
             state: RecordState::Unhealthy,
             since,
-            incident: incident.clone(),
+            incident: Some(incident.clone()),
         };
         self.write_live(&record)?;
         self.state = HealthState::Unhealthy { since, incident };
@@ -284,14 +333,26 @@ impl HealthTracker {
     }
 
     /// Mark the agent `Healthy` after a successful tick. If the agent
-    /// was previously `Unhealthy`, the live `health.json` is moved into
-    /// `health/<transitioned_at>.json` (archive) and removed from its
-    /// live location. Per-tick counters are also reset.
-    pub fn mark_tick_success(&mut self) -> Result<(), HealthError> {
+    /// was previously `Unhealthy`, the live `health.json` is copied to
+    /// `health/<transitioned_at>.json` (archive) and then overwritten in
+    /// place with a fresh Healthy record (`since = now`). If the agent
+    /// was already Healthy, this is a no-op — `health.json` is not
+    /// rewritten and `since` is preserved (avoids per-tick disk churn).
+    /// Per-tick counters are reset in either case.
+    ///
+    /// `now` is injected for the same reason as in `open`: deterministic
+    /// timestamps in tests, and so the run loop can pin all timestamps
+    /// for a tick to the same instant.
+    pub fn mark_tick_success(&mut self, now: DateTime<Utc>) -> Result<(), HealthError> {
         if let HealthState::Unhealthy { incident, .. } = &self.state {
+            // Archive first, then overwrite the live file. If the live
+            // overwrite fails after archive succeeds, a future open()
+            // rehydrates Unhealthy from the (still-present) live file —
+            // the safer of the two failure modes.
             self.archive_current(&incident.transitioned_at)?;
+            self.write_healthy(now)?;
+            self.state = HealthState::Healthy { since: now };
         }
-        self.state = HealthState::Healthy;
         self.inference_used = 0;
         self.tool_used = 0;
         Ok(())
@@ -305,6 +366,20 @@ impl HealthTracker {
         atomic_write(&live, &bytes)
     }
 
+    fn write_healthy(&self, since: DateTime<Utc>) -> Result<(), HealthError> {
+        let record = HealthRecord {
+            version: SCHEMA_VERSION,
+            state: RecordState::Healthy,
+            since,
+            incident: None,
+        };
+        self.write_live(&record)
+    }
+
+    /// Copy the current live Unhealthy `health.json` to
+    /// `health/<transitioned_at>.json`. The live file is **not** removed
+    /// — the caller (`mark_tick_success`) overwrites it with a Healthy
+    /// record so the file-always-present invariant holds.
     fn archive_current(&self, transitioned_at: &DateTime<Utc>) -> Result<(), HealthError> {
         let live = self.root.join(HEALTH_FILE);
         if !live.exists() {
@@ -321,11 +396,7 @@ impl HealthTracker {
         let archive = archive_dir.join(format!("{stamp}.json"));
 
         let bytes = fs::read(&live).map_err(|e| HealthError::io(&live, e))?;
-        // Atomic-write the archive copy first, then delete the live file.
-        // If the rename succeeds but the unlink fails, a future open()
-        // still rehydrates from the live file — safer than the inverse.
         atomic_write(&archive, &bytes)?;
-        fs::remove_file(&live).map_err(|e| HealthError::io(&live, e))?;
         Ok(())
     }
 }
@@ -381,31 +452,92 @@ mod tests {
         }
     }
 
+    /// Pinned timestamp used for the initial `open` in tests where the
+    /// open-time `since` is incidental to what's being asserted.
+    fn t0() -> DateTime<Utc> {
+        ts("2026-05-04T00:00:00Z")
+    }
+
     fn fresh(budget: RetryBudget) -> (TempDir, HealthTracker) {
         let tmp = TempDir::new().unwrap();
-        let tracker = HealthTracker::open(tmp.path(), budget).unwrap();
+        let tracker = HealthTracker::open(tmp.path(), budget, t0()).unwrap();
         (tmp, tracker)
     }
 
     #[test]
-    fn empty_start_yields_healthy_and_no_file() {
+    fn open_with_no_file_creates_healthy_health_json() {
         let (tmp, tracker) = fresh(RetryBudget::default());
-        assert!(matches!(tracker.state(), HealthState::Healthy));
-        assert!(!tmp.path().join("health.json").exists());
+        // State is Healthy with the injected `since`.
+        match tracker.state() {
+            HealthState::Healthy { since } => assert_eq!(since, &t0()),
+            HealthState::Unhealthy { .. } => panic!("expected Healthy"),
+        }
+        // File exists with Healthy content. Archive dir is not created.
+        let live = tmp.path().join("health.json");
+        assert!(live.is_file());
         assert!(!tmp.path().join("health").exists());
+
+        let v: serde_json::Value = serde_json::from_slice(&fs::read(&live).unwrap()).unwrap();
+        assert_eq!(v.get("version").and_then(|x| x.as_u64()), Some(1));
+        assert_eq!(v.get("state").and_then(|x| x.as_str()), Some("Healthy"));
+        assert_eq!(
+            v.get("since").and_then(|x| x.as_str()),
+            Some("2026-05-04T00:00:00Z")
+        );
+        // Healthy records do not carry an incident.
+        assert!(v.get("incident").is_none() || v.get("incident").unwrap().is_null());
     }
 
     #[test]
-    fn record_failure_under_budget_stays_healthy_no_file() {
+    fn record_failure_under_budget_keeps_healthy_file_intact() {
         let (tmp, mut tracker) = fresh(RetryBudget::new(2, 3));
+        let before = fs::read(tmp.path().join("health.json")).unwrap();
         tracker
             .record_failure(FailureKind::Inference, "boom")
             .unwrap();
         tracker
             .record_failure(FailureKind::Inference, "boom2")
             .unwrap();
-        assert!(matches!(tracker.state(), HealthState::Healthy));
-        assert!(!tmp.path().join("health.json").exists());
+        // State still Healthy; recording-under-budget does not touch the
+        // live file.
+        assert!(matches!(tracker.state(), HealthState::Healthy { .. }));
+        let after = fs::read(tmp.path().join("health.json")).unwrap();
+        assert_eq!(before, after, "Healthy file should not be rewritten");
+    }
+
+    #[test]
+    fn reopen_of_healthy_file_rehydrates_with_same_since() {
+        let tmp = TempDir::new().unwrap();
+        let opened_at = ts("2026-05-04T08:00:00Z");
+        {
+            let _t = HealthTracker::open(tmp.path(), RetryBudget::default(), opened_at).unwrap();
+        }
+        // Re-open with a *different* `now` and assert the rehydrated
+        // `since` is the original one, not the new `now`.
+        let later = ts("2026-05-04T09:30:00Z");
+        let reopened = HealthTracker::open(tmp.path(), RetryBudget::default(), later).unwrap();
+        match reopened.state() {
+            HealthState::Healthy { since } => assert_eq!(since, &opened_at),
+            HealthState::Unhealthy { .. } => panic!("expected Healthy after reopen"),
+        }
+    }
+
+    #[test]
+    fn healthy_to_healthy_does_not_rewrite_file() {
+        let (tmp, mut tracker) = fresh(RetryBudget::default());
+        let before = fs::read(tmp.path().join("health.json")).unwrap();
+        // A Healthy → Healthy transition (mark_tick_success while already
+        // Healthy) must not rewrite the live file: doing so would rotate
+        // `since` on every tick, which is wrong, and causes per-tick disk
+        // churn at the engine's millions-of-subagents scale.
+        let later = ts("2026-05-04T10:00:00Z");
+        tracker.mark_tick_success(later).unwrap();
+        let after = fs::read(tmp.path().join("health.json")).unwrap();
+        assert_eq!(before, after);
+        match tracker.state() {
+            HealthState::Healthy { since } => assert_eq!(since, &t0()),
+            HealthState::Unhealthy { .. } => panic!("state should still be Healthy"),
+        }
     }
 
     #[test]
@@ -450,28 +582,49 @@ mod tests {
                 assert_eq!(since, &when);
                 assert_eq!(i, &incident);
             }
-            HealthState::Healthy => panic!("state should be Unhealthy"),
+            HealthState::Healthy { .. } => panic!("state should be Unhealthy"),
         }
     }
 
     #[test]
-    fn recovery_archives_and_clears_live_health_json() {
+    fn recovery_archives_unhealthy_and_overwrites_live_with_healthy() {
         let (tmp, mut tracker) = fresh(RetryBudget::new(0, 0));
         let when = ts("2026-05-04T12:34:56Z");
+        let recovered_at = ts("2026-05-04T12:35:30Z");
         let _ = tracker.record_failure(FailureKind::Inference, "x");
         tracker
             .transition_to_unhealthy(sample_incident(FailureKind::Inference, when))
             .unwrap();
-        assert!(tmp.path().join("health.json").exists());
+        let live = tmp.path().join("health.json");
+        assert!(live.exists());
+        let unhealthy_bytes = fs::read(&live).unwrap();
 
-        tracker.mark_tick_success().unwrap();
-        assert!(matches!(tracker.state(), HealthState::Healthy));
-        assert!(!tmp.path().join("health.json").exists());
+        tracker.mark_tick_success(recovered_at).unwrap();
+        // State is Healthy with `since` set to the recovery timestamp.
+        match tracker.state() {
+            HealthState::Healthy { since } => assert_eq!(since, &recovered_at),
+            HealthState::Unhealthy { .. } => panic!("expected Healthy after recovery"),
+        }
 
+        // Live file still exists, but now carries Healthy content.
+        assert!(live.is_file(), "live health.json must remain present");
+        let v: serde_json::Value = serde_json::from_slice(&fs::read(&live).unwrap()).unwrap();
+        assert_eq!(v.get("state").and_then(|x| x.as_str()), Some("Healthy"));
+        assert_eq!(
+            v.get("since").and_then(|x| x.as_str()),
+            Some("2026-05-04T12:35:30Z")
+        );
+        assert!(v.get("incident").is_none() || v.get("incident").unwrap().is_null());
+
+        // Prior Unhealthy incident is preserved verbatim under the
+        // archive directory keyed by transitioned_at.
         let archive = tmp.path().join("health").join("2026-05-04T12:34:56Z.json");
         assert!(archive.is_file(), "archive should exist at {archive:?}");
-        let v: serde_json::Value = serde_json::from_slice(&fs::read(&archive).unwrap()).unwrap();
-        assert_eq!(v.get("state").and_then(|x| x.as_str()), Some("Unhealthy"));
+        assert_eq!(
+            fs::read(&archive).unwrap(),
+            unhealthy_bytes,
+            "archive should be a faithful copy of the live Unhealthy file"
+        );
     }
 
     #[test]
@@ -498,7 +651,7 @@ mod tests {
                 assert_eq!(incident.last_error, "newer");
                 assert_eq!(incident.failing.kind, FailureKind::ToolCall);
             }
-            HealthState::Healthy => panic!("state should still be Unhealthy"),
+            HealthState::Healthy { .. } => panic!("state should still be Unhealthy"),
         }
         assert!(!tmp.path().join("health").exists());
 
@@ -546,7 +699,9 @@ mod tests {
         assert_eq!(fs::read(&retirement).unwrap(), original);
 
         // Recovery.
-        tracker.mark_tick_success().unwrap();
+        tracker
+            .mark_tick_success(ts("2026-05-04T14:00:00Z"))
+            .unwrap();
         assert_eq!(fs::read(&retirement).unwrap(), original);
     }
 
@@ -559,7 +714,7 @@ mod tests {
         assert!(tracker.record_failure(FailureKind::Inference, "z").is_err());
         // begin_tick resets — state stays Healthy, counters fresh.
         tracker.begin_tick();
-        assert!(matches!(tracker.state(), HealthState::Healthy));
+        assert!(matches!(tracker.state(), HealthState::Healthy { .. }));
         tracker
             .record_failure(FailureKind::Inference, "fresh")
             .unwrap();
@@ -612,21 +767,24 @@ mod tests {
 
         // Re-open against the same root: state rehydrates Unhealthy with
         // the same incident, and `health.json` parses back into our
-        // private envelope deeply.
-        let reopened = HealthTracker::open(tmp.path(), RetryBudget::default()).unwrap();
+        // private envelope deeply. The injected `now` here is irrelevant
+        // because the file is present (Unhealthy) and `open` does not
+        // overwrite it.
+        let reopened = HealthTracker::open(tmp.path(), RetryBudget::default(), t0()).unwrap();
         match reopened.state() {
             HealthState::Unhealthy { since, incident: i } => {
                 assert_eq!(since, &when);
                 assert_eq!(i, &incident);
             }
-            HealthState::Healthy => panic!("expected Unhealthy after reopen"),
+            HealthState::Healthy { .. } => panic!("expected Unhealthy after reopen"),
         }
 
         let bytes = fs::read(tmp.path().join("health.json")).unwrap();
         let record: HealthRecord = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(record.version, SCHEMA_VERSION);
+        assert_eq!(record.state, RecordState::Unhealthy);
         assert_eq!(record.since, when);
-        assert_eq!(record.incident, incident);
+        assert_eq!(record.incident, Some(incident));
     }
 
     #[test]
@@ -646,7 +804,23 @@ mod tests {
         });
         fs::write(&live, serde_json::to_vec(&bogus).unwrap()).unwrap();
 
-        let err = HealthTracker::open(tmp.path(), RetryBudget::default()).unwrap_err();
+        let err = HealthTracker::open(tmp.path(), RetryBudget::default(), t0()).unwrap_err();
         assert!(matches!(err, HealthError::UnsupportedVersion(999)));
+    }
+
+    #[test]
+    fn open_rejects_unhealthy_record_missing_incident() {
+        let tmp = TempDir::new().unwrap();
+        let live = tmp.path().join("health.json");
+        // Schema-version-1, state=Unhealthy, but no `incident` field.
+        // Must error rather than silently downgrade to Healthy.
+        let bogus = json!({
+            "version": 1,
+            "state": "Unhealthy",
+            "since": "2026-05-04T12:34:56Z",
+        });
+        fs::write(&live, serde_json::to_vec(&bogus).unwrap()).unwrap();
+        let err = HealthTracker::open(tmp.path(), RetryBudget::default(), t0()).unwrap_err();
+        assert!(matches!(err, HealthError::Serde(_)));
     }
 }
