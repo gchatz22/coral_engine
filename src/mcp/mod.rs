@@ -1,0 +1,415 @@
+//! MCP client wrapper around the official `rmcp` SDK.
+//!
+//! `McpClient` connects to an MCP server over stdio (spawning a subprocess
+//! via `rmcp::transport::TokioChildProcess`), folds the MCP `initialize` +
+//! `initialized` handshake into the connect step, and exposes typed
+//! `list_tools` / `call_tool` methods over JSON-RPC.
+//!
+//! Errors are normalized into `McpError`, distinguishing transport failures,
+//! protocol violations, JSON-RPC server errors, and parse problems. Higher
+//! layers — `Tool for McpTool` (JAR2-23), `ToolRegistry::register_mcp_server`
+//! (JAR2-24), retry/health wiring (JAR2-25) — live in follower tickets.
+
+use std::sync::Arc;
+
+use rmcp::model::{CallToolRequestParams, JsonObject};
+use rmcp::service::{RoleClient, RunningService, ServiceError, ServiceExt};
+use rmcp::transport::TokioChildProcess;
+use rmcp::{service::ClientInitializeError, ErrorData};
+use serde_json::Value;
+use thiserror::Error;
+use tokio::process::Command;
+
+/// Public, transport-agnostic description of an MCP tool the connected
+/// server advertises. Mirrors `rmcp::model::Tool` but owns its strings and
+/// a plain `serde_json::Value` schema (rather than `Arc<JsonObject>`), so
+/// callers don't take a dep on rmcp's internal types.
+#[derive(Debug, Clone)]
+pub struct McpToolDescriptor {
+    pub name: String,
+    pub description: Option<String>,
+    pub input_schema: Value,
+}
+
+/// Unified error surface for the MCP client.
+#[derive(Debug, Error)]
+pub enum McpError {
+    /// Transport-layer failure: subprocess spawn error, stdio EOF / pipe
+    /// closed mid-call, or framing I/O error.
+    #[error("MCP transport error: {0}")]
+    Transport(String),
+
+    /// JSON-RPC error response from the peer (`id` matched, but the body
+    /// is an `Error` frame). `code` is the JSON-RPC error code; `message`
+    /// is the server-supplied message.
+    #[error("MCP server error {code}: {message}")]
+    ServerError { code: i32, message: String },
+
+    /// Protocol-level violation: handshake reply of the wrong shape, an
+    /// unexpected response variant, request cancelled, request timeout,
+    /// or any other non-error-frame breakage.
+    #[error("MCP protocol error: {0}")]
+    Protocol(String),
+
+    /// Failure to (de)serialize a value crossing the boundary — a tool's
+    /// arguments, a tool's result, or anything else that should have been
+    /// well-formed JSON.
+    #[error("MCP parse error: {0}")]
+    Parse(String),
+}
+
+impl From<ClientInitializeError> for McpError {
+    fn from(value: ClientInitializeError) -> Self {
+        match value {
+            ClientInitializeError::JsonRpcError(ErrorData { code, message, .. }) => {
+                McpError::ServerError {
+                    code: code.0,
+                    message: message.into_owned(),
+                }
+            }
+            ClientInitializeError::TransportError { error, context } => {
+                McpError::Transport(format!("{context}: {error}"))
+            }
+            ClientInitializeError::ConnectionClosed(ctx) => {
+                McpError::Transport(format!("connection closed: {ctx}"))
+            }
+            other => McpError::Protocol(other.to_string()),
+        }
+    }
+}
+
+impl From<ServiceError> for McpError {
+    fn from(value: ServiceError) -> Self {
+        match value {
+            ServiceError::McpError(ErrorData { code, message, .. }) => McpError::ServerError {
+                code: code.0,
+                message: message.into_owned(),
+            },
+            ServiceError::TransportSend(e) => McpError::Transport(e.to_string()),
+            ServiceError::TransportClosed => McpError::Transport("transport closed".to_string()),
+            other => McpError::Protocol(other.to_string()),
+        }
+    }
+}
+
+/// Typed MCP client. Holds a live `RunningService<RoleClient, ()>` whose
+/// background task drives the framing and response demux. The subprocess
+/// (when stdio-spawned) is owned by the underlying `TokioChildProcess`.
+pub struct McpClient {
+    inner: RunningService<RoleClient, ()>,
+}
+
+impl McpClient {
+    /// Spawn `command` with `args`, connect over stdio, and complete the
+    /// MCP handshake. Returns once the server's `initialize` response has
+    /// been received and the `initialized` notification has been sent.
+    pub async fn connect_stdio(command: &str, args: &[&str]) -> Result<Self, McpError> {
+        let mut cmd = Command::new(command);
+        cmd.args(args);
+        let transport = TokioChildProcess::new(cmd)
+            .map_err(|e| McpError::Transport(format!("spawn {command:?}: {e}")))?;
+        let inner = ().serve(transport).await?;
+        Ok(Self { inner })
+    }
+
+    /// Connect over an arbitrary `IntoTransport` (e.g. an in-memory duplex
+    /// pipe). Pulled out so tests can drive a fake server through
+    /// `tokio::io::duplex` without spawning a subprocess.
+    #[cfg(test)]
+    pub(crate) async fn connect_with<T, E, A>(transport: T) -> Result<Self, McpError>
+    where
+        T: rmcp::transport::IntoTransport<RoleClient, E, A>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let inner = ().serve(transport).await?;
+        Ok(Self { inner })
+    }
+
+    /// Enumerate every tool the peer advertises. Pages through `tools/list`
+    /// until `next_cursor` is empty.
+    pub async fn list_tools(&self) -> Result<Vec<McpToolDescriptor>, McpError> {
+        let tools = self.inner.peer().list_all_tools().await?;
+        Ok(tools.into_iter().map(to_descriptor).collect())
+    }
+
+    /// Call `name` with `args` and return the server's `CallToolResult` as
+    /// JSON. `args` must be a JSON object (`tools/call` parameters are an
+    /// object per the MCP spec); anything else returns `McpError::Parse`.
+    pub async fn call_tool(&self, name: &str, args: Value) -> Result<Value, McpError> {
+        let arguments = match args {
+            Value::Object(obj) => Some(obj),
+            Value::Null => None,
+            other => {
+                return Err(McpError::Parse(format!(
+                    "tools/call arguments must be a JSON object or null, got {}",
+                    type_name(&other)
+                )));
+            }
+        };
+        let mut params = CallToolRequestParams::new(name.to_string());
+        if let Some(obj) = arguments {
+            params = params.with_arguments(obj);
+        }
+        let result = self.inner.peer().call_tool(params).await?;
+        serde_json::to_value(result).map_err(|e| McpError::Parse(e.to_string()))
+    }
+
+    /// Cancel the background service task and close the transport.
+    /// Consumes `self`; subsequent calls would fail with `Transport`.
+    pub async fn shutdown(self) -> Result<(), McpError> {
+        self.inner
+            .cancel()
+            .await
+            .map_err(|e| McpError::Transport(format!("join error during shutdown: {e}")))?;
+        Ok(())
+    }
+}
+
+fn to_descriptor(tool: rmcp::model::Tool) -> McpToolDescriptor {
+    let input_schema = json_object_to_value(tool.input_schema);
+    McpToolDescriptor {
+        name: tool.name.into_owned(),
+        description: tool.description.map(|d| d.into_owned()),
+        input_schema,
+    }
+}
+
+fn json_object_to_value(obj: Arc<JsonObject>) -> Value {
+    // `Arc<Map>` -> `Value::Object`. Avoid cloning if we hold the only Arc.
+    let map = Arc::try_unwrap(obj).unwrap_or_else(|shared| (*shared).clone());
+    Value::Object(map)
+}
+
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::handler::server::ServerHandler;
+    use rmcp::model::{
+        CallToolResult, Content, ErrorCode, ListToolsResult, PaginatedRequestParams, ServerInfo,
+        Tool,
+    };
+    use rmcp::service::{NotificationContext, RequestContext, RoleServer};
+    use rmcp::{ErrorData, ServiceExt};
+    use serde_json::json;
+    use std::sync::Arc;
+    use tokio::io::{duplex, AsyncWriteExt};
+
+    /// Hand-built fake MCP server. Advertises one tool, `repeat`, that
+    /// echoes its `text` argument back; can be configured to return a
+    /// JSON-RPC error frame for `tools/call` to exercise the error path.
+    #[derive(Clone)]
+    struct FakeServer {
+        fail_with: Option<(i32, String)>,
+    }
+
+    impl FakeServer {
+        fn ok() -> Self {
+            Self { fail_with: None }
+        }
+        fn failing(code: i32, msg: impl Into<String>) -> Self {
+            Self {
+                fail_with: Some((code, msg.into())),
+            }
+        }
+    }
+
+    impl ServerHandler for FakeServer {
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            let mut schema = serde_json::Map::new();
+            schema.insert("type".into(), json!("object"));
+            schema.insert("properties".into(), json!({"text": {"type": "string"}}));
+            let tool = Tool::new("repeat", "echo the text back", Arc::new(schema));
+            Ok(ListToolsResult {
+                meta: None,
+                next_cursor: None,
+                tools: vec![tool],
+            })
+        }
+
+        async fn call_tool(
+            &self,
+            request: rmcp::model::CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResult, ErrorData> {
+            if let Some((code, msg)) = &self.fail_with {
+                return Err(ErrorData::new(ErrorCode(*code), msg.clone(), None));
+            }
+            let text = request
+                .arguments
+                .as_ref()
+                .and_then(|a| a.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "echo:{text}"
+            ))]))
+        }
+
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::default()
+        }
+
+        async fn on_initialized(&self, _context: NotificationContext<RoleServer>) {}
+    }
+
+    /// Plug a fake server's stdio into a duplex pipe and return the
+    /// matching client end as an `(AsyncRead, AsyncWrite)` tuple, plus a
+    /// handle to the server task so the test can keep it alive.
+    async fn paired(server: FakeServer) -> (McpClient, tokio::task::JoinHandle<()>) {
+        let (client_io, server_io) = duplex(8 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let server_task = tokio::spawn(async move {
+            let running = server
+                .serve((server_read, server_write))
+                .await
+                .expect("server handshake");
+            // Hold the running service until the client drops the pipe;
+            // `waiting()` returns when transport closes.
+            let _ = running.waiting().await;
+        });
+
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let client = McpClient::connect_with((client_read, client_write))
+            .await
+            .expect("client handshake");
+        (client, server_task)
+    }
+
+    #[tokio::test]
+    async fn list_and_call_round_trip() {
+        let (client, server) = paired(FakeServer::ok()).await;
+
+        let tools = client.list_tools().await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "repeat");
+        assert_eq!(tools[0].description.as_deref(), Some("echo the text back"));
+        assert_eq!(
+            tools[0].input_schema.get("type").and_then(Value::as_str),
+            Some("object")
+        );
+
+        let result = client
+            .call_tool("repeat", json!({"text": "hi"}))
+            .await
+            .unwrap();
+        // CallToolResult serializes with a `content` array of text parts.
+        let content = result
+            .get("content")
+            .and_then(Value::as_array)
+            .expect("content array");
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            content[0].get("text").and_then(Value::as_str),
+            Some("echo:hi")
+        );
+
+        client.shutdown().await.unwrap();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn server_error_frame_maps_to_server_error() {
+        let (client, server) = paired(FakeServer::failing(-32099, "boom")).await;
+
+        let err = client
+            .call_tool("repeat", json!({"text": "hi"}))
+            .await
+            .unwrap_err();
+        match err {
+            McpError::ServerError { code, message } => {
+                assert_eq!(code, -32099);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+
+        client.shutdown().await.unwrap();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn call_after_server_drop_yields_transport_error() {
+        let (client_io, server_io) = duplex(8 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+
+        // Server completes the handshake, then drops the running service
+        // (closing both pipe ends) before the client makes any further call.
+        let server_task = tokio::spawn(async move {
+            let running = FakeServer::ok()
+                .serve((server_read, server_write))
+                .await
+                .expect("server handshake");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(running);
+        });
+
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let client = McpClient::connect_with((client_read, client_write))
+            .await
+            .expect("client handshake");
+
+        // Wait for the server task to drop the running service, which
+        // closes the transport.
+        let _ = server_task.await;
+        let err = client.list_tools().await.unwrap_err();
+        assert!(
+            matches!(err, McpError::Transport(_) | McpError::Protocol(_)),
+            "expected transport/protocol error after server drop, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn garbage_bytes_during_handshake_yield_protocol_or_transport_error() {
+        // Drive raw bytes into the "server" side instead of running a real
+        // server; the handshake should fail when it can't decode an
+        // initialize response.
+        let (client_io, mut server_io) = duplex(8 * 1024);
+        let writer_task = tokio::spawn(async move {
+            // Wait for the client to send the initialize request, then
+            // reply with malformed (not JSON-RPC) bytes followed by EOF.
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut server_io, &mut buf).await;
+            let _ = server_io.write_all(b"not a json rpc message\n").await;
+            // Drop closes the pipe.
+        });
+
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let err = match McpClient::connect_with((client_read, client_write)).await {
+            Ok(_) => panic!("handshake should fail on garbage"),
+            Err(e) => e,
+        };
+
+        assert!(
+            matches!(err, McpError::Transport(_) | McpError::Protocol(_)),
+            "expected transport/protocol error from garbage, got {err:?}"
+        );
+        let _ = writer_task.await;
+    }
+
+    #[tokio::test]
+    async fn call_tool_rejects_non_object_arguments() {
+        let (client, server) = paired(FakeServer::ok()).await;
+        let err = client.call_tool("repeat", json!(42)).await.unwrap_err();
+        assert!(
+            matches!(err, McpError::Parse(_)),
+            "expected Parse, got {err:?}"
+        );
+        client.shutdown().await.unwrap();
+        let _ = server.await;
+    }
+}
