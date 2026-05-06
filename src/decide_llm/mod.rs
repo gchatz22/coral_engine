@@ -6,13 +6,15 @@
 //! renderer (JAR2-16), the `LlmDecide` adapter (JAR2-19), and the
 //! correction/re-prompt loop on top.
 //!
-//! Everything here is gated on `llm-anthropic` because it depends on
-//! `crate::model_client`'s `ToolSpec`/`ToolCall` types, which only exist
-//! when that feature is enabled. The gating choice mirrors the rest of the
-//! LLM stack and keeps the default build network-free.
+//! Available whenever any LLM impl is enabled (`llm-anthropic` or
+//! `llm-cohere`). The schema itself is vendor-neutral — it only depends on
+//! the always-compiled `ToolSpec`/`ToolCall` trait types in
+//! `crate::model_client` — but there is no `LlmDecide` consumer to feed
+//! when no vendor is built, so we gate the whole module on at-least-one
+//! impl to keep the default build network-free.
 
-#[cfg(feature = "llm-anthropic")]
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 pub mod schema;
 
-#[cfg(feature = "llm-anthropic")]
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 pub use schema::{decision_tools, parse_decision, DecisionParseError};
