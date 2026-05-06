@@ -14,6 +14,7 @@ pub mod health;
 pub mod mandate;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+pub mod model_client;
 pub mod scheduler;
 pub mod tools;
 pub mod trigger;
