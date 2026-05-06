@@ -67,6 +67,19 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Predicate: is a tool registered under `name`?
+    ///
+    /// Exposed so the agent run loop (JAR2-19) can discriminate "model
+    /// emitted `CallTool` for a tool that does not exist" — an apply-time
+    /// correction case the synthetic-trigger loop handles — from "the tool
+    /// itself errored", which is a real call failure (JAR2-25 owns the
+    /// retry semantics for that path). The two cases share `tools.call`'s
+    /// error type today, and string-matching the message would be fragile;
+    /// a pre-check is the smaller, sturdier surface.
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
     /// Look up the named tool, invoke it with `args`, and wrap the
     /// `(name, args, result)` triple into an `EvidenceRecord`.
     ///

@@ -275,8 +275,13 @@ impl HealthTracker {
         &self.state
     }
 
-    /// Reset the per-tick counters. Called at the start of every tick by
-    /// the run loop, regardless of prior outcome. Does not touch state.
+    /// Reset the per-tick counters. Called at the start of a *fresh* tick
+    /// — one driven by an external trigger or a `ScheduledWake`. The run
+    /// loop deliberately **skips** this call when the only triggers being
+    /// drained are synthetic-correction triggers (JAR2-19): such an
+    /// iteration is a continuation of the prior failed attempt, and the
+    /// budget must accumulate across it for exhaustion to mean anything.
+    /// Does not touch state.
     pub fn begin_tick(&mut self) {
         self.inference_used = 0;
         self.tool_used = 0;

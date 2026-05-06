@@ -1,39 +1,69 @@
-//! `Agent` — the run loop that wires FS, triggers, decide, and tools.
+//! `Agent` — the run loop that wires FS, triggers, decide, tools, and health.
 //!
-//! This is the JAR2-8 integration ticket. The loop is the literal Rust
-//! shape of `scratch/minimal_node_backend.md` § 4: race the trigger queue
-//! against the scheduler's idle deadline, drain triggers, build a context
-//! bundle, ask `Decide` what to do, and dispatch on the resulting
-//! `Decision`.
+//! Each iteration of the loop:
 //!
-//! # Type-parameter shape (deviation from the ticket sketch)
+//! 1. Race the trigger queue against the scheduler's idle deadline.
+//! 2. Drain the queue. If the drained set is non-empty *and every trigger is
+//!    a synthetic-correction trigger*, this iteration is a continuation of
+//!    the prior failed attempt and we **do not** call
+//!    [`HealthTracker::begin_tick`] — the per-tick retry budget must
+//!    accumulate across the correction so exhaustion can mean what JAR2-19
+//!    says it means. Otherwise we begin a fresh tick.
+//! 3. Build a `ContextBundle` from the drained triggers + recent FS state
+//!    and ask `Decide::decide` for a `Decision`.
+//! 4. Dispatch the decision.
+//! 5. **On [`ApplyOutcome::Continue`]**: mark the tick a success
+//!    (`HealthTracker::mark_tick_success`) — this archives any prior
+//!    Unhealthy incident on recovery.
+//! 6. **On [`ApplyOutcome::Retire`]**: persist `retirement.json` and exit
+//!    the loop with the reason.
+//! 7. **On [`ApplyOutcome::NeedsCorrection`]**: the model emitted a
+//!    `Decision` the runtime cannot satisfy (an unregistered tool, an
+//!    unresolvable evidence id). We record the failure against the
+//!    inference budget; if there is still room we inject a corrective
+//!    synthetic [`Trigger::External`] (with kind
+//!    [`SYNTHETIC_CORRECTION_KIND`]) describing the failure and let the
+//!    next iteration give the model a chance to self-correct. If the
+//!    budget is exhausted we build a [`HealthIncident`] and transition the
+//!    tracker to `Unhealthy`. The loop **does not halt** — the agent stays
+//!    subscribed to its trigger queue per `health.rs`'s contract; a later
+//!    successful tick recovers to `Healthy`.
 //!
-//! The ticket sketches `Agent<D: Decide, T>` with `T` as the tool registry.
-//! In the bootstrap there is exactly one tool registry implementation
-//! (`ToolRegistry`), no `ToolDispatch` trait, and a bare `T` with no bound
-//! cannot call `.call()`. Introducing a one-impl trait purely to honor the
-//! sketch would violate `DEVELOPMENT.md` § 2 ("no abstractions for
-//! hypothetical future needs"). We take `ToolRegistry` concretely.
-//! `Decide` stays generic because there are already two implementations in
-//! tree (`MockDecide` plus the future real adapter) and the trait is
-//! dyn-compatible by design.
+//! Decide-side `Err` (e.g. inference parse retries exhausted in
+//! `LlmDecide`) is treated as inference-retry exhaustion at the run-loop
+//! boundary: the tracker transitions to `Unhealthy` directly without
+//! consulting the per-tick budget. The `LlmDecide` impl already did its
+//! one allowed retry internally; spending another budget slot here would
+//! double-count.
+//!
+//! # Type-parameter shape (deviation from the original ticket sketch)
+//!
+//! The bootstrap took `ToolRegistry` concretely (no `ToolDispatch` trait,
+//! no abstraction-for-future-needs). That decision still holds: there is
+//! still exactly one registry implementation, and `Decide` stays generic
+//! because there are several impls in tree.
 //!
 //! # Provenance keep-alive
 //!
-//! `persist_output` enforces the provenance contract by returning
-//! `FsError::EmptyEvidence` or `FsError::EvidenceNotFound`. The acceptance
-//! criterion is "agent does not exit" on these — they're the agent's bug,
-//! not a runtime failure. The `EmitOutput` arm downcasts the `anyhow`
-//! error and, if it is one of those two `FsError` variants, emits a
-//! `tracing::warn!` and continues to the next tick. Real I/O errors and
-//! every other variant still bubble.
+//! Provenance violations (`FsError::EmptyEvidence`,
+//! `FsError::EvidenceNotFound`) used to degrade to a `tracing::warn!` and
+//! `Continue`. JAR2-19 routes them through the synthetic-trigger
+//! correction loop instead, so the model gets a chance to self-correct on
+//! the next tick. The agent is still kept alive on the failure (the
+//! original property), just via a different mechanism.
 
 use anyhow::Result;
+use chrono::Utc;
+use serde_json::json;
 use tokio::time::sleep_until;
 use tracing::{debug, info_span, warn, Instrument};
 
 use crate::decision::{assemble_context, Decide, Decision};
+use crate::evidence::EvidenceId;
 use crate::fs::{AgentFs, FsError};
+use crate::health::{
+    Attempt, FailingCall, FailureKind, HealthError, HealthIncident, HealthTracker,
+};
 use crate::mandate::Mandate;
 use crate::scheduler::Scheduler;
 use crate::tools::ToolRegistry;
@@ -52,8 +82,14 @@ impl RetireReason {
     }
 }
 
+/// Stable label on a `Trigger::External` that the run loop injects into
+/// the queue when an apply-time failure needs a correction tick. The
+/// payload is `{"failure": "<human-readable description>"}` — readable by
+/// the prompt renderer (which serializes triggers verbatim) and by audit.
+pub const SYNTHETIC_CORRECTION_KIND: &str = "decision_correction";
+
 /// The single-node agent. Owns the FS, the trigger queue, the model
-/// adapter, the tool registry, and the scheduler.
+/// adapter, the tool registry, the scheduler, and the health tracker.
 pub struct Agent<D: Decide> {
     cfg: Mandate,
     fs: AgentFs,
@@ -62,14 +98,27 @@ pub struct Agent<D: Decide> {
     tools: ToolRegistry,
     scheduler: Scheduler,
     sink: SignalSink,
+    health: HealthTracker,
 }
 
 impl<D: Decide> Agent<D> {
     /// Wire an agent. The scheduler is seeded with `cfg.idle_period` so the
     /// first deadline arrives at the configured cadence. A fresh
     /// `TriggerQueue` is constructed; its `SignalSink` is retained so
-    /// `signal()` can be called before `run()` consumes the agent.
-    pub fn new(cfg: Mandate, fs: AgentFs, decide: D, tools: ToolRegistry) -> Self {
+    /// `signal()` can be called before `run()` consumes the agent **and**
+    /// so the run loop can self-inject synthetic-correction triggers.
+    ///
+    /// `health` is constructed by the caller (typically rooted at the same
+    /// directory as `fs`) and passed in. The same construction-injection
+    /// pattern as `decide`/`tools` keeps the wiring boundary clean and lets
+    /// tests drive a tracker with deterministic timestamps and budgets.
+    pub fn new(
+        cfg: Mandate,
+        fs: AgentFs,
+        decide: D,
+        tools: ToolRegistry,
+        health: HealthTracker,
+    ) -> Self {
         let scheduler = Scheduler::new(cfg.idle_period);
         let (triggers, sink) = TriggerQueue::new();
         Self {
@@ -80,6 +129,7 @@ impl<D: Decide> Agent<D> {
             tools,
             scheduler,
             sink,
+            health,
         }
     }
 
@@ -90,8 +140,16 @@ impl<D: Decide> Agent<D> {
         self.sink.clone()
     }
 
-    /// Run the loop until a `Decision::Retire` arrives (or a non-provenance
-    /// error bubbles).
+    /// Run the loop until one of:
+    /// - a `Decision::Retire` arrives (the normal path; `retirement.json`
+    ///   is written and the reason is returned);
+    /// - the `Mandate.max_ticks` safety cap is hit (also writes
+    ///   `retirement.json`, with a synthesized `max_ticks (N) reached`
+    ///   reason);
+    /// - a non-recoverable error bubbles via `?`.
+    ///
+    /// `Unhealthy` transitions and synthetic-correction injections are
+    /// **not** exit conditions — see the module doc for why.
     pub async fn run(self) -> Result<RetireReason> {
         let Agent {
             cfg,
@@ -100,15 +158,21 @@ impl<D: Decide> Agent<D> {
             decide,
             tools,
             mut scheduler,
-            sink: _sink,
+            sink,
+            mut health,
         } = self;
+
+        // Retry trail accumulated across attempts in the *current* fresh
+        // tick. Cleared whenever `begin_tick` runs (i.e. at the start of a
+        // non-correction iteration). Used to populate `HealthIncident` on
+        // budget exhaustion.
+        let mut retry_trail: Vec<Attempt> = Vec::new();
 
         let mut tick: u64 = 0;
         loop {
             // `Mandate.max_ticks` is a safety cap on loop iterations.
             // `None` means "run until `Retire`." Check before incrementing
-            // so the cap is the count of ticks actually performed: with
-            // `max_ticks = Some(N)`, exactly N ticks run before retirement.
+            // so the cap is the count of ticks actually performed.
             if let Some(max) = cfg.max_ticks {
                 if tick >= max {
                     let reason = format!("max_ticks ({}) reached", max);
@@ -119,10 +183,6 @@ impl<D: Decide> Agent<D> {
             tick += 1;
             let span = info_span!("agent.tick", tick);
             let outcome = async {
-                // Race the queue against the idle deadline. The unselected
-                // future is dropped at the `}` of its arm, releasing the
-                // `&mut triggers` borrow before the sleep arm body needs
-                // it. Standard tokio idiom; see `select!` docs.
                 tokio::select! {
                     _ = triggers.wait_nonempty() => {}
                     _ = sleep_until(scheduler.next_deadline()) => {
@@ -131,11 +191,99 @@ impl<D: Decide> Agent<D> {
                 }
 
                 let drained = triggers.drain_ordered();
-                debug!(count = drained.len(), "drained triggers");
-                let bundle = assemble_context(&fs, &drained, &cfg).await?;
-                let decision = decide.decide(bundle).await?;
+                let is_correction_only = !drained.is_empty()
+                    && drained.iter().all(is_synthetic_correction);
+                if !is_correction_only {
+                    health.begin_tick();
+                    retry_trail.clear();
+                }
+                debug!(
+                    count = drained.len(),
+                    correction_only = is_correction_only,
+                    "drained triggers"
+                );
 
-                dispatch(&fs, &tools, &mut scheduler, decision).await
+                let bundle = assemble_context(&fs, &drained, &cfg).await?;
+                let decision = match decide.decide(bundle).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        // Decide-side Err: LlmDecide already did its
+                        // one-shot internal retry (or this is `MockDecide`
+                        // returning a script error). Treat as direct
+                        // inference-retry exhaustion — go straight to
+                        // Unhealthy without spending another budget slot.
+                        warn!(error = %e, "decide returned Err; transitioning to Unhealthy");
+                        let attempt = Attempt {
+                            attempt: (retry_trail.len() as u32) + 1,
+                            at: Utc::now(),
+                            error: format!("{e:#}"),
+                        };
+                        retry_trail.push(attempt);
+                        let incident = HealthIncident {
+                            failing: FailingCall {
+                                kind: FailureKind::Inference,
+                                details: json!({
+                                    "stage": "decide",
+                                    "error": format!("{e:#}"),
+                                }),
+                            },
+                            retry_trail: retry_trail.clone(),
+                            last_error: format!("{e:#}"),
+                            transitioned_at: Utc::now(),
+                        };
+                        health.transition_to_unhealthy(incident)?;
+                        return Ok::<TickOutcome, anyhow::Error>(TickOutcome::Continue);
+                    }
+                };
+
+                match dispatch(&fs, &tools, &mut scheduler, decision).await? {
+                    ApplyOutcome::Continue => {
+                        health.mark_tick_success(Utc::now())?;
+                        retry_trail.clear();
+                        Ok(TickOutcome::Continue)
+                    }
+                    ApplyOutcome::Retire(reason) => Ok(TickOutcome::Retire(reason)),
+                    ApplyOutcome::NeedsCorrection(desc) => {
+                        let attempt = Attempt {
+                            attempt: (retry_trail.len() as u32) + 1,
+                            at: Utc::now(),
+                            error: desc.clone(),
+                        };
+                        retry_trail.push(attempt);
+                        match health.record_failure(FailureKind::Inference, &desc) {
+                            Ok(()) => {
+                                warn!(failure = %desc, "apply-time failure; injecting synthetic correction");
+                                let synthetic = Trigger::External {
+                                    kind: SYNTHETIC_CORRECTION_KIND.into(),
+                                    payload: json!({"failure": desc}),
+                                };
+                                // Self-send via the retained sink. The
+                                // receiver is owned by `triggers` which
+                                // we still hold, so this cannot fail.
+                                let _ = sink.send(synthetic);
+                                Ok(TickOutcome::Continue)
+                            }
+                            Err(HealthError::BudgetExhausted { kind }) => {
+                                warn!(?kind, "inference budget exhausted; transitioning to Unhealthy");
+                                let incident = HealthIncident {
+                                    failing: FailingCall {
+                                        kind,
+                                        details: json!({
+                                            "stage": "apply",
+                                            "error": desc,
+                                        }),
+                                    },
+                                    retry_trail: retry_trail.clone(),
+                                    last_error: desc,
+                                    transitioned_at: Utc::now(),
+                                };
+                                health.transition_to_unhealthy(incident)?;
+                                Ok(TickOutcome::Continue)
+                            }
+                            Err(other) => Err(other.into()),
+                        }
+                    }
+                }
             }
             .instrument(span)
             .await?;
@@ -147,6 +295,13 @@ impl<D: Decide> Agent<D> {
     }
 }
 
+/// Predicate: is `t` a synthetic-correction trigger this run loop emitted?
+/// Recognized by the `Trigger::External` variant carrying the
+/// [`SYNTHETIC_CORRECTION_KIND`] kind label.
+fn is_synthetic_correction(t: &Trigger) -> bool {
+    matches!(t, Trigger::External { kind, .. } if kind == SYNTHETIC_CORRECTION_KIND)
+}
+
 /// What a single tick decided. Either continue to the next tick or
 /// terminate with a retirement reason.
 enum TickOutcome {
@@ -154,31 +309,56 @@ enum TickOutcome {
     Retire(RetireReason),
 }
 
-/// Apply a single `Decision`. Provenance violations from `EmitOutput`
-/// degrade to a `tracing::warn!` and `Continue`; every other error path
-/// bubbles via `?` so the loop terminates with a real failure rather than
-/// silently swallowing it.
+/// Outcome of trying to apply one `Decision`.
+///
+/// `NeedsCorrection` is the JAR2-19 case: the decision parsed cleanly but
+/// the runtime cannot satisfy it (unregistered tool, unresolvable
+/// evidence). The contained string is the human-readable failure
+/// description; it ends up in both the synthetic-correction trigger
+/// payload and the `HealthIncident` retry trail.
+enum ApplyOutcome {
+    Continue,
+    Retire(RetireReason),
+    NeedsCorrection(String),
+}
+
+/// Apply a single `Decision`. Recoverable apply-time failures surface as
+/// [`ApplyOutcome::NeedsCorrection`]; everything else either continues,
+/// retires, or bubbles via `?`.
 async fn dispatch(
     fs: &AgentFs,
     tools: &ToolRegistry,
     scheduler: &mut Scheduler,
     decision: Decision,
-) -> Result<TickOutcome> {
+) -> Result<ApplyOutcome> {
     match decision {
         Decision::CallTool { name, args, .. } => {
             debug!(tool = %name, "decision: call_tool");
+            // Pre-check distinguishes "model picked a tool that doesn't
+            // exist" (correctable inference error) from "the tool
+            // existed and errored" (real call failure — JAR2-25's lane).
+            if !tools.contains(&name) {
+                return Ok(ApplyOutcome::NeedsCorrection(format!(
+                    "call_tool: no tool registered under name {name:?}"
+                )));
+            }
             let ev = tools.call(&name, args).await?;
             fs.record_evidence(ev)?;
-            Ok(TickOutcome::Continue)
+            Ok(ApplyOutcome::Continue)
         }
         Decision::EmitOutput { content, evidence } => {
             debug!(evidence_count = evidence.len(), "decision: emit_output");
             match fs.persist_output(&content, &evidence) {
-                Ok(_) => Ok(TickOutcome::Continue),
+                Ok(_) => Ok(ApplyOutcome::Continue),
                 Err(e) => match e.downcast_ref::<FsError>() {
-                    Some(FsError::EmptyEvidence) | Some(FsError::EvidenceNotFound(_)) => {
-                        warn!(error = %e, "provenance violation; agent staying alive");
-                        Ok(TickOutcome::Continue)
+                    Some(FsError::EmptyEvidence) => Ok(ApplyOutcome::NeedsCorrection(
+                        "emit_output: evidence list is empty (provenance contract)".into(),
+                    )),
+                    Some(FsError::EvidenceNotFound(id)) => {
+                        let id: EvidenceId = id.clone();
+                        Ok(ApplyOutcome::NeedsCorrection(format!(
+                            "emit_output: evidence {id} not found on disk"
+                        )))
                     }
                     _ => Err(e),
                 },
@@ -187,7 +367,7 @@ async fn dispatch(
         Decision::RewriteFs { ops } => {
             debug!(op_count = ops.len(), "decision: rewrite_fs");
             fs.apply_ops(ops)?;
-            Ok(TickOutcome::Continue)
+            Ok(ApplyOutcome::Continue)
         }
         Decision::Idle { next_after } => {
             debug!(
@@ -195,12 +375,12 @@ async fn dispatch(
                 "decision: idle"
             );
             scheduler.set_next_after(next_after);
-            Ok(TickOutcome::Continue)
+            Ok(ApplyOutcome::Continue)
         }
         Decision::Retire { reason } => {
             debug!(%reason, "decision: retire");
             fs.persist_retirement(&reason)?;
-            Ok(TickOutcome::Retire(RetireReason(reason)))
+            Ok(ApplyOutcome::Retire(RetireReason(reason)))
         }
     }
 }
