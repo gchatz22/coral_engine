@@ -14,7 +14,13 @@
 //! impl to keep the default build network-free.
 
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+pub mod prompt;
+
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 pub mod schema;
+
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+pub use prompt::render;
 
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 pub use schema::{decision_tools, parse_decision, DecisionParseError};
