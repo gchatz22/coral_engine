@@ -19,6 +19,10 @@ path = "src/bin/node_run.rs"
 name = "compute-evidence-id"
 path = "src/bin/compute_evidence_id.rs"
 
+[[bin]]
+name = "model-call"
+path = "src/bin/model_call.rs"
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
@@ -41,6 +45,7 @@ ulid = { version = "1", features = ["serde"] }
 # default. JAR2-22 added the `mcp` feature on the same opt-in pattern.
 default = []
 llm-anthropic = ["dep:reqwest"]
+llm-cohere = ["dep:reqwest"]
 mcp = ["dep:rmcp"]
 
 # Clippy 1.88 promoted a handful of style lints (notably `uninlined_format_args`)
