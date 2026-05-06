@@ -1,7 +1,7 @@
 //! `model-call` — one-shot DX CLI for exercising a `ModelClient` impl.
 //!
 //! Companion to `compute-evidence-id`: a hand-runnable binary for sanity-
-//! checking the JAR2-14 `ModelClient` Anthropic adapter against a real
+//! checking the JAR2-14 / JAR2-15 `ModelClient` adapters against a real
 //! vendor without writing a custom test or booting the agent loop. Useful
 //! for prompt iteration, vendor parity, and confirming auth + wire format
 //! end-to-end. Not part of the agent runtime.
@@ -9,22 +9,30 @@
 //! # Usage
 //!
 //! ```text
-//! model-call --vendor anthropic [--model <id>] [--system <text>] \
+//! model-call --vendor <anthropic|cohere> [--model <id>] [--system <text>] \
 //!     [--max-tokens N] (--prompt <text> | --from-stdin)
 //! ```
 //!
-//! * `--vendor anthropic` — only vendor wired today. `--vendor cohere`
-//!   parses but exits non-zero with a `JAR2-15` placeholder message.
-//! * `--model <id>` — overrides the impl's default model. Default is
-//!   whatever `AnthropicClient::new` selects (currently `claude-haiku-4-5`).
-//! * `--system <text>` — optional system prompt. Concatenated by the impl
-//!   into the top-level Anthropic `system` field.
+//! * `--vendor anthropic` — requires the `llm-anthropic` feature.
+//! * `--vendor cohere` — requires the `llm-cohere` feature.
+//! * `--model <id>` — overrides the impl's default model. Defaults are
+//!   whatever the vendor adapter selects (`AnthropicClient` →
+//!   `claude-haiku-4-5`; `CohereClient` → `command-a-03-2025`).
+//! * `--system <text>` — optional system prompt.
 //! * `--max-tokens N` — sampling cap, defaults to 1024.
 //! * `--prompt <text>` / `--from-stdin` — exactly one is required. Stdin
 //!   mode reads to EOF and uses the entire blob as the user message.
 //!
-//! Auth: `ANTHROPIC_API_KEY` must be set. The impl bubbles a
-//! `ModelError::Auth` if it is missing, which this binary surfaces verbatim.
+//! Auth: `ANTHROPIC_API_KEY` for Anthropic; `COHERE_API_KEY` for Cohere.
+//! The adapters bubble a `ModelError::Auth` if missing, surfaced verbatim.
+//!
+//! # Feature gating
+//!
+//! The `[[bin]]` entry no longer pins `required-features` because cargo
+//! does not support OR in that field. Instead, the per-vendor dispatch
+//! arms below are gated with `#[cfg(feature = "llm-...")]`; a build with
+//! neither feature still compiles the binary but every `--vendor` choice
+//! errors at runtime with a "rebuild with --features ..." hint.
 //!
 //! # Output split
 //!
@@ -35,16 +43,19 @@
 
 use std::io::{self, Read};
 use std::process::ExitCode;
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 
-use jarvis_node::model_client::{
-    CompleteOptions, CompleteRequest, ContentBlock, Message, ModelClient,
-};
+use jarvis_node::model_client::{CompleteOptions, CompleteRequest, Message};
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+use jarvis_node::model_client::{ContentBlock, ModelClient, Usage};
 
 #[cfg(feature = "llm-anthropic")]
 use jarvis_node::model_client::anthropic::AnthropicClient;
+#[cfg(feature = "llm-cohere")]
+use jarvis_node::model_client::cohere::CohereClient;
 
 const USAGE: &str = "\
 model-call — one-shot DX CLI for ad-hoc ModelClient inference.
@@ -54,8 +65,8 @@ USAGE:
                [--max-tokens N] (--prompt <text> | --from-stdin)
 
 ARGS:
-    --vendor <name>     Required. `anthropic` is wired; `cohere` is reserved
-                        for JAR2-15 and currently exits non-zero.
+    --vendor <name>     Required. `anthropic` (build with --features llm-anthropic)
+                        or `cohere` (build with --features llm-cohere).
     --model <id>        Override the impl's default model id.
     --system <text>     Optional system prompt.
     --max-tokens N      Sampling cap (default: 1024).
@@ -64,6 +75,7 @@ ARGS:
 
 ENV:
     ANTHROPIC_API_KEY   Required for --vendor anthropic.
+    COHERE_API_KEY      Required for --vendor cohere.
 
 OUTPUT:
     stdout              Joined text content blocks; tool_calls section if any.
@@ -108,7 +120,6 @@ fn main() -> ExitCode {
     }
 }
 
-#[cfg(feature = "llm-anthropic")]
 fn run() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.iter().any(|a| a == "-h" || a == "--help") {
@@ -119,17 +130,53 @@ fn run() -> Result<()> {
     let prompt = read_prompt(&parsed, &mut io::stdin().lock())?;
     let request = build_request(&parsed, prompt)?;
 
-    // build_request rejects non-anthropic vendors; reaching this point
-    // means the vendor is anthropic.
+    match parsed.vendor {
+        Vendor::Anthropic => run_anthropic(&parsed, request),
+        Vendor::Cohere => run_cohere(&parsed, request),
+    }
+}
+
+#[cfg(feature = "llm-anthropic")]
+fn run_anthropic(parsed: &ParsedArgs, request: CompleteRequest) -> Result<()> {
     let client = match parsed.model.as_deref() {
         Some(m) => AnthropicClient::new().with_model(m),
         None => AnthropicClient::new(),
     };
-    let model_id = client.model().to_string();
+    dispatch(&client, client.model().to_string(), request)
+}
 
-    // Build a single-thread Tokio runtime here rather than `#[tokio::main]`
-    // so the rest of the binary stays sync and unit-testable without a
-    // runtime. Latency is measured around the await only.
+#[cfg(not(feature = "llm-anthropic"))]
+fn run_anthropic(_: &ParsedArgs, _: CompleteRequest) -> Result<()> {
+    Err(anyhow!(
+        "vendor 'anthropic' is not built into this binary; \
+         rebuild with --features llm-anthropic"
+    ))
+}
+
+#[cfg(feature = "llm-cohere")]
+fn run_cohere(parsed: &ParsedArgs, request: CompleteRequest) -> Result<()> {
+    let client = match parsed.model.as_deref() {
+        Some(m) => CohereClient::new().with_model(m),
+        None => CohereClient::new(),
+    };
+    dispatch(&client, client.model().to_string(), request)
+}
+
+#[cfg(not(feature = "llm-cohere"))]
+fn run_cohere(_: &ParsedArgs, _: CompleteRequest) -> Result<()> {
+    Err(anyhow!(
+        "vendor 'cohere' is not built into this binary; \
+         rebuild with --features llm-cohere"
+    ))
+}
+
+/// Vendor-agnostic submit: build a single-thread Tokio runtime, await the
+/// model call, print response + diagnostics. Only compiled when at least
+/// one vendor adapter is enabled (it would be dead code otherwise).
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+fn dispatch(client: &dyn ModelClient, model_id: String, request: CompleteRequest) -> Result<()> {
+    // Single-thread runtime so the rest of the binary stays sync and
+    // unit-testable without a runtime. Latency is measured around the await.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -143,17 +190,6 @@ fn run() -> Result<()> {
     print_response(&response);
     print_diagnostics(&model_id, elapsed, response.usage);
     Ok(())
-}
-
-#[cfg(not(feature = "llm-anthropic"))]
-fn run() -> Result<()> {
-    // The binary's `[[bin]]` entry has `required-features = ["llm-anthropic"]`,
-    // so this branch is unreachable from a normal cargo build. The fallback
-    // exists only so `cargo check` of the file content without the feature
-    // produces a sensible error rather than a missing-symbol confusion.
-    Err(anyhow!(
-        "model-call requires the `llm-anthropic` feature; rebuild with --features llm-anthropic"
-    ))
 }
 
 /// Parse argv (without the binary name) into a `ParsedArgs`.
@@ -283,16 +319,10 @@ fn read_prompt<R: Read>(parsed: &ParsedArgs, reader: &mut R) -> Result<String> {
     }
 }
 
-/// Translate parsed args + resolved prompt into a `CompleteRequest`.
-///
-/// Vendor gating happens here: `cohere` returns the JAR2-15 placeholder
-/// error so the binary exits non-zero with a clear message until the
-/// sibling impl lands.
+/// Translate parsed args + resolved prompt into a `CompleteRequest`. The
+/// shape is vendor-agnostic; the per-vendor dispatch in `run` is what
+/// chooses which adapter consumes it.
 fn build_request(parsed: &ParsedArgs, prompt: String) -> Result<CompleteRequest> {
-    if parsed.vendor != Vendor::Anthropic {
-        return Err(anyhow!("vendor `cohere` not yet implemented (JAR2-15)"));
-    }
-
     let mut messages = Vec::with_capacity(2);
     if let Some(sys) = &parsed.system {
         messages.push(Message::system(sys));
@@ -309,7 +339,7 @@ fn build_request(parsed: &ParsedArgs, prompt: String) -> Result<CompleteRequest>
     })
 }
 
-#[cfg(feature = "llm-anthropic")]
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 fn print_response(response: &jarvis_node::model_client::CompleteResponse) {
     let text: Vec<&str> = response
         .content
@@ -334,8 +364,8 @@ fn print_response(response: &jarvis_node::model_client::CompleteResponse) {
     }
 }
 
-#[cfg(feature = "llm-anthropic")]
-fn print_diagnostics(model: &str, elapsed: Duration, usage: jarvis_node::model_client::Usage) {
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+fn print_diagnostics(model: &str, elapsed: Duration, usage: Usage) {
     eprintln!(
         "model={model} latency_ms={lat} input_tokens={i} output_tokens={o}",
         lat = elapsed.as_millis(),
@@ -474,18 +504,33 @@ mod tests {
     }
 
     #[test]
-    fn build_request_rejects_cohere_with_jar2_15_message() {
-        let p = ParsedArgs {
-            vendor: Vendor::Cohere,
+    fn parse_args_accepts_cohere_vendor() {
+        let p = parse_args(&s(&["--vendor", "cohere", "--prompt", "hi"])).unwrap();
+        assert_eq!(p.vendor, Vendor::Cohere);
+    }
+
+    #[test]
+    fn build_request_is_vendor_agnostic() {
+        // Same parsed args differing only in vendor produce identical
+        // CompleteRequests — adapter-specific shaping happens in the
+        // adapter, not here.
+        let p_a = ParsedArgs {
+            vendor: Vendor::Anthropic,
             model: None,
-            system: None,
-            max_tokens: 1024,
+            system: Some("be terse".into()),
+            max_tokens: 64,
             prompt_source: PromptSource::Literal("hi".into()),
         };
-        let err = build_request(&p, "hi".into()).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("cohere"), "msg: {msg}");
-        assert!(msg.contains("JAR2-15"), "msg: {msg}");
+        let p_c = ParsedArgs {
+            vendor: Vendor::Cohere,
+            ..p_a.clone()
+        };
+        let r_a = build_request(&p_a, "hi".into()).unwrap();
+        let r_c = build_request(&p_c, "hi".into()).unwrap();
+        assert_eq!(r_a, r_c);
+        assert_eq!(r_a.messages[0], Message::system("be terse"));
+        assert_eq!(r_a.messages[1], Message::user("hi"));
+        assert_eq!(r_a.options.max_tokens, 64);
     }
 
     #[test]
@@ -503,6 +548,23 @@ mod tests {
         assert!(req.tools.is_empty());
         assert_eq!(req.options.max_tokens, 1024);
         assert!(req.options.temperature.is_none());
+    }
+
+    #[test]
+    fn build_request_cohere_succeeds() {
+        // JAR2-15 wiring: cohere now goes through the same vendor-agnostic
+        // request builder as anthropic. The previous "rejects with JAR2-15
+        // placeholder" behavior is gone.
+        let p = ParsedArgs {
+            vendor: Vendor::Cohere,
+            model: None,
+            system: None,
+            max_tokens: 1024,
+            prompt_source: PromptSource::Literal("hi".into()),
+        };
+        let req = build_request(&p, "hi".into()).unwrap();
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0], Message::user("hi"));
     }
 
     #[test]
@@ -547,11 +609,46 @@ mod tests {
         assert!(format!("{err:#}").contains("empty"));
     }
 
-    /// Compile-time check that the request a JAR2-14 client can consume is
-    /// what `build_request` actually produces — `ModelClient::complete` is
-    /// the consumer.
+    /// Compile-time check that the request a JAR2-14 / JAR2-15 client can
+    /// consume is what `build_request` actually produces — `ModelClient::complete`
+    /// is the consumer.
     #[allow(dead_code)]
-    fn _build_request_yields_modelclient_input(client: &dyn ModelClient, req: CompleteRequest) {
+    fn _build_request_yields_modelclient_input(
+        client: &dyn jarvis_node::model_client::ModelClient,
+        req: CompleteRequest,
+    ) {
         let _fut = client.complete(req);
+    }
+
+    #[test]
+    #[cfg(not(feature = "llm-anthropic"))]
+    fn run_anthropic_without_feature_errors_with_helpful_hint() {
+        let p = ParsedArgs {
+            vendor: Vendor::Anthropic,
+            model: None,
+            system: None,
+            max_tokens: 1024,
+            prompt_source: PromptSource::Literal("hi".into()),
+        };
+        let req = build_request(&p, "hi".into()).unwrap();
+        let err = run_anthropic(&p, req).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("llm-anthropic"), "msg: {msg}");
+    }
+
+    #[test]
+    #[cfg(not(feature = "llm-cohere"))]
+    fn run_cohere_without_feature_errors_with_helpful_hint() {
+        let p = ParsedArgs {
+            vendor: Vendor::Cohere,
+            model: None,
+            system: None,
+            max_tokens: 1024,
+            prompt_source: PromptSource::Literal("hi".into()),
+        };
+        let req = build_request(&p, "hi".into()).unwrap();
+        let err = run_cohere(&p, req).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("llm-cohere"), "msg: {msg}");
     }
 }
