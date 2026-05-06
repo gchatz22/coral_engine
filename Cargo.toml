@@ -19,6 +19,11 @@ path = "src/bin/node_run.rs"
 name = "compute-evidence-id"
 path = "src/bin/compute_evidence_id.rs"
 
+[[bin]]
+name = "model-call"
+path = "src/bin/model_call.rs"
+required-features = ["llm-anthropic"]
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
