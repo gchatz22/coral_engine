@@ -2,3 +2,4 @@
 # Local secrets loaded by direnv (or anything else)
 .envrc
 .env
+.claude/
