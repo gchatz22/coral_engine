@@ -7,6 +7,7 @@
 //! later tickets (JAR2-4+).
 
 pub mod agent;
+pub mod decide_llm;
 pub mod decision;
 pub mod evidence;
 pub mod fs;
