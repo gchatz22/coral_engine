@@ -14,6 +14,7 @@
 //!   outputs/<ulid>.json   — produced artifacts; the agent's public claims
 //!   evidence/<sha256>.json — raw record of every tool call; the provenance trail
 //!   notes/                — private working memory; scratchpad, intermediate reasoning
+//!   claims/<slug>.json    — claim_seed registry; one file per opened claim (JAR2-28)
 //!   retirement.json       — terminal marker; agent has cleanly ended
 //! ```
 //!
@@ -73,6 +74,23 @@
 //! Evidence is upstream of thinking, not part of it. You don't edit
 //! evidence; it's what the world told you. Notes are how you reasoned
 //! about it.
+//!
+//! # `claims/` — seed registry for claim-id stability across ticks
+//!
+//! `Decision::CallTool` carries a `ClaimSeed` the agent picks. The
+//! kernel uses that seed to derive a stable claim id, so multiple
+//! ticks supporting the same conceptual claim collapse into one. LLMs
+//! are non-deterministic, though — woken on tick 7 the agent may pick
+//! a different seed than it did on tick 3, and provenance fragments.
+//!
+//! `claims/` is the durable place the agent writes seeds it has
+//! already minted. Per `VISION.md` § 4, *state is files, not hidden
+//! context*: the agent doesn't have to *remember* a seed across ticks;
+//! it gets to *look it up*. The convention (slug rules, file shape,
+//! prompt addendum) lives in `scratch/claim_seed_persistence.md` and
+//! moves into the prompt-template module under JAR2-16. See
+//! [`AgentFs::write_claim`], [`AgentFs::read_claim`],
+//! [`AgentFs::list_claims`], and [`claim_slug`].
 //!
 //! # `mandate.json`
 //!
@@ -136,6 +154,7 @@ use crate::evidence::{EvidenceId, EvidenceRecord};
 use crate::mandate::{Mandate, Output};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -186,6 +205,93 @@ struct RetirementRecord {
     retired_at: DateTime<Utc>,
 }
 
+/// Lifecycle status the agent assigns to a claim. The kernel does not
+/// interpret these; they exist so the agent's future self can tell
+/// "still being investigated" from "already settled, don't gather more
+/// evidence under this seed."
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimStatus {
+    Open,
+    Resolved,
+    Abandoned,
+}
+
+/// On-disk record written to `claims/<slug>.json`. The agent reads
+/// these back at the top of a tick to decide whether a new
+/// `claim_seed` is needed or an existing one should be reused.
+///
+/// `seed` is the canonical string the agent attached to
+/// `Decision::CallTool`; same string in the file as in the seed. The
+/// slug is derived from `seed` via [`claim_slug`] and is not stored on
+/// the record (it's the filename).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Claim {
+    pub seed: String,
+    pub description: String,
+    pub status: ClaimStatus,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Maximum byte length of the kebab body in a slug (before the hash
+/// suffix). 80 keeps `claims/` listings readable on a terminal and
+/// leaves headroom under typical filesystem name limits once the
+/// `-<8 hex>` suffix and `.json` extension are added.
+const SLUG_BODY_MAX: usize = 80;
+
+/// Derive the on-disk slug for a claim from its seed string.
+///
+/// Rules: lowercase, runs of non-`[a-z0-9]` collapse to `-`, leading
+/// and trailing `-` are trimmed, the body is truncated to
+/// [`SLUG_BODY_MAX`] bytes, and `-<first 8 hex chars of sha256(seed)>`
+/// is *always* appended.
+///
+/// The hash suffix is unconditional on purpose. Conditional suffixing
+/// (only on collision) makes the slug a function of prior writes
+/// rather than of the seed alone, which would silently break
+/// `read_claim` when the same seed maps to different filenames in
+/// different orders. With the always-on suffix, two distinct seeds
+/// that slugify to the same kebab body still get different filenames,
+/// and the same seed always resolves to the same file.
+///
+/// If the kebab body is empty after trimming (e.g. seed `"!!!"`), the
+/// slug is just the hash suffix. The 8-char prefix gives ~32 bits of
+/// collision resistance, which is far more than the agent population
+/// of one filesystem will ever contend with.
+pub fn claim_slug(seed: &str) -> String {
+    let mut body = String::with_capacity(seed.len());
+    let mut prev_dash = true; // leading dashes get trimmed by suppressing them
+    for ch in seed.chars() {
+        let lc = ch.to_ascii_lowercase();
+        if lc.is_ascii_alphanumeric() {
+            body.push(lc);
+            prev_dash = false;
+        } else if !prev_dash {
+            body.push('-');
+            prev_dash = true;
+        }
+    }
+    while body.ends_with('-') {
+        body.pop();
+    }
+    if body.len() > SLUG_BODY_MAX {
+        body.truncate(SLUG_BODY_MAX);
+        // Truncation may have left a trailing `-`; clean it.
+        while body.ends_with('-') {
+            body.pop();
+        }
+    }
+
+    let digest = Sha256::digest(seed.as_bytes());
+    let suffix = hex::encode(&digest[..4]); // 8 hex chars
+
+    if body.is_empty() {
+        suffix
+    } else {
+        format!("{body}-{suffix}")
+    }
+}
+
 /// Directory-backed per-agent filesystem. Cheap to clone — holds only the
 /// root path.
 #[derive(Debug, Clone)]
@@ -206,6 +312,7 @@ impl AgentFs {
         Self::ensure_dir(&root.join("outputs"))?;
         Self::ensure_dir(&root.join("evidence"))?;
         Self::ensure_dir(&root.join("notes"))?;
+        Self::ensure_dir(&root.join("claims"))?;
 
         let mandate_path = root.join("mandate.json");
         if !mandate_path.exists() {
@@ -347,7 +454,50 @@ impl AgentFs {
         Ok(())
     }
 
+    /// Write a claim under `claims/<slug>.json`. Slug is derived from
+    /// `claim.seed` via [`claim_slug`]. Overwrites any existing file at
+    /// that slug — status updates flow through the same path.
+    ///
+    /// See `scratch/claim_seed_persistence.md` for the convention; the
+    /// short version is that the agent writes here on first mint of a
+    /// seed so future ticks can find it via [`Self::read_claim`] /
+    /// [`Self::list_claims`] before issuing `Decision::CallTool` and
+    /// reuse the existing seed instead of fragmenting the claim id.
+    pub fn write_claim(&self, claim: &Claim) -> anyhow::Result<()> {
+        let path = self.claim_path(&claim.seed);
+        let bytes = serde_json::to_vec_pretty(claim)?;
+        fs::write(&path, &bytes).map_err(|e| FsError::io(&path, e))?;
+        Ok(())
+    }
+
+    /// Read the claim previously written for `seed`. Returns `Ok(None)`
+    /// when no file is present so callers can branch cleanly between
+    /// "first time minting this seed" and "I/O failed."
+    pub fn read_claim(&self, seed: &str) -> anyhow::Result<Option<Claim>> {
+        let path = self.claim_path(seed);
+        match fs::read(&path) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(FsError::io(&path, e).into()),
+        }
+    }
+
+    /// Return every claim currently on disk in ascending filename
+    /// order. The order is deterministic but not chronological — file
+    /// names are slugs, not ULIDs. Callers that need recency should
+    /// sort by `created_at` themselves.
+    pub fn list_claims(&self) -> anyhow::Result<Vec<Claim>> {
+        let dir = self.root.join("claims");
+        Self::read_recent_json(&dir, usize::MAX)
+    }
+
     // ---- helpers --------------------------------------------------------
+
+    fn claim_path(&self, seed: &str) -> PathBuf {
+        self.root
+            .join("claims")
+            .join(format!("{}.json", claim_slug(seed)))
+    }
 
     fn evidence_path(&self, id: &EvidenceId) -> PathBuf {
         self.root.join("evidence").join(format!("{}.json", id))
@@ -488,6 +638,7 @@ mod tests {
         assert!(root.join("outputs").is_dir());
         assert!(root.join("evidence").is_dir());
         assert!(root.join("notes").is_dir());
+        assert!(root.join("claims").is_dir());
 
         let bytes = std::fs::read(root.join("mandate.json")).unwrap();
         let back: Mandate = serde_json::from_slice(&bytes).unwrap();
@@ -749,5 +900,234 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(v.get("reason").and_then(|x| x.as_str()), Some("done"));
         assert!(v.get("retired_at").and_then(|x| x.as_str()).is_some());
+    }
+
+    // ---- JAR2-28: claim_seed persistence -------------------------------
+
+    use crate::decision::{ClaimSeed, ContextBundle, Decide, Decision};
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-05-06T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn claim_slug_is_kebab_lowercase_and_carries_hash_suffix() {
+        let s = claim_slug("Phase 2 Clearance");
+        // body is kebab-case lowercased
+        assert!(s.starts_with("phase-2-clearance-"));
+        // suffix is exactly 8 lowercase hex chars
+        let suffix = s.rsplit('-').next().unwrap();
+        assert_eq!(suffix.len(), 8);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn claim_slug_is_deterministic_for_same_seed() {
+        assert_eq!(claim_slug("seed-x"), claim_slug("seed-x"));
+        assert_eq!(claim_slug("Phase 2"), claim_slug("Phase 2"));
+    }
+
+    #[test]
+    fn claim_slug_differs_for_seeds_that_kebab_to_the_same_body() {
+        // Both kebab to "abc"; the hash suffix must keep them distinct.
+        let a = claim_slug("abc");
+        let b = claim_slug("ABC");
+        assert_ne!(a, b);
+        assert!(a.starts_with("abc-"));
+        assert!(b.starts_with("abc-"));
+    }
+
+    #[test]
+    fn claim_slug_handles_empty_body() {
+        let s = claim_slug("!!!");
+        assert_eq!(s.len(), 8);
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn claim_slug_truncates_long_bodies() {
+        let long = "a".repeat(200);
+        let s = claim_slug(&long);
+        // body 80 chars + '-' + 8 hex chars
+        assert_eq!(s.len(), SLUG_BODY_MAX + 1 + 8);
+    }
+
+    #[test]
+    fn write_claim_round_trip_via_read_claim() {
+        let (_tmp, fs, _m) = fresh_fs();
+        let claim = Claim {
+            seed: "phase-2-clearance".into(),
+            description: "Did drug X pass phase 2?".into(),
+            status: ClaimStatus::Open,
+            created_at: now(),
+        };
+        fs.write_claim(&claim).unwrap();
+
+        let back = fs.read_claim("phase-2-clearance").unwrap();
+        assert_eq!(back, Some(claim));
+    }
+
+    #[test]
+    fn read_claim_returns_none_for_missing_seed() {
+        let (_tmp, fs, _m) = fresh_fs();
+        assert_eq!(fs.read_claim("never-written").unwrap(), None);
+    }
+
+    #[test]
+    fn write_claim_overwrites_for_status_updates() {
+        let (_tmp, fs, _m) = fresh_fs();
+        let mut claim = Claim {
+            seed: "drug-x-p2".into(),
+            description: "?".into(),
+            status: ClaimStatus::Open,
+            created_at: now(),
+        };
+        fs.write_claim(&claim).unwrap();
+        claim.status = ClaimStatus::Resolved;
+        fs.write_claim(&claim).unwrap();
+
+        let back = fs.read_claim("drug-x-p2").unwrap().unwrap();
+        assert_eq!(back.status, ClaimStatus::Resolved);
+    }
+
+    #[test]
+    fn list_claims_returns_all_in_filename_order() {
+        let (_tmp, fs, _m) = fresh_fs();
+        for s in ["alpha", "bravo", "charlie"] {
+            fs.write_claim(&Claim {
+                seed: s.into(),
+                description: s.into(),
+                status: ClaimStatus::Open,
+                created_at: now(),
+            })
+            .unwrap();
+        }
+        let listed = fs.list_claims().unwrap();
+        assert_eq!(listed.len(), 3);
+        // Filename order is stable: same call twice yields same order.
+        let again = fs.list_claims().unwrap();
+        assert_eq!(listed, again);
+    }
+
+    /// Mock `Decide` impl that consults `claims/` before issuing
+    /// `Decision::CallTool`. Reuses an existing seed if it finds a
+    /// matching `description`; otherwise mints a new seed (and writes
+    /// the claim file) before emitting the decision.
+    ///
+    /// The "matching description" lookup stands in for the real
+    /// LLM-side recognition step ("is this conceptually the same
+    /// claim I already opened?"). The point of the test is the
+    /// seed-reuse path, not how the agent recognizes the match.
+    struct ClaimAwareMock {
+        fs: AgentFs,
+        topic: String,
+        new_seed: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Decide for ClaimAwareMock {
+        async fn decide(&self, _ctx: ContextBundle) -> anyhow::Result<Decision> {
+            // Reuse a seed if a claim already exists for this topic.
+            let claims = self.fs.list_claims()?;
+            let existing = claims.into_iter().find(|c| c.description == self.topic);
+            let seed = match existing {
+                Some(c) => c.seed,
+                None => {
+                    let seed = self.new_seed.clone();
+                    self.fs.write_claim(&Claim {
+                        seed: seed.clone(),
+                        description: self.topic.clone(),
+                        status: ClaimStatus::Open,
+                        created_at: now(),
+                    })?;
+                    seed
+                }
+            };
+            Ok(Decision::CallTool {
+                name: "echo".into(),
+                args: serde_json::json!({"q": self.topic}),
+                claim_seed: ClaimSeed::new(seed),
+            })
+        }
+    }
+
+    fn empty_bundle(mandate: Mandate) -> ContextBundle {
+        ContextBundle {
+            mandate,
+            triggers: vec![],
+            recent_outputs: vec![],
+            recent_evidence: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_reuse_round_trip_returns_existing_claim_seed() {
+        let (_tmp, fs, mandate) = fresh_fs();
+
+        // Tick 0: claim already on disk from a prior tick.
+        fs.write_claim(&Claim {
+            seed: "phase-2-clearance".into(),
+            description: "Did drug X pass phase 2?".into(),
+            status: ClaimStatus::Open,
+            created_at: now(),
+        })
+        .unwrap();
+
+        let mock = ClaimAwareMock {
+            fs: fs.clone(),
+            topic: "Did drug X pass phase 2?".into(),
+            new_seed: "should-not-be-minted".into(),
+        };
+
+        let decision = mock.decide(empty_bundle(mandate)).await.unwrap();
+        match decision {
+            Decision::CallTool { claim_seed, .. } => {
+                // Same seed string → same ClaimSeed (== same kernel-side claim id).
+                assert_eq!(claim_seed, ClaimSeed::new("phase-2-clearance"));
+            }
+            other => panic!("expected CallTool, got {other:?}"),
+        }
+
+        // Mock must not have minted a second claim file.
+        let listed = fs.list_claims().unwrap();
+        assert_eq!(listed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn new_seed_creation_path_writes_claim_and_emits_call_tool() {
+        let (_tmp, fs, mandate) = fresh_fs();
+        assert!(fs.list_claims().unwrap().is_empty());
+
+        let mock = ClaimAwareMock {
+            fs: fs.clone(),
+            topic: "Did drug X pass phase 2?".into(),
+            new_seed: "phase-2-clearance".into(),
+        };
+
+        let decision = mock.decide(empty_bundle(mandate)).await.unwrap();
+        match decision {
+            Decision::CallTool { claim_seed, .. } => {
+                assert_eq!(claim_seed, ClaimSeed::new("phase-2-clearance"));
+            }
+            other => panic!("expected CallTool, got {other:?}"),
+        }
+
+        // The claim file is now on disk and a future tick would find it.
+        let back = fs.read_claim("phase-2-clearance").unwrap().unwrap();
+        assert_eq!(back.description, "Did drug X pass phase 2?");
+        assert_eq!(back.status, ClaimStatus::Open);
+    }
+
+    #[test]
+    fn stable_claim_ids_for_identical_seed_strings() {
+        // Sanity: the kernel-side derivation from `ClaimSeed` is
+        // identity today (the seed *is* the id), so identical seed
+        // strings compare equal. This test pins that invariant so a
+        // future change to the derivation has to update it
+        // deliberately.
+        assert_eq!(ClaimSeed::new("phase-2"), ClaimSeed::new("phase-2"));
+        assert_ne!(ClaimSeed::new("phase-2"), ClaimSeed::new("phase-3"));
     }
 }
