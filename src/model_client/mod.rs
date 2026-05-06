@@ -31,6 +31,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "llm-anthropic")]
 pub mod anthropic;
 
+#[cfg(feature = "llm-cohere")]
+pub mod cohere;
+
 /// One conversational turn handed to a `ModelClient`.
 ///
 /// Roles match the four Anthropic-style buckets the prompt renderer

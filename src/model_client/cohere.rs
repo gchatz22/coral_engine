@@ -1,0 +1,702 @@
+//! Cohere V2 Chat API implementation of `ModelClient`.
+//!
+//! Endpoint: `POST https://api.cohere.com/v2/chat`. Auth via the
+//! `Authorization: Bearer <token>` header pulled from `COHERE_API_KEY`.
+//!
+//! Mirrors the structure of `anthropic.rs`: three pure functions —
+//! `build_body`, `parse_response`, `map_status_error` — composed by an
+//! async `complete` method around `reqwest`. Tests exercise the seams
+//! directly so `cargo test` never makes a live HTTP call.
+//!
+//! # Wire-format quirks vs. the Anthropic adapter
+//!
+//! 1. Tool definitions are wrapped: `{type: "function", function: {name,
+//!    description, parameters}}`. Note `parameters`, not `input_schema`.
+//! 2. Cohere's response keeps `tool_use` out of `content` entirely. Tool
+//!    calls only appear at `message.tool_calls[]`. We synthesize
+//!    `ContentBlock::ToolUse` blocks from those so the trait invariant
+//!    (calls visible in both `content` and `tool_calls`) holds.
+//! 3. `tool_calls[].function.arguments` is a JSON-encoded **string** on the
+//!    wire. We `serde_json::from_str` it; a malformed string is
+//!    `ModelError::Parse`.
+//! 4. Usage lives at `usage.tokens.input_tokens` / `usage.tokens.output_tokens`
+//!    (nested under `tokens`, not flat).
+//! 5. `Role::Tool` maps to a real `tool` message with a top-level
+//!    `tool_call_id` field — Cohere has a native `tool` role, unlike
+//!    Anthropic. We emit one Cohere message per `ToolResult` block so the
+//!    `tool_use_id` correlation is preserved.
+//! 6. `stream: false` is sent explicitly per the docs.
+
+use std::env;
+
+use serde_json::{json, Value};
+
+use super::{
+    CompleteRequest, CompleteResponse, ContentBlock, ModelClient, ModelError, Role, ToolCall, Usage,
+};
+
+/// Default model identifier. Configurable via `CohereClient::with_model`.
+///
+/// `command-a-03-2025` is Cohere's current cost-optimized flagship per the
+/// V2 chat API reference docs (verified May 2026).
+pub const DEFAULT_MODEL: &str = "command-a-03-2025";
+
+/// Cohere V2 chat endpoint. Override only for proxies or recording layers.
+pub const DEFAULT_BASE_URL: &str = "https://api.cohere.com/v2/chat";
+
+/// `COHERE_API_KEY` env var name. Read inside `complete` so a missing key
+/// surfaces as `ModelError::Auth` at request time.
+pub const API_KEY_ENV: &str = "COHERE_API_KEY";
+
+/// HTTP-bound `ModelClient` for Cohere's V2 Chat API.
+#[derive(Clone, Debug)]
+pub struct CohereClient {
+    http: reqwest::Client,
+    model: String,
+    base_url: String,
+}
+
+impl CohereClient {
+    /// Build a client with the default model and base URL.
+    pub fn new() -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            model: DEFAULT_MODEL.to_string(),
+            base_url: DEFAULT_BASE_URL.to_string(),
+        }
+    }
+
+    /// Override the default model.
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
+    /// Override the base URL. Intended for proxies or recording layers; not
+    /// exercised by the default tests.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
+    }
+
+    /// Read the configured model id.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+impl Default for CohereClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelClient for CohereClient {
+    async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse, ModelError> {
+        let api_key = env::var(API_KEY_ENV)
+            .map_err(|_| ModelError::Auth(format!("{API_KEY_ENV} not set in environment")))?;
+
+        let body = build_body(&req, &self.model);
+        let resp = self
+            .http
+            .post(&self.base_url)
+            .header("authorization", format!("Bearer {api_key}"))
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ModelError::Transport(e.to_string()))?;
+
+        let status = resp.status().as_u16();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ModelError::Transport(e.to_string()))?;
+
+        if status != 200 {
+            return Err(map_status_error(status, &bytes));
+        }
+        parse_response(&bytes)
+    }
+}
+
+/// Build the request body Cohere expects. Pure: no I/O, no env access.
+///
+/// Each trait `Message` translates to one Cohere `messages[]` entry with
+/// the one exception: `Role::Tool` messages emit one Cohere `tool` message
+/// per `ToolResult` block they contain, so each carries its own
+/// `tool_call_id`. Non-`ToolResult` blocks on a `Role::Tool` message are
+/// dropped (the prompt renderer is responsible for well-formed tool turns).
+pub fn build_body(req: &CompleteRequest, model: &str) -> Value {
+    let mut messages: Vec<Value> = Vec::with_capacity(req.messages.len());
+
+    for msg in &req.messages {
+        match msg.role {
+            Role::System => {
+                messages.push(json!({
+                    "role": "system",
+                    "content": render_text_content(&msg.content),
+                }));
+            }
+            Role::User => {
+                messages.push(json!({
+                    "role": "user",
+                    "content": render_text_content(&msg.content),
+                }));
+            }
+            Role::Assistant => {
+                let mut entry = serde_json::Map::new();
+                entry.insert("role".into(), json!("assistant"));
+
+                let mut text_chunks: Vec<&str> = Vec::new();
+                let mut tool_calls: Vec<Value> = Vec::new();
+                for block in &msg.content {
+                    match block {
+                        ContentBlock::Text { text } => text_chunks.push(text.as_str()),
+                        ContentBlock::ToolUse { id, name, input } => {
+                            // `arguments` is a JSON-encoded string on the wire.
+                            // `serde_json::to_string` on owned-Value can only fail
+                            // if a Map key isn't a string, which Value never produces.
+                            let args_str =
+                                serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                            tool_calls.push(json!({
+                                "id": id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": args_str,
+                                },
+                            }));
+                        }
+                        ContentBlock::ToolResult { .. } => {
+                            // Tool results don't belong on assistant turns; ignore.
+                        }
+                    }
+                }
+                entry.insert("content".into(), json!(text_chunks.join("")));
+                if !tool_calls.is_empty() {
+                    entry.insert("tool_calls".into(), Value::Array(tool_calls));
+                }
+                messages.push(Value::Object(entry));
+            }
+            Role::Tool => {
+                for block in &msg.content {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                    } = block
+                    {
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_use_id,
+                            "content": content,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut body = serde_json::Map::new();
+    body.insert("model".into(), json!(model));
+    body.insert("stream".into(), json!(false));
+    body.insert("max_tokens".into(), json!(req.options.max_tokens));
+    if let Some(t) = req.options.temperature {
+        body.insert("temperature".into(), json!(t));
+    }
+    body.insert("messages".into(), Value::Array(messages));
+    if !req.tools.is_empty() {
+        let tools: Vec<Value> = req
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    },
+                })
+            })
+            .collect();
+        body.insert("tools".into(), Value::Array(tools));
+    }
+    Value::Object(body)
+}
+
+/// Concatenate `Text` blocks into a single string. Cohere's `system` and
+/// `user` messages accept either a string or a content-block array; we use
+/// the simpler string form. Non-text blocks on these turns are dropped —
+/// the prompt renderer is responsible for well-formedness.
+fn render_text_content(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Parse a 200 OK response body into the trait's `CompleteResponse`.
+///
+/// Synthesizes `ContentBlock::ToolUse` blocks from `message.tool_calls[]`
+/// so `content` mirrors the Anthropic adapter's invariant (every call is
+/// visible in both `content` and the flat `tool_calls` projection). Unknown
+/// content-block types (`thinking`, future additions) are tolerated.
+pub fn parse_response(body: &[u8]) -> Result<CompleteResponse, ModelError> {
+    let v: Value = serde_json::from_slice(body)
+        .map_err(|e| ModelError::Parse(format!("response body is not JSON: {e}")))?;
+
+    let message = v
+        .get("message")
+        .ok_or_else(|| ModelError::Parse("response missing `message`".into()))?;
+
+    let mut content: Vec<ContentBlock> = Vec::new();
+    if let Some(arr) = message.get("content").and_then(|c| c.as_array()) {
+        for block in arr {
+            let ty = block
+                .get("type")
+                .and_then(|t| t.as_str())
+                .ok_or_else(|| ModelError::Parse("content block missing string `type`".into()))?;
+            if ty == "text" {
+                let text = block
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .ok_or_else(|| ModelError::Parse("text block missing `text`".into()))?
+                    .to_string();
+                content.push(ContentBlock::Text { text });
+            }
+            // Tolerate `thinking` and any forward-compat block types.
+        }
+    }
+
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    if let Some(arr) = message.get("tool_calls").and_then(|c| c.as_array()) {
+        for tc in arr {
+            let id = tc
+                .get("id")
+                .and_then(|t| t.as_str())
+                .ok_or_else(|| ModelError::Parse("tool_call missing `id`".into()))?
+                .to_string();
+            let func = tc
+                .get("function")
+                .ok_or_else(|| ModelError::Parse("tool_call missing `function`".into()))?;
+            let name = func
+                .get("name")
+                .and_then(|t| t.as_str())
+                .ok_or_else(|| ModelError::Parse("tool_call missing `function.name`".into()))?
+                .to_string();
+            let args_str = func
+                .get("arguments")
+                .and_then(|t| t.as_str())
+                .ok_or_else(|| {
+                    ModelError::Parse("tool_call missing `function.arguments` string".into())
+                })?;
+            // Cohere encodes arguments as a JSON string; decode to a Value
+            // to match the trait's `serde_json::Value` shape.
+            let arguments: Value = serde_json::from_str(args_str).map_err(|e| {
+                ModelError::Parse(format!("tool_call arguments are not valid JSON: {e}"))
+            })?;
+
+            content.push(ContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: arguments.clone(),
+            });
+            tool_calls.push(ToolCall {
+                id,
+                name,
+                arguments,
+            });
+        }
+    }
+
+    let usage_v = v
+        .get("usage")
+        .ok_or_else(|| ModelError::Parse("response missing `usage`".into()))?;
+    let tokens = usage_v
+        .get("tokens")
+        .ok_or_else(|| ModelError::Parse("usage missing `tokens`".into()))?;
+    let input_tokens = tokens
+        .get("input_tokens")
+        .and_then(|n| n.as_u64())
+        .ok_or_else(|| ModelError::Parse("usage.tokens missing `input_tokens`".into()))?
+        as u32;
+    let output_tokens = tokens
+        .get("output_tokens")
+        .and_then(|n| n.as_u64())
+        .ok_or_else(|| ModelError::Parse("usage.tokens missing `output_tokens`".into()))?
+        as u32;
+
+    Ok(CompleteResponse {
+        content,
+        tool_calls,
+        usage: Usage {
+            input_tokens,
+            output_tokens,
+        },
+    })
+}
+
+/// Map a non-200 HTTP status + raw body to a `ModelError`. Categorization
+/// is by status class — the body is included verbatim in the error string.
+pub fn map_status_error(status: u16, body: &[u8]) -> ModelError {
+    let snippet = String::from_utf8_lossy(body).into_owned();
+    match status {
+        401 | 403 => ModelError::Auth(format!("HTTP {status}: {snippet}")),
+        429 => ModelError::RateLimit(format!("HTTP {status}: {snippet}")),
+        500..=599 => ModelError::Transport(format!("HTTP {status}: {snippet}")),
+        _ => ModelError::Other(format!("HTTP {status}: {snippet}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model_client::{CompleteOptions, Message, ToolSpec};
+    use serde_json::json;
+
+    fn representative_request() -> CompleteRequest {
+        CompleteRequest {
+            messages: vec![
+                Message::system("be terse"),
+                Message::user("what's the weather?"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::Text {
+                            text: "checking".into(),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "call_01".into(),
+                            name: "get_weather".into(),
+                            input: json!({"location": "SF"}),
+                        },
+                    ],
+                },
+                Message {
+                    role: Role::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_01".into(),
+                        content: "72F".into(),
+                    }],
+                },
+            ],
+            tools: vec![ToolSpec {
+                name: "get_weather".into(),
+                description: "Get current weather for a location".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                }),
+            }],
+            options: CompleteOptions {
+                max_tokens: 256,
+                temperature: Some(0.0),
+            },
+        }
+    }
+
+    #[test]
+    fn build_body_matches_cohere_wire_shape_golden() {
+        let body = build_body(&representative_request(), DEFAULT_MODEL);
+        let expected = json!({
+            "model": DEFAULT_MODEL,
+            "stream": false,
+            "max_tokens": 256,
+            "temperature": 0.0,
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "what's the weather?"},
+                {
+                    "role": "assistant",
+                    "content": "checking",
+                    "tool_calls": [{
+                        "id": "call_01",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"location\":\"SF\"}",
+                        },
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_01",
+                    "content": "72F",
+                },
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get current weather for a location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                    },
+                },
+            }],
+        });
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn build_body_omits_optional_fields_when_unset() {
+        let req = CompleteRequest {
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            options: CompleteOptions {
+                max_tokens: 32,
+                temperature: None,
+            },
+        };
+        let body = build_body(&req, "m");
+        assert!(body.get("temperature").is_none(), "no temperature field");
+        assert!(body.get("tools").is_none(), "no tools field");
+        assert_eq!(body["max_tokens"], json!(32));
+        assert_eq!(body["model"], json!("m"));
+        assert_eq!(body["stream"], json!(false));
+    }
+
+    #[test]
+    fn build_body_emits_one_tool_message_per_tool_result_block() {
+        let req = CompleteRequest {
+            messages: vec![
+                Message::user("go"),
+                Message {
+                    role: Role::Tool,
+                    content: vec![
+                        ContentBlock::ToolResult {
+                            tool_use_id: "a".into(),
+                            content: "1".into(),
+                        },
+                        ContentBlock::ToolResult {
+                            tool_use_id: "b".into(),
+                            content: "2".into(),
+                        },
+                    ],
+                },
+            ],
+            tools: vec![],
+            options: CompleteOptions {
+                max_tokens: 32,
+                temperature: None,
+            },
+        };
+        let body = build_body(&req, "m");
+        let msgs = body["messages"].as_array().unwrap();
+        // user + 2 tool messages
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1]["role"], json!("tool"));
+        assert_eq!(msgs[1]["tool_call_id"], json!("a"));
+        assert_eq!(msgs[2]["role"], json!("tool"));
+        assert_eq!(msgs[2]["tool_call_id"], json!("b"));
+    }
+
+    #[test]
+    fn parse_response_handles_text_only() {
+        let raw = br#"{
+            "id": "msg_1",
+            "finish_reason": "COMPLETE",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hello"}]
+            },
+            "usage": {"tokens": {"input_tokens": 10, "output_tokens": 5}}
+        }"#;
+        let r = parse_response(raw).unwrap();
+        assert_eq!(
+            r.content,
+            vec![ContentBlock::Text {
+                text: "hello".into()
+            }]
+        );
+        assert!(r.tool_calls.is_empty());
+        assert_eq!(r.usage.input_tokens, 10);
+        assert_eq!(r.usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn parse_response_handles_tool_use_only() {
+        // Cohere puts tool calls at message.tool_calls (NOT in content); the
+        // adapter synthesizes a ContentBlock::ToolUse so the trait invariant
+        // (calls visible in both content and tool_calls) holds.
+        let raw = br#"{
+            "finish_reason": "TOOL_CALL",
+            "message": {
+                "role": "assistant",
+                "content": [],
+                "tool_calls": [{
+                    "id": "call_99",
+                    "type": "function",
+                    "function": {
+                        "name": "echo",
+                        "arguments": "{\"msg\": \"hi\"}"
+                    }
+                }]
+            },
+            "usage": {"tokens": {"input_tokens": 7, "output_tokens": 3}}
+        }"#;
+        let r = parse_response(raw).unwrap();
+        assert_eq!(
+            r.content,
+            vec![ContentBlock::ToolUse {
+                id: "call_99".into(),
+                name: "echo".into(),
+                input: json!({"msg": "hi"}),
+            }]
+        );
+        assert_eq!(
+            r.tool_calls,
+            vec![ToolCall {
+                id: "call_99".into(),
+                name: "echo".into(),
+                arguments: json!({"msg": "hi"}),
+            }]
+        );
+        assert_eq!(r.usage.input_tokens, 7);
+        assert_eq!(r.usage.output_tokens, 3);
+    }
+
+    #[test]
+    fn parse_response_handles_mixed_text_and_tool_use_and_skips_thinking() {
+        let raw = br#"{
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "ignored future block"},
+                    {"type": "text", "text": "let me check"}
+                ],
+                "tool_calls": [{
+                    "id": "t1",
+                    "type": "function",
+                    "function": {"name": "echo", "arguments": "{\"x\": 1}"}
+                }]
+            },
+            "usage": {"tokens": {"input_tokens": 4, "output_tokens": 9}}
+        }"#;
+        let r = parse_response(raw).unwrap();
+        // 1 text block + 1 synthesized tool_use block (thinking dropped).
+        assert_eq!(r.content.len(), 2);
+        assert!(matches!(&r.content[0], ContentBlock::Text { text } if text == "let me check"));
+        assert!(matches!(&r.content[1], ContentBlock::ToolUse { id, .. } if id == "t1"));
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0].id, "t1");
+        assert_eq!(r.tool_calls[0].arguments, json!({"x": 1}));
+    }
+
+    #[test]
+    fn parse_response_rejects_malformed_json() {
+        let raw = b"not json {{{";
+        let err = parse_response(raw).unwrap_err();
+        assert!(matches!(err, ModelError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_response_rejects_missing_usage() {
+        let raw = br#"{"message": {"content": []}}"#;
+        let err = parse_response(raw).unwrap_err();
+        assert!(matches!(err, ModelError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_response_rejects_missing_message() {
+        let raw = br#"{"usage": {"tokens": {"input_tokens": 1, "output_tokens": 1}}}"#;
+        let err = parse_response(raw).unwrap_err();
+        assert!(matches!(err, ModelError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_response_rejects_tool_call_with_invalid_arguments_json() {
+        let raw = br#"{
+            "message": {
+                "content": [],
+                "tool_calls": [{
+                    "id": "x",
+                    "type": "function",
+                    "function": {"name": "f", "arguments": "not json {{"}
+                }]
+            },
+            "usage": {"tokens": {"input_tokens": 1, "output_tokens": 1}}
+        }"#;
+        let err = parse_response(raw).unwrap_err();
+        assert!(matches!(err, ModelError::Parse(_)));
+        assert!(err.to_string().contains("arguments"));
+    }
+
+    #[test]
+    fn map_status_401_is_auth() {
+        let e = map_status_error(401, b"{\"message\":\"bad key\"}");
+        assert!(matches!(e, ModelError::Auth(_)));
+        assert!(e.to_string().contains("401"));
+    }
+
+    #[test]
+    fn map_status_403_is_auth() {
+        let e = map_status_error(403, b"forbidden");
+        assert!(matches!(e, ModelError::Auth(_)));
+    }
+
+    #[test]
+    fn map_status_429_is_rate_limit() {
+        let e = map_status_error(429, b"too many");
+        assert!(matches!(e, ModelError::RateLimit(_)));
+        assert!(e.to_string().contains("429"));
+    }
+
+    #[test]
+    fn map_status_500_is_transport() {
+        let e = map_status_error(500, b"oops");
+        assert!(matches!(e, ModelError::Transport(_)));
+        assert!(e.to_string().contains("500"));
+    }
+
+    #[test]
+    fn map_status_503_is_transport() {
+        let e = map_status_error(503, b"unavailable");
+        assert!(matches!(e, ModelError::Transport(_)));
+    }
+
+    #[test]
+    fn map_status_400_is_other() {
+        let e = map_status_error(400, b"{\"message\":\"bad request\"}");
+        assert!(matches!(e, ModelError::Other(_)));
+        assert!(e.to_string().contains("400"));
+        assert!(e.to_string().contains("bad request"));
+    }
+
+    #[test]
+    fn cohere_client_dyn_dispatch_compiles() {
+        // Compile-time: CohereClient implements `ModelClient` and is
+        // `Send + Sync`, so it can be stashed behind `Box<dyn ModelClient>`.
+        let _: Box<dyn ModelClient> = Box::new(CohereClient::new());
+    }
+
+    #[tokio::test]
+    async fn complete_returns_auth_error_when_api_key_missing() {
+        // `set_var`/`remove_var` are unsafe in Rust 2024 / 1.84+ because they
+        // are not thread-safe with concurrent env reads. Single-threaded test
+        // with no readers, so this is fine.
+        unsafe {
+            std::env::remove_var(API_KEY_ENV);
+        }
+        let client = CohereClient::new();
+        let req = CompleteRequest {
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            options: CompleteOptions {
+                max_tokens: 32,
+                temperature: None,
+            },
+        };
+        let err = client.complete(req).await.unwrap_err();
+        assert!(matches!(err, ModelError::Auth(_)), "got: {err:?}");
+    }
+}
