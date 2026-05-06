@@ -12,6 +12,8 @@
 
 use std::sync::Arc;
 
+pub mod tool;
+
 use rmcp::model::{CallToolRequestParams, JsonObject};
 use rmcp::service::{RoleClient, RunningService, ServiceError, ServiceExt};
 use rmcp::transport::TokioChildProcess;
