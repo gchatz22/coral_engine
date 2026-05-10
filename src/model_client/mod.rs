@@ -156,11 +156,18 @@ pub struct CompleteRequest {
 /// once in `content` (as a `ToolUse` block) and once in `tool_calls`; the
 /// duplication is intentional — JAR2-17's Decision parser walks `content`,
 /// while a future router walks `tool_calls`.
+///
+/// `stats` carries the JAR2-20 cost/latency accounting block. It composes
+/// `usage` rather than duplicating its token fields, plus the model id,
+/// vendor tag, and wall-clock latency measured around the upstream call.
+/// Real $/token pricing and budget enforcement are out of scope here —
+/// raw counts only.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompleteResponse {
     pub content: Vec<ContentBlock>,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Usage,
+    pub stats: CallStats,
 }
 
 /// A single tool invocation projected out of `CompleteResponse::content`.
@@ -178,6 +185,72 @@ pub struct ToolCall {
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+}
+
+/// Which vendor produced a `CallStats`. Small closed enum rather than a
+/// `String` so callers can match on it cheaply and tracing field rendering
+/// stays allocation-free.
+///
+/// `Default` picks `Anthropic` purely so `CallStats::default()` compiles
+/// for test fixtures and the pre-overwrite path in `parse_response`; the
+/// real vendor is always set by `complete` before stats reach a caller.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Vendor {
+    #[default]
+    Anthropic,
+    Cohere,
+}
+
+impl Vendor {
+    /// Stable string form, used for tracing fields and tests.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Vendor::Anthropic => "anthropic",
+            Vendor::Cohere => "cohere",
+        }
+    }
+}
+
+/// Per-call cost + latency accounting block (JAR2-20).
+///
+/// Composes `Usage` rather than duplicating the token counts so there is
+/// exactly one source of truth for tokens-in / tokens-out across the
+/// codebase. Real pricing translation and budget enforcement live in
+/// future tickets — this struct intentionally ships only the raw inputs
+/// those layers will need.
+///
+/// `Default` is provided so the pure `parse_response` helpers (which
+/// can't see latency, vendor, or model id) can construct a
+/// `CompleteResponse` with placeholder stats that `complete` overwrites
+/// after the HTTP call. End users of `ModelClient` always see stats
+/// populated by `complete`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallStats {
+    pub usage: Usage,
+    /// Wall-clock latency around the `ModelClient::complete` HTTP call,
+    /// measured by the vendor impl with `std::time::Instant`.
+    pub latency_ms: u64,
+    /// Vendor that produced this call. See `Vendor::as_str` for the
+    /// stable tracing string.
+    pub vendor: Vendor,
+    /// Model id the call hit. `&'static str` would be the natural choice
+    /// for a fixed enum of models, but model ids are configurable
+    /// (`ANTHROPIC_MODEL` / `COHERE_MODEL` env vars + `with_model`), so
+    /// an owned `String` is the right shape.
+    pub model: String,
+}
+
+impl CallStats {
+    /// Convenience accessor matching the field name in the ticket spec.
+    pub fn tokens_in(&self) -> u32 {
+        self.usage.input_tokens
+    }
+
+    /// Convenience accessor matching the field name in the ticket spec.
+    pub fn tokens_out(&self) -> u32 {
+        self.usage.output_tokens
+    }
 }
 
 /// Categorized failure mode from a model adapter.
