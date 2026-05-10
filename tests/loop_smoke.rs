@@ -8,14 +8,18 @@
 //!   wakes on signal, wakes on deadline, `EmitOutput` with valid evidence
 //!   writes a file, `Retire` exits cleanly, `RewriteFs` writes under
 //!   `notes/`, `CallTool` records evidence, `max_ticks` caps the loop.
-//! * **JAR2-19** synthetic-trigger correction loop and health
-//!   transitions: `EmitOutput` with empty / unknown evidence and
-//!   `CallTool` for an unregistered tool now route through
-//!   `ApplyOutcome::NeedsCorrection` and inject a synthetic-correction
-//!   trigger; persistent failure exhausts the inference budget and flips
-//!   the tracker to `Unhealthy`; the next successful tick recovers and
-//!   archives the prior incident; Decide-side `Err` transitions to
-//!   `Unhealthy` directly while keeping the run loop alive.
+//! * **JAR2-19** correction loop and health transitions: `EmitOutput` with
+//!   empty / unknown evidence and `CallTool` for an unregistered tool now
+//!   route through `ApplyOutcome::NeedsCorrection` and stage a
+//!   `CorrectionContext` for the next tick (agent-internal continuation
+//!   state, not a queue trigger — see `agent.rs`'s module doc); persistent
+//!   failure exhausts the inference budget and flips the tracker to
+//!   `Unhealthy`; the next successful tick recovers and archives the prior
+//!   incident; Decide-side `Err` transitions to `Unhealthy` directly while
+//!   keeping the run loop alive. A regression test
+//!   (`apply_failure_correction_budget_is_immune_to_concurrent_external_triggers`)
+//!   pins the contract that external triggers landing between an apply
+//!   failure and the next tick cannot reset the per-tick retry budget.
 //!
 //! Time-sensitive tests use `#[tokio::test(flavor = "current_thread",
 //! start_paused = true)]` so the runtime auto-advances when the only
@@ -23,21 +27,24 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
 use jarvis_node::agent::{Agent, RetireReason};
-use jarvis_node::decision::{ClaimSeed, Decision, FsOp, MockDecide};
+use jarvis_node::decision::{ClaimSeed, ContextBundle, Decide, Decision, FsOp, MockDecide};
 use jarvis_node::evidence::{EvidenceId, EvidenceRecord};
 use jarvis_node::fs::AgentFs;
 use jarvis_node::health::{HealthTracker, RetryBudget};
 use jarvis_node::mandate::Mandate;
 use jarvis_node::tools::{EchoTool, ToolRegistry};
 use jarvis_node::trigger::Trigger;
+use jarvis_node::trigger_queue::SignalSink;
 
 fn fresh_fs(idle_period: Duration) -> (TempDir, AgentFs, Mandate) {
     let tmp = TempDir::new().expect("tempdir");
@@ -360,27 +367,27 @@ async fn max_ticks_caps_loop_iterations_and_writes_retirement() {
     assert!(tmp.path().join("retirement.json").is_file());
 }
 
-// ---- JAR2-19: synthetic-trigger correction loop + health transitions ----
+// ---- JAR2-19: correction loop + health transitions ----
 
 /// JAR2-19 acceptance test 1: model emits an unsatisfiable `Decision`
 /// (`CallTool` for an unregistered tool); the runtime must catch the
-/// apply-time failure, inject a corrective synthetic trigger into the
-/// queue, and the next tick must produce a valid `Decision` that
-/// completes. The agent stays Healthy throughout.
+/// apply-time failure, stage a correction for the next tick, and the next
+/// tick must produce a valid `Decision` that completes. The agent stays
+/// Healthy throughout.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn invalid_call_tool_injects_synthetic_correction_then_recovers() {
+async fn invalid_call_tool_stages_correction_then_recovers() {
     let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
     let script = vec![
         // Tick 1: model picks a tool that is not registered. Apply-time
         // failure → record_failure(Inference) → counter=1 (under default
-        // budget of 1) → synthetic correction injected for the next tick.
+        // budget of 1) → pending_correction set for the next tick.
         Decision::CallTool {
             name: "no_such_tool".into(),
             args: json!({"x": 1}),
             claim_seed: ClaimSeed::new("seed-1"),
         },
-        // Tick 2: synthetic correction trigger arrives; script's next
-        // decision is Retire. dispatch returns Retire → loop exits.
+        // Tick 2: correction continuation; script's next decision is
+        // Retire. dispatch returns Retire → loop exits.
         Decision::Retire {
             reason: "recovered".into(),
         },
@@ -432,10 +439,10 @@ async fn invalid_call_tool_injects_synthetic_correction_then_recovers() {
 /// `EmitOutput` with an *empty* evidence list is rejected by
 /// `AgentFs::persist_output` with `FsError::EmptyEvidence`. Per JAR2-19,
 /// that maps to `ApplyOutcome::NeedsCorrection` rather than the legacy
-/// "log + continue" warn — the next iteration pulls the synthetic
-/// correction trigger and the script's second decision retires.
+/// "log + continue" warn — the next iteration runs as a correction
+/// continuation and the script's second decision retires.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn emit_output_with_empty_evidence_injects_synthetic_correction() {
+async fn emit_output_with_empty_evidence_stages_correction() {
     let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
     let script = vec![
         Decision::EmitOutput {
@@ -482,7 +489,7 @@ async fn emit_output_with_empty_evidence_injects_synthetic_correction() {
 /// Mirrors the empty-evidence test above; the two cover the two distinct
 /// `FsError` variants the apply-time correction path catches.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn emit_output_with_unknown_evidence_injects_synthetic_correction() {
+async fn emit_output_with_unknown_evidence_stages_correction() {
     let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
     let bogus = EvidenceId::from_hex("deadbeef".repeat(8));
     let script = vec![
@@ -526,11 +533,11 @@ async fn emit_output_with_unknown_evidence_injects_synthetic_correction() {
 }
 
 /// JAR2-19 acceptance test 2: persistent apply-time failure exhausts the
-/// per-tick inference budget across the original attempt + one
-/// synthetic-correction continuation. The agent transitions to
-/// `Unhealthy`, the run loop **does not halt**, and a subsequent
-/// successful tick (here, an `Idle` decision) recovers the tracker to
-/// `Healthy` while archiving the prior incident.
+/// per-tick inference budget across the original attempt + one correction
+/// continuation. The agent transitions to `Unhealthy`, the run loop
+/// **does not halt**, and a subsequent successful tick (here, an `Idle`
+/// decision) recovers the tracker to `Healthy` while archiving the prior
+/// incident.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn persistent_apply_time_failure_exhausts_budget_and_recovers_on_next_success() {
     let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
@@ -709,5 +716,166 @@ async fn decide_err_transitions_to_unhealthy_and_keeps_loop_alive() {
     assert!(
         last_err.contains("script exhausted"),
         "incident's last_error should preserve the underlying Decide-Err message, got: {last_err}"
+    );
+}
+
+/// Regression test for the bug that motivated moving correction state off
+/// the trigger queue: an external trigger landing in the queue between an
+/// apply-time failure and the correction-continuation tick must NOT reset
+/// the per-tick retry budget.
+///
+/// Before this fix, mid-correction continuation was signaled by a
+/// self-injected synthetic trigger; the next tick classified itself as
+/// "correction-only" by inspecting drained triggers. A racing external
+/// trigger arriving in the same window made `is_correction_only` false,
+/// which called `begin_tick` and reset the budget — so a noisy producer
+/// could grant unlimited correction attempts. With `pending_correction`
+/// stored on the agent, the classification is a stored fact; this
+/// scenario must still exhaust the budget after the configured number of
+/// failures.
+///
+/// Timing reproduction: tick 1's `Decide::decide` injects an external
+/// trigger via a captured `SignalSink` *before* returning the bad
+/// `CallTool`. By the time tick 1's dispatch sets `pending_correction`,
+/// the external is buffered. Tick 2's drain sees `[External]`. Under the
+/// old design, that drain (one external, zero synthetic-correction-kind
+/// triggers) would have flipped `is_correction_only` to false and reset
+/// the budget. Under the new design, `pending_correction.is_some()`
+/// short-circuits the `begin_tick` call and the budget accumulates,
+/// exhausting on tick 2's failure as required.
+///
+/// budget = `RetryBudget::new(1, 3)` → max_inference = 1 → two apply-time
+/// failures within one continuous window exhaust.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn apply_failure_correction_budget_is_immune_to_concurrent_external_triggers() {
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let script = vec![
+        // Tick 1 (fresh): the wrapper Decide injects an external trigger,
+        // then returns this bad CallTool. record_failure ok (counter=1)
+        // → pending_correction set.
+        Decision::CallTool {
+            name: "no_such_tool".into(),
+            args: json!({}),
+            claim_seed: ClaimSeed::new("seed-1"),
+        },
+        // Tick 2 (correction continuation; drain pulls the racing
+        // external trigger, but pending_correction.is_some() so
+        // begin_tick is skipped): bad CallTool again → counter=2 >
+        // max=1 → BudgetExhausted → Unhealthy.
+        Decision::CallTool {
+            name: "no_such_tool".into(),
+            args: json!({}),
+            claim_seed: ClaimSeed::new("seed-1"),
+        },
+        // Tick 3 (fresh — pending_correction cleared on the Unhealthy
+        // transition): valid Idle → mark_tick_success → archives the
+        // incident and flips back to Healthy.
+        Decision::Idle {
+            next_after: Duration::from_millis(50),
+        },
+        // Tick 4: retire cleanly.
+        Decision::Retire {
+            reason: "post-exhaustion".into(),
+        },
+    ];
+
+    // The wrapper Decide needs a `SignalSink` for the same `TriggerQueue`
+    // the agent runs against, but the agent owns its queue and only
+    // exposes a sink via `signal()` — which we can't call until after
+    // `Agent::new` consumes the Decide. Resolve the cycle with a deferred
+    // slot: the wrapper holds `Arc<Mutex<Option<SignalSink>>>`, we move
+    // the wrapper into the agent, then fill the slot with the agent's
+    // sink before spawning `run()`.
+    let pending_sink: Arc<Mutex<Option<SignalSink>>> = Arc::new(Mutex::new(None));
+
+    struct DeferredSinkDecide {
+        inner: MockDecide,
+        sink_slot: Arc<Mutex<Option<SignalSink>>>,
+        inject_on_call: u32,
+        calls: Mutex<u32>,
+    }
+    #[async_trait]
+    impl Decide for DeferredSinkDecide {
+        async fn decide(&self, ctx: ContextBundle) -> anyhow::Result<Decision> {
+            let n = {
+                let mut c = self.calls.lock().unwrap();
+                let n = *c;
+                *c += 1;
+                n
+            };
+            if n == self.inject_on_call {
+                let guard = self.sink_slot.lock().unwrap();
+                guard
+                    .as_ref()
+                    .expect("sink must be installed before run starts")
+                    .send(jarvis_node::trigger::Trigger::External {
+                        kind: "interfering_producer".into(),
+                        payload: json!({"noise": true}),
+                    })
+                    .expect("inject");
+            }
+            self.inner.decide(ctx).await
+        }
+    }
+
+    let decide = DeferredSinkDecide {
+        inner: MockDecide::new(script),
+        sink_slot: pending_sink.clone(),
+        inject_on_call: 0,
+        calls: Mutex::new(0),
+    };
+
+    let agent = Agent::new(
+        mandate,
+        fs,
+        decide,
+        registry_with_echo(),
+        fresh_health_with(tmp.path(), RetryBudget::new(1, 3)),
+    );
+    *pending_sink.lock().unwrap() = Some(agent.signal());
+
+    let handle = tokio::spawn(agent.run());
+
+    let RetireReason(reason) = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("agent did not retire in time")
+        .expect("join")
+        .expect("run ok");
+    assert_eq!(reason, "post-exhaustion");
+
+    // The archive must hold exactly one Unhealthy incident with a
+    // retry_trail of length 2 — proof that the budget exhausted on tick 2
+    // despite the racing trigger landing in tick 2's drain. Under the old
+    // design, the racing trigger would have caused tick 2 to call
+    // begin_tick, the test would never archive an incident, and this
+    // assertion would fail.
+    let archive_dir = tmp.path().join("health");
+    assert!(
+        archive_dir.is_dir(),
+        "archive dir should be created on recovery — \
+         absence means the budget was reset by the racing external trigger"
+    );
+    let archived: Vec<_> = std::fs::read_dir(&archive_dir)
+        .expect("read archive")
+        .map(|e| e.expect("dirent").path())
+        .collect();
+    assert_eq!(
+        archived.len(),
+        1,
+        "exactly one archived incident expected (budget exhausted), got: {archived:?}"
+    );
+
+    let inc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&archived[0]).expect("read archive"))
+            .expect("parse archive");
+    let retry_trail = inc
+        .get("incident")
+        .and_then(|i| i.get("retry_trail"))
+        .and_then(|x| x.as_array())
+        .expect("retry_trail");
+    assert_eq!(
+        retry_trail.len(),
+        2,
+        "retry trail should accumulate both apply-time attempts despite the race"
     );
 }

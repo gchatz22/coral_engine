@@ -285,6 +285,7 @@ mod tests {
             triggers: vec![],
             recent_outputs: vec![],
             recent_evidence: vec![],
+            correction: None,
         }
     }
 

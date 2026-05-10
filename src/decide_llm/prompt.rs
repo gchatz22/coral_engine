@@ -10,6 +10,10 @@
 //! - One `system` message containing the mandate text and the standing
 //!   invariants the model must respect (provenance-by-construction,
 //!   one-decision-per-turn, the decision-tool taxonomy from JAR2-17).
+//! - When `bundle.correction` is `Some` (the runtime rejected the previous
+//!   tick's `Decision`), one `user` message that surfaces the failure
+//!   description so the model can self-correct. Rendered ahead of the
+//!   trigger window because it is the most actionable signal this tick.
 //! - One `user` message per non-empty content window (triggers, recent
 //!   outputs, recent evidence). Empty windows are dropped so the prompt
 //!   does not waste tokens on `(none)` placeholders.
@@ -51,7 +55,7 @@
 //! - The decision-tool schemas. Those are published via
 //!   `CompleteRequest::tools`; duplicating them in prose risks drift.
 
-use crate::decision::ContextBundle;
+use crate::decision::{ContextBundle, CorrectionContext};
 use crate::evidence::EvidenceRecord;
 use crate::mandate::{Mandate, Output};
 use crate::model_client::Message;
@@ -73,11 +77,14 @@ Invariants:
 /// `CompleteRequest::messages`. The caller is responsible for filling
 /// `CompleteRequest::tools` with `decide_llm::schema::decision_tools()`.
 pub fn render(bundle: &ContextBundle) -> Vec<Message> {
-    // Capacity is at most 4: system + triggers + outputs + evidence.
-    // Pre-allocating saves a couple of small reallocs in the common case
-    // without committing to a fixed shape.
-    let mut out = Vec::with_capacity(4);
+    // Capacity is at most 5: system + correction + triggers + outputs +
+    // evidence. Pre-allocating saves a couple of small reallocs in the
+    // common case without committing to a fixed shape.
+    let mut out = Vec::with_capacity(5);
     out.push(Message::system(render_system(&bundle.mandate)));
+    if let Some(c) = &bundle.correction {
+        out.push(Message::user(render_correction(c)));
+    }
     if !bundle.triggers.is_empty() {
         out.push(Message::user(render_triggers(&bundle.triggers)));
     }
@@ -100,6 +107,25 @@ fn render_system(m: &Mandate) -> String {
     format!(
         "You are an agent operating under the following mandate:\n\n{}\n\n{INVARIANTS}",
         m.text
+    )
+}
+
+/// Render the correction window: a single user message describing the
+/// failure that prompted this continuation tick.
+///
+/// Phrasing is plain English rather than serialized JSON because the model
+/// is expected to act on it directly ("here's what to fix"), not summarize
+/// it as background context. The text is kept short and ends with the
+/// concrete next-step instruction so the model has no excuse to hallucinate
+/// a non-decision turn.
+fn render_correction(c: &CorrectionContext) -> String {
+    format!(
+        "# Previous-attempt failure\n\
+         \n\
+         The runtime could not satisfy your previous decision: {failure}.\n\
+         \n\
+         Reply by calling exactly one decision tool that addresses the failure.",
+        failure = c.failure,
     )
 }
 
@@ -175,7 +201,7 @@ mod tests {
     //!   `crate::evidence`); identical inputs always produce identical ids.
 
     use super::*;
-    use crate::decision::ContextBundle;
+    use crate::decision::{ContextBundle, CorrectionContext};
     use crate::evidence::{EvidenceId, EvidenceRecord};
     use crate::mandate::{Mandate, Output};
     use crate::model_client::{ContentBlock, Role};
@@ -215,6 +241,7 @@ mod tests {
             triggers: vec![],
             recent_outputs: vec![],
             recent_evidence: vec![],
+            correction: None,
         }
     }
 
@@ -251,6 +278,7 @@ mod tests {
             triggers: vec![Trigger::ScheduledWake],
             recent_outputs: vec![Output::new("draft", vec![ev.id.clone()], ts())],
             recent_evidence: vec![ev],
+            correction: None,
         };
         let a = render(&bundle);
         let b = render(&bundle);
@@ -492,6 +520,7 @@ mod tests {
             triggers: vec![Trigger::ScheduledWake],
             recent_outputs: vec![Output::new("draft", vec![ev.id.clone()], ts())],
             recent_evidence: vec![ev],
+            correction: None,
         };
         let msgs = render(&bundle);
 
@@ -504,6 +533,63 @@ mod tests {
         assert!(text(&msgs[2]).starts_with("# Recent outputs"));
         assert_eq!(msgs[3].role, Role::User);
         assert!(text(&msgs[3]).starts_with("# Recent evidence"));
+    }
+
+    /// Correction snapshot: a bundle with `correction = Some(...)` produces
+    /// a dedicated user message describing the failure, placed between the
+    /// system message and any other windows.
+    #[test]
+    fn snapshot_correction_only() {
+        let bundle = ContextBundle {
+            correction: Some(CorrectionContext::new(
+                "call_tool: no tool registered under name \"send_email\"",
+            )),
+            ..empty_bundle()
+        };
+        let msgs = render(&bundle);
+        assert_eq!(msgs.len(), 2, "expected system + correction");
+
+        assert_eq!(msgs[1].role, Role::User);
+        assert_eq!(
+            text(&msgs[1]),
+            "# Previous-attempt failure\n\
+             \n\
+             The runtime could not satisfy your previous decision: call_tool: no tool registered under name \"send_email\".\n\
+             \n\
+             Reply by calling exactly one decision tool that addresses the failure."
+        );
+    }
+
+    /// Position invariant: when both correction and triggers are present,
+    /// the correction message appears immediately after system and before
+    /// triggers. The model's most actionable signal this tick is "your last
+    /// move failed because X" — putting it ahead of fresh triggers keeps
+    /// the framing right.
+    #[test]
+    fn correction_renders_before_triggers_and_other_windows() {
+        let ev = EvidenceRecord::new("echo", json!({"k": 1}), json!({"v": 2}), ts());
+        let bundle = ContextBundle {
+            mandate: mandate(),
+            triggers: vec![Trigger::ScheduledWake],
+            recent_outputs: vec![Output::new("draft", vec![ev.id.clone()], ts())],
+            recent_evidence: vec![ev],
+            correction: Some(CorrectionContext::new(
+                "emit_output: evidence list is empty (provenance contract)",
+            )),
+        };
+        let msgs = render(&bundle);
+
+        // 1 system + 1 correction + 3 windows = 5
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(msgs[0].role, Role::System);
+        assert_eq!(msgs[1].role, Role::User);
+        assert!(text(&msgs[1]).starts_with("# Previous-attempt failure"));
+        assert_eq!(msgs[2].role, Role::User);
+        assert!(text(&msgs[2]).starts_with("# Triggers"));
+        assert_eq!(msgs[3].role, Role::User);
+        assert!(text(&msgs[3]).starts_with("# Recent outputs"));
+        assert_eq!(msgs[4].role, Role::User);
+        assert!(text(&msgs[4]).starts_with("# Recent evidence"));
     }
 
     /// Strings with characters that need JSON escaping (quotes, newlines)

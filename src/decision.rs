@@ -96,12 +96,46 @@ pub enum FsOp {
 /// fighting lifetimes. The bootstrap shape mirrors the ticket spec
 /// verbatim: mandate + the triggers that woke us + a small slice of recent
 /// FS state. Trim fields here only when one is unambiguously dead.
+///
+/// `correction` is `Some` when this tick is a continuation of a prior
+/// attempt the runtime rejected (an unsatisfiable `Decision`). It carries
+/// a human-readable description of why the previous attempt failed; the
+/// prompt renderer surfaces it as a distinct section so the model can
+/// self-correct. See `agent.rs` for the budget-accounting contract that
+/// pairs with this field.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContextBundle {
     pub mandate: Mandate,
     pub triggers: Vec<Trigger>,
     pub recent_outputs: Vec<Output>,
     pub recent_evidence: Vec<EvidenceRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correction: Option<CorrectionContext>,
+}
+
+/// "Your previous decision was unsatisfiable; here is why" — agent-internal
+/// continuation state, distinct from the trigger stream that represents
+/// outside-world events.
+///
+/// Set by the run loop when a `Decision` parses cleanly but cannot be
+/// applied (an unregistered tool, an unresolvable evidence id). The next
+/// tick threads it into the `ContextBundle` so the model gets a chance to
+/// emit a satisfiable `Decision`. Kept off the trigger queue on purpose —
+/// see `agent.rs`'s module doc for the rationale.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorrectionContext {
+    /// Human-readable description of the failure that prompted this
+    /// correction. Echoed to the model in the rendered prompt and stamped
+    /// into the `HealthIncident` retry trail.
+    pub failure: String,
+}
+
+impl CorrectionContext {
+    pub fn new(failure: impl Into<String>) -> Self {
+        Self {
+            failure: failure.into(),
+        }
+    }
 }
 
 /// Trait every model adapter (mock, real LLM, deterministic policy)
@@ -200,10 +234,15 @@ const RECENT_WINDOW: usize = 8;
 /// which sort filenames lexically and return the last `RECENT_WINDOW`
 /// entries — see `AgentFs::list_recent_outputs` /
 /// `AgentFs::list_recent_evidence`.
+///
+/// `correction` carries continuation state from the run loop when the
+/// previous tick produced an unsatisfiable `Decision`. When `Some`, the
+/// rendered prompt surfaces it as a dedicated section.
 pub async fn assemble_context(
     fs: &AgentFs,
     triggers: &[Trigger],
     cfg: &Mandate,
+    correction: Option<CorrectionContext>,
 ) -> anyhow::Result<ContextBundle> {
     let recent_outputs = fs.list_recent_outputs(RECENT_WINDOW)?;
     let recent_evidence = fs.list_recent_evidence(RECENT_WINDOW)?;
@@ -212,6 +251,7 @@ pub async fn assemble_context(
         triggers: triggers.to_vec(),
         recent_outputs,
         recent_evidence,
+        correction,
     })
 }
 
@@ -358,6 +398,7 @@ mod tests {
             triggers: vec![],
             recent_outputs: vec![],
             recent_evidence: vec![],
+            correction: None,
         }
     }
 
@@ -418,11 +459,27 @@ mod tests {
             },
         ];
 
-        let bundle = assemble_context(&fs, &triggers, &mandate).await.unwrap();
+        let bundle = assemble_context(&fs, &triggers, &mandate, None)
+            .await
+            .unwrap();
         assert_eq!(bundle.triggers, triggers);
         assert_eq!(bundle.mandate, mandate);
         assert!(bundle.recent_outputs.is_empty());
         assert!(bundle.recent_evidence.is_empty());
+        assert!(bundle.correction.is_none());
+    }
+
+    #[tokio::test]
+    async fn assemble_context_threads_correction_into_bundle() {
+        let tmp = TempDir::new().unwrap();
+        let mandate = dummy_mandate();
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+
+        let correction = CorrectionContext::new("call_tool: no tool registered under name \"x\"");
+        let bundle = assemble_context(&fs, &[], &mandate, Some(correction.clone()))
+            .await
+            .unwrap();
+        assert_eq!(bundle.correction.as_ref(), Some(&correction));
     }
 
     #[tokio::test]
@@ -450,8 +507,12 @@ mod tests {
         }
 
         let triggers = vec![Trigger::ScheduledWake];
-        let a = assemble_context(&fs, &triggers, &mandate).await.unwrap();
-        let b = assemble_context(&fs, &triggers, &mandate).await.unwrap();
+        let a = assemble_context(&fs, &triggers, &mandate, None)
+            .await
+            .unwrap();
+        let b = assemble_context(&fs, &triggers, &mandate, None)
+            .await
+            .unwrap();
 
         // Determinism across calls: same inputs, same output order.
         assert_eq!(a.recent_outputs, b.recent_outputs);
