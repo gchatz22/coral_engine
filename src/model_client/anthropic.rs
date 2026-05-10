@@ -27,8 +27,14 @@ use super::{
     CompleteRequest, CompleteResponse, ContentBlock, ModelClient, ModelError, Role, ToolCall, Usage,
 };
 
-/// Default model identifier. Configurable via `AnthropicClient::with_model`.
+/// Default model identifier. Used when neither `MODEL_ENV` nor
+/// `AnthropicClient::with_model` overrides it.
 pub const DEFAULT_MODEL: &str = "claude-haiku-4-5";
+
+/// `ANTHROPIC_MODEL` env var name. Read once at `new()` time; a non-empty
+/// value wins over `DEFAULT_MODEL`, an explicit `with_model` call still
+/// wins over the env. Lets ops swap models via `.envrc` without recompiling.
+pub const MODEL_ENV: &str = "ANTHROPIC_MODEL";
 
 /// Anthropic Messages API base URL. The impl POSTs directly to this URL;
 /// override only if a proxy is in front of the public endpoint.
@@ -56,11 +62,17 @@ pub struct AnthropicClient {
 }
 
 impl AnthropicClient {
-    /// Build a client with the default model and base URL.
+    /// Build a client with the default model and base URL. The model id
+    /// comes from `ANTHROPIC_MODEL` if set and non-empty, otherwise
+    /// `DEFAULT_MODEL`. `with_model` still overrides whatever this picks.
     pub fn new() -> Self {
+        let model = env::var(MODEL_ENV)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
         Self {
             http: reqwest::Client::new(),
-            model: DEFAULT_MODEL.to_string(),
+            model,
             base_url: DEFAULT_BASE_URL.to_string(),
         }
     }
@@ -607,5 +619,38 @@ mod tests {
         };
         let err = client.complete(req).await.unwrap_err();
         assert!(matches!(err, ModelError::Auth(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn new_uses_anthropic_model_env_when_set() {
+        // `set_var`/`remove_var` are unsafe per Rust 2024; safe here because
+        // the test is single-threaded and no other reader races us.
+        unsafe {
+            std::env::set_var(MODEL_ENV, "claude-sonnet-4-5");
+        }
+        let client = AnthropicClient::new();
+        unsafe {
+            std::env::remove_var(MODEL_ENV);
+        }
+        assert_eq!(client.model(), "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn new_falls_back_to_default_when_anthropic_model_env_unset_or_empty() {
+        // Empty must behave like unset — `.envrc` defaults often ship as ""
+        // before someone fills them in, and we don't want that to send an
+        // empty string to the API.
+        unsafe {
+            std::env::remove_var(MODEL_ENV);
+        }
+        assert_eq!(AnthropicClient::new().model(), DEFAULT_MODEL);
+        unsafe {
+            std::env::set_var(MODEL_ENV, "");
+        }
+        let client = AnthropicClient::new();
+        unsafe {
+            std::env::remove_var(MODEL_ENV);
+        }
+        assert_eq!(client.model(), DEFAULT_MODEL);
     }
 }

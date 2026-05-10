@@ -17,7 +17,8 @@
 //! * `--vendor cohere` — requires the `llm-cohere` feature.
 //! * `--model <id>` — overrides the impl's default model. Defaults are
 //!   whatever the vendor adapter selects (`AnthropicClient` →
-//!   `claude-haiku-4-5`; `CohereClient` → `command-a-03-2025`).
+//!   `claude-haiku-4-5`; `CohereClient` → `command-a-03-2025`), unless
+//!   `ANTHROPIC_MODEL` / `COHERE_MODEL` is set in the environment.
 //! * `--system <text>` — optional system prompt.
 //! * `--max-tokens N` — sampling cap, defaults to 1024.
 //! * `--prompt <text>` / `--from-stdin` — exactly one is required. Stdin
@@ -76,6 +77,10 @@ ARGS:
 ENV:
     ANTHROPIC_API_KEY   Required for --vendor anthropic.
     COHERE_API_KEY      Required for --vendor cohere.
+    ANTHROPIC_MODEL     Optional. Overrides the Anthropic default model id
+                        when --model is not given.
+    COHERE_MODEL        Optional. Overrides the Cohere default model id
+                        when --model is not given.
 
 OUTPUT:
     stdout              Joined text content blocks; tool_calls section if any.
