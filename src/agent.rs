@@ -332,6 +332,72 @@ impl<D: Decide> Agent<D> {
                             Err(other) => Err(other.into()),
                         }
                     }
+                    ApplyOutcome::ToolError { tool, error } => {
+                        // JAR2-25: the tool's internal retry policy
+                        // (`McpTool::call`) has already exhausted its
+                        // `RetryPolicy::max_attempts` attempts before
+                        // surfacing this error. Each exhausted call counts
+                        // as one tick against `RetryBudget::max_tool`. The
+                        // two bounds are deliberately distinct: per-call
+                        // retries handle a single flaky tool invocation,
+                        // per-tick budget handles "many tools breaking on
+                        // one tick".
+                        //
+                        // Unlike the Inference/`NeedsCorrection` path,
+                        // there is no synthetic-trigger correction loop
+                        // for tool failures in this ticket — feeding the
+                        // model a "your tool errored, retry differently"
+                        // signal is a separate concern. So we do not
+                        // stage a `CorrectionContext`; we just record the
+                        // failure and continue. On exhaustion we
+                        // transition to Unhealthy and the standard
+                        // recovery path applies on the next successful
+                        // tick.
+                        let attempt = Attempt {
+                            attempt: (retry_trail.len() as u32) + 1,
+                            at: Utc::now(),
+                            error: error.clone(),
+                        };
+                        retry_trail.push(attempt);
+                        match health.record_failure(FailureKind::ToolCall, &error) {
+                            Ok(()) => {
+                                warn!(
+                                    tool = %tool,
+                                    error = %error,
+                                    "tool call exhausted retries; recorded against tool-call budget"
+                                );
+                                Ok(TickOutcome::Continue)
+                            }
+                            Err(HealthError::BudgetExhausted { kind }) => {
+                                warn!(
+                                    ?kind,
+                                    tool = %tool,
+                                    "tool-call budget exhausted; transitioning to Unhealthy"
+                                );
+                                let incident = HealthIncident {
+                                    failing: FailingCall {
+                                        kind,
+                                        details: json!({
+                                            "stage": "apply",
+                                            "tool": tool,
+                                            "error": error,
+                                        }),
+                                    },
+                                    retry_trail: retry_trail.clone(),
+                                    last_error: error,
+                                    transitioned_at: Utc::now(),
+                                };
+                                health.transition_to_unhealthy(incident)?;
+                                // Tool-call exhaustion does not interact
+                                // with the inference correction window —
+                                // clear it defensively so a fresh tick
+                                // begins from a clean slate.
+                                pending_correction = None;
+                                Ok(TickOutcome::Continue)
+                            }
+                            Err(other) => Err(other.into()),
+                        }
+                    }
                 }
             }
             .instrument(span)
@@ -358,10 +424,17 @@ enum TickOutcome {
 /// evidence). The contained string is the human-readable failure
 /// description; it ends up in both the next bundle's
 /// `CorrectionContext::failure` and the `HealthIncident` retry trail.
+///
+/// `ToolError` is the JAR2-25 case: the tool exists and was invoked, but
+/// its internal retry policy (`McpTool::call` / equivalent) exhausted on
+/// transient errors. The agent feeds this into the per-tick
+/// `FailureKind::ToolCall` budget rather than the inference budget, and
+/// does not stage a synthetic correction.
 enum ApplyOutcome {
     Continue,
     Retire(RetireReason),
     NeedsCorrection(String),
+    ToolError { tool: String, error: String },
 }
 
 /// Apply a single `Decision`. Recoverable apply-time failures surface as
@@ -384,9 +457,23 @@ async fn dispatch(
                     "call_tool: no tool registered under name {name:?}"
                 )));
             }
-            let ev = tools.call(&name, args).await?;
-            fs.record_evidence(ev)?;
-            Ok(ApplyOutcome::Continue)
+            // The tool's internal retry policy (e.g. `McpTool::call` /
+            // `RetryPolicy`) is responsible for retrying transient
+            // failures before this point. Any `Err` here means retries
+            // were exhausted (or the tool is non-retriable by design);
+            // route it through `ApplyOutcome::ToolError` so the run loop
+            // can feed the shared `FailureKind::ToolCall` budget without
+            // halting.
+            match tools.call(&name, args).await {
+                Ok(ev) => {
+                    fs.record_evidence(ev)?;
+                    Ok(ApplyOutcome::Continue)
+                }
+                Err(e) => Ok(ApplyOutcome::ToolError {
+                    tool: name,
+                    error: format!("{e:#}"),
+                }),
+            }
         }
         Decision::EmitOutput { content, evidence } => {
             debug!(evidence_count = evidence.len(), "decision: emit_output");

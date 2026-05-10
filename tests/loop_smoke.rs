@@ -42,7 +42,7 @@ use jarvis_node::evidence::{EvidenceId, EvidenceRecord};
 use jarvis_node::fs::AgentFs;
 use jarvis_node::health::{HealthTracker, RetryBudget};
 use jarvis_node::mandate::Mandate;
-use jarvis_node::tools::{EchoTool, ToolRegistry};
+use jarvis_node::tools::{EchoTool, Tool, ToolRegistry};
 use jarvis_node::trigger::Trigger;
 use jarvis_node::trigger_queue::SignalSink;
 
@@ -877,5 +877,266 @@ async fn apply_failure_correction_budget_is_immune_to_concurrent_external_trigge
         retry_trail.len(),
         2,
         "retry trail should accumulate both apply-time attempts despite the race"
+    );
+}
+
+// ---- JAR2-25: tool-call retry + health wiring ----
+
+/// Test-only `Tool` impl: fails its first `fail_count` calls with a
+/// caller-supplied `anyhow::Error`, then succeeds. Used to exercise the
+/// agent-side `ApplyOutcome::ToolError` path without standing up an MCP
+/// server in tests. We pass an `anyhow::Error` as the failure mode rather
+/// than going through `McpTool`'s `RetryPolicy` because:
+///
+/// 1. The unit tests in `src/mcp/tool.rs` already cover the
+///    `RetryPolicy` mechanics — first-try success, second-try success
+///    after a transient failure, exhaustion after the configured number
+///    of attempts.
+/// 2. From the agent run loop's perspective, "the tool errored" is the
+///    only observable signal — by the time `tools.call(...)` returns
+///    `Err`, the tool has already exhausted whatever retry policy it was
+///    configured with. The integration tests below assert the run-loop
+///    wiring (budget accounting + `Unhealthy` transition + recovery)
+///    given that surface.
+struct FlakyTool {
+    name: String,
+    /// Remaining failures before the tool starts succeeding. Decremented
+    /// on each call. `Mutex` because `Tool::call` takes `&self`.
+    remaining_failures: Mutex<u32>,
+}
+
+impl FlakyTool {
+    fn new(name: impl Into<String>, fail_count: u32) -> Self {
+        Self {
+            name: name.into(),
+            remaining_failures: Mutex::new(fail_count),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for FlakyTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    async fn call(&self, args: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let mut remaining = self.remaining_failures.lock().unwrap();
+        if *remaining > 0 {
+            *remaining -= 1;
+            return Err(anyhow::anyhow!(
+                "flaky tool {:?} failing (remaining_failures was {})",
+                self.name,
+                *remaining + 1
+            ));
+        }
+        Ok(json!({"ok": true, "args": args}))
+    }
+}
+
+fn registry_with_flaky(name: &str, fail_count: u32) -> ToolRegistry {
+    let mut r = ToolRegistry::new();
+    r.register(Arc::new(FlakyTool::new(name, fail_count)))
+        .expect("register flaky");
+    r
+}
+
+/// JAR2-25 acceptance test: a tool that fails persistently exhausts the
+/// per-tick `FailureKind::ToolCall` budget and trips the tracker to
+/// `Unhealthy`. We pin `max_tool = 0` so a single exhausted call is
+/// enough to exhaust the budget — that's the cleanest interpretation of
+/// "trip `Unhealthy` after max retries": each exhausted tool call counts
+/// as one tick-level slot, and with budget = 0 the first one trips it.
+/// The run loop must **not** halt — verified by the fact that the script
+/// then runs a successful `Idle` and a `Retire` decision in the recovery
+/// test below.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn tool_call_exhausts_retry_budget_trips_unhealthy() {
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    // Tool fails forever within the lifetime of this test.
+    let registry = registry_with_flaky("flaky", u32::MAX);
+    let script = vec![
+        // Tick 1: model calls the flaky tool → tool errors →
+        // ApplyOutcome::ToolError → record_failure(ToolCall, _) →
+        // budget exhausted (max_tool=0) → transition_to_unhealthy.
+        // Run loop continues.
+        Decision::CallTool {
+            name: "flaky".into(),
+            args: json!({"x": 1}),
+            claim_seed: ClaimSeed::new("seed-1"),
+        },
+        // Tick 2: retire so the test terminates.
+        Decision::Retire {
+            reason: "after-tool-exhaustion".into(),
+        },
+    ];
+    // Anchor budget shape explicitly: max_inference=1 keeps inference
+    // path healthy, max_tool=0 trips on the first exhausted tool call.
+    let agent = Agent::new(
+        mandate,
+        fs,
+        MockDecide::new(script),
+        registry,
+        fresh_health_with(tmp.path(), RetryBudget::new(1, 0)),
+    );
+
+    let handle = tokio::spawn(agent.run());
+    let RetireReason(reason) = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("agent did not retire in time")
+        .expect("join")
+        .expect("run ok");
+    assert_eq!(reason, "after-tool-exhaustion");
+
+    // Tick 1 transitioned to Unhealthy; the script's second decision was
+    // a clean Retire which (per dispatch) does not mark a tick success,
+    // so the live health.json should still be Unhealthy when the loop
+    // exited. (Retire is the terminal path; recovery is exercised in the
+    // companion test below.)
+    let v: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(tmp.path().join("health.json")).expect("read health"),
+    )
+    .expect("parse health");
+    assert_eq!(
+        v.get("state").and_then(|x| x.as_str()),
+        Some("Unhealthy"),
+        "tool-call budget exhaustion must transition to Unhealthy"
+    );
+    let failing = v
+        .get("incident")
+        .and_then(|i| i.get("failing"))
+        .expect("failing block");
+    assert_eq!(
+        failing.get("type").and_then(|x| x.as_str()),
+        Some("ToolCall"),
+        "incident must be tagged as a tool-call failure, not inference"
+    );
+    let details = failing.get("details").expect("details block");
+    assert_eq!(
+        details.get("tool").and_then(|x| x.as_str()),
+        Some("flaky"),
+        "incident details should record which tool failed"
+    );
+    assert!(
+        details
+            .get("error")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .contains("flaky tool"),
+        "incident details should preserve the underlying error message"
+    );
+    // No evidence record was persisted for the failed call.
+    let evidence_dir = tmp.path().join("evidence");
+    if evidence_dir.exists() {
+        assert!(
+            std::fs::read_dir(&evidence_dir).unwrap().next().is_none(),
+            "no evidence should have been recorded for an errored tool call"
+        );
+    }
+}
+
+/// JAR2-25 acceptance test: after the per-tick tool-call budget exhausts
+/// and trips `Unhealthy`, the very next successful tick must recover the
+/// tracker to `Healthy` and archive the prior incident — same recovery
+/// contract A1.5 (`src/health.rs`) defines for the inference path. We
+/// reuse the same flaky tool but only fail it once, so the next tick's
+/// `CallTool` succeeds and the tick is marked successful.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    // Fail exactly once: tick 1 exhausts (budget=0 trips immediately),
+    // tick 2's CallTool succeeds, mark_tick_success archives the
+    // Unhealthy incident.
+    let registry = registry_with_flaky("flaky", 1);
+    let script = vec![
+        // Tick 1: tool errors → Unhealthy.
+        Decision::CallTool {
+            name: "flaky".into(),
+            args: json!({"x": 1}),
+            claim_seed: ClaimSeed::new("seed-1"),
+        },
+        // Tick 2 (fresh — pending_correction is None because the
+        // ToolError path does not stage one): tool succeeds →
+        // ApplyOutcome::Continue → mark_tick_success → archive incident
+        // and flip back to Healthy.
+        Decision::CallTool {
+            name: "flaky".into(),
+            args: json!({"x": 2}),
+            claim_seed: ClaimSeed::new("seed-2"),
+        },
+        // Tick 3: retire cleanly.
+        Decision::Retire {
+            reason: "after-recovery".into(),
+        },
+    ];
+    let agent = Agent::new(
+        mandate,
+        fs,
+        MockDecide::new(script),
+        registry,
+        fresh_health_with(tmp.path(), RetryBudget::new(1, 0)),
+    );
+
+    let handle = tokio::spawn(agent.run());
+    let RetireReason(reason) = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("agent did not retire in time")
+        .expect("join")
+        .expect("run ok");
+    assert_eq!(reason, "after-recovery");
+
+    // Live health.json now reflects Healthy with `since` at the
+    // recovery tick's timestamp.
+    let v: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(tmp.path().join("health.json")).expect("read health"),
+    )
+    .expect("parse health");
+    assert_eq!(
+        v.get("state").and_then(|x| x.as_str()),
+        Some("Healthy"),
+        "next successful tick must recover the tracker to Healthy"
+    );
+    assert!(v.get("incident").is_none() || v.get("incident").unwrap().is_null());
+
+    // Prior Unhealthy incident archived under health/<transitioned_at>.
+    let archive_dir = tmp.path().join("health");
+    assert!(
+        archive_dir.is_dir(),
+        "archive dir should be created on recovery"
+    );
+    let archived: Vec<_> = std::fs::read_dir(&archive_dir)
+        .expect("read archive")
+        .map(|e| e.expect("dirent").path())
+        .collect();
+    assert_eq!(
+        archived.len(),
+        1,
+        "exactly one archived incident expected, got: {archived:?}"
+    );
+    let inc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&archived[0]).expect("read archive"))
+            .expect("parse archive");
+    assert_eq!(
+        inc.get("incident")
+            .and_then(|i| i.get("failing"))
+            .and_then(|f| f.get("type"))
+            .and_then(|x| x.as_str()),
+        Some("ToolCall"),
+        "archived incident must preserve the tool-call kind"
+    );
+
+    // Recovery tick's successful CallTool must have persisted evidence.
+    let evidence_dir = tmp.path().join("evidence");
+    assert!(
+        evidence_dir.is_dir(),
+        "evidence dir should exist after recovery"
+    );
+    let evs: Vec<_> = std::fs::read_dir(&evidence_dir)
+        .expect("read evidence")
+        .map(|e| e.expect("dirent").path())
+        .collect();
+    assert_eq!(
+        evs.len(),
+        1,
+        "exactly one evidence record expected from the recovery tick"
     );
 }
