@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 pub mod tool;
 
+use crate::mcp::tool::McpTool;
+use crate::tools::ToolRegistry;
 use rmcp::model::{CallToolRequestParams, JsonObject};
 use rmcp::service::{RoleClient, RunningService, ServiceError, ServiceExt};
 use rmcp::transport::TokioChildProcess;
@@ -164,6 +166,41 @@ impl McpClient {
             .await
             .map_err(|e| McpError::Transport(format!("join error during shutdown: {e}")))?;
         Ok(())
+    }
+}
+
+/// MCP-aware extension methods on `ToolRegistry`. Lives in the `mcp` module
+/// so the core `tools` module stays free of any MCP dependency.
+impl ToolRegistry {
+    /// Introspect `client` via `tools/list` and register every advertised
+    /// tool against this registry, returning the registered names in the
+    /// order the server announced them.
+    ///
+    /// Trusts the server's advertised schemas — no in-engine re-validation.
+    /// Spec (JAR2-24) suggested `&self`; this implementation takes
+    /// `&mut self` to match the existing `ToolRegistry::register` surface
+    /// rather than introduce interior mutability for one helper.
+    ///
+    /// **Duplicate-name policy.** Reuses `ToolRegistry::register`, which
+    /// errors on collision. If the server advertises a name already in the
+    /// registry (because another MCP server or built-in tool got there
+    /// first), the helper returns `Err` on that descriptor — first-wins.
+    /// Registration is *not* atomic: descriptors that registered before the
+    /// collision remain in the registry. Pre-check with
+    /// `ToolRegistry::contains` if atomicity matters.
+    pub async fn register_mcp_server(
+        &mut self,
+        client: Arc<McpClient>,
+    ) -> anyhow::Result<Vec<String>> {
+        let descriptors = client.list_tools().await?;
+        let mut names = Vec::with_capacity(descriptors.len());
+        for descriptor in descriptors {
+            let name = descriptor.name.clone();
+            let tool = McpTool::new(descriptor, Arc::clone(&client));
+            self.register(Arc::new(tool))?;
+            names.push(name);
+        }
+        Ok(names)
     }
 }
 
@@ -412,6 +449,191 @@ mod tests {
             "expected Parse, got {err:?}"
         );
         client.shutdown().await.unwrap();
+        let _ = server.await;
+    }
+
+    /// Fake MCP server that advertises two tools — `repeat` (echoes its
+    /// `text` argument) and `shout` (echoes the same text uppercased) —
+    /// for exercising `ToolRegistry::register_mcp_server`'s bulk-register
+    /// path. Kept separate from the single-tool `FakeServer` above per the
+    /// "duplicate the minimum" convention used in `mcp::tool::tests`.
+    #[derive(Clone)]
+    struct MultiToolServer;
+
+    impl ServerHandler for MultiToolServer {
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            let mut schema = serde_json::Map::new();
+            schema.insert("type".into(), json!("object"));
+            schema.insert("properties".into(), json!({"text": {"type": "string"}}));
+            let schema = Arc::new(schema);
+            let repeat = Tool::new("repeat", "echo the text back", Arc::clone(&schema));
+            let shout = Tool::new("shout", "echo the text back uppercased", schema);
+            Ok(ListToolsResult {
+                meta: None,
+                next_cursor: None,
+                tools: vec![repeat, shout],
+            })
+        }
+
+        async fn call_tool(
+            &self,
+            request: rmcp::model::CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResult, ErrorData> {
+            let text = request
+                .arguments
+                .as_ref()
+                .and_then(|a| a.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let out = match request.name.as_ref() {
+                "repeat" => format!("echo:{text}"),
+                "shout" => format!("echo:{}", text.to_uppercase()),
+                other => {
+                    return Err(ErrorData::new(
+                        ErrorCode(-32601),
+                        format!("unknown tool {other}"),
+                        None,
+                    ));
+                }
+            };
+            Ok(CallToolResult::success(vec![Content::text(out)]))
+        }
+
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::default()
+        }
+
+        async fn on_initialized(&self, _context: NotificationContext<RoleServer>) {}
+    }
+
+    async fn paired_multi() -> (McpClient, tokio::task::JoinHandle<()>) {
+        let (client_io, server_io) = duplex(8 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let server_task = tokio::spawn(async move {
+            let running = MultiToolServer
+                .serve((server_read, server_write))
+                .await
+                .expect("server handshake");
+            let _ = running.waiting().await;
+        });
+
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let client = McpClient::connect_with((client_read, client_write))
+            .await
+            .expect("client handshake");
+        (client, server_task)
+    }
+
+    #[tokio::test]
+    async fn register_mcp_server_registers_all_advertised_tools() {
+        let (client, server) = paired_multi().await;
+        let client = Arc::new(client);
+        let mut registry = ToolRegistry::new();
+
+        let names = registry
+            .register_mcp_server(Arc::clone(&client))
+            .await
+            .expect("register_mcp_server");
+
+        // Server announces them in (repeat, shout) order; the helper
+        // preserves that order in its return value.
+        assert_eq!(names, vec!["repeat".to_string(), "shout".to_string()]);
+        assert!(registry.contains("repeat"));
+        assert!(registry.contains("shout"));
+
+        // Drop the registry (and its Arc<McpTool>s) before awaiting the
+        // server task so the transport closes.
+        drop(registry);
+        // Drop our local Arc too so the server's `waiting()` returns.
+        drop(client);
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn registered_tool_is_invocable_through_registry() {
+        let (client, server) = paired_multi().await;
+        let client = Arc::new(client);
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_mcp_server(Arc::clone(&client))
+            .await
+            .expect("register_mcp_server");
+
+        let ev = registry
+            .call("shout", json!({"text": "hi"}))
+            .await
+            .expect("registry.call");
+        assert_eq!(ev.tool, "shout");
+        // `shout` is the uppercased variant, so the fixture echoes "HI".
+        let content = ev
+            .result
+            .get("content")
+            .and_then(Value::as_array)
+            .expect("content array");
+        assert_eq!(
+            content[0].get("text").and_then(Value::as_str),
+            Some("echo:HI")
+        );
+
+        drop(registry);
+        drop(client);
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn register_mcp_server_errors_on_name_conflict_and_keeps_prior_tools() {
+        // First-wins policy: when the server advertises a name already in
+        // the registry, the helper returns Err on that descriptor.
+        // Registration is *not* atomic — descriptors processed before the
+        // collision stay registered, and any descriptors after it are not
+        // registered.
+        let (client, server) = paired_multi().await;
+        let client = Arc::new(client);
+        let mut registry = ToolRegistry::new();
+
+        // Pre-register a tool named "shout" so the second descriptor
+        // the server advertises collides. "repeat" (advertised first)
+        // should still land.
+        struct PlaceholderShout;
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for PlaceholderShout {
+            fn name(&self) -> &str {
+                "shout"
+            }
+            async fn call(&self, _args: Value) -> anyhow::Result<Value> {
+                Ok(json!("placeholder"))
+            }
+        }
+        registry.register(Arc::new(PlaceholderShout)).unwrap();
+
+        let err = registry
+            .register_mcp_server(Arc::clone(&client))
+            .await
+            .expect_err("expected duplicate-name error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("shout") && msg.contains("already"),
+            "duplicate-name error should mention the colliding name, got: {msg}"
+        );
+
+        // First-wins: the descriptor that came before "shout" landed,
+        // the placeholder is still in place, and nothing past the
+        // collision was registered.
+        assert!(registry.contains("repeat"));
+        assert!(registry.contains("shout"));
+        let placeholder = registry
+            .call("shout", json!({"text": "ignored"}))
+            .await
+            .expect("placeholder still wired");
+        assert_eq!(placeholder.result, json!("placeholder"));
+
+        drop(registry);
+        drop(client);
         let _ = server.await;
     }
 }

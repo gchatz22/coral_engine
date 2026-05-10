@@ -20,14 +20,14 @@ These override any default behavior. Read `DEVELOPMENT.md` in full before non-tr
 
 For anything larger than a trivial one-shot edit, the **first job is planning, not coding**. All work lives under the Linear team **"Jarvis Engine"**.
 
-1. **Decompose into Linear tickets** sized to the request:
+1. **Decompose into Linear tickets** sized to the request, **writing tickets in parallel** (or reusing existing ones if they already cover the work — check before filing):
    - Large (~10+ sub-tickets) → Linear **Project** holding the spec, with child issues.
    - Medium (~3–10 sub-tickets, one session) → **parent issue with sub-issues**.
    - Single task → **one issue**, no project, no parent.
    Sub-tickets that are themselves multi-step become parent issues with their own sub-issues.
 2. Each ticket needs: clear title; description with goal, acceptance criteria, in-scope, explicitly-out-of-scope, dependencies; effort estimate. Order by dependency. Post the breakdown back to the maintainer (project if any, then ticket IDs/titles/one-line scopes).
-3. **Stop and wait.** Do not implement until the maintainer points at a specific ticket and says go.
-4. Execute **one ticket at a time**, applying the rules above, then stop and wait for review. The default loop is *plan → approve → one ticket → review → next ticket*. Skip it only on explicit "just do it."
+3. **Stop and wait for review of the ticket set.** Do not implement until the maintainer has reviewed the breakdown and says go.
+4. Once approved, **execute the tickets in parallel via subagents** — one subagent per ticket (or per independent batch), each applying the rules above against its own ticket. Sequence only across true dependency edges; siblings run concurrently. The default loop is *plan all tickets → approve → parallel execution → review*.
 
 The Linear MCP server is the mechanism for filing tickets. If it is not configured, ask the maintainer to configure it or post the breakdown as text — do not skip the planning step.
 
