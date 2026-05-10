@@ -9,21 +9,23 @@
 //!    [`crate::decide_llm::schema::decision_tools`].
 //! 3. Parse the model's tool-use response with
 //!    [`crate::decide_llm::schema::parse_decision`].
-//! 4. **On parse failure**: append a corrective `system` message naming
-//!    the failure and call `complete` once more. If the second response
-//!    also fails to parse, return `Err`. The agent run loop treats this
-//!    `Err` as inference-retry exhaustion (per JAR2-19's spec) and goes
-//!    straight to the health-policy `Unhealthy` transition.
+//! 4. **On parse failure**: append the model's bad turn plus a corrective
+//!    `system` message naming the failure, and call `complete` again — up
+//!    to [`MAX_DECISION_RETRIES`] additional times. If every attempt fails
+//!    to parse, return `Err`. The agent run loop treats this `Err` as
+//!    inference-retry exhaustion (per JAR2-19's spec) and goes straight to
+//!    the health-policy `Unhealthy` transition.
 //! 5. **On vendor error** (transport / rate-limit / auth / other): bubble
 //!    immediately, no retry — vendor-side backoff is out of scope per the
 //!    parent JAR2-12's "Decided" notes.
 //!
-//! The internal one-shot retry exists because tool-use payload errors are
-//! frequently soft: a malformed `arguments` blob, a hallucinated tool name,
-//! a missing required field. A single corrective turn fixes most of these
-//! without the runtime having to escalate to an `Unhealthy` transition.
-//! Anything past the second attempt is signal that the model is genuinely
-//! confused, and that is what the budget is for.
+//! The internal retry loop (capped at [`MAX_DECISION_RETRIES`]) exists
+//! because tool-use payload errors are frequently soft: a malformed
+//! `arguments` blob, a hallucinated tool name, a missing required field. A
+//! handful of corrective turns fix most of these without the runtime having
+//! to escalate to an `Unhealthy` transition. Anything past the cap is
+//! signal that the model is genuinely confused, and that is what the
+//! per-tick budget is for.
 //!
 //! # Why the corrective message is `system`
 //!
@@ -46,6 +48,13 @@ use crate::decision::{ContextBundle, Decide, Decision};
 use crate::model_client::{
     CompleteOptions, CompleteRequest, ContentBlock, Message, ModelClient, ModelError, Role,
 };
+
+/// Number of corrective re-asks performed after the first attempt fails to
+/// parse. Total upstream calls per `decide` is therefore at most
+/// `1 + MAX_DECISION_RETRIES`. The default of `1` matches the original
+/// JAR2-19 behavior; raise it if soft tool-use mistakes need more rope
+/// before falling through to the per-tick `RetryBudget`.
+pub const MAX_DECISION_RETRIES: usize = 1;
 
 /// `Decide` impl that asks a `ModelClient` what to do next.
 ///
@@ -70,55 +79,70 @@ impl LlmDecide {
 impl Decide for LlmDecide {
     async fn decide(&self, ctx: ContextBundle) -> Result<Decision> {
         let tools = decision_tools();
-        let initial_messages = prompt::render(&ctx);
+        // Conversation grows across attempts: original prompt, then for
+        // each parse failure an assistant-echo of the bad turn followed by
+        // a system-role corrective. The model thus sees its full failure
+        // history, not just the most recent miss.
+        let mut messages = prompt::render(&ctx);
+        let mut errors: Vec<DecisionParseError> = Vec::new();
+        let total_attempts = MAX_DECISION_RETRIES + 1;
 
-        // 1st attempt.
-        let first_resp = self
-            .client
-            .complete(CompleteRequest {
-                messages: initial_messages.clone(),
-                tools: tools.clone(),
-                options: self.options.clone(),
-            })
-            .await
-            .map_err(model_err_to_anyhow)?;
+        for attempt in 0..total_attempts {
+            let resp = self
+                .client
+                .complete(CompleteRequest {
+                    messages: messages.clone(),
+                    tools: tools.clone(),
+                    options: self.options.clone(),
+                })
+                .await
+                .map_err(model_err_to_anyhow)?;
 
-        let first_err = match parse_decision(&first_resp.tool_calls) {
-            Ok(d) => return Ok(d),
-            Err(e) => e,
-        };
-
-        // 2nd attempt — replay the original prompt, append the model's
-        // first response (so the model can see what it actually said), and
-        // append a system-role corrective naming the failure.
-        let mut retry_messages = initial_messages;
-        retry_messages.push(assistant_echo(&first_resp.content));
-        retry_messages.push(Message {
-            role: Role::System,
-            content: vec![ContentBlock::Text {
-                text: corrective_system_text(&first_err),
-            }],
-        });
-
-        let second_resp = self
-            .client
-            .complete(CompleteRequest {
-                messages: retry_messages,
-                tools,
-                options: self.options.clone(),
-            })
-            .await
-            .map_err(model_err_to_anyhow)?;
-
-        match parse_decision(&second_resp.tool_calls) {
-            Ok(d) => Ok(d),
-            Err(second_err) => Err(anyhow!(
-                "LlmDecide: parse failed on both attempts. \
-                 first attempt: {first_err}. \
-                 second attempt (after corrective system message): {second_err}"
-            )),
+            match parse_decision(&resp.tool_calls) {
+                Ok(d) => return Ok(d),
+                Err(e) => {
+                    let is_last = attempt + 1 == total_attempts;
+                    if !is_last {
+                        // Stage the next attempt's prompt before recording
+                        // the error so `e` is still owned by us.
+                        messages.push(assistant_echo(&resp.content));
+                        messages.push(Message {
+                            role: Role::System,
+                            content: vec![ContentBlock::Text {
+                                text: corrective_system_text(&e),
+                            }],
+                        });
+                    }
+                    errors.push(e);
+                }
+            }
         }
+
+        Err(anyhow!(
+            "LlmDecide: parse failed on all {} attempt(s). {}",
+            total_attempts,
+            format_attempt_errors(&errors)
+        ))
     }
+}
+
+/// Render a list of per-attempt parse errors into a single string for the
+/// final `anyhow!` payload. Each entry is prefixed `attempt N` so a reader
+/// can correlate it with the upstream call count.
+fn format_attempt_errors(errors: &[DecisionParseError]) -> String {
+    errors
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let n = i + 1;
+            if i == 0 {
+                format!("attempt {n}: {e}")
+            } else {
+                format!("attempt {n} (after corrective system message): {e}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Build the `assistant` turn we replay back to the model on retry, so the
@@ -342,11 +366,21 @@ mod tests {
 
         let err = decide.decide(empty_bundle()).await.unwrap_err();
         let s = err.to_string();
+        // The message must enumerate every attempt so an operator reading
+        // a log can see how the model failed at each step. We pin the
+        // exact attempt count so the loop refactor stays honest.
+        let total_attempts = MAX_DECISION_RETRIES + 1;
         assert!(
-            s.contains("first attempt") && s.contains("second attempt"),
-            "error should reference both attempts, got: {s}"
+            s.contains(&format!("all {total_attempts} attempt")),
+            "error should report total attempt count, got: {s}"
         );
-        assert_eq!(mock.seen().len(), 2);
+        for n in 1..=total_attempts {
+            assert!(
+                s.contains(&format!("attempt {n}")),
+                "error should reference attempt {n}, got: {s}"
+            );
+        }
+        assert_eq!(mock.seen().len(), total_attempts);
     }
 
     #[tokio::test]
