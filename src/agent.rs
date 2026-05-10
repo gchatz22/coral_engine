@@ -5,7 +5,10 @@
 //! 1. **If a correction is pending**, skip the wait: the run loop is
 //!    continuing a conversation with itself across an iteration boundary,
 //!    not waiting on the world. Otherwise race the trigger queue against
-//!    the scheduler's idle deadline.
+//!    the scheduler's idle deadline. The race is `biased;` — when both
+//!    arms are ready (the prior tick took longer than `idle_period` and a
+//!    real trigger is also buffered), the queue arm wins, so
+//!    `ScheduledWake` is pushed only when the queue is genuinely empty.
 //! 2. Drain whatever is currently in the queue (may be empty when a
 //!    correction is pending).
 //! 3. **If a correction is pending**, this iteration is a continuation of
@@ -215,7 +218,20 @@ impl<D: Decide> Agent<D> {
                 // queue against the deadline as usual.
                 let is_correction = pending_correction.is_some();
                 if !is_correction {
+                    // `biased;` makes tokio poll arms in declaration order
+                    // rather than randomly. The queue arm is listed first
+                    // so that when both are ready (the prior tick took
+                    // longer than `idle_period`, leaving an elapsed
+                    // deadline alongside buffered triggers), the queue
+                    // wins and we don't push a spurious `ScheduledWake`
+                    // onto a queue that already has work. `ScheduledWake`
+                    // should mean "the idle period elapsed without other
+                    // work" — a stronger semantic than tokio's default
+                    // tie-break gives us — and pinning it here keeps the
+                    // bundle deterministic across runs that share world
+                    // state.
                     tokio::select! {
+                        biased;
                         _ = triggers.wait_nonempty() => {}
                         _ = sleep_until(scheduler.next_deadline()) => {
                             triggers.push(Trigger::ScheduledWake);
