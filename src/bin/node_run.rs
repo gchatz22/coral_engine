@@ -57,6 +57,7 @@ use serde::Deserialize;
 use jarvis_node::agent::{Agent, RetireReason};
 use jarvis_node::decision::{Decision, MockDecide};
 use jarvis_node::fs::AgentFs;
+use jarvis_node::health::{HealthTracker, RetryBudget};
 use jarvis_node::mandate::Mandate;
 use jarvis_node::tools::{EchoTool, ToolRegistry};
 use jarvis_node::trigger::Trigger;
@@ -130,10 +131,16 @@ async fn run() -> Result<()> {
     let agent_fs = AgentFs::open(fs_root.clone(), &mandate)
         .with_context(|| format!("opening agent fs at {}", fs_root.display()))?;
 
+    // The health tracker shares the same on-disk root as the FS — that is
+    // the convention `health.rs` documents (`<root>/health.json` +
+    // `<root>/health/<ts>.json`).
+    let health = HealthTracker::open(&fs_root, RetryBudget::default(), chrono::Utc::now())
+        .with_context(|| format!("opening health tracker at {}", fs_root.display()))?;
+
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(EchoTool))?;
 
-    let agent = Agent::new(mandate, agent_fs, MockDecide::new(decisions), tools);
+    let agent = Agent::new(mandate, agent_fs, MockDecide::new(decisions), tools, health);
     let sink = agent.signal();
 
     // Spawn the trigger feeder before starting the loop so triggers with a
