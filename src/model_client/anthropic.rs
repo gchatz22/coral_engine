@@ -20,11 +20,13 @@
 //!   `tool` slot.
 
 use std::env;
+use std::time::Instant;
 
 use serde_json::{json, Value};
 
 use super::{
-    CompleteRequest, CompleteResponse, ContentBlock, ModelClient, ModelError, Role, ToolCall, Usage,
+    CallStats, CompleteRequest, CompleteResponse, ContentBlock, ModelClient, ModelError, Role,
+    ToolCall, Usage, Vendor,
 };
 
 /// Default model identifier. Used when neither `MODEL_ENV` nor
@@ -109,6 +111,10 @@ impl ModelClient for AnthropicClient {
             .map_err(|_| ModelError::Auth(format!("{API_KEY_ENV} not set in environment")))?;
 
         let body = build_body(&req, &self.model);
+        // Start the latency clock once we're committed to the HTTP call.
+        // We measure end-to-end wall time including body read so the
+        // number matches what an observer would see on the wire.
+        let started = Instant::now();
         let resp = self
             .http
             .post(&self.base_url)
@@ -125,11 +131,19 @@ impl ModelClient for AnthropicClient {
             .bytes()
             .await
             .map_err(|e| ModelError::Transport(e.to_string()))?;
+        let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         if status != 200 {
             return Err(map_status_error(status, &bytes));
         }
-        parse_response(&bytes)
+        let mut parsed = parse_response(&bytes)?;
+        parsed.stats = CallStats {
+            usage: parsed.usage,
+            latency_ms,
+            vendor: Vendor::Anthropic,
+            model: self.model.clone(),
+        };
+        Ok(parsed)
     }
 }
 
@@ -312,6 +326,10 @@ pub fn parse_response(body: &[u8]) -> Result<CompleteResponse, ModelError> {
             input_tokens,
             output_tokens,
         },
+        // `parse_response` is pure — it can't see latency, vendor, or
+        // model. The async `complete` overwrites this default with the
+        // real `CallStats` before returning.
+        stats: CallStats::default(),
     })
 }
 
