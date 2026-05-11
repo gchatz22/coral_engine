@@ -23,6 +23,11 @@ path = "src/bin/compute_evidence_id.rs"
 name = "model-call"
 path = "src/bin/model_call.rs"
 
+[[bin]]
+name = "node-run-mcp"
+path = "src/bin/node_run_mcp.rs"
+required-features = ["mcp"]
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
