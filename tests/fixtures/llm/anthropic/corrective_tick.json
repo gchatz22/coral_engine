@@ -1,0 +1,51 @@
+{
+  "synthesized": true,
+  "vendor": "anthropic",
+  "note": "JAR2-21 corrective-tick fixture: response 1 is a malformed tool call (unknown tool name 'send_email') that fails LlmDecide's parse step; response 2 is a valid `idle` decision that completes the tick. Exercises the JAR2-19 parse-retry path; both responses contribute to last_tick_calls()/last_tick_totals(). Hand-written against the Anthropic Messages API wire shape (parse_response unit tests in src/model_client/anthropic.rs).",
+  "responses": [
+    {
+      "status": 200,
+      "body": {
+        "id": "msg_bad",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-haiku-4-5",
+        "stop_reason": "tool_use",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_unknown_1",
+            "name": "send_email",
+            "input": {"to": "ops@example.com", "subject": "hi"}
+          }
+        ],
+        "usage": {
+          "input_tokens": 121,
+          "output_tokens": 33
+        }
+      }
+    },
+    {
+      "status": 200,
+      "body": {
+        "id": "msg_good",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-haiku-4-5",
+        "stop_reason": "tool_use",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_idle_1",
+            "name": "idle",
+            "input": {"next_after": 1500}
+          }
+        ],
+        "usage": {
+          "input_tokens": 178,
+          "output_tokens": 22
+        }
+      }
+    }
+  ]
+}
