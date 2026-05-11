@@ -332,7 +332,7 @@ impl<D: Decide> Agent<D> {
                             Err(other) => Err(other.into()),
                         }
                     }
-                    ApplyOutcome::ToolError { tool, error } => {
+                    ApplyOutcome::ToolError { tool, args, error } => {
                         // JAR2-25: the tool's internal retry policy
                         // (`McpTool::call`) has already exhausted its
                         // `RetryPolicy::max_attempts` attempts before
@@ -343,16 +343,27 @@ impl<D: Decide> Agent<D> {
                         // per-tick budget handles "many tools breaking on
                         // one tick".
                         //
-                        // Unlike the Inference/`NeedsCorrection` path,
-                        // there is no synthetic-trigger correction loop
-                        // for tool failures in this ticket — feeding the
-                        // model a "your tool errored, retry differently"
-                        // signal is a separate concern. So we do not
-                        // stage a `CorrectionContext`; we just record the
-                        // failure and continue. On exhaustion we
-                        // transition to Unhealthy and the standard
-                        // recovery path applies on the next successful
-                        // tick.
+                        // JAR2-30: symmetric to the inference correction
+                        // loop in `NeedsCorrection` above, we stage a
+                        // `pending_correction` describing the failure
+                        // (tool name, args summary, last error). The next
+                        // tick threads it into the `ContextBundle` so the
+                        // model can self-correct (try different args, a
+                        // different tool, an `idle`, etc.). The shape of
+                        // the corrective signal is the same `CorrectionContext`
+                        // the inference path uses — reusing the existing
+                        // mechanism rather than introducing a parallel
+                        // trigger class, per the ticket's
+                        // "no public Trigger variant explosion" guidance.
+                        //
+                        // Budget accumulation is symmetric: once a
+                        // correction is staged, the next iteration skips
+                        // `begin_tick` (see top of this function), so the
+                        // `max_tool` counter accumulates across the
+                        // correction continuation. Exhaustion still flips
+                        // the tracker to `Unhealthy`; the run loop does
+                        // not halt.
+                        let desc = tool_failure_correction_text(&tool, &args, &error);
                         let attempt = Attempt {
                             attempt: (retry_trail.len() as u32) + 1,
                             at: Utc::now(),
@@ -364,8 +375,9 @@ impl<D: Decide> Agent<D> {
                                 warn!(
                                     tool = %tool,
                                     error = %error,
-                                    "tool call exhausted retries; recorded against tool-call budget"
+                                    "tool call exhausted retries; staging correction"
                                 );
+                                pending_correction = Some(CorrectionContext::new(desc));
                                 Ok(TickOutcome::Continue)
                             }
                             Err(HealthError::BudgetExhausted { kind }) => {
@@ -388,10 +400,9 @@ impl<D: Decide> Agent<D> {
                                     transitioned_at: Utc::now(),
                                 };
                                 health.transition_to_unhealthy(incident)?;
-                                // Tool-call exhaustion does not interact
-                                // with the inference correction window —
-                                // clear it defensively so a fresh tick
-                                // begins from a clean slate.
+                                // Budget exhaustion closes the correction
+                                // window; the next fresh tick starts
+                                // clean.
                                 pending_correction = None;
                                 Ok(TickOutcome::Continue)
                             }
@@ -428,13 +439,21 @@ enum TickOutcome {
 /// `ToolError` is the JAR2-25 case: the tool exists and was invoked, but
 /// its internal retry policy (`McpTool::call` / equivalent) exhausted on
 /// transient errors. The agent feeds this into the per-tick
-/// `FailureKind::ToolCall` budget rather than the inference budget, and
-/// does not stage a synthetic correction.
+/// `FailureKind::ToolCall` budget rather than the inference budget. Per
+/// JAR2-30 it also stages a `CorrectionContext` describing the tool
+/// call (name, args, error) so the model can self-correct on the next
+/// tick — symmetric to the `NeedsCorrection` path. `args` is carried
+/// alongside `tool`/`error` because the corrective message needs to tell
+/// the model *what* it called, not just that the call failed.
 enum ApplyOutcome {
     Continue,
     Retire(RetireReason),
     NeedsCorrection(String),
-    ToolError { tool: String, error: String },
+    ToolError {
+        tool: String,
+        args: serde_json::Value,
+        error: String,
+    },
 }
 
 /// Apply a single `Decision`. Recoverable apply-time failures surface as
@@ -464,13 +483,14 @@ async fn dispatch(
             // route it through `ApplyOutcome::ToolError` so the run loop
             // can feed the shared `FailureKind::ToolCall` budget without
             // halting.
-            match tools.call(&name, args).await {
+            match tools.call(&name, args.clone()).await {
                 Ok(ev) => {
                     fs.record_evidence(ev)?;
                     Ok(ApplyOutcome::Continue)
                 }
                 Err(e) => Ok(ApplyOutcome::ToolError {
                     tool: name,
+                    args,
                     error: format!("{e:#}"),
                 }),
             }
@@ -511,5 +531,89 @@ async fn dispatch(
             fs.persist_retirement(&reason)?;
             Ok(ApplyOutcome::Retire(RetireReason(reason)))
         }
+    }
+}
+
+/// Build the human-readable failure description for the
+/// `CorrectionContext` staged after a tool-call exhaustion (JAR2-30).
+///
+/// The message is short and concrete: tool name, the args the model
+/// supplied (serialized as JSON so the model sees them verbatim), and the
+/// underlying error. The phrasing mirrors the inference-side correction
+/// shape JAR2-19 established — a sentence the model can act on directly
+/// ("here is what failed; reply with a different decision"). The text
+/// flows into both `CorrectionContext::failure` (rendered by
+/// `crate::decide_llm::prompt` next tick) and the `HealthIncident` retry
+/// trail on exhaustion.
+///
+/// Promoted to a named helper so the unit test below can assert against
+/// the exact same string the run loop emits, and so a future cosmetic
+/// change to the wording lands in one place.
+fn tool_failure_correction_text(tool: &str, args: &serde_json::Value, error: &str) -> String {
+    let args_text =
+        serde_json::to_string(args).unwrap_or_else(|_| "<unserializable args>".to_string());
+    format!(
+        "call_tool {tool:?} failed after exhausting retries: {error}. \
+         Args were {args_text}. Reply with a different decision \
+         (different args, a different tool, an idle, or a retire)."
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the JAR2-30 corrective-text helper.
+    //!
+    //! Integration coverage for the end-to-end exhaustion → correction →
+    //! recovery flow lives in `tests/loop_smoke.rs`.
+
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tool_failure_correction_text_quotes_tool_name_and_includes_args_and_error() {
+        let s = tool_failure_correction_text(
+            "search_web",
+            &json!({"q": "what", "n": 3}),
+            "503 Service Unavailable",
+        );
+        // Tool name is quoted so the model parses it as a token, not as
+        // free text to summarize.
+        assert!(
+            s.contains("\"search_web\""),
+            "tool name should be JSON-quoted, got: {s}"
+        );
+        // Args round-trip as JSON so the model sees exactly what it sent.
+        // Key order is BTreeMap-sorted (see prompt.rs's determinism notes).
+        assert!(
+            s.contains("{\"n\":3,\"q\":\"what\"}"),
+            "args should be rendered as JSON with sorted keys, got: {s}"
+        );
+        // Error string is preserved verbatim.
+        assert!(
+            s.contains("503 Service Unavailable"),
+            "error should be preserved, got: {s}"
+        );
+        // Standing instruction at the end mirrors JAR2-19's "reply by
+        // calling exactly one decision tool" framing so the model has a
+        // clear next-step cue.
+        assert!(
+            s.contains("Reply with a different decision"),
+            "should end with next-step cue, got: {s}"
+        );
+    }
+
+    #[test]
+    fn tool_failure_correction_text_handles_non_object_args() {
+        // `call_tool`'s `args` is `serde_json::Value`; defensively the
+        // helper must not assume an object — a model could supply a list
+        // or even a primitive. Surface whatever it serializes to.
+        let s = tool_failure_correction_text("noop", &json!([1, 2, 3]), "boom");
+        assert!(s.contains("[1,2,3]"), "got: {s}");
+    }
+
+    #[test]
+    fn tool_failure_correction_text_handles_null_args() {
+        let s = tool_failure_correction_text("noop", &json!(null), "boom");
+        assert!(s.contains("null"), "got: {s}");
     }
 }
