@@ -1148,7 +1148,7 @@ async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
     );
 }
 
-// ---- JAR2-30: tool-failure synthetic-trigger correction ----
+// ---- JAR2-30: tool-failure correction (mirrors JAR2-19 inference path) ----
 
 /// Capturing `Decide` wrapper that snapshots every `ContextBundle` it sees
 /// and then defers to a `MockDecide` script. Used by the JAR2-30 tests to

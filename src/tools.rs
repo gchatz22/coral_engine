@@ -71,7 +71,7 @@ impl ToolRegistry {
     ///
     /// Exposed so the agent run loop (JAR2-19) can discriminate "model
     /// emitted `CallTool` for a tool that does not exist" — an apply-time
-    /// correction case the synthetic-trigger loop handles — from "the tool
+    /// correction case the pending-correction loop handles — from "the tool
     /// itself errored", which is a real call failure (JAR2-25 owns the
     /// retry semantics for that path). The two cases share `tools.call`'s
     /// error type today, and string-matching the message would be fragile;
