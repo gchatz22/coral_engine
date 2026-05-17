@@ -20,6 +20,12 @@
 //!   (`apply_failure_correction_budget_is_immune_to_concurrent_external_triggers`)
 //!   pins the contract that external triggers landing between an apply
 //!   failure and the next tick cannot reset the per-tick retry budget.
+//! * **JAR2-30** symmetric correction loop for tool failures: when
+//!   `ApplyOutcome::ToolError` surfaces (the tool's internal retry policy
+//!   exhausted), the run loop stages a `CorrectionContext` describing the
+//!   call (tool, args, error) so the next tick's `ContextBundle` gives the
+//!   model a chance to self-correct — same mechanism JAR2-19 uses, applied
+//!   to the tool-call failure mode.
 //!
 //! Time-sensitive tests use `#[tokio::test(flavor = "current_thread",
 //! start_paused = true)]` so the runtime auto-advances when the only
@@ -1054,10 +1060,11 @@ async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
             args: json!({"x": 1}),
             claim_seed: ClaimSeed::new("seed-1"),
         },
-        // Tick 2 (fresh — pending_correction is None because the
-        // ToolError path does not stage one): tool succeeds →
-        // ApplyOutcome::Continue → mark_tick_success → archive incident
-        // and flip back to Healthy.
+        // Tick 2 (fresh — tick 1's BudgetExhausted with max_tool=0
+        // cleared pending_correction in the Unhealthy transition, so
+        // begin_tick runs again): tool succeeds → ApplyOutcome::Continue
+        // → mark_tick_success → archive incident and flip back to
+        // Healthy.
         Decision::CallTool {
             name: "flaky".into(),
             args: json!({"x": 2}),
@@ -1138,5 +1145,263 @@ async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
         evs.len(),
         1,
         "exactly one evidence record expected from the recovery tick"
+    );
+}
+
+// ---- JAR2-30: tool-failure correction (mirrors JAR2-19 inference path) ----
+
+/// Capturing `Decide` wrapper that snapshots every `ContextBundle` it sees
+/// and then defers to a `MockDecide` script. Used by the JAR2-30 tests to
+/// assert on the bundle the run loop hands the model on the
+/// post-tool-failure tick — that's the surface the corrective signal
+/// rides on.
+///
+/// Pattern matches `DeferredSinkDecide` above (same "wrap a `MockDecide`,
+/// instrument decide()" shape); kept local rather than promoted to a
+/// crate-level helper because it has no callers outside this test file.
+struct CapturingDecide {
+    inner: MockDecide,
+    seen: Arc<Mutex<Vec<ContextBundle>>>,
+}
+
+#[async_trait]
+impl Decide for CapturingDecide {
+    async fn decide(&self, ctx: ContextBundle) -> anyhow::Result<Decision> {
+        self.seen.lock().unwrap().push(ctx.clone());
+        self.inner.decide(ctx).await
+    }
+}
+
+/// JAR2-30 acceptance test 1: when a `CallTool` exhausts its retry budget
+/// inside the tool (surfaces as `Err` from `tools.call`) and the per-tick
+/// `FailureKind::ToolCall` budget still has room, the run loop must
+/// stage a `CorrectionContext` so the next tick's `ContextBundle` carries
+/// a corrective signal describing the failure (tool name, args, error).
+///
+/// This is the symmetric property to JAR2-19's apply-time correction
+/// loop — the model gets a chance to self-correct rather than having to
+/// rediscover from scratch why its last decision failed.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn tool_call_failure_stages_correction_visible_on_next_tick_bundle() {
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    // Tool fails twice: tick 1's CallTool errors (after the tool's
+    // internal RetryPolicy gives up); tick 2's CallTool also errors but
+    // the test exits before exhausting the budget — we only care that
+    // tick 2 saw a correction in its bundle.
+    let registry = registry_with_flaky("flaky", u32::MAX);
+    let script = vec![
+        // Tick 1: bad CallTool → tool errors → record_failure ok (budget
+        // has room) → pending_correction set.
+        Decision::CallTool {
+            name: "flaky".into(),
+            args: json!({"q": "what", "n": 3}),
+            claim_seed: ClaimSeed::new("seed-1"),
+        },
+        // Tick 2 (correction continuation): retire so the test
+        // terminates. The bundle this decide() sees must carry the
+        // correction from tick 1.
+        Decision::Retire {
+            reason: "stop-after-seeing-correction".into(),
+        },
+    ];
+    // Anchor budget so tick 1 fits comfortably: max_tool=3 → tick 1's
+    // single failure stays under the cap, and pending_correction is
+    // staged rather than the tracker tripping to Unhealthy.
+    let seen: Arc<Mutex<Vec<ContextBundle>>> = Arc::new(Mutex::new(Vec::new()));
+    let decide = CapturingDecide {
+        inner: MockDecide::new(script),
+        seen: seen.clone(),
+    };
+    let agent = Agent::new(
+        mandate,
+        fs,
+        decide,
+        registry,
+        fresh_health_with(tmp.path(), RetryBudget::new(1, 3)),
+    );
+
+    let handle = tokio::spawn(agent.run());
+    let RetireReason(reason) = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("agent did not retire in time")
+        .expect("join")
+        .expect("run ok");
+    assert_eq!(reason, "stop-after-seeing-correction");
+
+    let captured = seen.lock().unwrap().clone();
+    assert_eq!(
+        captured.len(),
+        2,
+        "expected exactly two decide() invocations, got {}",
+        captured.len()
+    );
+
+    // Tick 1's bundle: no correction (this is the failure-generating
+    // tick, not the continuation).
+    assert!(
+        captured[0].correction.is_none(),
+        "tick 1 must not carry a correction: it generates the failure"
+    );
+
+    // Tick 2's bundle: a correction describing the tool failure.
+    let correction = captured[1]
+        .correction
+        .as_ref()
+        .expect("tick 2 must carry a correction staged by tick 1");
+    let failure = &correction.failure;
+    // Tool name surfaced (quoted, per the helper's contract).
+    assert!(
+        failure.contains("\"flaky\""),
+        "correction should name the failed tool, got: {failure}"
+    );
+    // Args surfaced verbatim — model sees what it sent.
+    assert!(
+        failure.contains("{\"n\":3,\"q\":\"what\"}"),
+        "correction should include args summary, got: {failure}"
+    );
+    // Error string preserved so the model can diagnose.
+    assert!(
+        failure.contains("flaky tool"),
+        "correction should preserve underlying error message, got: {failure}"
+    );
+    // Concrete next-step instruction (mirrors JAR2-19's framing).
+    assert!(
+        failure.contains("different decision"),
+        "correction should end with a next-step cue, got: {failure}"
+    );
+
+    // Sanity: the agent stayed Healthy because the per-tick tool-call
+    // budget had room (max_tool=3, only one failure recorded before
+    // retire). No archive directory should have been created.
+    let v: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(tmp.path().join("health.json")).expect("read health"),
+    )
+    .expect("parse health");
+    assert_eq!(
+        v.get("state").and_then(|x| x.as_str()),
+        Some("Healthy"),
+        "single tool failure under budget should not transition to Unhealthy"
+    );
+}
+
+/// JAR2-30 acceptance test 2: after a tool failure stages a correction,
+/// the next tick uses the corrective context to emit a *different*
+/// decision (here, a different tool call that succeeds), the tick
+/// completes via `ApplyOutcome::Continue`, and the agent stays / returns
+/// to `Healthy`. This is symmetric to JAR2-19's
+/// `invalid_call_tool_stages_correction_then_recovers` test.
+///
+/// We assert against a `CapturingDecide` again so we can show the second
+/// tick saw the correction *and* emitted a different `Decision`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn tool_call_failure_correction_then_different_decision_recovers_to_healthy() {
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    // Two tools: `flaky` fails forever; `echo` always succeeds. The
+    // script drives the model to call `flaky` first, see the correction,
+    // and then call `echo` on the continuation.
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Arc::new(FlakyTool::new("flaky", u32::MAX)))
+        .expect("register flaky");
+    registry
+        .register(Arc::new(EchoTool))
+        .expect("register echo");
+
+    let script = vec![
+        // Tick 1: CallTool flaky → errors → pending_correction set.
+        Decision::CallTool {
+            name: "flaky".into(),
+            args: json!({"x": 1}),
+            claim_seed: ClaimSeed::new("seed-flaky"),
+        },
+        // Tick 2 (correction continuation): the model sees the
+        // correction in the bundle and emits a *different* decision
+        // (calls echo instead). That succeeds → ApplyOutcome::Continue
+        // → mark_tick_success → pending_correction cleared, tracker
+        // stays Healthy.
+        Decision::CallTool {
+            name: "echo".into(),
+            args: json!({"msg": "recovered"}),
+            claim_seed: ClaimSeed::new("seed-echo"),
+        },
+        // Tick 3: retire cleanly.
+        Decision::Retire {
+            reason: "recovered-after-tool-failure".into(),
+        },
+    ];
+    let seen: Arc<Mutex<Vec<ContextBundle>>> = Arc::new(Mutex::new(Vec::new()));
+    let decide = CapturingDecide {
+        inner: MockDecide::new(script),
+        seen: seen.clone(),
+    };
+    // Budget with enough rope: max_tool=3 so the single failure on tick
+    // 1 stays under cap. The point of this test is the recovery happens
+    // before exhaustion ever fires.
+    let agent = Agent::new(
+        mandate,
+        fs,
+        decide,
+        registry,
+        fresh_health_with(tmp.path(), RetryBudget::new(1, 3)),
+    );
+
+    let handle = tokio::spawn(agent.run());
+    let RetireReason(reason) = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("agent did not retire in time")
+        .expect("join")
+        .expect("run ok");
+    assert_eq!(reason, "recovered-after-tool-failure");
+
+    let captured = seen.lock().unwrap().clone();
+    assert_eq!(captured.len(), 3, "expected three decide() invocations");
+
+    // Tick 2 saw the correction — that's how it "knew" to choose a
+    // different tool. This pins the correction-was-visible property.
+    let correction = captured[1]
+        .correction
+        .as_ref()
+        .expect("tick 2 must see the correction staged by tick 1's tool failure");
+    assert!(
+        correction.failure.contains("\"flaky\""),
+        "correction should name the failed tool, got: {}",
+        correction.failure
+    );
+
+    // Tick 3 is a fresh tick (recovery cleared pending_correction), so
+    // it carries no correction.
+    assert!(
+        captured[2].correction.is_none(),
+        "tick 3 must not carry a correction: tick 2 succeeded and cleared it"
+    );
+
+    // Health stays Healthy across the whole cycle: single failure under
+    // the per-tick budget, then a success, then retire.
+    let v: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(tmp.path().join("health.json")).expect("read health"),
+    )
+    .expect("parse health");
+    assert_eq!(
+        v.get("state").and_then(|x| x.as_str()),
+        Some("Healthy"),
+        "agent must stay Healthy: failure was absorbed by the correction loop"
+    );
+    // No archive directory: tracker never transitioned to Unhealthy.
+    assert!(
+        !tmp.path().join("health").exists(),
+        "no archive directory should exist when the agent never tripped Unhealthy"
+    );
+
+    // Recovery tick's successful CallTool must have persisted exactly
+    // one evidence record (from echo). The flaky tool produced none.
+    let evidence_dir = tmp.path().join("evidence");
+    let evs: Vec<_> = std::fs::read_dir(&evidence_dir)
+        .expect("read evidence")
+        .map(|e| e.expect("dirent").path())
+        .collect();
+    assert_eq!(
+        evs.len(),
+        1,
+        "exactly one evidence record expected (echo's), got: {evs:?}"
     );
 }
