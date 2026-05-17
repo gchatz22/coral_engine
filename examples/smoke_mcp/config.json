@@ -1,0 +1,5 @@
+{
+  "text": "smoke test against @modelcontextprotocol/server-everything",
+  "idle_period": 100,
+  "max_ticks": 3
+}
