@@ -191,13 +191,13 @@ pub struct Usage {
 /// `String` so callers can match on it cheaply and tracing field rendering
 /// stays allocation-free.
 ///
-/// `Default` picks `Anthropic` purely so `CallStats::default()` compiles
-/// for test fixtures and the pre-overwrite path in `parse_response`; the
-/// real vendor is always set by `complete` before stats reach a caller.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// No `Default` impl on purpose: a `CallStats` always carries a real vendor
+/// — the parse-then-stamp split in each vendor adapter guarantees that. See
+/// `ParsedComplete` in `anthropic`/`cohere` for the shape `parse_response`
+/// returns before `complete` mints the final `CallStats`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Vendor {
-    #[default]
     Anthropic,
     Cohere,
 }
@@ -220,12 +220,13 @@ impl Vendor {
 /// future tickets — this struct intentionally ships only the raw inputs
 /// those layers will need.
 ///
-/// `Default` is provided so the pure `parse_response` helpers (which
-/// can't see latency, vendor, or model id) can construct a
-/// `CompleteResponse` with placeholder stats that `complete` overwrites
-/// after the HTTP call. End users of `ModelClient` always see stats
-/// populated by `complete`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// No `Default` impl: a `CallStats` is only ever constructed by a vendor
+/// adapter's `complete` method, which knows the real vendor, latency, and
+/// model id. The pure `parse_response` helpers return a
+/// vendor-private `ParsedComplete` (content + tool_calls + usage) and
+/// `complete` mints the final `CompleteResponse` from it. That keeps
+/// "stats with a placeholder vendor" unrepresentable.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallStats {
     pub usage: Usage,
     /// Wall-clock latency around the `ModelClient::complete` HTTP call,

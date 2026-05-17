@@ -345,8 +345,24 @@ mod tests {
         }
     }
 
+    /// Zero-valued `CallStats` for mock responses that don't care about
+    /// per-call accounting. Real adapters fill these from the HTTP path;
+    /// these tests assert on `Decision` parsing, not on stats.
+    ///
+    /// `Vendor` no longer has a `Default` (JAR2-32), so pick one
+    /// arbitrarily — the tests that care about vendor stamping use
+    /// `resp_with_stats` with explicit per-vendor stats instead.
+    fn stub_stats() -> CallStats {
+        CallStats {
+            usage: Usage::default(),
+            latency_ms: 0,
+            vendor: Vendor::Anthropic,
+            model: String::new(),
+        }
+    }
+
     /// Build a `CompleteResponse` whose `tool_calls` is the supplied list,
-    /// with empty content/usage and default stats. The parser only inspects
+    /// with empty content/usage and stub stats. The parser only inspects
     /// `tool_calls`; stats-aware tests use `resp_with_stats` instead.
     fn resp_with_tool_calls(calls: Vec<ToolCall>) -> CompleteResponse {
         CompleteResponse {
@@ -360,7 +376,7 @@ mod tests {
                 .collect(),
             tool_calls: calls,
             usage: Usage::default(),
-            stats: CallStats::default(),
+            stats: stub_stats(),
         }
     }
 
@@ -529,7 +545,7 @@ mod tests {
                 }],
                 tool_calls: vec![],
                 usage: Usage::default(),
-                stats: CallStats::default(),
+                stats: stub_stats(),
             }),
             MockOutcome::Resp(resp_with_tool_calls(vec![good_idle_call()])),
         ]);
@@ -802,12 +818,13 @@ mod tests {
 
     #[cfg(feature = "llm-anthropic")]
     #[test]
-    fn anthropic_parse_response_carries_tokens_and_zero_stats_defaults() {
-        // The pure `parse_response` populates `usage` from the wire body
-        // and leaves `stats` at default (latency/vendor/model are filled
-        // by `complete`). This pins the contract the vendor adapter
-        // depends on. The full `complete` wire path is end-to-end-tested
-        // by JAR2-21's recorded-fixture suite (see follow-ups).
+    fn anthropic_parse_response_carries_tokens_in_parsed_complete() {
+        // The pure `parse_response` returns a vendor-private
+        // `ParsedComplete { content, tool_calls, usage }` — no `stats`,
+        // because latency/vendor/model are not on the wire and live on
+        // `complete`. This pins the contract the vendor adapter depends
+        // on. The full `complete` wire path is end-to-end-tested by
+        // JAR2-21's recorded-fixture suite.
         let raw = br#"{
             "content": [{"type": "text", "text": "hi"}],
             "usage": {"input_tokens": 21, "output_tokens": 8}
@@ -815,14 +832,13 @@ mod tests {
         let r = crate::model_client::anthropic::parse_response(raw).unwrap();
         assert_eq!(r.usage.input_tokens, 21);
         assert_eq!(r.usage.output_tokens, 8);
-        // stats defaults to all-zero — complete() overwrites this.
-        assert_eq!(r.stats.latency_ms, 0);
-        assert!(r.stats.model.is_empty());
+        assert_eq!(r.content, vec![ContentBlock::Text { text: "hi".into() }]);
+        assert!(r.tool_calls.is_empty());
     }
 
     #[cfg(feature = "llm-cohere")]
     #[test]
-    fn cohere_parse_response_carries_tokens_and_zero_stats_defaults() {
+    fn cohere_parse_response_carries_tokens_in_parsed_complete() {
         let raw = br#"{
             "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
             "usage": {"tokens": {"input_tokens": 33, "output_tokens": 14}}
@@ -830,7 +846,7 @@ mod tests {
         let r = crate::model_client::cohere::parse_response(raw).unwrap();
         assert_eq!(r.usage.input_tokens, 33);
         assert_eq!(r.usage.output_tokens, 14);
-        assert_eq!(r.stats.latency_ms, 0);
-        assert!(r.stats.model.is_empty());
+        assert_eq!(r.content, vec![ContentBlock::Text { text: "hi".into() }]);
+        assert!(r.tool_calls.is_empty());
     }
 }
