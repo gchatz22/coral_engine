@@ -1,0 +1,57 @@
+{
+  "synthesized": true,
+  "vendor": "cohere",
+  "note": "JAR2-21 happy-path tick for Cohere. Mirrors the Anthropic fixture but in Cohere V2 chat shape (per src/model_client/cohere.rs:parse_response unit tests): message.tool_calls is the tool-call array, arguments is a JSON-encoded string, usage.tokens.{input,output}_tokens. Hand-written; the maintainer's COHERE_API_KEY in the worktree env can re-record this via `JARVIS_LIVE_LLM=1 cargo test --features llm-cohere`.",
+  "responses": [
+    {
+      "status": 200,
+      "body": {
+        "id": "cohere_msg_01",
+        "finish_reason": "TOOL_CALL",
+        "message": {
+          "role": "assistant",
+          "content": [
+            {"type": "text", "text": "Calling echo with the supplied message."}
+          ],
+          "tool_calls": [
+            {
+              "id": "tc_call_tool_1",
+              "type": "function",
+              "function": {
+                "name": "call_tool",
+                "arguments": "{\"name\":\"echo\",\"args\":{\"msg\":\"hello jarvis\"},\"claim_seed\":\"fixture-seed-1\"}"
+              }
+            }
+          ]
+        },
+        "usage": {
+          "tokens": {"input_tokens": 156, "output_tokens": 94}
+        }
+      }
+    },
+    {
+      "status": 200,
+      "body": {
+        "id": "cohere_msg_02",
+        "finish_reason": "TOOL_CALL",
+        "message": {
+          "role": "assistant",
+          "content": [],
+          "tool_calls": [
+            {
+              "id": "tc_emit_1",
+              "type": "function",
+              "function": {
+                "name": "emit_output",
+                "arguments": "{\"content\":\"the echo tool returned hello jarvis\",\"evidence\":[\"a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90\"]}"
+              }
+            }
+          ]
+        },
+        "usage": {
+          "tokens": {"input_tokens": 211, "output_tokens": 71}
+        }
+      }
+    }
+  ]
+}

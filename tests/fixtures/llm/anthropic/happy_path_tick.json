@@ -1,0 +1,62 @@
+{
+  "synthesized": true,
+  "vendor": "anthropic",
+  "note": "JAR2-21 happy-path tick: first response asks call_tool(echo), second emits an output citing a synthesized evidence id. Hand-written against the Anthropic Messages API wire shape documented in src/model_client/anthropic.rs (parse_response unit tests). Re-record with `JARVIS_LIVE_LLM=1 cargo test --features llm-anthropic` once a real ANTHROPIC_API_KEY is available.",
+  "responses": [
+    {
+      "status": 200,
+      "body": {
+        "id": "msg_01",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-haiku-4-5",
+        "stop_reason": "tool_use",
+        "content": [
+          {
+            "type": "text",
+            "text": "Calling echo with the supplied message."
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_call_tool_1",
+            "name": "call_tool",
+            "input": {
+              "name": "echo",
+              "args": {"msg": "hello jarvis"},
+              "claim_seed": "fixture-seed-1"
+            }
+          }
+        ],
+        "usage": {
+          "input_tokens": 142,
+          "output_tokens": 87
+        }
+      }
+    },
+    {
+      "status": 200,
+      "body": {
+        "id": "msg_02",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-haiku-4-5",
+        "stop_reason": "tool_use",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_emit_1",
+            "name": "emit_output",
+            "input": {
+              "content": "the echo tool returned hello jarvis",
+              "evidence": ["a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"]
+            }
+          }
+        ],
+        "usage": {
+          "input_tokens": 198,
+          "output_tokens": 64
+        }
+      }
+    }
+  ]
+}
