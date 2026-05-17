@@ -1,0 +1,14 @@
+# Scripted decisions for the @modelcontextprotocol/server-everything smoke.
+# Tick 1: call the server's `get-sum` tool with two ints (a=2, b=3).
+# Tick 2: emit an output backed by the evidence id of that call.
+# Tick 3: idle; the Mandate's max_ticks=3 cap retires the agent after this tick.
+#
+# The evidence id below is sha256(canonical_json) of the (tool, args, result)
+# triple that `tools/call get-sum {a: 2, b: 3}` produces, where `result` is
+# the JSON-serialized CallToolResult the server returns. Recompute with the
+# `compute-evidence-id` binary if the canonical-JSON rules in
+# src/evidence.rs ever change, or if the server's reply shape drifts (e.g.
+# server-everything bumps its content envelope).
+{"type":"call_tool","name":"get-sum","args":{"a":2,"b":3},"claim_seed":"seed-1"}
+{"type":"emit_output","content":"get-sum(2, 3) via MCP server-everything","evidence":["10c7854829677f9d39acaafa5aa5ae4e9fa59ae5cba2a1dafc941c4c9f4938de"]}
+{"type":"idle","next_after":50}
