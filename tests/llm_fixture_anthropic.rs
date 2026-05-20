@@ -283,6 +283,12 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
 
     let agent = Agent::new(mandate, fs, decide, registry, health);
 
+    // JAR2-33: capture the stats handle *before* `Agent::run` consumes
+    // the agent. The handle survives the run and lets the test read
+    // post-run `CallStats` directly instead of inferring from captured
+    // HTTP traffic.
+    let stats = agent.stats_handle();
+
     let handle = tokio::spawn(agent.run());
     let RetireReason(reason) = timeout(Duration::from_secs(10), handle)
         .await
@@ -292,8 +298,35 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
     assert_eq!(reason, "post-recovery");
 
     // All four fixtures should have been consumed across the three ticks.
+    // We keep this wire-level remaining/captured check because it pins
+    // the *number* of upstream calls across the whole run; the new
+    // stats accessor only sees the most recent tick.
     assert_eq!(mock.remaining(), 0);
     assert_eq!(mock.captured().len(), 4);
+
+    // JAR2-33: the final tick is the recovery `Retire("post-recovery")`
+    // — a single successful upstream call. The handle therefore reports
+    // exactly one call carrying Anthropic vendor + the configured model.
+    // Pre-JAR2-33 these properties were only checkable indirectly via
+    // the captured wire traffic above; the accessor now exposes them
+    // directly.
+    //
+    // Latency is *not* asserted here even though tests (a)/(b) do —
+    // this test uses `start_paused = true`, which freezes tokio's
+    // clock; the mock's `tokio::time::sleep` returns instantly and the
+    // adapter's `std::time::Instant` delta may round to 0ms.
+    let calls = stats.last_tick_calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "last tick was the recovery retire — one upstream call"
+    );
+    assert_eq!(calls[0].vendor, Vendor::Anthropic);
+    assert_eq!(calls[0].model, expected_model());
+    let totals = stats.last_tick_totals();
+    assert_eq!(totals.calls, 1);
+    assert!(totals.input_tokens > 0);
+    assert!(totals.output_tokens > 0);
 
     // The final health state must be Healthy with a prior incident archived.
     let live: Value = serde_json::from_slice(

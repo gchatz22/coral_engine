@@ -72,10 +72,16 @@ pub const MAX_DECISION_RETRIES: usize = 1;
 /// `Decide::decide` takes `&self`, so the storage uses interior
 /// mutability via `Mutex` — the lock is held only for `push`/`clear`
 /// (microseconds), never across an `await`.
+///
+/// JAR2-33: the accumulator lives behind an `Arc<Mutex<...>>` so callers
+/// (notably `Agent<LlmDecide>::stats_handle`) can hand out a cheap
+/// post-construction handle that survives `Agent::run` consuming the
+/// `LlmDecide`. The handle is read-only from the caller's side; only
+/// `decide()` mutates the inner vec.
 pub struct LlmDecide {
     client: Arc<dyn ModelClient>,
     options: CompleteOptions,
-    tick_stats: Mutex<Vec<CallStats>>,
+    tick_stats: Arc<Mutex<Vec<CallStats>>>,
 }
 
 impl LlmDecide {
@@ -86,7 +92,7 @@ impl LlmDecide {
         Self {
             client,
             options,
-            tick_stats: Mutex::new(Vec::new()),
+            tick_stats: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -109,6 +115,19 @@ impl LlmDecide {
             .expect("tick_stats mutex poisoned")
             .clone()
     }
+
+    /// JAR2-33: clone of the per-tick stats accumulator handle. Callers
+    /// that need to read stats after `Agent::run` has consumed the
+    /// `LlmDecide` should capture this before construction and read it
+    /// post-run. The returned `Arc` shares storage with this `LlmDecide`'s
+    /// internal accumulator; the inner vec is updated at the end of every
+    /// upstream `complete()` call and cleared at the start of every
+    /// `decide()`. Lock the inner mutex only briefly — never across
+    /// `await` boundaries — and clone the contents out rather than
+    /// holding the guard.
+    pub fn stats_handle(&self) -> Arc<Mutex<Vec<CallStats>>> {
+        self.tick_stats.clone()
+    }
 }
 
 /// Sum of one tick's worth of `CallStats`. Tokens accumulate, latency
@@ -126,7 +145,7 @@ pub struct TickTotals {
 }
 
 impl TickTotals {
-    fn from_calls(calls: &[CallStats]) -> Self {
+    pub(crate) fn from_calls(calls: &[CallStats]) -> Self {
         let mut totals = TickTotals::default();
         for c in calls {
             totals.input_tokens = totals.input_tokens.saturating_add(c.usage.input_tokens);

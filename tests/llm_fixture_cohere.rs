@@ -243,6 +243,11 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
         .expect("open health");
 
     let agent = Agent::new(mandate, fs, decide, registry, health);
+
+    // JAR2-33: capture stats handle before `Agent::run` consumes the
+    // agent. Mirrors the Anthropic fixture's migration.
+    let stats = agent.stats_handle();
+
     let handle = tokio::spawn(agent.run());
     let RetireReason(reason) = timeout(Duration::from_secs(10), handle)
         .await
@@ -251,8 +256,28 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
         .expect("run ok");
     assert_eq!(reason, "post-recovery");
 
+    // Wire-level count assertion — kept because the new stats accessor
+    // only sees the most recent tick, not the whole run.
     assert_eq!(mock.remaining(), 0);
     assert_eq!(mock.captured().len(), 4);
+
+    // JAR2-33: post-run stats inspection. The recovery tick issues one
+    // successful upstream call; its CallStats must carry Cohere vendor +
+    // configured model. Latency is not asserted here — `start_paused`
+    // freezes tokio's clock and the millisecond-resolution adapter
+    // measurement can round to 0.
+    let calls = stats.last_tick_calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "last tick was the recovery retire — one upstream call"
+    );
+    assert_eq!(calls[0].vendor, Vendor::Cohere);
+    assert_eq!(calls[0].model, expected_model());
+    let totals = stats.last_tick_totals();
+    assert_eq!(totals.calls, 1);
+    assert!(totals.input_tokens > 0);
+    assert!(totals.output_tokens > 0);
 
     let live: Value = serde_json::from_slice(
         &std::fs::read(tmp.path().join("health.json")).expect("read health"),
