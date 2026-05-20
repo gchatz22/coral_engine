@@ -63,9 +63,13 @@ use jarvis_node::health::{HealthTracker, RetryBudget};
 use jarvis_node::mandate::Mandate;
 #[cfg(feature = "mcp")]
 use jarvis_node::mcp::McpClient;
-#[cfg(feature = "llm-anthropic")]
+// Vendor adapter imports are scoped by both `mcp` (the binary only uses
+// them inside the cfg-gated `run_inner`) *and* the matching vendor
+// feature. Otherwise enabling only `llm-anthropic` (no `mcp`) triggers
+// an `unused_imports` warning that fails the CI feature matrix.
+#[cfg(all(feature = "mcp", feature = "llm-anthropic"))]
 use jarvis_node::model_client::anthropic::AnthropicClient;
-#[cfg(feature = "llm-cohere")]
+#[cfg(all(feature = "mcp", feature = "llm-cohere"))]
 use jarvis_node::model_client::cohere::CohereClient;
 #[cfg(feature = "mcp")]
 use jarvis_node::model_client::{CompleteOptions, ModelClient};
