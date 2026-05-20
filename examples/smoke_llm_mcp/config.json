@@ -1,0 +1,5 @@
+{
+  "text": "Your task: call the MCP tool named `get-sum` with arguments {\"a\": 2, \"b\": 3} via the `call_tool` decision. The runtime will store the tool's result as an evidence record. After the tool result arrives, on the next tick emit an Output via the `emit_output` decision whose `content` includes the resulting sum and whose `evidence` array cites the evidence id of the get-sum call you just made. Then retire. Do not call any other tool; do not loop; do not idle except as a last resort.",
+  "idle_period": 1000,
+  "max_ticks": 8
+}
