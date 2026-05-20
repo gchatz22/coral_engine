@@ -44,39 +44,76 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+// `Arc` and `ModelClient` are needed by `run_inner` and by the
+// `build_*_client` "not built" stubs, which exist whenever `mcp` is on
+// (the stubs cover the missing-vendor runtime error). `Duration` is
+// only consumed inside `run_inner`, so it rides the tighter gate.
 #[cfg(feature = "mcp")]
 use std::sync::Arc;
-#[cfg(feature = "mcp")]
+#[cfg(all(
+    feature = "mcp",
+    any(feature = "llm-anthropic", feature = "llm-cohere")
+))]
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
-#[cfg(feature = "mcp")]
+// The runtime path needs `mcp` *and* at least one vendor: `LlmDecide`
+// itself is gated on `any(llm-anthropic, llm-cohere)` in
+// `src/decide_llm/mod.rs`, so a `--features mcp` build without any
+// vendor cannot compile `run_inner`. All imports that are only consumed
+// inside `run_inner` ride the same compound gate; the binary still
+// compiles with zero features (and errors at runtime).
+#[cfg(all(
+    feature = "mcp",
+    any(feature = "llm-anthropic", feature = "llm-cohere")
+))]
 use jarvis_node::agent::{Agent, RetireReason};
-#[cfg(feature = "mcp")]
+#[cfg(all(
+    feature = "mcp",
+    any(feature = "llm-anthropic", feature = "llm-cohere")
+))]
 use jarvis_node::decide_llm::LlmDecide;
-#[cfg(feature = "mcp")]
+#[cfg(all(
+    feature = "mcp",
+    any(feature = "llm-anthropic", feature = "llm-cohere")
+))]
 use jarvis_node::fs::AgentFs;
-#[cfg(feature = "mcp")]
+#[cfg(all(
+    feature = "mcp",
+    any(feature = "llm-anthropic", feature = "llm-cohere")
+))]
 use jarvis_node::health::{HealthTracker, RetryBudget};
 use jarvis_node::mandate::Mandate;
-#[cfg(feature = "mcp")]
+#[cfg(all(
+    feature = "mcp",
+    any(feature = "llm-anthropic", feature = "llm-cohere")
+))]
 use jarvis_node::mcp::McpClient;
-// Vendor adapter imports are scoped by both `mcp` (the binary only uses
-// them inside the cfg-gated `run_inner`) *and* the matching vendor
-// feature. Otherwise enabling only `llm-anthropic` (no `mcp`) triggers
-// an `unused_imports` warning that fails the CI feature matrix.
 #[cfg(all(feature = "mcp", feature = "llm-anthropic"))]
 use jarvis_node::model_client::anthropic::AnthropicClient;
 #[cfg(all(feature = "mcp", feature = "llm-cohere"))]
 use jarvis_node::model_client::cohere::CohereClient;
+// `CompleteOptions` is only used in `run_inner`; `ModelClient` is also
+// referenced by the `build_*_client` stubs, so it rides the looser gate.
+#[cfg(all(
+    feature = "mcp",
+    any(feature = "llm-anthropic", feature = "llm-cohere")
+))]
+use jarvis_node::model_client::CompleteOptions;
 #[cfg(feature = "mcp")]
-use jarvis_node::model_client::{CompleteOptions, ModelClient};
-#[cfg(feature = "mcp")]
+use jarvis_node::model_client::ModelClient;
+#[cfg(all(
+    feature = "mcp",
+    any(feature = "llm-anthropic", feature = "llm-cohere")
+))]
 use jarvis_node::tools::ToolRegistry;
 use jarvis_node::trigger::Trigger;
-#[cfg(feature = "mcp")]
+#[cfg(all(
+    feature = "mcp",
+    any(feature = "llm-anthropic", feature = "llm-cohere")
+))]
 use jarvis_node::trigger_queue::SignalSink;
 
 const USAGE: &str = "\
@@ -173,7 +210,10 @@ enum TriggerLine {
 }
 
 impl TriggerLine {
-    #[cfg(feature = "mcp")]
+    #[cfg(all(
+        feature = "mcp",
+        any(feature = "llm-anthropic", feature = "llm-cohere")
+    ))]
     fn into_parts(self) -> (Duration, Trigger) {
         match self {
             TriggerLine::Envelope { delay_ms, trigger } => {
@@ -200,10 +240,16 @@ async fn run() -> Result<()> {
     run_inner(args).await
 }
 
-/// MCP-gated body. The MCP feature controls all the agent / registry / tool
-/// types; without it the binary still compiles (CLI parse path stays
-/// callable) but every invocation errors at runtime.
-#[cfg(feature = "mcp")]
+/// MCP + vendor-gated body. Requires both the `mcp` feature *and* at
+/// least one vendor (`llm-anthropic` or `llm-cohere`) — `LlmDecide`
+/// itself is gated on the vendor set, so a `--features mcp` build
+/// with no vendor cannot compile this path. The two `cfg(not(...))`
+/// stubs below cover the runtime-error case in both missing
+/// configurations. CLI parsing still works unconditionally.
+#[cfg(all(
+    feature = "mcp",
+    any(feature = "llm-anthropic", feature = "llm-cohere")
+))]
 async fn run_inner(args: Args) -> Result<()> {
     let mandate = load_mandate(&args.config)?;
     let triggers = load_triggers(&args.triggers)?;
@@ -295,13 +341,28 @@ async fn run_inner(args: Args) -> Result<()> {
     Ok(())
 }
 
-/// MCP-disabled stub. The binary still compiles, parse_args still works,
-/// but any real run errors out. Mirrors model_call's per-vendor stubs.
+/// `mcp`-missing stub. Binary compiles + parses; runtime errors with a
+/// rebuild hint. Mirrors model_call's per-vendor stubs.
 #[cfg(not(feature = "mcp"))]
 async fn run_inner(_args: Args) -> Result<()> {
     Err(anyhow!(
         "node-run-llm requires the `mcp` feature; rebuild with --features mcp \
          (plus a vendor feature: llm-anthropic or llm-cohere)"
+    ))
+}
+
+/// `mcp`-present-but-no-vendor stub. The `mcp`-only build is a valid
+/// configuration for the rest of the crate (and is exercised by the CI
+/// feature matrix), so the binary must compile in that case. Errors at
+/// runtime since `LlmDecide` requires a vendor.
+#[cfg(all(
+    feature = "mcp",
+    not(any(feature = "llm-anthropic", feature = "llm-cohere"))
+))]
+async fn run_inner(_args: Args) -> Result<()> {
+    Err(anyhow!(
+        "node-run-llm needs a vendor feature; rebuild with \
+         --features \"mcp llm-anthropic\" or --features \"mcp llm-cohere\""
     ))
 }
 
@@ -315,7 +376,12 @@ fn build_anthropic_client(model: Option<&str>) -> Result<Arc<dyn ModelClient>> {
     Ok(Arc::new(c))
 }
 
+// `#[allow(dead_code)]`: when the binary is built with `--features mcp`
+// alone, `run_inner` is the no-vendor stub and never calls these. The
+// unit test in the `tests` module still exercises this path, but cargo's
+// dead-code lint considers only the non-test build of the bin target.
 #[cfg(all(feature = "mcp", not(feature = "llm-anthropic")))]
+#[allow(dead_code)]
 fn build_anthropic_client(_model: Option<&str>) -> Result<Arc<dyn ModelClient>> {
     Err(anyhow!(
         "vendor 'anthropic' is not built into this binary; \
@@ -333,7 +399,9 @@ fn build_cohere_client(model: Option<&str>) -> Result<Arc<dyn ModelClient>> {
     Ok(Arc::new(c))
 }
 
+// `#[allow(dead_code)]`: same reason as build_anthropic_client above.
 #[cfg(all(feature = "mcp", not(feature = "llm-cohere")))]
+#[allow(dead_code)]
 fn build_cohere_client(_model: Option<&str>) -> Result<Arc<dyn ModelClient>> {
     Err(anyhow!(
         "vendor 'cohere' is not built into this binary; \
@@ -492,7 +560,10 @@ fn load_triggers(path: &Path) -> Result<Vec<TriggerLine>> {
     Ok(out)
 }
 
-#[cfg(feature = "mcp")]
+#[cfg(all(
+    feature = "mcp",
+    any(feature = "llm-anthropic", feature = "llm-cohere")
+))]
 async fn feed_triggers(sink: SignalSink, lines: Vec<TriggerLine>) -> Result<()> {
     for line in lines {
         let (delay, trigger) = line.into_parts();
@@ -803,6 +874,34 @@ mod tests {
             .expect_err("expected mcp-missing error");
         let msg = format!("{err:#}");
         assert!(msg.contains("mcp"), "msg: {msg}");
+    }
+
+    /// When the binary is built with `mcp` but without any vendor
+    /// feature, `run_inner` is the no-vendor stub: every invocation
+    /// errors with a "rebuild with --features ..." hint pointing at the
+    /// vendor flags. Covers the CI feature-matrix entry `--features mcp`.
+    #[tokio::test]
+    #[cfg(all(
+        feature = "mcp",
+        not(any(feature = "llm-anthropic", feature = "llm-cohere"))
+    ))]
+    async fn run_inner_mcp_without_vendor_errors_with_helpful_hint() {
+        let args = Args {
+            vendor: Vendor::Anthropic,
+            model: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            temperature: None,
+            config: PathBuf::from("config.json"),
+            triggers: PathBuf::from("triggers.jsonl"),
+            fs_root: PathBuf::from("/tmp/fs"),
+            spawn: vec!["npx".to_string()],
+        };
+        let err = run_inner(args)
+            .await
+            .expect_err("expected vendor-missing error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("llm-anthropic"), "msg: {msg}");
+        assert!(msg.contains("llm-cohere"), "msg: {msg}");
     }
 
     /// When the binary is built with `mcp` but without `llm-anthropic`,
