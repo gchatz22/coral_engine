@@ -5,6 +5,20 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Single pin for the MCP reference server used by mcp-smoke and
+  # runbook-smoke. The smoke_mcp fixture's hardcoded evidence id
+  # (10c78548…) was computed against this version per JAR2-26's
+  # timeline; bumping requires recomputing that sha.
+  MCP_SERVER_EVERYTHING_VERSION: "2026.1.26"
+
 jobs:
   lint-and-test:
     name: build / clippy / fmt / test
@@ -15,7 +29,7 @@ jobs:
       - name: Install Rust toolchain (pinned via rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.84"
+          toolchain: "1.88"
           components: rustfmt, clippy
 
       - name: cargo build
@@ -29,3 +43,141 @@ jobs:
 
       - name: cargo test
         run: cargo test --all-targets --locked
+
+  feature-matrix:
+    name: feature matrix
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - features: "llm-anthropic"
+            name: "llm-anthropic"
+          - features: "llm-cohere"
+            name: "llm-cohere"
+          - features: "mcp"
+            name: "mcp"
+          - features: "llm-anthropic,llm-cohere,mcp"
+            name: "all features"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+
+      - name: cargo build [${{ matrix.name }}]
+        run: cargo build --all-targets --locked --features "${{ matrix.features }}"
+
+      - name: cargo test [${{ matrix.name }}]
+        run: cargo test --all-targets --locked --features "${{ matrix.features }}"
+
+  mcp-smoke:
+    # Activates tests/smoke_mcp_server_everything.rs, which is gated behind
+    # JARVIS_SMOKE_MCP=1 and needs Node + a pinned server-everything on the
+    # runner. See JAR2-34 and examples/smoke_mcp/README.md.
+    name: mcp smoke (integration)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run smoke_mcp_server_everything against pinned server
+        env:
+          JARVIS_SMOKE_MCP: "1"
+          JARVIS_SMOKE_MCP_CMD: "npx -y @modelcontextprotocol/server-everything@${{ env.MCP_SERVER_EVERYTHING_VERSION }}"
+        run: |
+          mkdir -p ci-logs
+          set -o pipefail
+          cargo test --features mcp --test smoke_mcp_server_everything --locked -- --nocapture \
+            2>&1 | tee ci-logs/mcp-smoke.log
+
+      - name: Upload mcp-smoke logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-smoke-logs
+          path: ci-logs/
+
+  runbook-smoke:
+    # Drives the user-facing runbook binaries (node-run + node-run-mcp) against
+    # their committed fixtures and asserts on the durable artifacts they
+    # produce (retirement.json, evidence/<sha>.json, outputs/<ulid>.json). See
+    # JAR2-35.
+    name: runbook binary smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run node-run against examples/smoke fixture
+        run: |
+          mkdir -p ci-logs
+          set -o pipefail
+          cargo run --locked --bin node-run -- \
+            examples/smoke/config.json \
+            examples/smoke/triggers.jsonl \
+            "${RUNNER_TEMP}/jarvis-smoke-fs" \
+            2>&1 | tee ci-logs/node-run.log
+
+      - name: Assert node-run artifacts
+        run: |
+          bash scripts/ci/assert_smoke.sh \
+            "${RUNNER_TEMP}/jarvis-smoke-fs" \
+            "1d6a153a69d110156ca44ed281f859ca09d9875747e3ed16b9964c52632fd96e" \
+            "echo" \
+            '{"hello":"smoke"}' \
+            "smoke test passed"
+
+      - name: Run node-run-mcp against examples/smoke_mcp fixture
+        run: |
+          set -o pipefail
+          cargo run --locked --features mcp --bin node-run-mcp -- \
+            examples/smoke_mcp/config.json \
+            examples/smoke_mcp/triggers.jsonl \
+            "${RUNNER_TEMP}/jarvis-smoke-mcp-fs" \
+            -- npx -y "@modelcontextprotocol/server-everything@${MCP_SERVER_EVERYTHING_VERSION}" \
+            2>&1 | tee ci-logs/node-run-mcp.log
+
+      - name: Assert node-run-mcp artifacts
+        run: |
+          bash scripts/ci/assert_smoke.sh \
+            "${RUNNER_TEMP}/jarvis-smoke-mcp-fs" \
+            "10c7854829677f9d39acaafa5aa5ae4e9fa59ae5cba2a1dafc941c4c9f4938de" \
+            "get-sum" \
+            '{"a":2,"b":3}' \
+            "get-sum(2, 3) via MCP server-everything"
+
+      - name: Upload runbook smoke artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runbook-smoke-artifacts
+          path: |
+            ci-logs/
+            ${{ runner.temp }}/jarvis-smoke-fs/
+            ${{ runner.temp }}/jarvis-smoke-mcp-fs/
