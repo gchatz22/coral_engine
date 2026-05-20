@@ -57,6 +57,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 // The runtime path needs `mcp` *and* at least one vendor: `LlmDecide`
@@ -137,8 +138,15 @@ ARGS:
     <triggers.jsonl>  One JSON object per line. Either a bare Trigger or an
                       envelope: {\"delay_ms\": <u64>, \"trigger\": <Trigger>}.
                       Blank lines and lines starting with `#` are ignored.
-    <fs_root>         Directory for the agent's per-agent FS layout
-                      (mandate.json, outputs/, evidence/, notes/, retirement.json).
+    <fs_root>         *Parent* directory for the per-agent FS. The binary
+                      stamps a fresh timestamped subdirectory inside it for
+                      this invocation (`<YYYY-MM-DDTHH-MM-SS-sssZ>`) and
+                      writes the agent's FS layout there (mandate.json,
+                      outputs/, evidence/, notes/, retirement.json). The
+                      resolved absolute path is printed on the first line
+                      of stdout (`node-run-llm: fs_root=...`). Two
+                      successive invocations accumulate; they do not
+                      clobber each other.
     --                Separates jarvis args from the MCP server spawn command.
     <cmd> [args...]   Executable + args that speak the MCP stdio protocol on
                       stdin/stdout. The process is spawned by this binary and
@@ -254,13 +262,30 @@ async fn run_inner(args: Args) -> Result<()> {
     let mandate = load_mandate(&args.config)?;
     let triggers = load_triggers(&args.triggers)?;
 
-    let agent_fs = AgentFs::open(args.fs_root.clone(), &mandate)
-        .with_context(|| format!("opening agent fs at {}", args.fs_root.display()))?;
+    // Treat the supplied `<fs_root>` positional as a *parent* directory
+    // and stamp a fresh per-invocation subdirectory inside it. Created
+    // before anything else so the resolved path can be printed as the
+    // very first stdout line — integration tests parse it by prefix
+    // (`node-run-llm: fs_root=...`).
+    //
+    // Two successive invocations against the same parent must produce
+    // distinct subdirs even when they share a wall-clock second; the
+    // helper uses millisecond precision and falls back to appending a
+    // ULID if a same-millisecond collision somehow happens.
+    let now = Utc::now();
+    let resolved_fs_root = resolve_fs_root(&args.fs_root, now)
+        .with_context(|| format!("resolving fs_root under parent {}", args.fs_root.display()))?;
+    // `println!` flushes line-by-line on a tty/pipe; this is the
+    // load-bearing first line of stdout.
+    println!("node-run-llm: fs_root={}", resolved_fs_root.display());
+
+    let agent_fs = AgentFs::open(resolved_fs_root.clone(), &mandate)
+        .with_context(|| format!("opening agent fs at {}", resolved_fs_root.display()))?;
 
     // Same convention as `node-run-mcp`: per-agent FS root doubles as the
     // health tracker root.
-    let health = HealthTracker::open(&args.fs_root, RetryBudget::default(), chrono::Utc::now())
-        .with_context(|| format!("opening health tracker at {}", args.fs_root.display()))?;
+    let health = HealthTracker::open(&resolved_fs_root, RetryBudget::default(), now)
+        .with_context(|| format!("opening health tracker at {}", resolved_fs_root.display()))?;
 
     let (cmd, cmd_args) = args.spawn.split_first().ok_or_else(|| {
         anyhow!("internal: parse_args returned an empty spawn vec; should be unreachable")
@@ -334,9 +359,9 @@ async fn run_inner(args: Args) -> Result<()> {
         }
     }
 
-    println!("node-run-llm: fs tree at {}:", args.fs_root.display());
+    println!("node-run-llm: fs tree at {}:", resolved_fs_root.display());
     let mut out = io::stdout().lock();
-    print_tree(&mut out, &args.fs_root)?;
+    print_tree(&mut out, &resolved_fs_root)?;
 
     Ok(())
 }
@@ -528,6 +553,71 @@ fn parse_vendor(s: &str) -> Result<Vendor> {
             "unknown vendor `{other}` (expected `anthropic` or `cohere`)"
         )),
     }
+}
+
+/// Format a per-invocation subdirectory name from a UTC timestamp.
+///
+/// Format is `YYYY-MM-DDTHH-MM-SS-sssZ` — ISO-8601-ish with the time
+/// component's colons replaced by dashes (filename-safe across shells
+/// and most tools), plus three digits of millisecond precision so two
+/// invocations within the same wall-clock second still produce
+/// distinct names without a separate uniquifier. `chrono` substitutes
+/// `%.3f` for fractional seconds; the literal dashes between H/M/S
+/// come from the format string itself, not a post-process step.
+fn subdir_name(now: DateTime<Utc>) -> String {
+    now.format("%Y-%m-%dT%H-%M-%S-%3fZ").to_string()
+}
+
+/// Treat the supplied `parent` as a parent directory and create a
+/// fresh timestamped subdirectory inside it for this invocation's
+/// per-agent FS. Returns the absolute path of the new subdirectory.
+///
+/// * Creates `parent` (and any intermediates) if it doesn't already
+///   exist — the parent's existence is not a precondition. This is
+///   what makes `cargo run ... /tmp/jarvis-smoke-llm-mcp-fs` a
+///   one-shot command rather than requiring `mkdir -p` first.
+/// * Uses `create_dir` (not `create_dir_all`) on the *subdir itself*
+///   so a name collision with an existing directory surfaces as
+///   `AlreadyExists`; in that case appends a short ULID and retries.
+///   Same-millisecond collisions are astronomically unlikely with the
+///   format above but the fallback keeps the contract crisp.
+/// * Canonicalizes the result so the path that lands on stdout is
+///   absolute regardless of the input's shape.
+#[allow(dead_code)]
+fn resolve_fs_root(parent: &Path, now: DateTime<Utc>) -> Result<PathBuf> {
+    fs::create_dir_all(parent)
+        .with_context(|| format!("creating fs_root parent at {}", parent.display()))?;
+
+    let base = subdir_name(now);
+    let mut candidate = parent.join(&base);
+    match fs::create_dir(&candidate) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // Collision: append a short ULID and retry once. ULID is a
+            // crate dep already; ulid::Ulid::new() is monotonic-ish per
+            // process but always unique. One retry is enough — a second
+            // collision would require two ULIDs to match, which is the
+            // 128-bit collision case.
+            let suffix = ulid::Ulid::new();
+            candidate = parent.join(format!("{base}-{suffix}"));
+            fs::create_dir(&candidate).with_context(|| {
+                format!(
+                    "creating fs_root subdir at {} (post-collision)",
+                    candidate.display()
+                )
+            })?;
+        }
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("creating fs_root subdir at {}", candidate.display()));
+        }
+    }
+
+    // Canonicalize so the printed path is absolute. `canonicalize` will
+    // resolve symlinks but the subdir we just created is a plain dir,
+    // so the only thing it normalizes is `.`-relative input.
+    fs::canonicalize(&candidate)
+        .with_context(|| format!("canonicalizing fs_root subdir {}", candidate.display()))
 }
 
 #[allow(dead_code)]
@@ -930,5 +1020,84 @@ mod tests {
             Err(e) => format!("{e:#}"),
         };
         assert!(msg.contains("llm-cohere"), "msg: {msg}");
+    }
+
+    /// Given a fixed `DateTime<Utc>`, `subdir_name` produces the
+    /// documented `YYYY-MM-DDTHH-MM-SS-sssZ` shape with dashes (not
+    /// colons) in the time component, three digits of millisecond
+    /// precision, and a trailing `Z`. The literal dashes come from the
+    /// chrono format string itself; no post-process substitution.
+    #[test]
+    fn subdir_name_formats_with_dashes_and_milliseconds() {
+        use chrono::{TimeZone, Timelike};
+        let dt = Utc
+            .with_ymd_and_hms(2026, 5, 20, 4, 30, 7)
+            .unwrap()
+            .with_nanosecond(123_000_000)
+            .unwrap();
+        let s = subdir_name(dt);
+        assert_eq!(s, "2026-05-20T04-30-07-123Z");
+        assert!(!s.contains(':'), "expected colons replaced by dashes: {s}");
+    }
+
+    /// Two timestamps a millisecond apart produce distinct subdir
+    /// names — the back-stop against successive invocations clobbering
+    /// each other's FS root.
+    #[test]
+    fn subdir_name_distinguishes_millisecond_neighbors() {
+        use chrono::{TimeZone, Timelike};
+        let base = Utc.with_ymd_and_hms(2026, 5, 20, 4, 30, 7).unwrap();
+        let a = base.with_nanosecond(123_000_000).unwrap();
+        let b = base.with_nanosecond(124_000_000).unwrap();
+        assert_ne!(subdir_name(a), subdir_name(b));
+    }
+
+    /// `resolve_fs_root` must `create_dir_all` the parent on its own —
+    /// the binary should be runnable against a path that doesn't exist
+    /// yet without the user having to `mkdir -p` first.
+    #[test]
+    fn resolve_fs_root_creates_missing_parent() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        // Parent path that does not exist yet (nested under the tempdir
+        // root, which is the only thing on disk).
+        let parent = tmp.path().join("nested").join("does-not-exist-yet");
+        assert!(!parent.exists());
+        let now = Utc::now();
+        let resolved = resolve_fs_root(&parent, now).expect("resolve_fs_root");
+        assert!(parent.exists(), "parent should have been created");
+        assert!(resolved.exists(), "subdir should have been created");
+        assert!(
+            resolved.starts_with(parent.canonicalize().unwrap()),
+            "resolved {} should sit under parent {}",
+            resolved.display(),
+            parent.display()
+        );
+        // Resolved name should match the subdir_name(now) format.
+        let name = resolved
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("subdir name");
+        // Loose shape check — the strict format is covered by
+        // `subdir_name_formats_with_dashes_and_milliseconds`.
+        assert!(name.ends_with('Z'), "subdir name should end with Z: {name}");
+        assert!(
+            !name.contains(':'),
+            "subdir name must not contain colons: {name}"
+        );
+    }
+
+    /// Calling `resolve_fs_root` twice against the same parent — even
+    /// with the same `now` — produces distinct subdirs. The first call
+    /// gets the bare timestamp; the second collides on `AlreadyExists`
+    /// and falls through to the ULID-suffixed retry. This covers the
+    /// pathological same-millisecond case the helper guards against.
+    #[test]
+    fn resolve_fs_root_avoids_collision_on_repeat_now() {
+        use chrono::TimeZone;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let fixed_now = Utc.with_ymd_and_hms(2026, 5, 20, 4, 30, 7).unwrap();
+        let a = resolve_fs_root(tmp.path(), fixed_now).expect("first resolve");
+        let b = resolve_fs_root(tmp.path(), fixed_now).expect("second resolve");
+        assert_ne!(a, b, "same `now` should still yield distinct subdirs");
     }
 }

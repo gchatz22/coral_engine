@@ -31,11 +31,25 @@
 
 #![cfg(all(feature = "mcp", feature = "llm-anthropic"))]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
 use tempfile::TempDir;
+
+/// Parse the resolved per-invocation FS root out of `node-run-llm`'s
+/// stdout. The binary prints `node-run-llm: fs_root=<absolute path>`
+/// on a line of its own (load-bearing: see the binary's `run_inner`).
+/// We scan by prefix rather than line index so unrelated startup
+/// noise on stdout doesn't break the test.
+fn parse_resolved_fs_root(stdout: &str) -> PathBuf {
+    const PREFIX: &str = "node-run-llm: fs_root=";
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with(PREFIX))
+        .unwrap_or_else(|| panic!("missing `{PREFIX}` line in stdout:\n{stdout}"));
+    PathBuf::from(line.trim_start_matches(PREFIX).trim_end())
+}
 
 /// Resolve the MCP server spawn command. Honors `JARVIS_SMOKE_MCP_CMD`
 /// (whitespace-split into command + args) for environments where the
@@ -94,8 +108,11 @@ fn end_to_end_llm_decide_against_server_everything() {
         return;
     }
 
-    // A fresh tempdir per run keeps repeated invocations independent.
-    let fs_root = TempDir::new().expect("tempdir");
+    // A fresh tempdir is the *parent* of the per-invocation FS root —
+    // the binary now stamps a timestamped subdirectory inside whatever
+    // path we pass on the CLI. We discover the resolved subdir below
+    // by parsing stdout, then assert against files under it.
+    let parent_dir = TempDir::new().expect("tempdir");
     let (cmd, args) = spawn_command();
 
     // Cargo injects this for every `[[bin]]` target. The path points at
@@ -113,7 +130,7 @@ fn end_to_end_llm_decide_against_server_everything() {
         .arg("anthropic")
         .arg(&config)
         .arg(&triggers)
-        .arg(fs_root.path())
+        .arg(parent_dir.path())
         .arg("--")
         .arg(&cmd)
         .args(&args);
@@ -129,8 +146,17 @@ fn end_to_end_llm_decide_against_server_everything() {
         output.status
     );
 
+    // Discover the per-invocation FS root from stdout. Everything below
+    // asserts under this resolved path, not under `parent_dir.path()`.
+    let fs_root = parse_resolved_fs_root(&stdout);
+    assert!(
+        fs_root.exists(),
+        "resolved fs_root {} does not exist",
+        fs_root.display()
+    );
+
     // Terminal marker must exist on a clean retirement.
-    let retirement = fs_root.path().join("retirement.json");
+    let retirement = fs_root.join("retirement.json");
     assert!(
         retirement.exists(),
         "retirement.json missing at {}",
@@ -140,7 +166,7 @@ fn end_to_end_llm_decide_against_server_everything() {
     // The agent should be `Healthy` after a successful run. `state` is
     // either the string `"Healthy"` or an object with `"Healthy"` key
     // depending on the version of the encoder; check for either shape.
-    let health_path = fs_root.path().join("health.json");
+    let health_path = fs_root.join("health.json");
     let health_bytes = std::fs::read(&health_path).expect("read health.json");
     let health: Value = serde_json::from_slice(&health_bytes).expect("parse health.json");
     let state = &health["state"];
@@ -156,7 +182,7 @@ fn end_to_end_llm_decide_against_server_everything() {
     );
 
     // At least one output is the parent-acceptance bar.
-    let outputs_dir = fs_root.path().join("outputs");
+    let outputs_dir = fs_root.join("outputs");
     let outputs = read_json_dir(&outputs_dir);
     assert!(
         !outputs.is_empty(),
@@ -167,7 +193,7 @@ fn end_to_end_llm_decide_against_server_everything() {
     // Every evidence id in every Output must resolve to a file on disk
     // under `evidence/<id>.json`. This is the JAR2-12 parent-acceptance
     // assertion in test form.
-    let evidence_dir = fs_root.path().join("evidence");
+    let evidence_dir = fs_root.join("evidence");
     for out in &outputs {
         let evidence = out["evidence"]
             .as_array()

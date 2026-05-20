@@ -93,14 +93,24 @@ the emit, optionally 1 for an explicit retire); the looser cap is in
 place because the LLM may interleave an `idle` or re-read context
 before settling on the answer.
 
+The `<fs_root>` positional you pass on the CLI is treated as a
+*parent directory*: each invocation stamps a fresh
+`<YYYY-MM-DDTHH-MM-SS-sssZ>` subdirectory inside it and writes the
+per-agent FS there. The first line of stdout prints the absolute path
+of that resolved subdirectory so you can `cd` into the right run when
+inspecting after the fact. Two successive invocations against the
+same parent **accumulate** — they do not clobber each other — so
+comparing prompt/mandate tweaks across runs is trivial.
+
 On success, stdout includes:
 
 ```
+node-run-llm: fs_root=/tmp/jarvis-smoke-llm-mcp-fs/2026-05-20T04-30-07-123Z
 node-run-llm: registered 13 MCP tool(s): echo, get-annotated-message, get-env, ...
 node-run-llm: vendor=anthropic model=claude-haiku-4-5
 node-run-llm: agent retired: <model's reason or max_ticks (8) reached>
-node-run-llm: fs tree at /tmp/jarvis-smoke-llm-mcp-fs:
-/tmp/jarvis-smoke-llm-mcp-fs
+node-run-llm: fs tree at /tmp/jarvis-smoke-llm-mcp-fs/2026-05-20T04-30-07-123Z:
+/tmp/jarvis-smoke-llm-mcp-fs/2026-05-20T04-30-07-123Z
 ├── claims
 ├── evidence
 │   └── <hex>.json
@@ -112,8 +122,9 @@ node-run-llm: fs tree at /tmp/jarvis-smoke-llm-mcp-fs:
 └── retirement.json
 ```
 
-(For the Cohere run the second line reads `vendor=cohere model=command-...`
-instead.)
+(For the Cohere run the `vendor=` line reads `vendor=cohere model=command-...`
+instead. The `fs_root=` timestamp is the literal UTC instant the
+binary started; expect a different one on each run.)
 
 Key files in the per-agent FS tree:
 
@@ -134,6 +145,14 @@ will drift if the server's release bumps its tool surface.
 ```bash
 rm -rf /tmp/jarvis-smoke-llm-mcp-fs
 ```
+
+This nukes the *parent* directory and every accumulated
+`<timestamp>/` subdirectory inside it. Successive `node-run-llm`
+invocations don't overwrite each other — each run gets its own
+timestamped subdir under the parent — so the parent can grow large
+over an iteration session. Drop the whole tree when you're done, or
+delete individual `<timestamp>/` subdirs if you want to keep a subset
+for comparison.
 
 The MCP server subprocess is shut down by the binary on retirement;
 nothing leaks past the `cargo run` invocation.
