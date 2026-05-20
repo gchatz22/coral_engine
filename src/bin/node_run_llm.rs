@@ -9,16 +9,19 @@
 //! `register_mcp_server_with_policy`, trigger feeder, `agent.run`) is
 //! identical and copied verbatim.
 //!
-//! Gated behind both the `mcp` and `llm-anthropic` cargo features; the
-//! `[[bin]]` entry in `Cargo.toml` declares `required-features = ["mcp",
-//! "llm-anthropic"]`. Anthropic is the only vendor wired at the binary
-//! layer for v1; `--vendor cohere` errors at `parse_args` time with a
-//! "not yet wired" hint.
+//! # Feature gating
+//!
+//! The `[[bin]]` entry no longer pins `required-features` because cargo
+//! does not support OR in that field. Instead, the per-vendor dispatch
+//! arms and the MCP-using body are gated with `#[cfg(feature = "...")]`;
+//! a build with neither `mcp` nor a vendor feature still compiles the
+//! binary but every `--vendor` choice errors at runtime with a "rebuild
+//! with --features ..." hint. Mirrors `src/bin/model_call.rs`.
 //!
 //! # Usage
 //!
 //! ```text
-//! node-run-llm --vendor anthropic [--model <id>] [--max-tokens N]
+//! node-run-llm --vendor <anthropic|cohere> [--model <id>] [--max-tokens N]
 //!     [--temperature F] <config.json> <triggers.jsonl> <fs_root>
 //!     -- <cmd> [args...]
 //! ```
@@ -41,35 +44,50 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+#[cfg(feature = "mcp")]
 use std::sync::Arc;
+#[cfg(feature = "mcp")]
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
+#[cfg(feature = "mcp")]
 use jarvis_node::agent::{Agent, RetireReason};
+#[cfg(feature = "mcp")]
 use jarvis_node::decide_llm::LlmDecide;
+#[cfg(feature = "mcp")]
 use jarvis_node::fs::AgentFs;
+#[cfg(feature = "mcp")]
 use jarvis_node::health::{HealthTracker, RetryBudget};
 use jarvis_node::mandate::Mandate;
+#[cfg(feature = "mcp")]
 use jarvis_node::mcp::McpClient;
+#[cfg(feature = "llm-anthropic")]
 use jarvis_node::model_client::anthropic::AnthropicClient;
+#[cfg(feature = "llm-cohere")]
+use jarvis_node::model_client::cohere::CohereClient;
+#[cfg(feature = "mcp")]
 use jarvis_node::model_client::{CompleteOptions, ModelClient};
+#[cfg(feature = "mcp")]
 use jarvis_node::tools::ToolRegistry;
 use jarvis_node::trigger::Trigger;
+#[cfg(feature = "mcp")]
 use jarvis_node::trigger_queue::SignalSink;
 
 const USAGE: &str = "\
 node-run-llm — boot a single jarvis_node Agent against an MCP server with an LLM-driven Decide.
 
 USAGE:
-    node-run-llm --vendor anthropic [--model <id>] [--max-tokens N] [--temperature F]
-                 <config.json> <triggers.jsonl> <fs_root> -- <cmd> [args...]
+    node-run-llm --vendor <anthropic|cohere> [--model <id>] [--max-tokens N]
+                 [--temperature F] <config.json> <triggers.jsonl> <fs_root>
+                 -- <cmd> [args...]
 
 ARGS:
-    --vendor <name>   Required. `anthropic` (this binary requires --features llm-anthropic).
-                      `cohere` is reserved; rebuild with --features llm-cohere and add the
-                      arm when the wiring lands.
+    --vendor <name>   Required. `anthropic` (build with --features llm-anthropic)
+                      or `cohere` (build with --features llm-cohere). The `mcp`
+                      feature is also required for the MCP wiring; without it
+                      every --vendor choice errors at runtime.
     --model <id>      Optional override of the adapter's default model id.
     --max-tokens N    Optional sampling cap on the model's reply (default 1024).
     --temperature F   Optional sampling temperature; omitted from CompleteOptions when unset.
@@ -88,8 +106,12 @@ ARGS:
 ENV:
     ANTHROPIC_API_KEY  Required for --vendor anthropic. Surfaced verbatim as
                        ModelError::Auth if missing.
-    ANTHROPIC_MODEL    Optional. Overrides the default model id when --model
-                       is not given.
+    ANTHROPIC_MODEL    Optional. Overrides the Anthropic default model id when
+                       --model is not given.
+    COHERE_API_KEY     Required for --vendor cohere. Surfaced verbatim as
+                       ModelError::Auth if missing.
+    COHERE_MODEL       Optional. Overrides the Cohere default model id when
+                       --model is not given.
 
 EXAMPLE:
     node-run-llm --vendor anthropic \\
@@ -101,15 +123,15 @@ EXAMPLE:
 
 const DEFAULT_MAX_TOKENS: u32 = 1024;
 
-/// Vendors the CLI surface understands. Intentionally closed: v1 wires
-/// Anthropic only. `--vendor cohere` is rejected inside `parse_vendor`
-/// (not represented here) so the reject path has access to a specific
-/// "rebuild with --features llm-cohere" hint rather than the generic
-/// "unknown vendor" message. New vendors get a variant here as their
-/// dispatch arm in `run()` lands.
+/// Vendors the CLI surface understands. Each variant is accepted at parse
+/// time regardless of which vendor features were compiled in; the runtime
+/// dispatch in `run_inner` errors with a "rebuild with --features ..."
+/// hint when the requested vendor's adapter is not built. Mirrors
+/// `src/bin/model_call.rs`'s `Vendor`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Vendor {
     Anthropic,
+    Cohere,
 }
 
 /// Parsed command line. Mirrors the fields documented in `USAGE`.
@@ -129,8 +151,14 @@ struct Args {
 /// the two binaries do not share the type because Rust binaries do not
 /// share non-public items and promoting this to the library for two
 /// callers is scope creep.
+///
+/// `allow(dead_code)` is applied because when the binary is built
+/// without the `mcp` feature the fields are unread (the runtime path
+/// that consumes them is itself cfg-gated). The CLI parse path still
+/// instantiates the enum from JSON.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
+#[allow(dead_code)]
 enum TriggerLine {
     Envelope {
         #[serde(default)]
@@ -141,6 +169,7 @@ enum TriggerLine {
 }
 
 impl TriggerLine {
+    #[cfg(feature = "mcp")]
     fn into_parts(self) -> (Duration, Trigger) {
         match self {
             TriggerLine::Envelope { delay_ms, trigger } => {
@@ -164,7 +193,14 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     let args = parse_args(std::env::args().skip(1).collect())?;
+    run_inner(args).await
+}
 
+/// MCP-gated body. The MCP feature controls all the agent / registry / tool
+/// types; without it the binary still compiles (CLI parse path stays
+/// callable) but every invocation errors at runtime.
+#[cfg(feature = "mcp")]
+async fn run_inner(args: Args) -> Result<()> {
     let mandate = load_mandate(&args.config)?;
     let triggers = load_triggers(&args.triggers)?;
 
@@ -198,19 +234,12 @@ async fn run() -> Result<()> {
         registered.join(", ")
     );
 
-    // Vendor dispatch. `--vendor cohere` is rejected at parse time, so
-    // only the Anthropic arm exists here. Build the client, optionally
-    // override the model, and wrap as `Arc<dyn ModelClient>` so
-    // `LlmDecide::new` can take it.
+    // Vendor dispatch. Each arm is gated on its vendor feature; the
+    // "not built" arm runs when the binary was compiled without that
+    // vendor and surfaces a "rebuild with --features ..." hint.
     let model_client: Arc<dyn ModelClient> = match args.vendor {
-        Vendor::Anthropic => {
-            let c = match args.model.as_deref() {
-                Some(m) => AnthropicClient::new().with_model(m),
-                None => AnthropicClient::new(),
-            };
-            println!("node-run-llm: vendor=anthropic model={}", c.model());
-            Arc::new(c)
-        }
+        Vendor::Anthropic => build_anthropic_client(args.model.as_deref())?,
+        Vendor::Cohere => build_cohere_client(args.model.as_deref())?,
     };
     let options = CompleteOptions {
         max_tokens: args.max_tokens,
@@ -260,6 +289,52 @@ async fn run() -> Result<()> {
     print_tree(&mut out, &args.fs_root)?;
 
     Ok(())
+}
+
+/// MCP-disabled stub. The binary still compiles, parse_args still works,
+/// but any real run errors out. Mirrors model_call's per-vendor stubs.
+#[cfg(not(feature = "mcp"))]
+async fn run_inner(_args: Args) -> Result<()> {
+    Err(anyhow!(
+        "node-run-llm requires the `mcp` feature; rebuild with --features mcp \
+         (plus a vendor feature: llm-anthropic or llm-cohere)"
+    ))
+}
+
+#[cfg(all(feature = "mcp", feature = "llm-anthropic"))]
+fn build_anthropic_client(model: Option<&str>) -> Result<Arc<dyn ModelClient>> {
+    let c = match model {
+        Some(m) => AnthropicClient::new().with_model(m),
+        None => AnthropicClient::new(),
+    };
+    println!("node-run-llm: vendor=anthropic model={}", c.model());
+    Ok(Arc::new(c))
+}
+
+#[cfg(all(feature = "mcp", not(feature = "llm-anthropic")))]
+fn build_anthropic_client(_model: Option<&str>) -> Result<Arc<dyn ModelClient>> {
+    Err(anyhow!(
+        "vendor 'anthropic' is not built into this binary; \
+         rebuild with --features \"mcp llm-anthropic\""
+    ))
+}
+
+#[cfg(all(feature = "mcp", feature = "llm-cohere"))]
+fn build_cohere_client(model: Option<&str>) -> Result<Arc<dyn ModelClient>> {
+    let c = match model {
+        Some(m) => CohereClient::new().with_model(m),
+        None => CohereClient::new(),
+    };
+    println!("node-run-llm: vendor=cohere model={}", c.model());
+    Ok(Arc::new(c))
+}
+
+#[cfg(all(feature = "mcp", not(feature = "llm-cohere")))]
+fn build_cohere_client(_model: Option<&str>) -> Result<Arc<dyn ModelClient>> {
+    Err(anyhow!(
+        "vendor 'cohere' is not built into this binary; \
+         rebuild with --features \"mcp llm-cohere\""
+    ))
 }
 
 /// Parse the CLI. Hand-rolled to match the rest of the binary suite (no
@@ -369,21 +444,21 @@ fn parse_args(mut argv: Vec<String>) -> Result<Args> {
     })
 }
 
-/// Parse the `--vendor` value into a typed `Vendor`. `cohere` is rejected
-/// here (not in the dispatch arm) so the CLI surface fails fast with a
-/// specific hint and the unit tests don't need feature flags to assert
-/// the rejection.
+/// Parse the `--vendor` value into a typed `Vendor`. The set is closed at
+/// the CLI surface: unknown vendors are rejected here, but every accepted
+/// variant is validated at runtime against the compiled-in features (see
+/// `run_inner` / `build_*_client`).
 fn parse_vendor(s: &str) -> Result<Vendor> {
     match s {
         "anthropic" => Ok(Vendor::Anthropic),
-        "cohere" => Err(anyhow!(
-            "vendor 'cohere' is not yet wired; rebuild with --features llm-cohere \
-             and add the arm in src/bin/node_run_llm.rs"
+        "cohere" => Ok(Vendor::Cohere),
+        other => Err(anyhow!(
+            "unknown vendor `{other}` (expected `anthropic` or `cohere`)"
         )),
-        other => Err(anyhow!("unknown vendor `{other}` (expected `anthropic`)")),
     }
 }
 
+#[allow(dead_code)]
 fn load_mandate(path: &Path) -> Result<Mandate> {
     let bytes =
         fs::read(path).with_context(|| format!("reading mandate from {}", path.display()))?;
@@ -391,6 +466,7 @@ fn load_mandate(path: &Path) -> Result<Mandate> {
         .with_context(|| format!("parsing mandate JSON in {}", path.display()))
 }
 
+#[allow(dead_code)]
 fn load_triggers(path: &Path) -> Result<Vec<TriggerLine>> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading triggers from {}", path.display()))?;
@@ -412,6 +488,7 @@ fn load_triggers(path: &Path) -> Result<Vec<TriggerLine>> {
     Ok(out)
 }
 
+#[cfg(feature = "mcp")]
 async fn feed_triggers(sink: SignalSink, lines: Vec<TriggerLine>) -> Result<()> {
     for line in lines {
         let (delay, trigger) = line.into_parts();
@@ -425,6 +502,7 @@ async fn feed_triggers(sink: SignalSink, lines: Vec<TriggerLine>) -> Result<()> 
     Ok(())
 }
 
+#[allow(dead_code)]
 fn print_tree(out: &mut impl Write, root: &Path) -> Result<()> {
     if !root.exists() {
         writeln!(out, "(missing)")?;
@@ -444,6 +522,7 @@ fn print_tree(out: &mut impl Write, root: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn print_tree_entry(out: &mut impl Write, path: &Path, prefix: &str, last: bool) -> Result<()> {
     let connector = if last { "└── " } else { "├── " };
     let name = path
@@ -504,6 +583,26 @@ mod tests {
                 "@modelcontextprotocol/server-everything".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn parse_args_accepts_cohere_vendor() {
+        // Parse-only: --vendor cohere is now accepted at parse time. The
+        // runtime feature check lives in `build_cohere_client`; this test
+        // does not exercise that path.
+        let parsed = parse_args(v(&[
+            "--vendor",
+            "cohere",
+            "config.json",
+            "triggers.jsonl",
+            "/tmp/fs",
+            "--",
+            "npx",
+            "-y",
+            "@modelcontextprotocol/server-everything",
+        ]))
+        .expect("parse");
+        assert_eq!(parsed.vendor, Vendor::Cohere);
     }
 
     #[test]
@@ -632,23 +731,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_rejects_cohere_vendor_with_helpful_hint() {
-        let err = parse_args(v(&[
-            "--vendor",
-            "cohere",
-            "config.json",
-            "triggers.jsonl",
-            "/tmp/fs",
-            "--",
-            "npx",
-        ]))
-        .expect_err("expected cohere-rejected error");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("cohere"), "msg: {msg}");
-        assert!(msg.contains("llm-cohere"), "msg: {msg}");
-    }
-
-    #[test]
     fn parse_args_rejects_unknown_vendor() {
         let err = parse_args(v(&[
             "--vendor",
@@ -694,5 +776,56 @@ mod tests {
         ]))
         .expect_err("expected unknown-flag error");
         assert!(format!("{err:#}").contains("--tools"));
+    }
+
+    /// When the binary is built without the `mcp` feature, every run
+    /// errors with a "rebuild with --features mcp" hint regardless of
+    /// vendor. The CLI parse path still works; only `run_inner` rejects.
+    #[tokio::test]
+    #[cfg(not(feature = "mcp"))]
+    async fn run_inner_without_mcp_errors_with_helpful_hint() {
+        let args = Args {
+            vendor: Vendor::Anthropic,
+            model: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            temperature: None,
+            config: PathBuf::from("config.json"),
+            triggers: PathBuf::from("triggers.jsonl"),
+            fs_root: PathBuf::from("/tmp/fs"),
+            spawn: vec!["npx".to_string()],
+        };
+        let err = run_inner(args)
+            .await
+            .expect_err("expected mcp-missing error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("mcp"), "msg: {msg}");
+    }
+
+    /// When the binary is built with `mcp` but without `llm-anthropic`,
+    /// `--vendor anthropic` errors with a "rebuild with --features
+    /// llm-anthropic" hint at the build-client step. Tests the runtime
+    /// feature check path that model-call also uses.
+    ///
+    /// `Arc<dyn ModelClient>` does not impl `Debug`, so we can't use
+    /// `expect_err` — match the result by hand instead.
+    #[test]
+    #[cfg(all(feature = "mcp", not(feature = "llm-anthropic")))]
+    fn build_anthropic_without_feature_errors_with_helpful_hint() {
+        let msg = match build_anthropic_client(None) {
+            Ok(_) => panic!("expected llm-anthropic-missing error"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(msg.contains("llm-anthropic"), "msg: {msg}");
+    }
+
+    /// Cohere counterpart of the anthropic feature-missing test above.
+    #[test]
+    #[cfg(all(feature = "mcp", not(feature = "llm-cohere")))]
+    fn build_cohere_without_feature_errors_with_helpful_hint() {
+        let msg = match build_cohere_client(None) {
+            Ok(_) => panic!("expected llm-cohere-missing error"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(msg.contains("llm-cohere"), "msg: {msg}");
     }
 }
