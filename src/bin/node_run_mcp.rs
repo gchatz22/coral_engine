@@ -150,8 +150,10 @@ async fn run() -> Result<()> {
     let client = Arc::new(client);
 
     let mut tools = ToolRegistry::new();
+    // JAR2-31: thread `Mandate::retry_policy` (when set) into every
+    // `McpTool` we mint for this agent. `None` keeps JAR2-25 defaults.
     let registered = tools
-        .register_mcp_server(Arc::clone(&client))
+        .register_mcp_server_with_policy(Arc::clone(&client), mandate.retry_policy)
         .await
         .context("bulk-registering MCP server tools")?;
     println!(

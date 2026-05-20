@@ -99,6 +99,14 @@ use crate::tools::ToolRegistry;
 use crate::trigger::Trigger;
 use crate::trigger_queue::{SignalSink, TriggerQueue};
 
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+use std::sync::{Arc, Mutex};
+
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+use crate::decide_llm::llm_decide::{LlmDecide, TickTotals};
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+use crate::model_client::CallStats;
+
 /// Reason an agent retired, surfaced from `Agent::run`. Newtype around the
 /// raw string so callers can distinguish a clean retirement from any other
 /// `String` they might be holding.
@@ -559,6 +567,90 @@ fn tool_failure_correction_text(tool: &str, args: &serde_json::Value, error: &st
     )
 }
 
+// ---------- JAR2-33: post-run / between-tick CallStats accessor ----------
+//
+// The accessor and its supporting `StatsHandle` are scoped to
+// `Agent<LlmDecide>` — non-LLM `Decide` impls (test doubles, future
+// non-model decision sources) don't need a stats surface, and per
+// `JAR2-33` we kept the diff minimal by not extending the `Decide` trait
+// with a stats method. The whole section is feature-gated on the
+// `llm-*` features for the same reason `LlmDecide` itself is.
+
+/// Cheap, clonable handle onto an `LlmDecide`'s per-tick `CallStats`
+/// accumulator. Surfaces the same data as `LlmDecide::last_tick_calls` /
+/// `last_tick_totals` but survives `Agent::run` consuming the `LlmDecide`,
+/// so callers can read the most recent tick's stats after the run loop
+/// retires.
+///
+/// **Update timing.** The underlying accumulator is reset at the start of
+/// every `LlmDecide::decide` call and pushed once per upstream
+/// `ModelClient::complete` call. A read in between two `decide`
+/// invocations reflects the *previous* tick — there is no per-tick
+/// history. Before the first `decide` runs the handle reports zero
+/// calls and `TickTotals::default()`.
+///
+/// **Concurrency.** Internally an `Arc<Mutex<Vec<CallStats>>>`. The lock
+/// is held only for the duration of the read; no `await` is performed
+/// while holding it. Cloning the handle is `Arc::clone`-cheap.
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+#[derive(Clone)]
+pub struct StatsHandle {
+    inner: Arc<Mutex<Vec<CallStats>>>,
+}
+
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+impl StatsHandle {
+    /// Per-call stats for the most recent `decide()` invocation, in call
+    /// order. Returns an owned `Vec` (clone of the inner storage) so the
+    /// caller never has to hold the lock.
+    pub fn last_tick_calls(&self) -> Vec<CallStats> {
+        self.inner.lock().expect("stats mutex poisoned").clone()
+    }
+
+    /// Aggregate totals for the most recent `decide()` invocation.
+    /// Returns `TickTotals::default()` before the first `decide` runs.
+    pub fn last_tick_totals(&self) -> TickTotals {
+        let stats = self.inner.lock().expect("stats mutex poisoned");
+        TickTotals::from_calls(&stats)
+    }
+}
+
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+impl Agent<LlmDecide> {
+    /// JAR2-33: capture a `StatsHandle` onto the inner `LlmDecide`'s
+    /// per-tick `CallStats` accumulator. Cheap (one `Arc::clone`). The
+    /// handle outlives the agent — `Agent::run` will consume `self` and
+    /// drop the `LlmDecide`, but the `Arc<Mutex<...>>` storage remains
+    /// reachable through any `StatsHandle` cloned out beforehand.
+    ///
+    /// Typical use in a test:
+    /// ```ignore
+    /// let agent = Agent::new(mandate, fs, decide, registry, health);
+    /// let stats = agent.stats_handle();
+    /// let RetireReason(_) = agent.run().await?;
+    /// let calls = stats.last_tick_calls(); // last tick's CallStats
+    /// ```
+    pub fn stats_handle(&self) -> StatsHandle {
+        StatsHandle {
+            inner: self.decide.stats_handle(),
+        }
+    }
+
+    /// Convenience: per-call stats for the most recent tick, via the
+    /// inner `LlmDecide`. Useful between ticks from a borrow on the
+    /// agent. Post-run callers must use `stats_handle()` to capture a
+    /// handle before `.run()` consumes the agent.
+    pub fn last_tick_calls(&self) -> Vec<CallStats> {
+        self.decide.last_tick_calls()
+    }
+
+    /// Convenience: aggregate totals for the most recent tick. Same
+    /// timing semantics as `StatsHandle::last_tick_totals`.
+    pub fn last_tick_totals(&self) -> TickTotals {
+        self.decide.last_tick_totals()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Unit tests for the JAR2-30 corrective-text helper.
@@ -615,5 +707,222 @@ mod tests {
     fn tool_failure_correction_text_handles_null_args() {
         let s = tool_failure_correction_text("noop", &json!(null), "boom");
         assert!(s.contains("null"), "got: {s}");
+    }
+
+    // ---------- JAR2-33: stats accessor unit tests ----------
+
+    #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+    mod stats_handle_tests {
+        //! Unit tests for the JAR2-33 `StatsHandle` / `Agent<LlmDecide>`
+        //! accessors. End-to-end coverage through `Agent::run` lives in
+        //! the JAR2-21 fixture suites (see
+        //! `tests/llm_fixture_anthropic.rs::unhealthy_then_recovery_cycle_via_agent_run`
+        //! and the Cohere mirror).
+        use super::*;
+        use crate::model_client::{
+            CallStats, CompleteOptions, CompleteRequest, CompleteResponse, ContentBlock,
+            ModelClient, ModelError, ToolCall, Usage, Vendor,
+        };
+        use async_trait::async_trait;
+        use serde_json::json;
+        use std::sync::Mutex as StdMutex;
+
+        /// Minimal scripted `ModelClient`: pops the next `CompleteResponse`
+        /// from a queue on each `complete` call. Mirrors the pattern in
+        /// `decide_llm::llm_decide::tests::MockModelClient` but lives here
+        /// so the agent-side accessor tests don't reach into another
+        /// module's private test surface.
+        struct ScriptedClient {
+            script: StdMutex<Vec<CompleteResponse>>,
+        }
+
+        #[async_trait]
+        impl ModelClient for ScriptedClient {
+            async fn complete(
+                &self,
+                _req: CompleteRequest,
+            ) -> Result<CompleteResponse, ModelError> {
+                let next = self
+                    .script
+                    .lock()
+                    .unwrap()
+                    .drain(..1)
+                    .next()
+                    .expect("ScriptedClient: script exhausted");
+                Ok(next)
+            }
+        }
+
+        fn resp(stats: CallStats, tool_call: ToolCall) -> CompleteResponse {
+            CompleteResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: tool_call.id.clone(),
+                    name: tool_call.name.clone(),
+                    input: tool_call.arguments.clone(),
+                }],
+                tool_calls: vec![tool_call],
+                usage: stats.usage,
+                stats,
+            }
+        }
+
+        fn idle_call() -> ToolCall {
+            ToolCall {
+                id: "toolu_idle".into(),
+                name: "idle".into(),
+                arguments: json!({"next_after": 1000}),
+            }
+        }
+
+        fn stats(input: u32, output: u32, latency_ms: u64) -> CallStats {
+            CallStats {
+                usage: Usage {
+                    input_tokens: input,
+                    output_tokens: output,
+                },
+                latency_ms,
+                vendor: Vendor::Anthropic,
+                model: "test-model".into(),
+            }
+        }
+
+        fn empty_bundle() -> crate::decision::ContextBundle {
+            crate::decision::ContextBundle {
+                mandate: Mandate::new("stats-test", std::time::Duration::from_secs(1), Some(1)),
+                triggers: vec![],
+                recent_outputs: vec![],
+                recent_evidence: vec![],
+                correction: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn stats_handle_zero_before_first_decide() {
+            // A fresh `Agent<LlmDecide>` has run no ticks. The handle must
+            // report no calls and a zero `TickTotals`.
+            let client: Arc<dyn ModelClient> = Arc::new(ScriptedClient {
+                script: StdMutex::new(vec![]),
+            });
+            let decide = LlmDecide::new(client, CompleteOptions::default());
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mandate = Mandate::new("stats-test", std::time::Duration::from_millis(10), Some(1));
+            let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+            let registry = ToolRegistry::new();
+            let health = HealthTracker::open(
+                tmp.path(),
+                crate::health::RetryBudget::default(),
+                Utc::now(),
+            )
+            .unwrap();
+            let agent = Agent::new(mandate, fs, decide, registry, health);
+
+            let handle = agent.stats_handle();
+            assert!(handle.last_tick_calls().is_empty());
+            assert_eq!(handle.last_tick_totals(), TickTotals::default());
+            // Pre-run convenience accessor should agree.
+            assert!(agent.last_tick_calls().is_empty());
+            assert_eq!(agent.last_tick_totals(), TickTotals::default());
+        }
+
+        #[tokio::test]
+        async fn stats_handle_survives_after_run_consumes_agent() {
+            // The core JAR2-33 promise: capture the handle pre-run, run
+            // the agent to retirement (consuming `self`), then read the
+            // most recent tick's stats off the handle.
+            let s = stats(11, 7, 42);
+            let client: Arc<dyn ModelClient> = Arc::new(ScriptedClient {
+                script: StdMutex::new(vec![
+                    // Tick 1: idle → loop continues.
+                    resp(s.clone(), idle_call()),
+                    // Tick 2: retire → loop exits.
+                    resp(
+                        stats(3, 2, 5),
+                        ToolCall {
+                            id: "toolu_retire".into(),
+                            name: "retire".into(),
+                            arguments: json!({"reason": "done"}),
+                        },
+                    ),
+                ]),
+            });
+            let decide = LlmDecide::new(client, CompleteOptions::default());
+            let tmp = tempfile::TempDir::new().unwrap();
+            // Small idle_period + max_ticks cap so the test is fast and
+            // bounded regardless of which retire path actually fires.
+            let mandate = Mandate::new("stats-test", std::time::Duration::from_millis(1), Some(4));
+            let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+            let registry = ToolRegistry::new();
+            let health = HealthTracker::open(
+                tmp.path(),
+                crate::health::RetryBudget::default(),
+                Utc::now(),
+            )
+            .unwrap();
+            let agent = Agent::new(mandate, fs, decide, registry, health);
+
+            // Capture *before* run consumes the agent — this is the API
+            // contract test (c) depends on.
+            let stats_handle = agent.stats_handle();
+
+            let RetireReason(reason) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), agent.run())
+                    .await
+                    .expect("agent retired")
+                    .expect("run ok");
+            assert_eq!(reason, "done");
+
+            // Stats handle must reflect the *last* tick (the retire), not
+            // the first tick (idle). LlmDecide resets its accumulator at
+            // the start of every `decide`.
+            let calls = stats_handle.last_tick_calls();
+            assert_eq!(
+                calls.len(),
+                1,
+                "last tick was a single-call retire decision"
+            );
+            assert_eq!(calls[0].usage.input_tokens, 3);
+            assert_eq!(calls[0].usage.output_tokens, 2);
+            assert_eq!(calls[0].latency_ms, 5);
+
+            let totals = stats_handle.last_tick_totals();
+            assert_eq!(totals.calls, 1);
+            assert_eq!(totals.input_tokens, 3);
+            assert_eq!(totals.output_tokens, 2);
+            assert_eq!(totals.latency_ms, 5);
+        }
+
+        #[tokio::test]
+        async fn stats_handle_is_cheap_to_clone() {
+            // The handle must be cheap to clone and clones must share
+            // storage — otherwise callers can't, say, hand a clone to a
+            // tracing layer and read another clone post-run.
+            let client: Arc<dyn ModelClient> = Arc::new(ScriptedClient {
+                script: StdMutex::new(vec![resp(stats(50, 5, 99), idle_call())]),
+            });
+            let decide = LlmDecide::new(client, CompleteOptions::default());
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mandate = Mandate::new("stats-test", std::time::Duration::from_secs(1), Some(1));
+            let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+            let registry = ToolRegistry::new();
+            let health = HealthTracker::open(
+                tmp.path(),
+                crate::health::RetryBudget::default(),
+                Utc::now(),
+            )
+            .unwrap();
+            let agent = Agent::new(mandate, fs, decide, registry, health);
+
+            let h1 = agent.stats_handle();
+            let h2 = h1.clone();
+            // Drive one tick directly via the inner `decide` (no run
+            // loop) so the test exercises the `decide` reset semantics
+            // without depending on agent scheduling.
+            agent.decide.decide(empty_bundle()).await.unwrap();
+            // Both clones see the same accumulator state.
+            assert_eq!(h1.last_tick_calls(), h2.last_tick_calls());
+            assert_eq!(h1.last_tick_totals(), h2.last_tick_totals());
+            assert_eq!(h1.last_tick_totals().calls, 1);
+            assert_eq!(h1.last_tick_totals().input_tokens, 50);
+        }
     }
 }

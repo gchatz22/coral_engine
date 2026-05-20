@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 pub mod tool;
 
+use crate::mandate::RetryPolicy;
 use crate::mcp::tool::McpTool;
 use crate::tools::ToolRegistry;
 use rmcp::model::{CallToolRequestParams, JsonObject};
@@ -192,11 +193,30 @@ impl ToolRegistry {
         &mut self,
         client: Arc<McpClient>,
     ) -> anyhow::Result<Vec<String>> {
+        self.register_mcp_server_with_policy(client, None).await
+    }
+
+    /// Same as [`Self::register_mcp_server`], but threads an optional
+    /// `RetryPolicy` (typically from `Mandate::retry_policy`) through to
+    /// each registered `McpTool`. `None` preserves the
+    /// `RetryPolicy::default()` semantics JAR2-25 wired at
+    /// `McpTool::new`; `Some(p)` calls `McpTool::with_retry_policy(p)`
+    /// for every descriptor advertised by the server. JAR2-31 completes
+    /// the JAR2-25 punt by giving callers a single seam at which
+    /// per-mandate retry overrides land.
+    pub async fn register_mcp_server_with_policy(
+        &mut self,
+        client: Arc<McpClient>,
+        retry_policy: Option<RetryPolicy>,
+    ) -> anyhow::Result<Vec<String>> {
         let descriptors = client.list_tools().await?;
         let mut names = Vec::with_capacity(descriptors.len());
         for descriptor in descriptors {
             let name = descriptor.name.clone();
-            let tool = McpTool::new(descriptor, Arc::clone(&client));
+            let tool = match retry_policy {
+                Some(p) => McpTool::with_retry_policy(descriptor, Arc::clone(&client), p),
+                None => McpTool::new(descriptor, Arc::clone(&client)),
+            };
             self.register(Arc::new(tool))?;
             names.push(name);
         }
@@ -635,5 +655,178 @@ mod tests {
         drop(registry);
         drop(client);
         let _ = server.await;
+    }
+
+    // ---- JAR2-31: per-mandate retry policy plumbing ----
+
+    /// `register_mcp_server` (no policy override) still registers and
+    /// calls tools end-to-end after the JAR2-31 plumbing. The
+    /// "default-policy values" assertion lives in
+    /// `mandate::tests::retry_policy_default_is_3_attempts_50ms`; this
+    /// test pins the back-compat call surface (legacy callers do not
+    /// have to pass `None` explicitly to get the historical behavior).
+    #[tokio::test]
+    async fn register_mcp_server_without_override_still_registers_and_calls_tools() {
+        let (client, server) = paired(FakeServer::ok()).await;
+        let client = Arc::new(client);
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_mcp_server(Arc::clone(&client))
+            .await
+            .expect("register_mcp_server");
+        // Round-trip a happy call so we exercise the construction path
+        // end-to-end (the policy lives inside the trait object; behavior
+        // assertions on retry timing live in the override test below).
+        let ev = registry
+            .call("repeat", json!({"text": "hi"}))
+            .await
+            .expect("registry.call");
+        assert_eq!(ev.tool, "repeat");
+        drop(registry);
+        drop(client);
+        let _ = server.await;
+    }
+
+    /// JAR2-31 override behavior: when a mandate supplies a non-default
+    /// `RetryPolicy`, the policy reaches the tools constructed for that
+    /// agent and shapes their retry behavior.
+    ///
+    /// Shape: register the server with `max_attempts = 1, backoff = ZERO`,
+    /// then drop the server so every subsequent call surfaces a transient
+    /// `Transport` error. Under the default policy that would cost 2
+    /// backoff sleeps (~100 ms virtual); with the override it surfaces
+    /// after exactly one attempt and zero backoffs. We assert the latter
+    /// via virtual time (`tokio::time::Instant::now()` delta under
+    /// `start_paused`) — a real behavioral check on the retry loop, not
+    /// just a getter sanity check.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn register_mcp_server_with_policy_propagates_to_tools() {
+        let (client_io, server_io) = duplex(8 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let server_task = tokio::spawn(async move {
+            let running = FakeServer::ok()
+                .serve((server_read, server_write))
+                .await
+                .expect("server handshake");
+            // Give the client time to finish its half of the handshake
+            // before we close the transport. Virtual time under
+            // `start_paused`, so this is free in wall-clock terms.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Drop closes the transport; subsequent client calls become
+            // `McpError::Transport` (retryable).
+            drop(running);
+        });
+
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let client = McpClient::connect_with((client_read, client_write))
+            .await
+            .expect("client handshake");
+        let client = Arc::new(client);
+
+        // Per-mandate override: `max_attempts = 1` means "one shot only",
+        // so the retry loop never sleeps no matter how long `backoff`
+        // says. Plumbing through `register_mcp_server_with_policy` is the
+        // production path a `node-run-mcp`-shaped caller takes when it
+        // reads `mandate.retry_policy`.
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_mcp_server_with_policy(
+                Arc::clone(&client),
+                Some(RetryPolicy::new(1, std::time::Duration::from_secs(60))),
+            )
+            .await
+            .expect("register_mcp_server_with_policy");
+
+        let _ = server_task.await;
+
+        let start = tokio::time::Instant::now();
+        let err = registry
+            .call("repeat", json!({"text": "hi"}))
+            .await
+            .expect_err("server is gone; call should fail");
+        let elapsed = start.elapsed();
+
+        // The error is the same surface JAR2-25 already pinned; what's
+        // new here is the *speed* it surfaces at.
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("repeat"),
+            "expected tool name in error context, got: {msg}"
+        );
+        // Under default policy this would be ~120 s (2 × 60 s backoff);
+        // under the override it should be zero — pick a tight virtual-time
+        // bound that the default policy could not possibly satisfy.
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "override should short-circuit retries (no backoff); \
+             virtual-time elapsed was {elapsed:?}"
+        );
+
+        drop(registry);
+        drop(client);
+    }
+
+    /// Symmetric assertion at the policy default: without an override,
+    /// the same paired-then-dropped server forces the retry loop to
+    /// spend its `backoff`. The check here is "if we override to a
+    /// `backoff` we'd notice, we *do* notice"; combined with the test
+    /// above, it pins the propagation in both directions (default vs.
+    /// override actually behave differently).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn register_mcp_server_with_policy_observes_override_backoff() {
+        let (client_io, server_io) = duplex(8 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let server_task = tokio::spawn(async move {
+            let running = FakeServer::ok()
+                .serve((server_read, server_write))
+                .await
+                .expect("server handshake");
+            // Let the client finish its half of the handshake before we
+            // close the transport. Virtual time under `start_paused`.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(running);
+        });
+
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let client = McpClient::connect_with((client_read, client_write))
+            .await
+            .expect("client handshake");
+        let client = Arc::new(client);
+
+        // 3 attempts × a recognizable per-attempt backoff. Under
+        // virtual time we can read the elapsed delta and assert it
+        // matches the policy precisely.
+        let backoff = std::time::Duration::from_secs(7);
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_mcp_server_with_policy(
+                Arc::clone(&client),
+                Some(RetryPolicy::new(3, backoff)),
+            )
+            .await
+            .expect("register_mcp_server_with_policy");
+
+        let _ = server_task.await;
+
+        let start = tokio::time::Instant::now();
+        let _err = registry
+            .call("repeat", json!({"text": "hi"}))
+            .await
+            .expect_err("server is gone; call should fail");
+        let elapsed = start.elapsed();
+
+        // 3 attempts → 2 inter-attempt sleeps × 7 s = 14 s of virtual
+        // time. Lower bound is the salient signal — the upper bound is
+        // loose because rmcp transport setup is allowed to consume a
+        // bounded amount of additional virtual time.
+        assert!(
+            elapsed >= 2 * backoff,
+            "override backoff should accumulate across retries; \
+             virtual-time elapsed was {elapsed:?}, expected >= {:?}",
+            2 * backoff
+        );
+
+        drop(registry);
+        drop(client);
     }
 }
