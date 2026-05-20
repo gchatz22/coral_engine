@@ -30,59 +30,20 @@
 //! supervision live in JAR2-24 and the parent ticket respectively.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tracing::warn;
 
+use crate::mandate::RetryPolicy;
 use crate::mcp::{McpClient, McpError, McpToolDescriptor};
 use crate::tools::Tool;
 
-/// Retry policy for `McpTool::call`. Bounds attempts and the fixed delay
-/// between them. "Simple backoff" per the JAR2-25 spec — a fixed sleep
-/// keeps semantics auditable and avoids pulling in a backoff crate; a
-/// future ticket can swap in jittered exponential if real traffic
-/// motivates it.
-///
-/// Defaults: 3 total attempts, 50 ms between retries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RetryPolicy {
-    /// Total attempts including the first. `1` disables retry (one shot
-    /// only). `0` is rejected at construction.
-    pub max_attempts: u32,
-    /// Fixed sleep between retries. Set to `Duration::ZERO` in tests so
-    /// they do not pay for wall-clock backoff.
-    pub backoff: Duration,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: 3,
-            backoff: Duration::from_millis(50),
-        }
-    }
-}
-
-impl RetryPolicy {
-    /// Build a policy with `max_attempts` total attempts and `backoff`
-    /// between them. `max_attempts` is clamped to at least `1` — a
-    /// zero-attempt policy is a wiring bug, not a useful state.
-    pub fn new(max_attempts: u32, backoff: Duration) -> Self {
-        Self {
-            max_attempts: max_attempts.max(1),
-            backoff,
-        }
-    }
-
-    /// Convenience for tests: retry-3 with zero backoff so the retry loop
-    /// runs at virtual-time speed under `tokio::test(start_paused = true)`.
-    #[cfg(test)]
-    pub fn test_immediate(max_attempts: u32) -> Self {
-        Self::new(max_attempts, Duration::ZERO)
-    }
-}
+// `RetryPolicy` itself lives in `crate::mandate` (JAR2-31) so it can be a
+// field on `Mandate` without forcing that struct's API or wire format to
+// depend on the `mcp` cargo feature. The retry mechanics — what counts as
+// transient, when to back off, when to surface — still live here because
+// that is where `McpTool::call` exercises them.
 
 /// `Tool` impl that proxies one named MCP tool to a shared `McpClient`.
 ///
@@ -103,11 +64,11 @@ impl McpTool {
     }
 
     /// Build an `McpTool` with an explicit retry policy. Intended for
-    /// callers that want a per-tool override (e.g. a high-cost or
-    /// non-idempotent tool that should retry zero or one times). The
-    /// ticket's "overridable per-mandate" requirement is satisfied here
-    /// by per-tool override at construction; full plumbing through
-    /// `Mandate` is a follow-up.
+    /// callers that want an override (e.g. a high-cost or non-idempotent
+    /// tool that should retry zero or one times). Per-mandate overrides
+    /// reach this constructor via `ToolRegistry::register_mcp_server_with_policy`
+    /// (JAR2-31), which consults `Mandate::retry_policy` at registration
+    /// time.
     pub fn with_retry_policy(
         descriptor: McpToolDescriptor,
         client: Arc<McpClient>,
@@ -229,6 +190,7 @@ mod tests {
     use rmcp::{ErrorData, ServiceExt};
     use serde_json::json;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::io::duplex;
 
     /// Hand-built fake server. Mirrors the one in `mcp::tests` (kept local
@@ -374,8 +336,14 @@ mod tests {
         let _ = server.await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn transport_drop_mid_call_surfaces_as_tool_error() {
+        // JAR2-31: under `start_paused`, the 50 ms server-side sleep and
+        // the per-retry backoff inside `McpTool::call` advance virtually,
+        // so the test no longer pays the ~100 ms wall-clock cost JAR2-25
+        // added. The zero-backoff `test_immediate` policy is belt-and-
+        // braces: even without paused time, the retry loop would not
+        // sleep between attempts.
         let (client_io, server_io) = duplex(8 * 1024);
         let (server_read, server_write) = tokio::io::split(server_io);
 
@@ -385,7 +353,7 @@ mod tests {
                 .serve((server_read, server_write))
                 .await
                 .expect("server handshake");
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
             drop(running);
         });
 
@@ -393,7 +361,11 @@ mod tests {
         let client = McpClient::connect_with((client_read, client_write))
             .await
             .expect("client handshake");
-        let tool = McpTool::new(descriptor("repeat"), Arc::new(client));
+        let tool = McpTool::with_retry_policy(
+            descriptor("repeat"),
+            Arc::new(client),
+            RetryPolicy::test_immediate(3),
+        );
 
         let _ = server_task.await;
         let err = tool.call(json!({"text": "hi"})).await.unwrap_err();
