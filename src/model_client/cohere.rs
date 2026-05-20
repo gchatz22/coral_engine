@@ -135,15 +135,37 @@ impl ModelClient for CohereClient {
         if status != 200 {
             return Err(map_status_error(status, &bytes));
         }
-        let mut parsed = parse_response(&bytes)?;
-        parsed.stats = CallStats {
+        let parsed = parse_response(&bytes)?;
+        let stats = CallStats {
             usage: parsed.usage,
             latency_ms,
             vendor: Vendor::Cohere,
             model: self.model.clone(),
         };
-        Ok(parsed)
+        Ok(CompleteResponse {
+            content: parsed.content,
+            tool_calls: parsed.tool_calls,
+            usage: parsed.usage,
+            stats,
+        })
     }
+}
+
+/// Output of the pure `parse_response` helper.
+///
+/// `parse_response` is intentionally vendor-blind to anything not on the
+/// wire — it does not know latency (the HTTP call hasn't happened yet from
+/// its point of view), the vendor tag, or the model id (those live on the
+/// `CohereClient`). `complete` composes a `ParsedComplete` with those
+/// extras to mint the public `CompleteResponse` + `CallStats`.
+///
+/// Crate-private: it's an implementation detail of the parse/complete
+/// split, not part of the `ModelClient` surface.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ParsedComplete {
+    pub content: Vec<ContentBlock>,
+    pub tool_calls: Vec<ToolCall>,
+    pub usage: Usage,
 }
 
 /// Build the request body Cohere expects. Pure: no I/O, no env access.
@@ -266,13 +288,17 @@ fn render_text_content(blocks: &[ContentBlock]) -> String {
         .join("")
 }
 
-/// Parse a 200 OK response body into the trait's `CompleteResponse`.
+/// Parse a 200 OK response body into a `ParsedComplete`.
+///
+/// Vendor-blind on purpose: this function knows nothing about latency, the
+/// vendor tag, or the model id. `complete` composes the result with those
+/// extras to mint the public `CompleteResponse` + `CallStats`.
 ///
 /// Synthesizes `ContentBlock::ToolUse` blocks from `message.tool_calls[]`
 /// so `content` mirrors the Anthropic adapter's invariant (every call is
 /// visible in both `content` and the flat `tool_calls` projection). Unknown
 /// content-block types (`thinking`, future additions) are tolerated.
-pub fn parse_response(body: &[u8]) -> Result<CompleteResponse, ModelError> {
+pub(crate) fn parse_response(body: &[u8]) -> Result<ParsedComplete, ModelError> {
     let v: Value = serde_json::from_slice(body)
         .map_err(|e| ModelError::Parse(format!("response body is not JSON: {e}")))?;
 
@@ -357,17 +383,13 @@ pub fn parse_response(body: &[u8]) -> Result<CompleteResponse, ModelError> {
         .ok_or_else(|| ModelError::Parse("usage.tokens missing `output_tokens`".into()))?
         as u32;
 
-    Ok(CompleteResponse {
+    Ok(ParsedComplete {
         content,
         tool_calls,
         usage: Usage {
             input_tokens,
             output_tokens,
         },
-        // `parse_response` is pure — it can't see latency, vendor, or
-        // model. The async `complete` overwrites this default with the
-        // real `CallStats` before returning.
-        stats: CallStats::default(),
     })
 }
 
