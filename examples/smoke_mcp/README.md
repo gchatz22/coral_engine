@@ -125,9 +125,13 @@ This is the gate the test prints when it is skipped.
 
 ## Adjacent follow-ups
 
-* **CI integration.** Running this smoke on CI requires Node + npm on
-  the runner plus the cache-permissions issue described below. The
-  ticket leaves CI integration as a follow-up.
+* **CI integration.** Wired in JAR2-34 (`mcp-smoke` job) and JAR2-35
+  (`runbook-smoke` job) in `.github/workflows/ci.yml`. Both pin
+  `@modelcontextprotocol/server-everything` via the workflow-level
+  `MCP_SERVER_EVERYTHING_VERSION` env var; bumping that version
+  requires recomputing the evidence id hardcoded in
+  `decisions.jsonl` (see "Recomputing the evidence id" above) and
+  updating the `assert_smoke.sh` expectation in the same PR.
 * **Stale npm cache permissions.** A long-lived dev environment can
   end up with `~/.npm/_cacache/content-v2/sha512/<xx>/` directories
   owned by `root` (a stray `sudo npm install` years ago), which makes
