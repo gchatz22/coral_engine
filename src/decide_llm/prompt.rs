@@ -64,10 +64,23 @@ use crate::trigger::Trigger;
 /// Standing instructions appended after the mandate text in the system
 /// message. Promoted to a module-level constant so the snapshot tests can
 /// assert against the exact same string the renderer emits.
+///
+/// Invariant 2's "at most one tool call per response" clause is the
+/// prompt-side defense for JAR2-37 Bug B-narrow: the runtime is
+/// one-`Decision`-per-tick, so K parallel `tool_use` blocks in a single
+/// assistant response would parse as `MultipleCalls` and trigger a
+/// retry that replays unpaired `tool_use` blocks back to the vendor
+/// (HTTP 400). The Anthropic adapter additionally sets
+/// `tool_choice.disable_parallel_tool_use: true` at the request layer —
+/// belt-and-suspenders, because prompt instructions alone aren't enough
+/// for the live Anthropic case (observed parallel emissions even with
+/// "one decision per turn" already in the prompt). Cohere's V2 chat API
+/// has no equivalent flag (verified against the public schema as of
+/// 2026-05), so for Cohere this prompt invariant *is* the only lever.
 const INVARIANTS: &str = "\
 Invariants:
 1. Provenance by construction. Every `emit_output` decision must include `evidence` ids that all resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.
-2. One decision per turn. Reply by calling exactly one decision tool: `call_tool`, `emit_output`, `rewrite_fs`, `idle`, or `retire`. Use `idle` to wait without producing work; use `retire` to stop running.
+2. One decision per turn. Reply by calling exactly one decision tool: `call_tool`, `emit_output`, `rewrite_fs`, `idle`, or `retire`. Use `idle` to wait without producing work; use `retire` to stop running. Emit at most one tool call per response; if you need multiple calls, issue them one per response and wait for each result before the next.
 3. Evidence comes from tool calls. Use `call_tool` to invoke a runtime tool; the result is captured as a fresh evidence record that later `emit_output` decisions can cite.";
 
 /// Render a `ContextBundle` into the message list a `ModelClient::complete`
@@ -385,7 +398,7 @@ mod tests {
              \n\
              Invariants:\n\
              1. Provenance by construction. Every `emit_output` decision must include `evidence` ids that all resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.\n\
-             2. One decision per turn. Reply by calling exactly one decision tool: `call_tool`, `emit_output`, `rewrite_fs`, `idle`, or `retire`. Use `idle` to wait without producing work; use `retire` to stop running.\n\
+             2. One decision per turn. Reply by calling exactly one decision tool: `call_tool`, `emit_output`, `rewrite_fs`, `idle`, or `retire`. Use `idle` to wait without producing work; use `retire` to stop running. Emit at most one tool call per response; if you need multiple calls, issue them one per response and wait for each result before the next.\n\
              3. Evidence comes from tool calls. Use `call_tool` to invoke a runtime tool; the result is captured as a fresh evidence record that later `emit_output` decisions can cite."
         );
     }

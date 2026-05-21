@@ -236,6 +236,26 @@ pub fn build_body(req: &CompleteRequest, model: &str) -> Value {
             })
             .collect();
         body.insert("tools".into(), Value::Array(tools));
+        // JAR2-37 Bug B-narrow: force one-tool-per-response so the
+        // model can't emit K parallel `tool_use` blocks in a single
+        // assistant turn. `LlmDecide` / `Decision` is one-decision-per-tick;
+        // parallel `tool_use` blocks would parse as `MultipleCalls`,
+        // trigger the corrective retry, and that retry replays the
+        // unpaired `tool_use` blocks back to Anthropic which then
+        // returns HTTP 400 "`tool_use` ids were found without
+        // `tool_result` blocks immediately after". Disabling parallel
+        // tool use at the request layer prevents that whole loop.
+        // Documented behavior of Anthropic's Messages API: nested under
+        // `tool_choice`, applies to `auto` and `any`. Only sent when
+        // there are tools to choose from — `tool_choice` is undefined
+        // on tool-less requests.
+        body.insert(
+            "tool_choice".into(),
+            json!({
+                "type": "auto",
+                "disable_parallel_tool_use": true,
+            }),
+        );
     }
     Value::Object(body)
 }
@@ -461,6 +481,13 @@ mod tests {
                     "required": ["location"],
                 },
             }],
+            // JAR2-37 Bug B-narrow: force at most one tool_use block per
+            // assistant response so the one-Decision-per-tick invariant
+            // holds end-to-end.
+            "tool_choice": {
+                "type": "auto",
+                "disable_parallel_tool_use": true,
+            },
         });
         assert_eq!(body, expected);
     }
@@ -479,8 +506,45 @@ mod tests {
         assert!(body.get("temperature").is_none(), "no temperature field");
         assert!(body.get("system").is_none(), "no system field");
         assert!(body.get("tools").is_none(), "no tools field");
+        // JAR2-37: `tool_choice` is meaningless without `tools`, so it
+        // must also be absent on tool-less requests.
+        assert!(
+            body.get("tool_choice").is_none(),
+            "no tool_choice when tools list is empty"
+        );
         assert_eq!(body["max_tokens"], json!(32));
         assert_eq!(body["model"], json!("m"));
+    }
+
+    #[test]
+    fn build_body_sets_tool_choice_disable_parallel_when_tools_present() {
+        // Regression for the JAR2-37 Bug B-narrow contract: every
+        // tool-bearing request must publish
+        // `tool_choice: {"type": "auto", "disable_parallel_tool_use": true}`
+        // so the model never returns K parallel `tool_use` blocks the
+        // one-Decision-per-tick parser can't handle.
+        let req = CompleteRequest {
+            messages: vec![Message::user("hi")],
+            tools: vec![ToolSpec {
+                name: "echo".into(),
+                description: "echo".into(),
+                input_schema: json!({"type": "object"}),
+            }],
+            options: CompleteOptions {
+                max_tokens: 32,
+                temperature: None,
+            },
+        };
+        let body = build_body(&req, "m");
+        assert_eq!(
+            body["tool_choice"],
+            json!({
+                "type": "auto",
+                "disable_parallel_tool_use": true,
+            }),
+            "tool_choice must disable parallel tool use, got: {}",
+            body["tool_choice"],
+        );
     }
 
     #[test]
