@@ -221,7 +221,19 @@ pub fn build_body(req: &CompleteRequest, model: &str) -> Value {
                         }
                     }
                 }
-                entry.insert("content".into(), json!(text_chunks.join("")));
+                // Cohere validates every assistant message as having
+                // either non-empty `content` OR a `tool_calls` array
+                // ("must have non-empty content or tool calls", HTTP 400).
+                // An empty-string `content` counts as empty by that rule,
+                // so when the assistant turn is tool-call-only we must
+                // *omit* the field entirely rather than send `""`. The
+                // `content` field is documented as optional on the
+                // `AssistantMessageResponse` schema, so dropping it is
+                // safe on the text-too path as well (no API change).
+                let joined = text_chunks.join("");
+                if !joined.is_empty() {
+                    entry.insert("content".into(), json!(joined));
+                }
                 if !tool_calls.is_empty() {
                     entry.insert("tool_calls".into(), Value::Array(tool_calls));
                 }
@@ -514,6 +526,117 @@ mod tests {
         assert_eq!(body["max_tokens"], json!(32));
         assert_eq!(body["model"], json!("m"));
         assert_eq!(body["stream"], json!(false));
+    }
+
+    #[test]
+    fn build_body_omits_content_on_assistant_turn_with_tool_calls_only() {
+        // Regression: Cohere rejects assistant messages whose `content`
+        // is an empty string and that carry tool_calls
+        // ("invalid request: ... must have non-empty content or tool calls",
+        // HTTP 400). The adapter must omit the `content` field entirely
+        // on a tool-call-only assistant turn rather than emit `""`.
+        let req = CompleteRequest {
+            messages: vec![
+                Message::user("go"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_42".into(),
+                        name: "echo".into(),
+                        input: json!({"msg": "hi"}),
+                    }],
+                },
+                Message {
+                    role: Role::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_42".into(),
+                        content: "hi".into(),
+                    }],
+                },
+            ],
+            tools: vec![],
+            options: CompleteOptions {
+                max_tokens: 32,
+                temperature: None,
+            },
+        };
+        let body = build_body(&req, "m");
+        let msgs = body["messages"].as_array().unwrap();
+        // user + assistant + tool
+        assert_eq!(msgs.len(), 3);
+        let assistant = &msgs[1];
+        assert_eq!(assistant["role"], json!("assistant"));
+        assert!(
+            assistant.get("content").is_none(),
+            "tool-call-only assistant turn must omit `content`, got: {assistant}"
+        );
+        assert!(
+            assistant.get("tool_calls").is_some(),
+            "tool-call-only assistant turn must keep `tool_calls`"
+        );
+    }
+
+    #[test]
+    fn build_body_keeps_content_on_assistant_turn_with_text_and_tool_calls() {
+        // Mixed shape (some text + tool_calls) keeps `content` populated.
+        // The golden test covers the happy text-only-then-tool path; this
+        // test pins the "text and tool calls both present" boundary so a
+        // future refactor of the omission rule doesn't accidentally drop
+        // useful text content.
+        let req = CompleteRequest {
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "calling".into(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "c1".into(),
+                        name: "echo".into(),
+                        input: json!({"msg": "hi"}),
+                    },
+                ],
+            }],
+            tools: vec![],
+            options: CompleteOptions {
+                max_tokens: 32,
+                temperature: None,
+            },
+        };
+        let body = build_body(&req, "m");
+        let assistant = &body["messages"][0];
+        assert_eq!(assistant["content"], json!("calling"));
+        assert!(assistant.get("tool_calls").is_some());
+    }
+
+    #[test]
+    fn build_body_omits_content_on_assistant_turn_with_neither_text_nor_tool_calls() {
+        // Degenerate input: an assistant turn whose only content is a
+        // ToolResult block (which the assistant arm drops). The renderer
+        // is upstream's job to keep well-formed, but if we ever feed
+        // such a turn through, the result must still be valid Cohere
+        // wire format. Omitting `content` is the right call; the message
+        // will still fail Cohere's "non-empty content OR tool_calls"
+        // check, but the failure surfaces server-side rather than as a
+        // silent empty-string send.
+        let req = CompleteRequest {
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "x".into(),
+                    content: "ignored".into(),
+                }],
+            }],
+            tools: vec![],
+            options: CompleteOptions {
+                max_tokens: 8,
+                temperature: None,
+            },
+        };
+        let body = build_body(&req, "m");
+        let assistant = &body["messages"][0];
+        assert!(assistant.get("content").is_none());
+        assert!(assistant.get("tool_calls").is_none());
     }
 
     #[test]
