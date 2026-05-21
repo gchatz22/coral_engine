@@ -264,6 +264,16 @@ pub fn build_body(req: &CompleteRequest, model: &str) -> Value {
     if let Some(t) = req.options.temperature {
         body.insert("temperature".into(), json!(t));
     }
+    // Cohere V2 chat defaults `citation_options.mode` to `"ACCURATE"`,
+    // which makes the model wrap grounded spans in inline `<co>...</co: 0:[N]>`
+    // markers inside its text content whenever it thinks a span is
+    // supported by a tool result. That markup leaks straight into the
+    // text our `EmitOutput` decisions carry, polluting outputs end-to-end.
+    // `"OFF"` disables citation generation entirely (verified against
+    // the V2 chat API spec, 2026-05). Set unconditionally — the engine
+    // does its own provenance via the `evidence` array on `Output`, so
+    // vendor-side citation markup is pure noise for us.
+    body.insert("citation_options".into(), json!({ "mode": "OFF" }));
     body.insert("messages".into(), Value::Array(messages));
     if !req.tools.is_empty() {
         let tools: Vec<Value> = req
@@ -473,6 +483,7 @@ mod tests {
             "stream": false,
             "max_tokens": 256,
             "temperature": 0.0,
+            "citation_options": {"mode": "OFF"},
             "messages": [
                 {"role": "system", "content": "be terse"},
                 {"role": "user", "content": "what's the weather?"},
@@ -526,6 +537,33 @@ mod tests {
         assert_eq!(body["max_tokens"], json!(32));
         assert_eq!(body["model"], json!("m"));
         assert_eq!(body["stream"], json!(false));
+        // `citation_options` is unconditional, not gated on tools/temperature.
+        assert_eq!(body["citation_options"], json!({"mode": "OFF"}));
+    }
+
+    #[test]
+    fn build_body_disables_cohere_citation_markup() {
+        // JAR2-37 Bug C regression. Cohere V2 chat defaults
+        // `citation_options.mode` to `"ACCURATE"`, which wraps grounded
+        // spans in `<co>...</co: 0:[N]>` markers inside the assistant
+        // text. That markup was leaking into our `EmitOutput` content
+        // verbatim. The adapter must set `citation_options.mode == "OFF"`
+        // on every request to suppress it. Asserted as a top-level field
+        // on the wire body; the exact value is part of the API contract.
+        let req = CompleteRequest {
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            options: CompleteOptions {
+                max_tokens: 8,
+                temperature: None,
+            },
+        };
+        let body = build_body(&req, "m");
+        assert_eq!(
+            body["citation_options"],
+            json!({"mode": "OFF"}),
+            "citation_options.mode must be the exact string \"OFF\"; got body: {body}"
+        );
     }
 
     #[test]

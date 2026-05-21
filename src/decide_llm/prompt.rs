@@ -80,7 +80,7 @@ use crate::trigger::Trigger;
 const INVARIANTS: &str = "\
 Invariants:
 1. Provenance by construction. Every `emit_output` decision must include `evidence` ids that all resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.
-2. One decision per turn. Reply by calling exactly one decision tool: `call_tool`, `emit_output`, `rewrite_fs`, `idle`, or `retire`. Use `idle` to wait without producing work; use `retire` to stop running. Emit at most one tool call per response; if you need multiple calls, issue them one per response and wait for each result before the next.
+2. One decision per turn. Reply by calling exactly one decision tool: `call_tool`, `emit_output`, `rewrite_fs`, `idle`, or `retire`. Use `idle` to wait without producing work; use `retire` to stop running. Emit at most one tool call per response; if you need multiple calls, issue them one per response and wait for each result before the next. If the most recent Output in the context bundle already satisfies the mandate, call `retire` next instead of re-emitting the same Output.
 3. Evidence comes from tool calls. Use `call_tool` to invoke a runtime tool; the result is captured as a fresh evidence record that later `emit_output` decisions can cite.";
 
 /// Render a `ContextBundle` into the message list a `ModelClient::complete`
@@ -398,7 +398,7 @@ mod tests {
              \n\
              Invariants:\n\
              1. Provenance by construction. Every `emit_output` decision must include `evidence` ids that all resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.\n\
-             2. One decision per turn. Reply by calling exactly one decision tool: `call_tool`, `emit_output`, `rewrite_fs`, `idle`, or `retire`. Use `idle` to wait without producing work; use `retire` to stop running. Emit at most one tool call per response; if you need multiple calls, issue them one per response and wait for each result before the next.\n\
+             2. One decision per turn. Reply by calling exactly one decision tool: `call_tool`, `emit_output`, `rewrite_fs`, `idle`, or `retire`. Use `idle` to wait without producing work; use `retire` to stop running. Emit at most one tool call per response; if you need multiple calls, issue them one per response and wait for each result before the next. If the most recent Output in the context bundle already satisfies the mandate, call `retire` next instead of re-emitting the same Output.\n\
              3. Evidence comes from tool calls. Use `call_tool` to invoke a runtime tool; the result is captured as a fresh evidence record that later `emit_output` decisions can cite."
         );
     }
