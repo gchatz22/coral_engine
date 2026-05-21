@@ -65,7 +65,20 @@ use crate::trigger::Trigger;
 /// message. Promoted to a module-level constant so the snapshot tests can
 /// assert against the exact same string the renderer emits.
 ///
-/// Invariant 2's "at most one tool call per response" clause is the
+/// The list is split into six short, single-purpose clauses rather than a
+/// few dense paragraphs. Empirically (JAR2-37, observed Cohere behavior)
+/// the model would re-emit Outputs across consecutive turns when the
+/// "do not re-emit" rule was buried as the last sentence of a long
+/// paragraph and worded conditionally ("if the most recent Output already
+/// satisfies the mandate, retire"). The model has attention to spend on
+/// the system prompt; we spend it by giving the no-re-emit rule its own
+/// numbered clause (invariant 5) with unconditional phrasing ("once you
+/// have emitted any Output on this run, your next decision must be
+/// `retire`") and by explicitly tagging the recent-outputs window as
+/// *yours* so the model treats those entries as work it already did
+/// rather than ambient context.
+///
+/// Invariant 3's "at most one tool call per response" clause is the
 /// prompt-side defense for JAR2-37 Bug B-narrow: the runtime is
 /// one-`Decision`-per-tick, so K parallel `tool_use` blocks in a single
 /// assistant response would parse as `MultipleCalls` and trigger a
@@ -79,9 +92,12 @@ use crate::trigger::Trigger;
 /// 2026-05), so for Cohere this prompt invariant *is* the only lever.
 const INVARIANTS: &str = "\
 Invariants:
-1. Provenance by construction. Every `emit_output` decision must include `evidence` ids that all resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.
-2. One decision per turn. Reply by calling exactly one decision tool: `call_tool`, `emit_output`, `rewrite_fs`, `idle`, or `retire`. Use `idle` to wait without producing work; use `retire` to stop running. Emit at most one tool call per response; if you need multiple calls, issue them one per response and wait for each result before the next. If the most recent Output in the context bundle already satisfies the mandate, call `retire` next instead of re-emitting the same Output.
-3. Evidence comes from tool calls. Use `call_tool` to invoke a runtime tool; the result is captured as a fresh evidence record that later `emit_output` decisions can cite.";
+1. Provenance. Every `emit_output` decision must cite `evidence` ids that resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.
+2. One decision per turn. Reply by calling exactly one decision tool: `call_tool`, `emit_output`, `rewrite_fs`, `idle`, or `retire`.
+3. One tool call per response. If you need K tool calls, issue them one per response and wait for each result before the next. Parallel `tool_use` blocks in a single response will fail.
+4. Evidence comes from tool calls. The result of a `call_tool` becomes a fresh evidence record that later `emit_output` decisions can cite.
+5. Do not re-emit. Once you have emitted any Output on this run, your next decision must be `retire`. Do not emit a revised, paraphrased, or improved version of a prior Output. Outputs shown in the \"Recent outputs by you on this run\" window were emitted by you and count toward this rule.
+6. Retire is final. After the mandate's required Output has been emitted, `retire` is the only correct decision.";
 
 /// Render a `ContextBundle` into the message list a `ModelClient::complete`
 /// call should send.
@@ -166,7 +182,7 @@ fn render_triggers(triggers: &[Trigger]) -> String {
 /// ids that justify it. `OutputId` and `created_at` are deliberately
 /// dropped — see module docs.
 fn render_outputs(outputs: &[Output]) -> String {
-    let mut s = format!("# Recent outputs ({})", outputs.len());
+    let mut s = format!("# Recent outputs by you on this run ({})", outputs.len());
     for o in outputs {
         s.push_str("\n\n- content: ");
         s.push_str(&serde_json::to_string(&o.content).expect("string serializes"));
@@ -397,9 +413,12 @@ mod tests {
              Watch the FDA holds list and report drug-program risk.\n\
              \n\
              Invariants:\n\
-             1. Provenance by construction. Every `emit_output` decision must include `evidence` ids that all resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.\n\
-             2. One decision per turn. Reply by calling exactly one decision tool: `call_tool`, `emit_output`, `rewrite_fs`, `idle`, or `retire`. Use `idle` to wait without producing work; use `retire` to stop running. Emit at most one tool call per response; if you need multiple calls, issue them one per response and wait for each result before the next. If the most recent Output in the context bundle already satisfies the mandate, call `retire` next instead of re-emitting the same Output.\n\
-             3. Evidence comes from tool calls. Use `call_tool` to invoke a runtime tool; the result is captured as a fresh evidence record that later `emit_output` decisions can cite."
+             1. Provenance. Every `emit_output` decision must cite `evidence` ids that resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.\n\
+             2. One decision per turn. Reply by calling exactly one decision tool: `call_tool`, `emit_output`, `rewrite_fs`, `idle`, or `retire`.\n\
+             3. One tool call per response. If you need K tool calls, issue them one per response and wait for each result before the next. Parallel `tool_use` blocks in a single response will fail.\n\
+             4. Evidence comes from tool calls. The result of a `call_tool` becomes a fresh evidence record that later `emit_output` decisions can cite.\n\
+             5. Do not re-emit. Once you have emitted any Output on this run, your next decision must be `retire`. Do not emit a revised, paraphrased, or improved version of a prior Output. Outputs shown in the \"Recent outputs by you on this run\" window were emitted by you and count toward this rule.\n\
+             6. Retire is final. After the mandate's required Output has been emitted, `retire` is the only correct decision."
         );
     }
 
@@ -474,7 +493,7 @@ mod tests {
         assert_eq!(msgs.len(), 2);
 
         let expected = format!(
-            "# Recent outputs (2)\n\
+            "# Recent outputs by you on this run (2)\n\
              \n\
              - content: \"first claim\"\n  evidence: [\"{}\"]\n\
              \n\
@@ -625,7 +644,7 @@ mod tests {
         assert_eq!(
             text(&msgs[1]),
             format!(
-                "# Recent outputs (1)\n\n- content: \"she said \\\"hi\\\"\\nthen left\"\n  evidence: [\"{}\"]",
+                "# Recent outputs by you on this run (1)\n\n- content: \"she said \\\"hi\\\"\\nthen left\"\n  evidence: [\"{}\"]",
                 ev.as_str()
             )
         );
