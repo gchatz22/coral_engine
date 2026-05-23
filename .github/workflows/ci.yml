@@ -32,6 +32,12 @@ jobs:
           toolchain: "1.88"
           components: rustfmt, clippy
 
+      # `temporalio-sdk` pulls `prost-wkt-types` which needs `protoc` at
+      # build time. JAR2-41 added the SDK; this step is the workspace-level
+      # consequence. Confirmed via the build-script error in CI run 26342189004.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: cargo build
         run: cargo build --workspace --all-targets --locked
 
@@ -65,6 +71,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.88"
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       # Features live on `jarvis_node`, not the workspace. After the
       # JAR2-40 split, cross-crate selection takes the `<crate>/<feature>`
