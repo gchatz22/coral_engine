@@ -43,7 +43,9 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 
 use jarvis_node::agent::{Agent, RetireReason};
-use jarvis_node::decision::{ClaimSeed, ContextBundle, Decide, Decision, FsOp, MockDecide};
+use jarvis_node::decision::{
+    ClaimSeed, ContextBundle, Decide, Decision, FsOp, MockDecide, ToolCall,
+};
 use jarvis_node::evidence::{EvidenceId, EvidenceRecord};
 use jarvis_node::fs::AgentFs;
 use jarvis_node::health::{HealthTracker, RetryBudget};
@@ -282,10 +284,12 @@ async fn call_tool_records_evidence_and_emit_output_consumes_it() {
     let expected_ev = EvidenceId::new("echo", &args, &result);
 
     let script = vec![
-        Decision::CallTool {
-            name: "echo".into(),
-            args: args.clone(),
-            claim_seed: ClaimSeed::new("seed-1"),
+        Decision::CallTools {
+            calls: vec![ToolCall::new(
+                "echo",
+                args.clone(),
+                ClaimSeed::new("seed-1"),
+            )],
         },
         Decision::EmitOutput {
             content: "echoed".into(),
@@ -387,10 +391,12 @@ async fn invalid_call_tool_stages_correction_then_recovers() {
         // Tick 1: model picks a tool that is not registered. Apply-time
         // failure → record_failure(Inference) → counter=1 (under default
         // budget of 1) → pending_correction set for the next tick.
-        Decision::CallTool {
-            name: "no_such_tool".into(),
-            args: json!({"x": 1}),
-            claim_seed: ClaimSeed::new("seed-1"),
+        Decision::CallTools {
+            calls: vec![ToolCall::new(
+                "no_such_tool",
+                json!({"x": 1}),
+                ClaimSeed::new("seed-1"),
+            )],
         },
         // Tick 2: correction continuation; script's next decision is
         // Retire. dispatch returns Retire → loop exits.
@@ -553,18 +559,22 @@ async fn persistent_apply_time_failure_exhausts_budget_and_recovers_on_next_succ
     let script = vec![
         // Attempt 1 (fresh tick): bad CallTool → record_failure ok →
         // synthetic correction injected.
-        Decision::CallTool {
-            name: "no_such_tool".into(),
-            args: json!({}),
-            claim_seed: ClaimSeed::new("seed-1"),
+        Decision::CallTools {
+            calls: vec![ToolCall::new(
+                "no_such_tool",
+                json!({}),
+                ClaimSeed::new("seed-1"),
+            )],
         },
         // Attempt 2 (correction continuation tick — begin_tick skipped):
         // bad CallTool → counter=2 > max_inference=1 → BudgetExhausted →
         // transition_to_unhealthy. Run loop does NOT exit.
-        Decision::CallTool {
-            name: "no_such_tool".into(),
-            args: json!({}),
-            claim_seed: ClaimSeed::new("seed-1"),
+        Decision::CallTools {
+            calls: vec![ToolCall::new(
+                "no_such_tool",
+                json!({}),
+                ClaimSeed::new("seed-1"),
+            )],
         },
         // Attempt 3 (next deadline-driven fresh tick): valid Idle.
         // dispatch returns Continue → mark_tick_success → archives the
@@ -759,19 +769,23 @@ async fn apply_failure_correction_budget_is_immune_to_concurrent_external_trigge
         // Tick 1 (fresh): the wrapper Decide injects an external trigger,
         // then returns this bad CallTool. record_failure ok (counter=1)
         // → pending_correction set.
-        Decision::CallTool {
-            name: "no_such_tool".into(),
-            args: json!({}),
-            claim_seed: ClaimSeed::new("seed-1"),
+        Decision::CallTools {
+            calls: vec![ToolCall::new(
+                "no_such_tool",
+                json!({}),
+                ClaimSeed::new("seed-1"),
+            )],
         },
         // Tick 2 (correction continuation; drain pulls the racing
         // external trigger, but pending_correction.is_some() so
         // begin_tick is skipped): bad CallTool again → counter=2 >
         // max=1 → BudgetExhausted → Unhealthy.
-        Decision::CallTool {
-            name: "no_such_tool".into(),
-            args: json!({}),
-            claim_seed: ClaimSeed::new("seed-1"),
+        Decision::CallTools {
+            calls: vec![ToolCall::new(
+                "no_such_tool",
+                json!({}),
+                ClaimSeed::new("seed-1"),
+            )],
         },
         // Tick 3 (fresh — pending_correction cleared on the Unhealthy
         // transition): valid Idle → mark_tick_success → archives the
@@ -965,10 +979,12 @@ async fn tool_call_exhausts_retry_budget_trips_unhealthy() {
         // ApplyOutcome::ToolError → record_failure(ToolCall, _) →
         // budget exhausted (max_tool=0) → transition_to_unhealthy.
         // Run loop continues.
-        Decision::CallTool {
-            name: "flaky".into(),
-            args: json!({"x": 1}),
-            claim_seed: ClaimSeed::new("seed-1"),
+        Decision::CallTools {
+            calls: vec![ToolCall::new(
+                "flaky",
+                json!({"x": 1}),
+                ClaimSeed::new("seed-1"),
+            )],
         },
         // Tick 2: retire so the test terminates.
         Decision::Retire {
@@ -1055,20 +1071,24 @@ async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
     let registry = registry_with_flaky("flaky", 1);
     let script = vec![
         // Tick 1: tool errors → Unhealthy.
-        Decision::CallTool {
-            name: "flaky".into(),
-            args: json!({"x": 1}),
-            claim_seed: ClaimSeed::new("seed-1"),
+        Decision::CallTools {
+            calls: vec![ToolCall::new(
+                "flaky",
+                json!({"x": 1}),
+                ClaimSeed::new("seed-1"),
+            )],
         },
         // Tick 2 (fresh — tick 1's BudgetExhausted with max_tool=0
         // cleared pending_correction in the Unhealthy transition, so
         // begin_tick runs again): tool succeeds → ApplyOutcome::Continue
         // → mark_tick_success → archive incident and flip back to
         // Healthy.
-        Decision::CallTool {
-            name: "flaky".into(),
-            args: json!({"x": 2}),
-            claim_seed: ClaimSeed::new("seed-2"),
+        Decision::CallTools {
+            calls: vec![ToolCall::new(
+                "flaky",
+                json!({"x": 2}),
+                ClaimSeed::new("seed-2"),
+            )],
         },
         // Tick 3: retire cleanly.
         Decision::Retire {
@@ -1192,10 +1212,12 @@ async fn tool_call_failure_stages_correction_visible_on_next_tick_bundle() {
     let script = vec![
         // Tick 1: bad CallTool → tool errors → record_failure ok (budget
         // has room) → pending_correction set.
-        Decision::CallTool {
-            name: "flaky".into(),
-            args: json!({"q": "what", "n": 3}),
-            claim_seed: ClaimSeed::new("seed-1"),
+        Decision::CallTools {
+            calls: vec![ToolCall::new(
+                "flaky",
+                json!({"q": "what", "n": 3}),
+                ClaimSeed::new("seed-1"),
+            )],
         },
         // Tick 2 (correction continuation): retire so the test
         // terminates. The bundle this decide() sees must carry the
@@ -1309,20 +1331,24 @@ async fn tool_call_failure_correction_then_different_decision_recovers_to_health
 
     let script = vec![
         // Tick 1: CallTool flaky → errors → pending_correction set.
-        Decision::CallTool {
-            name: "flaky".into(),
-            args: json!({"x": 1}),
-            claim_seed: ClaimSeed::new("seed-flaky"),
+        Decision::CallTools {
+            calls: vec![ToolCall::new(
+                "flaky",
+                json!({"x": 1}),
+                ClaimSeed::new("seed-flaky"),
+            )],
         },
         // Tick 2 (correction continuation): the model sees the
         // correction in the bundle and emits a *different* decision
         // (calls echo instead). That succeeds → ApplyOutcome::Continue
         // → mark_tick_success → pending_correction cleared, tracker
         // stays Healthy.
-        Decision::CallTool {
-            name: "echo".into(),
-            args: json!({"msg": "recovered"}),
-            claim_seed: ClaimSeed::new("seed-echo"),
+        Decision::CallTools {
+            calls: vec![ToolCall::new(
+                "echo",
+                json!({"msg": "recovered"}),
+                ClaimSeed::new("seed-echo"),
+            )],
         },
         // Tick 3: retire cleanly.
         Decision::Retire {
@@ -1484,4 +1510,312 @@ async fn per_mandate_recent_outputs_cap_reaches_the_run_loop() {
     // The cap is also reflected on the bundle's mandate snapshot (the
     // bundle clones the mandate verbatim).
     assert_eq!(bundle.mandate.context_policy.recent_outputs, 2);
+}
+
+// ---- JAR2-38: parallel CallTools dispatch ----
+
+/// JAR2-38 acceptance test: K=3 parallel tool calls in a single tick.
+/// All three succeed; the agent loop must persist three distinct
+/// evidence records in input order and continue cleanly to the next
+/// tick's `EmitOutput`. Models the "synthesize 3 file reads in one
+/// tick" path that the JAR2-37 workaround forced into N+1 ticks.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn parallel_call_tools_k3_all_succeed_persists_evidence_in_order() {
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    // Three distinct evidence ids the EmitOutput will cite. EchoTool
+    // produces a content-addressed record per `(name, args, result)`
+    // triple, so picking three distinct args guarantees three distinct
+    // ids.
+    let args_a = json!({"path": "a.md"});
+    let args_b = json!({"path": "b.md"});
+    let args_c = json!({"path": "c.md"});
+    let result_a = json!({"echoed": args_a});
+    let result_b = json!({"echoed": args_b});
+    let result_c = json!({"echoed": args_c});
+    let ev_a = EvidenceId::new("echo", &args_a, &result_a);
+    let ev_b = EvidenceId::new("echo", &args_b, &result_b);
+    let ev_c = EvidenceId::new("echo", &args_c, &result_c);
+
+    let script = vec![
+        // Tick 1: K=3 parallel call_tool batch — all echo, distinct args.
+        Decision::CallTools {
+            calls: vec![
+                ToolCall::with_tool_use_id(
+                    "echo",
+                    args_a.clone(),
+                    ClaimSeed::new("seed-a"),
+                    "toolu_a",
+                ),
+                ToolCall::with_tool_use_id(
+                    "echo",
+                    args_b.clone(),
+                    ClaimSeed::new("seed-b"),
+                    "toolu_b",
+                ),
+                ToolCall::with_tool_use_id(
+                    "echo",
+                    args_c.clone(),
+                    ClaimSeed::new("seed-c"),
+                    "toolu_c",
+                ),
+            ],
+        },
+        // Tick 2: cite all three.
+        Decision::EmitOutput {
+            content: "synthesized from 3 reads".into(),
+            evidence: vec![ev_a.clone(), ev_b.clone(), ev_c.clone()],
+        },
+        Decision::Retire {
+            reason: "done".into(),
+        },
+    ];
+    let agent = Agent::new(
+        mandate,
+        fs,
+        MockDecide::new(script),
+        registry_with_echo(),
+        fresh_health(tmp.path()),
+    );
+
+    let handle = tokio::spawn(agent.run());
+    let RetireReason(reason) = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("agent did not retire in time")
+        .expect("join")
+        .expect("run ok");
+    assert_eq!(reason, "done");
+
+    // Three evidence files on disk, one per call.
+    let evidence_dir = tmp.path().join("evidence");
+    let evs: Vec<_> = std::fs::read_dir(&evidence_dir)
+        .expect("read evidence")
+        .map(|e| e.expect("dirent").file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(evs.len(), 3, "expected 3 evidence files, got: {evs:?}");
+    for id in [&ev_a, &ev_b, &ev_c] {
+        let name = format!("{}.json", id);
+        assert!(
+            evs.contains(&name),
+            "evidence {name} not on disk; got: {evs:?}"
+        );
+    }
+
+    // EmitOutput succeeded — one output file referencing all three ids.
+    let outputs_dir = tmp.path().join("outputs");
+    let outs: Vec<_> = std::fs::read_dir(&outputs_dir)
+        .expect("read outputs")
+        .map(|e| e.expect("dirent").path())
+        .collect();
+    assert_eq!(outs.len(), 1);
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&outs[0]).unwrap()).unwrap();
+    let ev_arr = v["evidence"].as_array().expect("evidence array");
+    assert_eq!(ev_arr.len(), 3);
+
+    // Health stayed Healthy across the parallel-dispatch tick.
+    let v: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(tmp.path().join("health.json")).expect("read health"),
+    )
+    .expect("parse health");
+    assert_eq!(v["state"].as_str(), Some("Healthy"));
+}
+
+/// JAR2-38 partial-failure test: K=3 parallel tool calls where the
+/// middle call fails. The successful sibling calls must persist their
+/// evidence (the model can cite them next tick), the failure stages a
+/// correction describing only the failed call, and the per-tick
+/// `ToolCall` budget is decremented by exactly one slot (K=1 failure
+/// here) — pinning the "K against budget" accounting documented in
+/// `agent.rs`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn parallel_call_tools_k3_partial_failure_persists_successes_and_stages_correction() {
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    // `echo` always succeeds; `flaky` always errors. Mix them in one
+    // batch to exercise the partial-failure dispatch path.
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Arc::new(EchoTool))
+        .expect("register echo");
+    registry
+        .register(Arc::new(FlakyTool::new("flaky", u32::MAX)))
+        .expect("register flaky");
+
+    let script = vec![
+        // Tick 1: parallel batch — echo, flaky, echo. Two successes
+        // sandwich one persistent failure.
+        Decision::CallTools {
+            calls: vec![
+                ToolCall::with_tool_use_id(
+                    "echo",
+                    json!({"k": "a"}),
+                    ClaimSeed::new("seed-a"),
+                    "toolu_a",
+                ),
+                ToolCall::with_tool_use_id(
+                    "flaky",
+                    json!({"k": "b"}),
+                    ClaimSeed::new("seed-b"),
+                    "toolu_b",
+                ),
+                ToolCall::with_tool_use_id(
+                    "echo",
+                    json!({"k": "c"}),
+                    ClaimSeed::new("seed-c"),
+                    "toolu_c",
+                ),
+            ],
+        },
+        // Tick 2: model sees correction; just retire so the test
+        // terminates with a deterministic reason.
+        Decision::Retire {
+            reason: "after-partial-failure".into(),
+        },
+    ];
+
+    // Capture the bundle on tick 2 so we can confirm the correction
+    // describes only the failed call.
+    let seen: Arc<Mutex<Vec<ContextBundle>>> = Arc::new(Mutex::new(Vec::new()));
+    let decide = CapturingDecide {
+        inner: MockDecide::new(script),
+        seen: seen.clone(),
+    };
+
+    // Generous budget so the single tool failure stages a correction
+    // without exhausting (the test asserts on correction shape, not on
+    // exhaustion).
+    let agent = Agent::new(
+        mandate,
+        fs,
+        decide,
+        registry,
+        fresh_health_with(tmp.path(), RetryBudget::new(1, 3)),
+    );
+
+    let handle = tokio::spawn(agent.run());
+    let RetireReason(reason) = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("agent did not retire in time")
+        .expect("join")
+        .expect("run ok");
+    assert_eq!(reason, "after-partial-failure");
+
+    // Successful sibling evidence stays on disk (the load-bearing
+    // "don't unwind on partial failure" property the dispatch site
+    // documents). The two persisted records correspond to the two
+    // echo siblings — assert by content-addressed id so the test
+    // pins *which* evidence survived, not just that two files exist.
+    let echo_a_id = EvidenceId::new("echo", &json!({"k": "a"}), &json!({"echoed": {"k": "a"}}));
+    let echo_c_id = EvidenceId::new("echo", &json!({"k": "c"}), &json!({"echoed": {"k": "c"}}));
+    let evidence_dir = tmp.path().join("evidence");
+    let evs: Vec<String> = std::fs::read_dir(&evidence_dir)
+        .expect("read evidence")
+        .map(|e| e.expect("dirent").file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(
+        evs.len(),
+        2,
+        "two successful echo calls should persist evidence even when sibling failed; got: {evs:?}"
+    );
+    assert!(
+        evs.contains(&format!("{}.json", echo_a_id)),
+        "evidence for echo(k=a) missing; got: {evs:?}"
+    );
+    assert!(
+        evs.contains(&format!("{}.json", echo_c_id)),
+        "evidence for echo(k=c) missing; got: {evs:?}"
+    );
+
+    // The next tick's bundle carries the corrective signal naming the
+    // failed tool/args.
+    let captured = seen.lock().unwrap().clone();
+    assert_eq!(captured.len(), 2);
+    let correction = captured[1]
+        .correction
+        .as_ref()
+        .expect("tick 2 must see a correction from the partial-batch failure");
+    assert!(
+        correction.failure.contains("\"flaky\""),
+        "correction must name the failed tool: {}",
+        correction.failure
+    );
+    // No mention of echo, which succeeded — the correction should
+    // describe only what the model needs to fix.
+    assert!(
+        !correction.failure.contains("\"echo\""),
+        "correction must not name successful siblings, got: {}",
+        correction.failure
+    );
+
+    // Health stayed Healthy: one tool failure under a 3-slot budget.
+    let v: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(tmp.path().join("health.json")).expect("read health"),
+    )
+    .expect("parse health");
+    assert_eq!(v["state"].as_str(), Some("Healthy"));
+}
+
+/// JAR2-38 budget-accounting test: K parallel failures must consume K
+/// slots in the `FailureKind::ToolCall` budget. With `max_tool = 2`
+/// and a K=3 batch of all-failing calls, the budget exhausts and the
+/// tracker transitions to `Unhealthy`. Pins the documented
+/// "K against budget" choice.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn parallel_call_tools_k3_all_fail_consumes_k_budget_slots_and_trips_unhealthy() {
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let registry = registry_with_flaky("flaky", u32::MAX);
+
+    let script = vec![
+        // K=3 all-failing batch. With max_tool=2, three failures
+        // exceed the budget on the third recorded slot.
+        Decision::CallTools {
+            calls: vec![
+                ToolCall::new("flaky", json!({"i": 1}), ClaimSeed::new("seed-1")),
+                ToolCall::new("flaky", json!({"i": 2}), ClaimSeed::new("seed-2")),
+                ToolCall::new("flaky", json!({"i": 3}), ClaimSeed::new("seed-3")),
+            ],
+        },
+        Decision::Retire {
+            reason: "after-batch-exhaustion".into(),
+        },
+    ];
+    let agent = Agent::new(
+        mandate,
+        fs,
+        MockDecide::new(script),
+        registry,
+        fresh_health_with(tmp.path(), RetryBudget::new(1, 2)),
+    );
+
+    let handle = tokio::spawn(agent.run());
+    let RetireReason(reason) = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("agent did not retire in time")
+        .expect("join")
+        .expect("run ok");
+    assert_eq!(reason, "after-batch-exhaustion");
+
+    // K=3 failures with max_tool=2 trips Unhealthy. The archived
+    // incident's retry trail captures all three failures so audit sees
+    // the whole batch even though only the third one tripped the
+    // budget.
+    let v: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(tmp.path().join("health.json")).expect("read health"),
+    )
+    .expect("parse health");
+    assert_eq!(
+        v["state"].as_str(),
+        Some("Unhealthy"),
+        "K=3 failures with max_tool=2 must trip Unhealthy",
+    );
+    let retry_trail = v["incident"]["retry_trail"]
+        .as_array()
+        .expect("retry_trail array");
+    assert_eq!(
+        retry_trail.len(),
+        3,
+        "every failed call in the batch should appear in the retry trail, got: {retry_trail:?}",
+    );
+    let failures = v["incident"]["failing"]["details"]["failures"]
+        .as_array()
+        .expect("failures array in incident details");
+    assert_eq!(failures.len(), 3);
 }

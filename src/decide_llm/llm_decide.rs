@@ -216,7 +216,26 @@ impl Decide for LlmDecide {
                     if !is_last {
                         // Stage the next attempt's prompt before recording
                         // the error so `e` is still owned by us.
+                        //
+                        // JAR2-38: when the bad assistant turn contains K
+                        // `tool_use` blocks (the parallel-tool path), both
+                        // vendor APIs require K matching `tool_result`
+                        // blocks in the immediately following user turn
+                        // before they will accept another assistant
+                        // response. We synthesize placeholder
+                        // `tool_result`s here so the retry request stays
+                        // schema-valid; the real semantic signal lives in
+                        // the corrective system message that follows.
+                        // Pre-JAR2-38 the disabled-parallel-tool flag
+                        // capped K at 1 and a single un-paired echo was
+                        // still tolerated by Anthropic in practice, but
+                        // the new path can replay K blocks at once and
+                        // the pairing requirement becomes load-bearing.
                         messages.push(assistant_echo(&resp.content));
+                        let tool_use_ids = tool_use_ids(&resp.content);
+                        if !tool_use_ids.is_empty() {
+                            messages.push(synthesized_tool_results(&tool_use_ids));
+                        }
                         messages.push(Message {
                             role: Role::System,
                             content: vec![ContentBlock::Text {
@@ -286,14 +305,51 @@ fn assistant_echo(content: &[ContentBlock]) -> Message {
     }
 }
 
+/// Collect the `tool_use.id` of every `ToolUse` block in `content`, in
+/// document order. Drives `synthesized_tool_results` on the retry path
+/// so each replayed `tool_use` block has a matching `tool_result`.
+fn tool_use_ids(content: &[ContentBlock]) -> Vec<String> {
+    content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// JAR2-38: synthesize a single tool turn that carries one `tool_result`
+/// block per supplied `tool_use.id`. The vendor adapters reshape this
+/// into the correct wire form — Anthropic wraps the whole turn as a
+/// `user` message with K `tool_result` blocks; Cohere emits K `tool`
+/// messages, one per block, each carrying its own `tool_call_id` (see
+/// `cohere::build_body`). The placeholder text is deliberately the same
+/// across blocks: the corrective system message that follows carries
+/// the real "what went wrong" signal, and the per-block content only
+/// has to be non-empty to keep the request schema-valid.
+fn synthesized_tool_results(ids: &[String]) -> Message {
+    Message {
+        role: Role::Tool,
+        content: ids
+            .iter()
+            .map(|id| ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: "(rejected by parser; see corrective system message)".into(),
+            })
+            .collect(),
+    }
+}
+
 /// Phrasing of the corrective system message. Promoted to a function so
 /// tests can reference the same source of truth as the renderer.
 fn corrective_system_text(err: &DecisionParseError) -> String {
     format!(
         "Your previous tool-use response could not be parsed into a Decision: {err}. \
-         Reply by calling exactly one of the five decision tools \
-         (`call_tool`, `emit_output`, `rewrite_fs`, `idle`, `retire`) \
-         with the schema-correct arguments."
+         Reply by calling exactly one terminal decision tool \
+         (`emit_output`, `rewrite_fs`, `idle`, `retire`) \
+         OR one or more `call_tool` blocks dispatched together as a single \
+         parallel batch, with schema-correct arguments. Do not mix `call_tool` \
+         with a terminal decision tool in the same response."
     )
 }
 
@@ -310,7 +366,7 @@ mod tests {
     //! scripted `CompleteResponse`s; no live HTTP traffic.
 
     use super::*;
-    use crate::decision::{ClaimSeed, ContextBundle};
+    use crate::decision::{ClaimSeed, ContextBundle, ToolCall as DecisionToolCall};
     use crate::evidence::EvidenceId;
     use crate::mandate::Mandate;
     use crate::model_client::{CompleteResponse, ToolCall, Usage, Vendor};
@@ -489,18 +545,22 @@ mod tests {
         let dec = decide.decide(empty_bundle()).await.unwrap();
         assert_eq!(
             dec,
-            Decision::CallTool {
-                name: "echo".into(),
-                args: json!({"msg": "hi"}),
-                claim_seed: ClaimSeed::new("seed-1"),
+            Decision::CallTools {
+                calls: vec![DecisionToolCall::with_tool_use_id(
+                    "echo",
+                    json!({"msg": "hi"}),
+                    ClaimSeed::new("seed-1"),
+                    "toolu_ct",
+                )]
             }
         );
 
         let seen = mock.seen();
         assert_eq!(seen.len(), 2, "expected exactly two upstream calls");
 
-        // The retry must replay the assistant's bad turn and append a
-        // corrective system message — that's the contract A1.6 promises.
+        // The retry must replay the assistant's bad turn, follow it with
+        // matching `tool_result` blocks (JAR2-38 pairing requirement), and
+        // close with the corrective system message.
         let retry = &seen[1];
         let last = retry.messages.last().expect("retry has messages");
         assert_eq!(last.role, Role::System);
@@ -513,12 +573,82 @@ mod tests {
             "corrective text should describe the parse failure, got: {last_text}"
         );
 
-        let echoed = &retry.messages[retry.messages.len() - 2];
+        // Second-to-last message is the synthesized tool turn with one
+        // `tool_result` block per `tool_use` in the bad assistant echo.
+        let tool_turn = &retry.messages[retry.messages.len() - 2];
+        assert_eq!(tool_turn.role, Role::Tool);
+        let result_ids: Vec<&str> = tool_turn
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(result_ids, vec!["toolu_bad"]);
+
+        let echoed = &retry.messages[retry.messages.len() - 3];
         assert_eq!(echoed.role, Role::Assistant);
         assert!(matches!(
             echoed.content[0],
             ContentBlock::ToolUse { ref name, .. } if name == "send_email"
         ));
+    }
+
+    /// JAR2-38: when the bad assistant turn contains K parallel
+    /// `tool_use` blocks, the retry must synthesize K matching
+    /// `tool_result` blocks so the next request stays schema-valid
+    /// against both vendor APIs.
+    #[tokio::test]
+    async fn parse_retry_synthesizes_one_tool_result_per_parallel_tool_use_block() {
+        // First attempt: a malformed parallel batch (mixed shape) the
+        // parser rejects. Two `tool_use` blocks → two `tool_result`
+        // blocks must appear in the retry.
+        let bad = vec![
+            ToolCall {
+                id: "toolu_one".into(),
+                name: "call_tool".into(),
+                arguments: json!({
+                    "name": "echo",
+                    "args": {},
+                    "claim_seed": "s1",
+                }),
+            },
+            ToolCall {
+                id: "toolu_two".into(),
+                name: "retire".into(),
+                arguments: json!({"reason": "stop"}),
+            },
+        ];
+        let mock = MockModelClient::new(vec![
+            MockOutcome::Resp(resp_with_tool_calls(bad)),
+            MockOutcome::Resp(resp_with_tool_calls(vec![good_idle_call()])),
+        ]);
+        let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
+        decide.decide(empty_bundle()).await.unwrap();
+
+        let seen = mock.seen();
+        assert_eq!(seen.len(), 2);
+        let retry = &seen[1];
+        // Find the Tool message in the retry payload.
+        let tool_turn = retry
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("retry must include a tool turn for the parallel tool_use ids");
+        let result_ids: Vec<&str> = tool_turn
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            result_ids,
+            vec!["toolu_one", "toolu_two"],
+            "every replayed `tool_use.id` needs a paired `tool_result`",
+        );
     }
 
     #[tokio::test]

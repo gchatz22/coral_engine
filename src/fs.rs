@@ -904,7 +904,9 @@ mod tests {
 
     // ---- JAR2-28: claim_seed persistence -------------------------------
 
-    use crate::decision::{ClaimSeed, ContextBundle, Decide, Decision};
+    use crate::decision::{
+        ClaimSeed, ContextBundle, Decide, Decision, ToolCall as DecisionToolCall,
+    };
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-05-06T12:00:00Z")
@@ -1045,10 +1047,12 @@ mod tests {
                     seed
                 }
             };
-            Ok(Decision::CallTool {
-                name: "echo".into(),
-                args: serde_json::json!({"q": self.topic}),
-                claim_seed: ClaimSeed::new(seed),
+            Ok(Decision::CallTools {
+                calls: vec![DecisionToolCall::new(
+                    "echo",
+                    serde_json::json!({"q": self.topic}),
+                    ClaimSeed::new(seed),
+                )],
             })
         }
     }
@@ -1085,11 +1089,12 @@ mod tests {
 
         let decision = mock.decide(empty_bundle(mandate)).await.unwrap();
         match decision {
-            Decision::CallTool { claim_seed, .. } => {
+            Decision::CallTools { calls } => {
+                assert_eq!(calls.len(), 1);
                 // Same seed string → same ClaimSeed (== same kernel-side claim id).
-                assert_eq!(claim_seed, ClaimSeed::new("phase-2-clearance"));
+                assert_eq!(calls[0].claim_seed, ClaimSeed::new("phase-2-clearance"));
             }
-            other => panic!("expected CallTool, got {other:?}"),
+            other => panic!("expected CallTools, got {other:?}"),
         }
 
         // Mock must not have minted a second claim file.
@@ -1110,10 +1115,11 @@ mod tests {
 
         let decision = mock.decide(empty_bundle(mandate)).await.unwrap();
         match decision {
-            Decision::CallTool { claim_seed, .. } => {
-                assert_eq!(claim_seed, ClaimSeed::new("phase-2-clearance"));
+            Decision::CallTools { calls } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].claim_seed, ClaimSeed::new("phase-2-clearance"));
             }
-            other => panic!("expected CallTool, got {other:?}"),
+            other => panic!("expected CallTools, got {other:?}"),
         }
 
         // The claim file is now on disk and a future tick would find it.

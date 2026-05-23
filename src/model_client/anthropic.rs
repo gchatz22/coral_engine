@@ -236,26 +236,12 @@ pub fn build_body(req: &CompleteRequest, model: &str) -> Value {
             })
             .collect();
         body.insert("tools".into(), Value::Array(tools));
-        // JAR2-37 Bug B-narrow: force one-tool-per-response so the
-        // model can't emit K parallel `tool_use` blocks in a single
-        // assistant turn. `LlmDecide` / `Decision` is one-decision-per-tick;
-        // parallel `tool_use` blocks would parse as `MultipleCalls`,
-        // trigger the corrective retry, and that retry replays the
-        // unpaired `tool_use` blocks back to Anthropic which then
-        // returns HTTP 400 "`tool_use` ids were found without
-        // `tool_result` blocks immediately after". Disabling parallel
-        // tool use at the request layer prevents that whole loop.
-        // Documented behavior of Anthropic's Messages API: nested under
-        // `tool_choice`, applies to `auto` and `any`. Only sent when
-        // there are tools to choose from — `tool_choice` is undefined
-        // on tool-less requests.
-        body.insert(
-            "tool_choice".into(),
-            json!({
-                "type": "auto",
-                "disable_parallel_tool_use": true,
-            }),
-        );
+        // JAR2-38 lifts the JAR2-37 `tool_choice.disable_parallel_tool_use`
+        // workaround: the parser now folds K parallel `tool_use` blocks
+        // into a single `Decision::CallTools` and the corrective-retry
+        // path emits matching `tool_result` blocks. Omitting `tool_choice`
+        // entirely keeps the API default (`auto`, parallel tools
+        // enabled).
     }
     Value::Object(body)
 }
@@ -481,13 +467,9 @@ mod tests {
                     "required": ["location"],
                 },
             }],
-            // JAR2-37 Bug B-narrow: force at most one tool_use block per
-            // assistant response so the one-Decision-per-tick invariant
-            // holds end-to-end.
-            "tool_choice": {
-                "type": "auto",
-                "disable_parallel_tool_use": true,
-            },
+            // JAR2-38: no `tool_choice` block; the API default keeps
+            // parallel tool use enabled, which the parser + agent loop
+            // now handle natively.
         });
         assert_eq!(body, expected);
     }
@@ -506,8 +488,8 @@ mod tests {
         assert!(body.get("temperature").is_none(), "no temperature field");
         assert!(body.get("system").is_none(), "no system field");
         assert!(body.get("tools").is_none(), "no tools field");
-        // JAR2-37: `tool_choice` is meaningless without `tools`, so it
-        // must also be absent on tool-less requests.
+        // JAR2-38: `tool_choice` is no longer set — at all. Default API
+        // behavior (parallel tools enabled) is what we want.
         assert!(
             body.get("tool_choice").is_none(),
             "no tool_choice when tools list is empty"
@@ -517,12 +499,12 @@ mod tests {
     }
 
     #[test]
-    fn build_body_sets_tool_choice_disable_parallel_when_tools_present() {
-        // Regression for the JAR2-37 Bug B-narrow contract: every
-        // tool-bearing request must publish
-        // `tool_choice: {"type": "auto", "disable_parallel_tool_use": true}`
-        // so the model never returns K parallel `tool_use` blocks the
-        // one-Decision-per-tick parser can't handle.
+    fn build_body_does_not_set_tool_choice_when_tools_present() {
+        // JAR2-38: lifting the JAR2-37 workaround. Tool-bearing requests
+        // must omit `tool_choice` entirely so the Anthropic API default
+        // (parallel tools enabled) applies. The parser + agent loop now
+        // handle K `tool_use` blocks in a single response, so the
+        // workaround is no longer needed.
         let req = CompleteRequest {
             messages: vec![Message::user("hi")],
             tools: vec![ToolSpec {
@@ -536,15 +518,11 @@ mod tests {
             },
         };
         let body = build_body(&req, "m");
-        assert_eq!(
-            body["tool_choice"],
-            json!({
-                "type": "auto",
-                "disable_parallel_tool_use": true,
-            }),
-            "tool_choice must disable parallel tool use, got: {}",
-            body["tool_choice"],
+        assert!(
+            body.get("tool_choice").is_none(),
+            "tool_choice must be absent on tool-bearing requests (JAR2-38), got: {body}"
         );
+        assert!(body.get("tools").is_some(), "tools field should be present");
     }
 
     #[test]

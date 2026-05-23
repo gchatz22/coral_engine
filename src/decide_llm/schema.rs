@@ -17,7 +17,7 @@
 //! the relevant fields, so the schema can never silently drift from
 //! `decision.rs` without a compile or test failure.
 
-use crate::decision::Decision;
+use crate::decision::{ClaimSeed, Decision, ToolCall as DecisionToolCall};
 use crate::model_client::{ToolCall, ToolSpec};
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -138,13 +138,20 @@ pub fn decision_tools() -> Vec<ToolSpec> {
 /// failure back to the model in a corrective system message.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DecisionParseError {
-    /// The model returned no tool call where exactly one was expected.
-    #[error("expected exactly one tool call, got none")]
+    /// The model returned no tool call where at least one was expected.
+    #[error("expected at least one tool call, got none")]
     NoCalls,
-    /// The model returned more than one tool call. Design #1 forbids this:
-    /// every `Decision` is one tool call.
-    #[error("expected exactly one tool call, got {count}")]
-    MultipleCalls { count: usize },
+    /// The model returned multiple tool calls that mix `call_tool` (the
+    /// parallel-tool path) with one of the terminal decision tools
+    /// (`emit_output`, `rewrite_fs`, `idle`, `retire`). Terminal
+    /// decisions cannot batch with other calls in the same tick.
+    #[error("mixed decision tools in one response: {names:?}")]
+    MixedDecisionTools { names: Vec<String> },
+    /// The model returned multiple instances of a terminal decision tool
+    /// (e.g. two `retire` blocks in the same response). Terminal
+    /// decisions are singular by construction.
+    #[error("expected exactly one `{tool}` call, got {count}")]
+    DuplicateTerminalTool { tool: String, count: usize },
     /// The tool name does not correspond to any `Decision` variant.
     #[error("unknown tool: {0}")]
     UnknownTool(String),
@@ -171,19 +178,68 @@ pub enum DecisionParseError {
 /// `{ id, name, arguments }`). Vendor-specific normalization (e.g.
 /// Cohere's `parameters` field) is the responsibility of the relevant
 /// `ModelClient` impl, not this layer.
+///
+/// Multi-call shape: when every entry names the `call_tool` decision
+/// tool, the parser folds them into a single `Decision::CallTools(vec![...])`.
+/// The vendor `ToolCall.id` (the `tool_use.id` on the wire) propagates
+/// into each `decision::ToolCall.tool_use_id` so the run loop can stage
+/// the paired `tool_result` blocks for the next prompt bundle. Terminal
+/// decision tools (`emit_output`, `rewrite_fs`, `idle`, `retire`)
+/// remain singular: a response that includes any terminal tool alongside
+/// another call (terminal or `call_tool`) fails as `MixedDecisionTools`
+/// rather than silently discarding the extras.
 pub fn parse_decision(calls: &[ToolCall]) -> Result<Decision, DecisionParseError> {
-    let call = match calls {
-        [] => return Err(DecisionParseError::NoCalls),
-        [c] => c,
-        more => {
-            return Err(DecisionParseError::MultipleCalls { count: more.len() });
-        }
-    };
-
-    if !TOOL_NAMES.contains(&call.name.as_str()) {
-        return Err(DecisionParseError::UnknownTool(call.name.clone()));
+    if calls.is_empty() {
+        return Err(DecisionParseError::NoCalls);
     }
 
+    // Validate every name up front so an unknown tool name surfaces as
+    // `UnknownTool` regardless of where it sits in the batch (the
+    // single-call path used to do this implicitly).
+    for c in calls {
+        if !TOOL_NAMES.contains(&c.name.as_str()) {
+            return Err(DecisionParseError::UnknownTool(c.name.clone()));
+        }
+    }
+
+    // Mixed-shape detection. If any call is `call_tool` and at least one
+    // other call is a terminal tool — or vice versa — the batch is
+    // malformed: terminals are singular, and mixing them with parallel
+    // calls is never a valid single-tick decision.
+    let any_call_tool = calls.iter().any(|c| c.name == "call_tool");
+    let any_terminal = calls.iter().any(|c| c.name != "call_tool");
+    if any_call_tool && any_terminal {
+        let names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
+        return Err(DecisionParseError::MixedDecisionTools { names });
+    }
+    if any_terminal && calls.len() > 1 {
+        // Two terminals (e.g. two `retire` blocks) — also invalid.
+        return Err(DecisionParseError::DuplicateTerminalTool {
+            tool: calls[0].name.clone(),
+            count: calls.len(),
+        });
+    }
+
+    if any_call_tool {
+        // Parallel-call path: fold every `call_tool` into a single
+        // `Decision::CallTools(vec![...])`. Vendor `ToolCall.id` becomes
+        // `decision::ToolCall.tool_use_id` so the dispatch layer can
+        // emit paired `tool_result` blocks next tick.
+        let mut tool_calls = Vec::with_capacity(calls.len());
+        for c in calls {
+            let args = parse_call_tool_args(c)?;
+            tool_calls.push(DecisionToolCall::with_tool_use_id(
+                args.name,
+                args.args,
+                args.claim_seed,
+                c.id.clone(),
+            ));
+        }
+        return Ok(Decision::CallTools { calls: tool_calls });
+    }
+
+    // Single terminal-tool path.
+    let call = &calls[0];
     let Value::Object(args) = &call.arguments else {
         return Err(DecisionParseError::ArgumentsNotObject {
             tool: call.name.clone(),
@@ -194,12 +250,11 @@ pub fn parse_decision(calls: &[ToolCall]) -> Result<Decision, DecisionParseError
     // error fires cleanly before serde gets a chance to complain about
     // shape. Lists below mirror the variant fields in `decision.rs`.
     let required: &[&str] = match call.name.as_str() {
-        "call_tool" => &["name", "args", "claim_seed"],
         "emit_output" => &["content", "evidence"],
         "rewrite_fs" => &["ops"],
         "idle" => &["next_after"],
         "retire" => &["reason"],
-        _ => unreachable!("guarded by TOOL_NAMES check above"),
+        _ => unreachable!("guarded by mixed/any_call_tool checks above"),
     };
     for field in required {
         if !args.contains_key(*field) {
@@ -213,7 +268,7 @@ pub fn parse_decision(calls: &[ToolCall]) -> Result<Decision, DecisionParseError
     // Re-tag the arguments as a `Decision` and let serde do the actual
     // shape validation. The `type` injection mirrors the `#[serde(tag =
     // "type")]` on `Decision`; tool name == variant tag by construction
-    // (see `TOOL_NAMES`).
+    // for the terminal tools.
     let mut tagged = args.clone();
     tagged.insert("type".into(), Value::String(call.name.clone()));
 
@@ -223,6 +278,56 @@ pub fn parse_decision(calls: &[ToolCall]) -> Result<Decision, DecisionParseError
             field: serde_path_or(&e),
             reason: e.to_string(),
         }
+    })
+}
+
+/// Inner shape of one `call_tool` decision-tool invocation, extracted from
+/// the model's tool-use payload. The fields mirror
+/// `decision::ToolCall` minus the vendor `tool_use_id` (which the caller
+/// pulls from `ToolCall.id`).
+struct ParsedCallToolArgs {
+    name: String,
+    args: serde_json::Value,
+    claim_seed: ClaimSeed,
+}
+
+fn parse_call_tool_args(call: &ToolCall) -> Result<ParsedCallToolArgs, DecisionParseError> {
+    let Value::Object(args) = &call.arguments else {
+        return Err(DecisionParseError::ArgumentsNotObject {
+            tool: call.name.clone(),
+        });
+    };
+    for field in ["name", "args", "claim_seed"] {
+        if !args.contains_key(field) {
+            return Err(DecisionParseError::MissingField {
+                tool: call.name.clone(),
+                field: field.into(),
+            });
+        }
+    }
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DecisionParseError::InvalidValue {
+            tool: call.name.clone(),
+            field: "name".into(),
+            reason: "expected string".into(),
+        })?
+        .to_string();
+    let inner_args = args.get("args").cloned().unwrap_or(Value::Null);
+    let claim_seed_str = args
+        .get("claim_seed")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DecisionParseError::InvalidValue {
+            tool: call.name.clone(),
+            field: "claim_seed".into(),
+            reason: "expected string".into(),
+        })?
+        .to_string();
+    Ok(ParsedCallToolArgs {
+        name,
+        args: inner_args,
+        claim_seed: ClaimSeed::new(claim_seed_str),
     })
 }
 
@@ -241,7 +346,7 @@ fn serde_path_or(_e: &serde_json::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::{ClaimSeed, FsOp};
+    use crate::decision::{ClaimSeed, FsOp, ToolCall as DecisionToolCall};
     use crate::evidence::EvidenceId;
     use serde_json::json;
     use std::time::Duration;
@@ -284,7 +389,7 @@ mod tests {
     // ---- happy-path round trips: one per Decision variant ---------------
 
     #[test]
-    fn parse_call_tool_round_trips() {
+    fn parse_single_call_tool_round_trips_as_one_element_call_tools() {
         let tc = call(
             "call_tool",
             json!({
@@ -293,15 +398,68 @@ mod tests {
                 "claim_seed": "seed-1"
             }),
         );
+        // The vendor `ToolCall.id` is "toolu_call_tool" (set by `call`); the
+        // parser must carry it through as the decision-side `tool_use_id`.
         let d = parse_decision(&[tc]).unwrap();
         assert_eq!(
             d,
-            Decision::CallTool {
-                name: "echo".into(),
-                args: json!({"msg": "hi"}),
-                claim_seed: ClaimSeed::new("seed-1"),
+            Decision::CallTools {
+                calls: vec![DecisionToolCall::with_tool_use_id(
+                    "echo",
+                    json!({"msg": "hi"}),
+                    ClaimSeed::new("seed-1"),
+                    "toolu_call_tool",
+                )]
             }
         );
+    }
+
+    #[test]
+    fn parse_k_call_tool_blocks_folds_into_one_call_tools_decision() {
+        // K=3 parallel call_tool blocks → single Decision::CallTools. The
+        // wire-side `id` on each becomes the per-call `tool_use_id`,
+        // load-bearing for the next prompt's `tool_result` pairing.
+        let calls = vec![
+            ToolCall {
+                id: "toolu_a".into(),
+                name: "call_tool".into(),
+                arguments: json!({
+                    "name": "read",
+                    "args": {"path": "a.md"},
+                    "claim_seed": "seed-a",
+                }),
+            },
+            ToolCall {
+                id: "toolu_b".into(),
+                name: "call_tool".into(),
+                arguments: json!({
+                    "name": "read",
+                    "args": {"path": "b.md"},
+                    "claim_seed": "seed-b",
+                }),
+            },
+            ToolCall {
+                id: "toolu_c".into(),
+                name: "call_tool".into(),
+                arguments: json!({
+                    "name": "read",
+                    "args": {"path": "c.md"},
+                    "claim_seed": "seed-c",
+                }),
+            },
+        ];
+        let d = parse_decision(&calls).unwrap();
+        match d {
+            Decision::CallTools { calls: tc } => {
+                assert_eq!(tc.len(), 3);
+                assert_eq!(tc[0].name, "read");
+                assert_eq!(tc[0].args, json!({"path": "a.md"}));
+                assert_eq!(tc[0].claim_seed, ClaimSeed::new("seed-a"));
+                assert_eq!(tc[0].tool_use_id.as_deref(), Some("toolu_a"));
+                assert_eq!(tc[2].tool_use_id.as_deref(), Some("toolu_c"));
+            }
+            other => panic!("expected CallTools, got {other:?}"),
+        }
     }
 
     #[test]
@@ -393,7 +551,9 @@ mod tests {
     fn every_decision_tools_name_parses() {
         // Round-trip the metadata: every name `decision_tools()` advertises
         // is one `parse_decision` accepts. Catches drift between the schema
-        // list and the parser's allowed-names table.
+        // list and the parser's allowed-names table. `call_tool` folds into
+        // the `call_tools` variant tag (the parallel-tool shape); the other
+        // four map one-to-one with their own variant tags.
         for spec in decision_tools() {
             let minimal: Value = match spec.name.as_str() {
                 "call_tool" => json!({
@@ -409,12 +569,17 @@ mod tests {
             };
             let tc = call(&spec.name, minimal);
             let d = parse_decision(&[tc]).expect(&spec.name);
-            // Tool name should map to the same variant tag the parser
-            // injected — round-trip the variant out via serde to verify.
             let back = serde_json::to_value(&d).unwrap();
+            let expected_variant = if spec.name == "call_tool" {
+                "call_tools"
+            } else {
+                spec.name.as_str()
+            };
             assert_eq!(
                 back.get("type").and_then(Value::as_str),
-                Some(spec.name.as_str())
+                Some(expected_variant),
+                "tool {} should parse to variant {expected_variant}",
+                spec.name,
             );
         }
     }
@@ -454,13 +619,38 @@ mod tests {
     }
 
     #[test]
-    fn parse_multiple_calls_errors() {
+    fn parse_mixed_call_tool_and_terminal_errors() {
+        // `call_tool` is the parallel-call shape; mixing it with any
+        // terminal decision (`emit_output`, `rewrite_fs`, `idle`,
+        // `retire`) is never a valid single-tick decision.
         let err = parse_decision(&[
-            call("idle", json!({"next_after": 1})),
-            call("retire", json!({"reason": "x"})),
+            call(
+                "call_tool",
+                json!({"name": "echo", "args": {}, "claim_seed": "s"}),
+            ),
+            call("retire", json!({"reason": "stop"})),
         ])
         .unwrap_err();
-        assert_eq!(err, DecisionParseError::MultipleCalls { count: 2 });
+        assert!(
+            matches!(err, DecisionParseError::MixedDecisionTools { ref names }
+                if names == &["call_tool".to_string(), "retire".to_string()]),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_duplicate_terminal_tools_errors() {
+        // Two `retire` blocks in one response — terminals are singular.
+        let err = parse_decision(&[
+            call("retire", json!({"reason": "a"})),
+            call("retire", json!({"reason": "b"})),
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(err, DecisionParseError::DuplicateTerminalTool { ref tool, count: 2 }
+                if tool == "retire"),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -508,6 +698,25 @@ mod tests {
             DecisionParseError::ArgumentsNotObject {
                 tool: "idle".into(),
             }
+        );
+    }
+
+    #[test]
+    fn parse_call_tool_missing_inner_field_errors() {
+        // The inner `{name, args, claim_seed}` block carries its own
+        // required-field check inside `parse_call_tool_args`. A missing
+        // `claim_seed` must surface as `MissingField` with the inner
+        // field name, not as a serde shape error against the outer
+        // CallTools variant.
+        let err = parse_decision(&[call(
+            "call_tool",
+            json!({"name": "echo", "args": {"msg": "hi"}}),
+        )])
+        .unwrap_err();
+        assert!(
+            matches!(err, DecisionParseError::MissingField { ref tool, ref field }
+                if tool == "call_tool" && field == "claim_seed"),
+            "got {err:?}"
         );
     }
 
