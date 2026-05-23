@@ -441,7 +441,126 @@ impl AgentFs {
                 .map_err(|e| FsError::storage(&mandate_key, e))?;
         }
 
+        // JAR2-54 tail-index reconciliation. A prior process may have
+        // crashed between an `outputs/<ulid>.json` PUT and the
+        // corresponding `_tail.json` PUT, leaving the tail lagging.
+        // `read_recent_window_with_tail` trusts a tail with
+        // `entries.len() < TAIL_K` as "complete" for O(1) reads — that
+        // trust would silently miss lag-orphans without this
+        // reconcile. Doing it once at open keeps the read path O(1)
+        // while honoring the `agent_storage.md` § 7.1 promise that the
+        // LIST fallback resolves lag. In-process single-writer-per-
+        // agent maintains the invariant for the lifetime of this
+        // `AgentFs`; cross-process inspectors (TUI, ad-hoc tools)
+        // wanting a fresh view can call `AgentFs::open` again.
+        //
+        // Cost: one LIST + at most one PUT per indexed prefix at open;
+        // subsequent `list_recent_*` calls stay O(1). When the on-disk
+        // filename set is already a subset of the tail (the common
+        // case) the PUT is skipped entirely.
+        me.reconcile_tail(OUTPUTS_TAIL_SUFFIX, "outputs/").await?;
+        me.reconcile_tail(EVIDENCE_TAIL_SUFFIX, "evidence/").await?;
+
         Ok(me)
+    }
+
+    /// Reconcile a tail object against the on-disk reality under its
+    /// indexed prefix. Called once per `new_with_storage` to recover
+    /// from any prior crash that PUT an object without updating the
+    /// tail (`scratch/agent_storage.md` § 7.1).
+    ///
+    /// Algorithm:
+    /// 1. LIST every key under the indexed prefix (skip the tail
+    ///    object itself and any non-record sidecar files).
+    /// 2. If every on-disk filename is in the tail (the common no-lag
+    ///    case), do nothing — no PUT, no churn.
+    /// 3. Otherwise, recompute the tail as the lex-greatest `TAIL_K`
+    ///    on-disk filenames in newest-first order, preserving any
+    ///    existing `added_at` timestamps from the prior tail (so a
+    ///    re-reconciliation produces byte-identical bytes), and PUT
+    ///    it back.
+    ///
+    /// Filenames-only comparison is correct for both `outputs/` and
+    /// `evidence/`: lex-greatest is what `list_recent_*` returns and
+    /// the tail's only role is to make that fetch O(1). Mis-ordered
+    /// `added_at` between recovered entries is cosmetic — no caller
+    /// uses the tail for chronology.
+    async fn reconcile_tail(&self, tail_suffix: &str, indexed_prefix: &str) -> anyhow::Result<()> {
+        let full_prefix = self.key(indexed_prefix);
+        let page = self
+            .storage
+            .list(&full_prefix, None, usize::MAX)
+            .await
+            .map_err(|e| FsError::storage(&full_prefix, e))?;
+        // Reduce keys to *record filenames* (strip the indexed prefix
+        // off, drop sidecars and tempfile artifacts).
+        let mut on_disk: Vec<String> = page
+            .keys
+            .into_iter()
+            .filter_map(|k| k.strip_prefix(&full_prefix).map(|s| s.to_string()))
+            .filter(|f| f.ends_with(".json"))
+            .filter(|f| f != "_tail.json")
+            .collect();
+        if on_disk.is_empty() {
+            return Ok(());
+        }
+        on_disk.sort();
+
+        let tail_key = self.key(tail_suffix);
+        let existing_tail: TailObject = match self
+            .storage
+            .get(&tail_key)
+            .await
+            .map_err(|e| FsError::storage(&tail_key, e))?
+        {
+            Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            None => TailObject::default(),
+        };
+
+        let tail_filenames: std::collections::HashSet<&str> = existing_tail
+            .entries
+            .iter()
+            .map(|e| e.filename.as_str())
+            .collect();
+
+        // Fast path: every on-disk filename is in the tail. Skip the
+        // PUT entirely. (The tail may carry stale entries pointing to
+        // out-of-band-deleted files — we don't garbage-collect them
+        // here; the read path silently drops absent keys.)
+        if on_disk.iter().all(|f| tail_filenames.contains(f.as_str())) {
+            return Ok(());
+        }
+
+        // Preserve original `added_at` for already-known filenames so
+        // a no-op subsequent reconcile produces identical bytes.
+        let existing_added_at: std::collections::HashMap<&str, DateTime<Utc>> = existing_tail
+            .entries
+            .iter()
+            .map(|e| (e.filename.as_str(), e.added_at))
+            .collect();
+
+        // Lex-greatest TAIL_K, in newest-first order (reverse-lex so
+        // entry 0 is the "most recent" in the tail's contract).
+        let take_from = on_disk.len().saturating_sub(TAIL_K);
+        let mut chosen: Vec<&str> = on_disk[take_from..].iter().map(String::as_str).collect();
+        chosen.reverse();
+        let now = Utc::now();
+        let rebuilt = TailObject {
+            entries: chosen
+                .into_iter()
+                .map(|f| TailEntry {
+                    filename: f.to_string(),
+                    added_at: existing_added_at.get(f).copied().unwrap_or(now),
+                })
+                .collect(),
+        };
+
+        let bytes = serde_json::to_vec(&rebuilt)?;
+        self.storage
+            .put(&tail_key, Bytes::from(bytes))
+            .await
+            .map_err(|e| FsError::storage(&tail_key, e))?;
+        Ok(())
     }
 
     /// Borrow the underlying storage. Exposed for higher layers (tail
@@ -1804,52 +1923,30 @@ mod tests {
         assert_eq!(got_ids, want_last_8);
     }
 
-    /// Crash recovery for a tail that lags behind on-disk files: PUT
-    /// an extra output directly via the storage backend (bypassing
-    /// the facade so the tail is not updated), then assert
-    /// `list_recent_outputs` still returns it via the LIST fallback.
-    /// Pins the recovery promise from `agent_storage.md` § 7.1.
+    /// Crash recovery — missing tail object. The read path's LIST
+    /// fallback kicks in when the tail object is absent (e.g. an
+    /// operator deleted it for forensics, or the very first tail PUT
+    /// in this agent's history never reached durable storage). On-
+    /// disk records surface normally.
     #[tokio::test]
-    async fn tail_lag_recovery_outputs_falls_back_to_list_when_tail_missing_entries() {
+    async fn list_recent_outputs_recovers_via_list_when_tail_object_absent() {
         let (_tmp, fs, _m) = fresh_fs().await;
         let id = fs
             .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
             .await
             .unwrap();
-        // Two regular writes go through the facade (tail updated).
         let _ = fs.persist_output("o-1", &[id.clone()]).await.unwrap();
         let _ = fs.persist_output("o-2", &[id.clone()]).await.unwrap();
-
-        // Craft a third output and PUT it directly through the
-        // storage backend so the tail does NOT see it. This is the
-        // "crash between object PUT and tail PUT" simulation per
-        // § 7.1.
         let orphan = Output::new("o-orphan".to_string(), vec![id.clone()], Utc::now());
         let orphan_key = format!("outputs/{}.json", orphan.id);
-        let orphan_bytes = serde_json::to_vec_pretty(&orphan).unwrap();
         fs.storage()
-            .put(&orphan_key, Bytes::from(orphan_bytes))
+            .put(
+                &orphan_key,
+                Bytes::from(serde_json::to_vec_pretty(&orphan).unwrap()),
+            )
             .await
             .unwrap();
-
-        // The orphan output's ULID is the most recent (Utc::now is
-        // monotonic enough across these calls), but the tail has
-        // 2 entries, not 3 — neither is at TAIL_K capacity, so
-        // `read_recent_window_with_tail` takes the tail-fast path
-        // and the orphan goes missing... unless we keep the LIST
-        // fallback honest by detecting the lag. The current logic
-        // accepts the tail when `entries.len() < TAIL_K` as
-        // "complete" — by construction here it is NOT complete
-        // (orphan exists on disk but not in tail). This is the
-        // exact failure mode the LIST fallback recovers from.
-        //
-        // Today's behaviour: with `entries.len() < TAIL_K` the tail
-        // is treated as authoritative. A LIST recovery is run when
-        // the tail looks at capacity but n > TAIL_K, or when the
-        // tail is missing entirely. To verify the LIST fallback
-        // mechanically works for this kind of lag, force the
-        // condition by deleting the tail file outright (simulating
-        // a tail-PUT that never reached durable storage).
+        // Simulate a tail-PUT that never reached durable storage.
         fs.storage().delete("outputs/_tail.json").await.unwrap();
 
         let got = fs.list_recent_outputs(8).await.unwrap();
@@ -1858,15 +1955,13 @@ mod tests {
             ids.contains(&orphan.id),
             "orphan output should be recovered via LIST fallback when tail is missing"
         );
-        // All three on-disk outputs should be present.
         assert_eq!(got.len(), 3);
     }
 
-    /// Same recovery shape for `evidence/`: a record present on disk
-    /// but absent from the tail still surfaces via LIST when the tail
-    /// is gone.
+    /// Same shape for `evidence/`: tail object absent, LIST fallback
+    /// returns every on-disk record.
     #[tokio::test]
-    async fn tail_lag_recovery_evidence_falls_back_to_list_when_tail_missing() {
+    async fn list_recent_evidence_recovers_via_list_when_tail_object_absent() {
         let (_tmp, fs, _m) = fresh_fs().await;
         let _id_a = fs
             .record_evidence(record("echo", json!({"a": 1}), json!({"r": 1})))
@@ -1878,8 +1973,126 @@ mod tests {
             .unwrap();
         fs.storage().delete("evidence/_tail.json").await.unwrap();
         let got = fs.list_recent_evidence(8).await.unwrap();
-        // Both records returned through the LIST fallback.
         assert_eq!(got.len(), 2);
+    }
+
+    /// Crash recovery — tail lags on-disk reality (the real § 7.1
+    /// scenario). A previous process PUT `outputs/<ulid>.json` but
+    /// crashed before updating the tail. The tail has fewer entries
+    /// than disk; the in-process read path's `entries.len() < TAIL_K`
+    /// trust would silently drop the orphan. Open-time reconciliation
+    /// in `new_with_storage` rebuilds the tail from the LIST so the
+    /// in-process read path stays O(1) and correct.
+    #[tokio::test]
+    async fn open_time_reconcile_rebuilds_tail_when_lagging_behind_outputs() {
+        let tmp = TempDir::new().unwrap();
+        let mandate = Mandate::new("reconcile", Duration::from_millis(100), Some(1));
+        // First session: write two outputs through the facade so the
+        // tail is consistent.
+        let id = {
+            let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+                .await
+                .unwrap();
+            let id = fs
+                .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
+                .await
+                .unwrap();
+            let _ = fs.persist_output("o-1", &[id.clone()]).await.unwrap();
+            let _ = fs.persist_output("o-2", &[id.clone()]).await.unwrap();
+            id
+        };
+
+        // Simulate a crashed worker that PUT an orphan output but
+        // never updated the tail. A fresh `LocalStorage` handle
+        // mimics an out-of-band write — or a crashed-mid-update.
+        let orphan = Output::new("orphan".to_string(), vec![id.clone()], Utc::now());
+        let orphan_key = format!("outputs/{}.json", orphan.id);
+        let storage_handle = Arc::new(LocalStorage::new(tmp.path().to_path_buf()).unwrap());
+        storage_handle
+            .put(
+                &orphan_key,
+                Bytes::from(serde_json::to_vec_pretty(&orphan).unwrap()),
+            )
+            .await
+            .unwrap();
+
+        // Sanity precondition: the pre-reconciliation tail does NOT
+        // contain the orphan, so a naive O(1) read path would miss it.
+        let pre_bytes = storage_handle
+            .get("outputs/_tail.json")
+            .await
+            .unwrap()
+            .unwrap();
+        let pre_tail: TailObject = serde_json::from_slice(&pre_bytes).unwrap();
+        let orphan_filename = format!("{}.json", orphan.id);
+        assert!(
+            !pre_tail
+                .entries
+                .iter()
+                .any(|e| e.filename == orphan_filename),
+            "precondition: tail should NOT yet contain the orphan"
+        );
+
+        // Re-open the FS — open-time reconcile rebuilds the tail.
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+            .await
+            .unwrap();
+        let got = fs.list_recent_outputs(8).await.unwrap();
+        let ids: Vec<_> = got.iter().map(|o| o.id).collect();
+        assert!(
+            ids.contains(&orphan.id),
+            "orphan output must surface after open-time reconcile"
+        );
+        assert_eq!(got.len(), 3);
+
+        // The rebuilt tail object on disk now carries every entry.
+        let post_bytes = storage_handle
+            .get("outputs/_tail.json")
+            .await
+            .unwrap()
+            .unwrap();
+        let post_tail: TailObject = serde_json::from_slice(&post_bytes).unwrap();
+        assert_eq!(post_tail.entries.len(), 3);
+        assert!(
+            post_tail
+                .entries
+                .iter()
+                .any(|e| e.filename == orphan_filename),
+            "rebuilt tail should contain the orphan"
+        );
+    }
+
+    /// Open-time reconcile is a no-op (no tail PUT) when on-disk and
+    /// tail agree — pins that we don't churn the tail file on every
+    /// process restart.
+    #[tokio::test]
+    async fn open_time_reconcile_is_noop_when_tail_matches_disk() {
+        let tmp = TempDir::new().unwrap();
+        let mandate = Mandate::new("noop", Duration::from_millis(100), Some(1));
+        let id;
+        {
+            let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+                .await
+                .unwrap();
+            id = fs
+                .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
+                .await
+                .unwrap();
+            let _ = fs.persist_output("o-1", &[id.clone()]).await.unwrap();
+        }
+        // Snapshot the tail file's bytes before re-open.
+        let before = std::fs::read(tmp.path().join("outputs").join("_tail.json")).unwrap();
+
+        // Re-open. Reconcile detects no lag and skips the PUT,
+        // leaving the bytes byte-identical.
+        let _fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+            .await
+            .unwrap();
+        let after = std::fs::read(tmp.path().join("outputs").join("_tail.json")).unwrap();
+        assert_eq!(
+            before, after,
+            "tail file should be untouched when reconcile is a no-op"
+        );
     }
 
     /// `list_recent_*` returns an empty Vec when the prefix has no
