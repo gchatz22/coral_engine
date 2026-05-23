@@ -214,7 +214,7 @@ impl<D: Decide> Agent<D> {
             if let Some(max) = cfg.max_ticks {
                 if tick >= max {
                     let reason = format!("max_ticks ({}) reached", max);
-                    fs.persist_retirement(&reason)?;
+                    fs.persist_retirement(&reason).await?;
                     return Ok(RetireReason(reason));
                 }
             }
@@ -541,7 +541,7 @@ async fn dispatch(
         Decision::CallTools { calls } => dispatch_call_tools(fs, tools, calls).await,
         Decision::EmitOutput { content, evidence } => {
             debug!(evidence_count = evidence.len(), "decision: emit_output");
-            match fs.persist_output(&content, &evidence) {
+            match fs.persist_output(&content, &evidence).await {
                 Ok(_) => Ok(ApplyOutcome::Continue),
                 Err(e) => match e.downcast_ref::<FsError>() {
                     Some(FsError::EmptyEvidence) => Ok(ApplyOutcome::NeedsCorrection(
@@ -559,7 +559,7 @@ async fn dispatch(
         }
         Decision::RewriteFs { ops } => {
             debug!(op_count = ops.len(), "decision: rewrite_fs");
-            fs.apply_ops(ops)?;
+            fs.apply_ops(ops).await?;
             Ok(ApplyOutcome::Continue)
         }
         Decision::Idle { next_after } => {
@@ -572,7 +572,7 @@ async fn dispatch(
         }
         Decision::Retire { reason } => {
             debug!(%reason, "decision: retire");
-            fs.persist_retirement(&reason)?;
+            fs.persist_retirement(&reason).await?;
             Ok(ApplyOutcome::Retire(RetireReason(reason)))
         }
     }
@@ -646,7 +646,7 @@ async fn dispatch_call_tools(
         let call = &calls[i];
         match result {
             Ok(ev) => {
-                fs.record_evidence(ev)?;
+                fs.record_evidence(ev).await?;
             }
             Err(e) => {
                 failures.push(ToolFailure {
@@ -976,7 +976,9 @@ mod tests {
             let decide = LlmDecide::new(client, CompleteOptions::default());
             let tmp = tempfile::TempDir::new().unwrap();
             let mandate = Mandate::new("stats-test", std::time::Duration::from_millis(10), Some(1));
-            let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+            let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+                .await
+                .unwrap();
             let registry = ToolRegistry::new();
             let health = HealthTracker::open(
                 tmp.path(),
@@ -1020,7 +1022,9 @@ mod tests {
             // Small idle_period + max_ticks cap so the test is fast and
             // bounded regardless of which retire path actually fires.
             let mandate = Mandate::new("stats-test", std::time::Duration::from_millis(1), Some(4));
-            let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+            let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+                .await
+                .unwrap();
             let registry = ToolRegistry::new();
             let health = HealthTracker::open(
                 tmp.path(),
@@ -1072,7 +1076,9 @@ mod tests {
             let decide = LlmDecide::new(client, CompleteOptions::default());
             let tmp = tempfile::TempDir::new().unwrap();
             let mandate = Mandate::new("stats-test", std::time::Duration::from_secs(1), Some(1));
-            let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+            let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+                .await
+                .unwrap();
             let registry = ToolRegistry::new();
             let health = HealthTracker::open(
                 tmp.path(),

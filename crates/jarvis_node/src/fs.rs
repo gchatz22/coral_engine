@@ -1,25 +1,37 @@
-//! `AgentFs` — directory-backed per-agent filesystem.
+//! `AgentFs` — facade over the pluggable per-agent storage backend.
 //!
-//! This module owns the on-disk representation of a single agent's state.
-//! The agent's working memory is **state-as-files** rather than a hidden
-//! context window (see `VISION.md` § 4: "every agent has a filesystem"),
-//! so this layout is the durable substrate the run loop reads and writes
-//! between wakeups.
+//! As of JAR2-53 (stage 2.5.3), `AgentFs` is a thin facade over
+//! [`crate::storage::AgentStorage`]: the on-disk representation of
+//! today's directory layout is one storage backend
+//! ([`crate::storage::LocalStorage`]); a forthcoming `S3Storage` lands
+//! at the future cloud-deployment stage. Callers continue to talk to
+//! `AgentFs` and never touch the backend directly. See
+//! `scratch/agent_storage.md` for the full design, especially:
+//!
+//! - § 2 — the method → object-op mapping table this module implements.
+//! - § 6.1 — `LocalStorage` semantics this facade still relies on
+//!   (atomic writes, `O_EXCL` for content-addressed evidence).
+//! - § 8 — atomicity contract (per-key, no cross-key transactions).
+//! - § 13 — load-bearing design decisions.
 //!
 //! # Schema
 //!
 //! ```text
-//! <root>/
-//!   mandate.json          — what the agent is told to do (current state)
-//!   outputs/<ulid>.json   — produced artifacts; the agent's public claims
-//!   evidence/<sha256>.json — raw record of every tool call; the provenance trail
-//!   notes/                — private working memory; scratchpad, intermediate reasoning
-//!   claims/<slug>.json    — claim_seed registry; one file per opened claim (JAR2-28)
-//!   retirement.json       — terminal marker; agent has cleanly ended
+//! <prefix>mandate.json          — what the agent is told to do
+//! <prefix>outputs/<ulid>.json   — produced artifacts; the agent's claims
+//! <prefix>evidence/<sha256>.json — raw record of every tool call
+//! <prefix>notes/                — private working memory
+//! <prefix>claims/<slug>.json    — claim_seed registry (JAR2-28)
+//! <prefix>retirement.json       — terminal marker
 //! ```
 //!
-//! Each subdirectory is a deliberate split, not a filing convention.
-//! The walls between them encode load-bearing rules.
+//! `<prefix>` is `""` for the single-host bootstrap. When multi-agent
+//! topology lands, the prefix becomes
+//! `graphs/<graph_id>/agents/<agent_id>/` so a single bucket /
+//! filesystem can hold every agent's state without collisions.
+//! [`AgentFs::new_with_storage`] is the constructor that exercises the
+//! prefix; the legacy `AgentFs::open` retains today's semantics for
+//! the bootstrap call sites.
 //!
 //! # `outputs/` vs `notes/` — claims vs thinking
 //!
@@ -63,8 +75,9 @@
 //! [`crate::evidence::EvidenceId::new`]. Three properties fall out:
 //!
 //! 1. **Dedup is automatic.** Two tool calls with the same `(tool, args,
-//!    result)` produce the same id, so [`AgentFs::record_evidence`] is
-//!    idempotent and we never write the same record twice.
+//!    result)` produce the same id, so [`AgentFs::record_evidence`]
+//!    uses [`crate::storage::AgentStorage::put_if_absent`] and is
+//!    idempotent — same bytes, same key, no duplicate.
 //! 2. **Outputs that cite the same evidence id are demonstrably
 //!    grounded in the same primary source.** An audit tool walks
 //!    `evidence_ids` from each output to its file with no joins.
@@ -141,27 +154,26 @@
 //! - **No mid-tick state.** By design, state lives in `notes/` between
 //!   ticks. If mid-tick state has to survive a crash, that's a separate
 //!   concern.
-//!
-//! # Implementation notes
-//!
-//! The bootstrap uses synchronous `std::fs`. The run loop ticket
-//! (JAR2-8) can wrap calls in `tokio::task::spawn_blocking` if it needs
-//! to. Concurrent multi-writer safety is out of scope: assume a single
-//! process owns the root.
+//! - **`health.json` is not on this facade.** [`crate::health::HealthTracker`]
+//!   writes `health.json` / `health/<ts>.json` directly via
+//!   `std::fs::write` against its own root. Moving the health tracker
+//!   over to `AgentStorage` is a follow-up — out of scope for stage
+//!   2.5.3 per the "smallest correct diff" rule.
 
 use crate::decision::FsOp;
 use crate::evidence::{EvidenceId, EvidenceRecord};
 use crate::mandate::{Mandate, Output};
+use crate::storage::{AgentStorage, LocalStorage, PutOutcome};
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs;
-use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 
-/// Typed errors the `AgentFs` raises. The run loop (JAR2-8) matches on
-/// these to distinguish provenance/traversal violations from real I/O
+/// Typed errors the `AgentFs` raises. The run loop matches on these to
+/// distinguish provenance/traversal violations from real storage
 /// failures, so adding variants is a breaking change for that consumer.
 #[derive(Debug, Error)]
 pub enum FsError {
@@ -179,19 +191,23 @@ pub enum FsError {
     /// `<root>/notes/`. Bootstrap `apply_ops` only writes under `notes/`.
     #[error("path outside notes/ rejected: {0}")]
     PathOutsideNotes(String),
-    /// Wrapped `std::io::Error` with the path that caused it, when known.
-    #[error("io error at {path}: {source}")]
-    Io {
-        path: PathBuf,
+    /// Wrapped backend error from the underlying
+    /// [`crate::storage::AgentStorage`]. The `key` field carries the
+    /// logical key (under the agent's prefix) that the operation
+    /// targeted, so a failure trail can be reconstructed even when the
+    /// backend's error string is opaque.
+    #[error("storage error at {key}: {source}")]
+    Storage {
+        key: String,
         #[source]
-        source: io::Error,
+        source: crate::storage::StorageError,
     },
 }
 
 impl FsError {
-    fn io(path: impl Into<PathBuf>, source: io::Error) -> Self {
-        FsError::Io {
-            path: path.into(),
+    fn storage(key: impl Into<String>, source: crate::storage::StorageError) -> Self {
+        FsError::Storage {
+            key: key.into(),
             source,
         }
     }
@@ -292,121 +308,208 @@ pub fn claim_slug(seed: &str) -> String {
     }
 }
 
-/// Directory-backed per-agent filesystem. Cheap to clone — holds only the
-/// root path.
-#[derive(Debug, Clone)]
+/// Per-agent filesystem, expressed as a facade over an `AgentStorage`
+/// backend. Cheap to clone — holds an `Arc` to the storage and a small
+/// key prefix.
+///
+/// Construct via [`AgentFs::open`] for today's single-host bootstrap
+/// shape (`<root>` is one agent's directory, prefix is empty), or via
+/// [`AgentFs::new_with_storage`] when a test wants to drive `AgentFs`
+/// against `MemoryStorage` / a custom storage prefix.
+#[derive(Clone)]
 pub struct AgentFs {
-    root: PathBuf,
+    storage: Arc<dyn AgentStorage>,
+    /// Key prefix applied to every operation. Empty for the bootstrap;
+    /// non-empty (`graphs/<graph_id>/agents/<agent_id>/`) when
+    /// multi-agent topology lands. Always either empty or ends in `/`.
+    prefix: String,
+}
+
+impl std::fmt::Debug for AgentFs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `dyn AgentStorage` doesn't carry a `Debug` bound (kept off
+        // the trait to leave backends free to choose), so we summarize
+        // the facade by its prefix instead.
+        f.debug_struct("AgentFs")
+            .field("prefix", &self.prefix)
+            .finish()
+    }
 }
 
 impl AgentFs {
-    /// Initialize the layout under `root` and write `mandate.json` if it
-    /// is not already present.
+    /// Open an on-disk agent FS rooted at `root`.
+    ///
+    /// Wraps a [`LocalStorage`] backend with an empty prefix; equivalent
+    /// to `new_with_storage(Arc::new(LocalStorage::new(root)?), "", mandate)`.
+    /// Kept as the primary entry point for the bootstrap call sites
+    /// (`bin/node_run*.rs`) and existing tests so this ticket's diff is
+    /// strictly "facade swap" rather than "rethread agent ids through
+    /// every caller". The `graphs/<graph_id>/agents/<agent_id>/` prefix
+    /// shape is exercised via [`AgentFs::new_with_storage`] and lands at
+    /// the call sites when multi-agent topology arrives.
     ///
     /// Idempotent: calling `open` against an existing FS does not clobber
     /// `mandate.json`, `outputs/`, `evidence/`, `notes/`, or
-    /// `retirement.json` — directories are created if missing, and the
-    /// mandate file is only written when absent.
-    pub fn open(root: PathBuf, mandate: &Mandate) -> anyhow::Result<Self> {
-        Self::ensure_dir(&root)?;
-        Self::ensure_dir(&root.join("outputs"))?;
-        Self::ensure_dir(&root.join("evidence"))?;
-        Self::ensure_dir(&root.join("notes"))?;
-        Self::ensure_dir(&root.join("claims"))?;
+    /// `retirement.json` — the mandate file is only written when absent.
+    pub async fn open(root: PathBuf, mandate: &Mandate) -> anyhow::Result<Self> {
+        let storage = Arc::new(LocalStorage::new(root)?);
+        Self::new_with_storage(storage, String::new(), mandate).await
+    }
 
-        let mandate_path = root.join("mandate.json");
-        if !mandate_path.exists() {
+    /// Build an `AgentFs` over any storage backend with the supplied key
+    /// prefix.
+    ///
+    /// `prefix` is normalized to either `""` or "`...something/`" — a
+    /// trailing slash is appended if missing so callers don't have to
+    /// remember the convention. Writing `mandate.json` is the only
+    /// state side effect; the trait's lazy-directory-creation
+    /// (`LocalStorage`) or implicit-namespace (`MemoryStorage`)
+    /// semantics handle the rest.
+    pub async fn new_with_storage(
+        storage: Arc<dyn AgentStorage>,
+        prefix: impl Into<String>,
+        mandate: &Mandate,
+    ) -> anyhow::Result<Self> {
+        let mut prefix = prefix.into();
+        if !prefix.is_empty() && !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        let me = Self { storage, prefix };
+
+        // Idempotent mandate write: read first, write only if absent so
+        // a re-open against an existing FS doesn't overwrite the
+        // current mandate (matches today's `open` semantics).
+        let mandate_key = me.key("mandate.json");
+        let existing = me
+            .storage
+            .get(&mandate_key)
+            .await
+            .map_err(|e| FsError::storage(&mandate_key, e))?;
+        if existing.is_none() {
             let bytes = serde_json::to_vec_pretty(mandate)?;
-            fs::write(&mandate_path, &bytes).map_err(|e| FsError::io(&mandate_path, e))?;
+            me.storage
+                .put(&mandate_key, Bytes::from(bytes))
+                .await
+                .map_err(|e| FsError::storage(&mandate_key, e))?;
         }
 
-        Ok(Self { root })
+        Ok(me)
     }
 
-    /// Borrow the agent's filesystem root.
-    pub fn root(&self) -> &Path {
-        &self.root
+    /// Borrow the underlying storage. Exposed for higher layers (tail
+    /// indices, snapshot scans) that need direct trait access without
+    /// going through every per-shape method.
+    pub fn storage(&self) -> &Arc<dyn AgentStorage> {
+        &self.storage
     }
 
-    /// Persist an `EvidenceRecord` under `evidence/<id>.json`.
+    /// Borrow the agent's key prefix (always either empty or ending in
+    /// `/`). Exposed so the tail-index work (JAR2-54) can compute
+    /// `<prefix>outputs/_tail.json` keys without re-implementing the
+    /// prefixing logic.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    /// Persist an `EvidenceRecord` under `<prefix>evidence/<id>.json`.
     ///
     /// Writing the same record twice is a no-op: the file is content-
-    /// addressed by `record.id` (which is itself the sha256 of the
-    /// canonical JSON of `(tool, args, result)` — see `evidence::EvidenceId::new`),
-    /// so a duplicate write would produce identical bytes. We skip the
-    /// write entirely if the file exists.
-    pub fn record_evidence(&self, record: EvidenceRecord) -> anyhow::Result<EvidenceId> {
+    /// addressed by `record.id` (sha256 of `(tool, args, result)` —
+    /// see [`crate::evidence::EvidenceId::new`]), so a duplicate write
+    /// would produce identical bytes. We use
+    /// [`crate::storage::AgentStorage::put_if_absent`] which makes the
+    /// dedup atomic — race-free against a concurrent re-record from a
+    /// retried activity, matching the property the on-disk
+    /// `O_EXCL` give us today.
+    pub async fn record_evidence(&self, record: EvidenceRecord) -> anyhow::Result<EvidenceId> {
         let id = record.id.clone();
-        let path = self.evidence_path(&id);
-        if path.exists() {
-            // Already present — content-addressed, so the bytes match.
-            return Ok(id);
-        }
+        let key = self.evidence_key(&id);
         let bytes = serde_json::to_vec_pretty(&record)?;
-        fs::write(&path, &bytes).map_err(|e| FsError::io(&path, e))?;
+        // `put_if_absent` returns Created on first write, Existed on
+        // subsequent attempts; both paths are success for the
+        // content-addressed dedup contract.
+        let _outcome: PutOutcome = self
+            .storage
+            .put_if_absent(&key, Bytes::from(bytes))
+            .await
+            .map_err(|e| FsError::storage(&key, e))?;
         Ok(id)
     }
 
-    /// Return `Ok(())` if `id` resolves to a file under `evidence/`,
+    /// Return `Ok(())` if `id` resolves to an evidence record,
     /// otherwise `Err(FsError::EvidenceNotFound)`.
-    pub fn evidence_must_exist(&self, id: &EvidenceId) -> anyhow::Result<()> {
-        if self.evidence_path(id).exists() {
+    pub async fn evidence_must_exist(&self, id: &EvidenceId) -> anyhow::Result<()> {
+        let key = self.evidence_key(id);
+        let got = self
+            .storage
+            .get(&key)
+            .await
+            .map_err(|e| FsError::storage(&key, e))?;
+        if got.is_some() {
             Ok(())
         } else {
             Err(FsError::EvidenceNotFound(id.clone()).into())
         }
     }
 
-    /// Persist an `Output` under `outputs/<ulid>.json`, enforcing the
-    /// provenance contract: at least one evidence id, and every id must
-    /// resolve to a record on disk.
-    pub fn persist_output(&self, content: &str, evidence: &[EvidenceId]) -> anyhow::Result<Output> {
+    /// Persist an `Output` under `<prefix>outputs/<ulid>.json`,
+    /// enforcing the provenance contract: at least one evidence id,
+    /// and every id must resolve to a record.
+    pub async fn persist_output(
+        &self,
+        content: &str,
+        evidence: &[EvidenceId],
+    ) -> anyhow::Result<Output> {
         if evidence.is_empty() {
             return Err(FsError::EmptyEvidence.into());
         }
+        // Verify presence of every cited evidence id before the write.
+        // A future optimization batches these via `get_many`; today's
+        // call counts are tiny (single-digit) so per-id `get` keeps
+        // the error message simple.
         for id in evidence {
-            self.evidence_must_exist(id)?;
+            self.evidence_must_exist(id).await?;
         }
         let output = Output::new(content.to_string(), evidence.to_vec(), Utc::now());
-        let path = self
-            .root
-            .join("outputs")
-            .join(format!("{}.json", output.id));
+        let key = self.key(&format!("outputs/{}.json", output.id));
         let bytes = serde_json::to_vec_pretty(&output)?;
-        fs::write(&path, &bytes).map_err(|e| FsError::io(&path, e))?;
+        self.storage
+            .put(&key, Bytes::from(bytes))
+            .await
+            .map_err(|e| FsError::storage(&key, e))?;
         Ok(output)
     }
 
     /// Apply a batch of filesystem ops. The bootstrap only supports
     /// writes and deletes under `notes/`; any path that escapes
     /// `<root>/notes/` is rejected before any write happens.
-    pub fn apply_ops(&self, ops: Vec<FsOp>) -> anyhow::Result<()> {
+    pub async fn apply_ops(&self, ops: Vec<FsOp>) -> anyhow::Result<()> {
         // Validate every op first so a partial batch with a bad path in
-        // the middle does not leave a half-applied state.
-        let mut planned: Vec<(PathBuf, &FsOp)> = Vec::with_capacity(ops.len());
-        for op in &ops {
-            let raw = match op {
+        // the middle does not leave a half-applied state. The validated
+        // key carries the agent prefix already.
+        let mut planned: Vec<(String, FsOp)> = Vec::with_capacity(ops.len());
+        for op in ops {
+            let raw = match &op {
                 FsOp::WriteFile { path, .. } | FsOp::DeleteFile { path } => path.as_str(),
             };
-            let resolved = self.resolve_notes_path(raw)?;
+            let resolved = self.resolve_notes_key(raw)?;
             planned.push((resolved, op));
         }
 
-        for (path, op) in planned {
+        for (key, op) in planned {
             match op {
                 FsOp::WriteFile { content, .. } => {
-                    if let Some(parent) = path.parent() {
-                        Self::ensure_dir(parent)?;
-                    }
-                    fs::write(&path, content.as_bytes()).map_err(|e| FsError::io(&path, e))?;
+                    self.storage
+                        .put(&key, Bytes::from(content.into_bytes()))
+                        .await
+                        .map_err(|e| FsError::storage(&key, e))?;
                 }
                 FsOp::DeleteFile { .. } => {
-                    // Idempotent at the type level — missing file is fine.
-                    match fs::remove_file(&path) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(FsError::io(&path, e).into()),
-                    }
+                    // Idempotent at the type level — missing key is fine.
+                    self.storage
+                        .delete(&key)
+                        .await
+                        .map_err(|e| FsError::storage(&key, e))?;
                 }
             }
         }
@@ -421,12 +524,11 @@ impl AgentFs {
     /// This lets the run loop hand a `Decide` implementation a stable
     /// "recent history" window without needing wall-clock comparisons.
     ///
-    /// Added for JAR2-6 (`assemble_context`); the bootstrap reads the full
-    /// directory and slices in memory because the corpus is small. A
-    /// follow-up can index or page if that ever stops being true.
-    pub fn list_recent_outputs(&self, n: usize) -> anyhow::Result<Vec<Output>> {
-        let dir = self.root.join("outputs");
-        Self::read_recent_json(&dir, n)
+    /// Stage-2.5.3 implementation: a full LIST + `get_many` of the
+    /// trailing window. The O(1) tail-index path lands in JAR2-54.
+    pub async fn list_recent_outputs(&self, n: usize) -> anyhow::Result<Vec<Output>> {
+        let prefix = self.key("outputs/");
+        self.read_recent_json::<Output>(&prefix, n).await
     }
 
     /// Return the most recent (up to) `n` `EvidenceRecord`s on disk.
@@ -436,49 +538,56 @@ impl AgentFs {
     /// purely lexical (ascending filename, last `n`). The bootstrap
     /// `assemble_context` only needs determinism, not true recency, and
     /// promoting evidence to a time-indexed store is out of scope.
-    pub fn list_recent_evidence(&self, n: usize) -> anyhow::Result<Vec<EvidenceRecord>> {
-        let dir = self.root.join("evidence");
-        Self::read_recent_json(&dir, n)
+    ///
+    /// Stage-2.5.3 implementation: see `list_recent_outputs`. JAR2-54
+    /// switches both to the tail-index O(1) path.
+    pub async fn list_recent_evidence(&self, n: usize) -> anyhow::Result<Vec<EvidenceRecord>> {
+        let prefix = self.key("evidence/");
+        self.read_recent_json::<EvidenceRecord>(&prefix, n).await
     }
 
     /// Write `retirement.json` with the supplied reason and the current
     /// UTC timestamp. Overwrites any prior retirement record.
-    pub fn persist_retirement(&self, reason: &str) -> anyhow::Result<()> {
+    pub async fn persist_retirement(&self, reason: &str) -> anyhow::Result<()> {
         let record = RetirementRecord {
             reason: reason.to_string(),
             retired_at: Utc::now(),
         };
-        let path = self.root.join("retirement.json");
+        let key = self.key("retirement.json");
         let bytes = serde_json::to_vec_pretty(&record)?;
-        fs::write(&path, &bytes).map_err(|e| FsError::io(&path, e))?;
+        self.storage
+            .put(&key, Bytes::from(bytes))
+            .await
+            .map_err(|e| FsError::storage(&key, e))?;
         Ok(())
     }
 
     /// Write a claim under `claims/<slug>.json`. Slug is derived from
     /// `claim.seed` via [`claim_slug`]. Overwrites any existing file at
     /// that slug — status updates flow through the same path.
-    ///
-    /// See `scratch/claim_seed_persistence.md` for the convention; the
-    /// short version is that the agent writes here on first mint of a
-    /// seed so future ticks can find it via [`Self::read_claim`] /
-    /// [`Self::list_claims`] before issuing `Decision::CallTool` and
-    /// reuse the existing seed instead of fragmenting the claim id.
-    pub fn write_claim(&self, claim: &Claim) -> anyhow::Result<()> {
-        let path = self.claim_path(&claim.seed);
+    pub async fn write_claim(&self, claim: &Claim) -> anyhow::Result<()> {
+        let key = self.claim_key(&claim.seed);
         let bytes = serde_json::to_vec_pretty(claim)?;
-        fs::write(&path, &bytes).map_err(|e| FsError::io(&path, e))?;
+        self.storage
+            .put(&key, Bytes::from(bytes))
+            .await
+            .map_err(|e| FsError::storage(&key, e))?;
         Ok(())
     }
 
     /// Read the claim previously written for `seed`. Returns `Ok(None)`
-    /// when no file is present so callers can branch cleanly between
+    /// when no record is present so callers can branch cleanly between
     /// "first time minting this seed" and "I/O failed."
-    pub fn read_claim(&self, seed: &str) -> anyhow::Result<Option<Claim>> {
-        let path = self.claim_path(seed);
-        match fs::read(&path) {
-            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(FsError::io(&path, e).into()),
+    pub async fn read_claim(&self, seed: &str) -> anyhow::Result<Option<Claim>> {
+        let key = self.claim_key(seed);
+        let got = self
+            .storage
+            .get(&key)
+            .await
+            .map_err(|e| FsError::storage(&key, e))?;
+        match got {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            None => Ok(None),
         }
     }
 
@@ -486,87 +595,102 @@ impl AgentFs {
     /// order. The order is deterministic but not chronological — file
     /// names are slugs, not ULIDs. Callers that need recency should
     /// sort by `created_at` themselves.
-    pub fn list_claims(&self) -> anyhow::Result<Vec<Claim>> {
-        let dir = self.root.join("claims");
-        Self::read_recent_json(&dir, usize::MAX)
+    pub async fn list_claims(&self) -> anyhow::Result<Vec<Claim>> {
+        let prefix = self.key("claims/");
+        self.read_recent_json::<Claim>(&prefix, usize::MAX).await
     }
 
-    // ---- helpers --------------------------------------------------------
+    // ---- key construction ----------------------------------------------
 
-    fn claim_path(&self, seed: &str) -> PathBuf {
-        self.root
-            .join("claims")
-            .join(format!("{}.json", claim_slug(seed)))
+    fn key(&self, tail: &str) -> String {
+        if self.prefix.is_empty() {
+            tail.to_string()
+        } else {
+            format!("{}{tail}", self.prefix)
+        }
     }
 
-    fn evidence_path(&self, id: &EvidenceId) -> PathBuf {
-        self.root.join("evidence").join(format!("{}.json", id))
+    fn claim_key(&self, seed: &str) -> String {
+        self.key(&format!("claims/{}.json", claim_slug(seed)))
     }
 
-    fn ensure_dir(path: &Path) -> anyhow::Result<()> {
-        fs::create_dir_all(path).map_err(|e| FsError::io(path, e))?;
-        Ok(())
+    fn evidence_key(&self, id: &EvidenceId) -> String {
+        self.key(&format!("evidence/{}.json", id))
     }
 
-    /// Read every regular `.json` file under `dir`, sort by filename
-    /// ascending, take the last `n`, and parse each into `T`.
+    /// Lex-sort every `.json` key under `prefix`, take the last `n`,
+    /// fetch and deserialize.
     ///
-    /// Filename sort is the stable ordering primitive — outputs use ULID
-    /// filenames (time-monotonic) and evidence uses sha256 (arbitrary but
-    /// deterministic). A missing directory yields an empty list rather
-    /// than an error so this is safe to call right after `open`.
+    /// Implementation mirrors the pre-2.5.3 `read_recent_json` but goes
+    /// through the storage trait: one `list` to enumerate keys, then a
+    /// single `get_many` for the trailing window so a remote backend
+    /// pays one round-trip instead of N. A missing prefix yields an
+    /// empty list (the backend returns an empty `ListPage`), preserving
+    /// the "safe to call right after `open`" property.
     ///
-    /// Scaling note: this enumerates every entry in `dir` and sorts the
-    /// full filename list, even though only the top `n` results are
-    /// returned. File *contents* are read lazily for the top `n` only,
-    /// so the cost is O(M) names + O(M log M) sort where M is the total
-    /// directory size. At bootstrap scale (M < 100, n = 8) this is
-    /// microseconds and irrelevant. A long-lived agent with thousands
-    /// of outputs/evidence records will want a real fix — most likely
-    /// an append-only `index.jsonl` per directory that lets us tail the
-    /// recent N without scanning. Bounded min-heap is a cheaper
-    /// intermediate (O(M log N), O(N) memory) but doesn't address the
-    /// underlying "scan a directory every wakeup" problem. Both
-    /// optimizations land alongside the FS-schema-evolution work that
-    /// snapshots/versioning will need anyway (`VISION.md` § 5).
-    fn read_recent_json<T>(dir: &Path, n: usize) -> anyhow::Result<Vec<T>>
+    /// Scaling note: still O(M) under the prefix because we ask for
+    /// every key and slice in memory. The O(1) tail-index path lands
+    /// in JAR2-54.
+    async fn read_recent_json<T>(&self, prefix: &str, n: usize) -> anyhow::Result<Vec<T>>
     where
         T: serde::de::DeserializeOwned,
     {
-        if !dir.exists() {
+        // `usize::MAX` as `limit` asks the backend for everything; both
+        // `MemoryStorage` and `LocalStorage` honor that without
+        // pagination. A future scale fix replaces this with a bounded
+        // page + heap-merge, but the tail-index work (JAR2-54)
+        // sidesteps it entirely for the common case.
+        let page = self
+            .storage
+            .list(prefix, None, usize::MAX)
+            .await
+            .map_err(|e| FsError::storage(prefix, e))?;
+        // Keep only `.json` keys — guards against any sidecar artifacts
+        // a backend might surface (e.g. JAR2-54's `_tail.json` is also
+        // `.json` so will be included — that's filtered separately in
+        // the tail-aware code path, not here).
+        let mut keys: Vec<String> = page
+            .keys
+            .into_iter()
+            .filter(|k| k.ends_with(".json"))
+            .collect();
+        keys.sort();
+        let start = keys.len().saturating_sub(n);
+        let window: Vec<String> = keys.into_iter().skip(start).collect();
+
+        if window.is_empty() {
             return Ok(Vec::new());
         }
-        // Collect (filename, full path) for every regular .json entry. We
-        // sort by filename rather than by full path so the ordering is
-        // independent of the FS root location.
-        let mut entries: Vec<(std::ffi::OsString, PathBuf)> = Vec::new();
-        for entry in fs::read_dir(dir).map_err(|e| FsError::io(dir, e))? {
-            let entry = entry.map_err(|e| FsError::io(dir, e))?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            entries.push((entry.file_name(), path));
-        }
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let start = entries.len().saturating_sub(n);
-        let mut out = Vec::with_capacity(entries.len() - start);
-        for (_, path) in entries.into_iter().skip(start) {
-            let bytes = fs::read(&path).map_err(|e| FsError::io(&path, e))?;
+        let refs: Vec<&str> = window.iter().map(String::as_str).collect();
+        let blobs = self
+            .storage
+            .get_many(&refs)
+            .await
+            .map_err(|e| FsError::storage(prefix, e))?;
+        let mut out = Vec::with_capacity(blobs.len());
+        for (key, blob) in window.iter().zip(blobs.into_iter()) {
+            let bytes = match blob {
+                Some(b) => b,
+                // Key disappeared between list and get_many — treat as
+                // absent rather than error. (Single-writer-per-agent
+                // makes this almost impossible in practice; pinning the
+                // behavior keeps races between concurrent test threads
+                // tame.)
+                None => {
+                    tracing::debug!(key = key.as_str(), "key absent between list and get_many");
+                    continue;
+                }
+            };
             let value: T = serde_json::from_slice(&bytes)?;
             out.push(value);
         }
         Ok(out)
     }
 
-    /// Resolve `raw` against `<root>/notes/`. Paths must be relative,
-    /// start with a `notes/` segment, contain only normal path
-    /// components (no `..`, no root, no Windows prefix), and name a file
-    /// inside `notes/` (not `notes/` itself).
+    /// Resolve `raw` to a storage key under `<prefix>notes/`. Paths must
+    /// be relative, start with a `notes/` segment, contain only normal
+    /// path components (no `..`, no root, no Windows prefix), and name
+    /// a file inside `notes/` (not `notes/` itself).
     ///
     /// We deliberately walk `Components` instead of using
     /// `Path::canonicalize`: target files may not exist yet (write
@@ -574,17 +698,15 @@ impl AgentFs {
     /// scope (single-process owner, no symlink farm) makes this
     /// component check sufficient. Symlinks pointing out of `notes/` are
     /// a known follow-up.
-    fn resolve_notes_path(&self, raw: &str) -> anyhow::Result<PathBuf> {
+    fn resolve_notes_key(&self, raw: &str) -> anyhow::Result<String> {
         let candidate = Path::new(raw);
 
-        // First pass: only Normal components and `.` are allowed. A
-        // `..`, root, or Windows-prefix component means the caller is
-        // trying to traverse out — reject before any normalization.
+        // First pass: only Normal components and `.` are allowed.
         let mut cleaned = PathBuf::new();
         for comp in candidate.components() {
             match comp {
                 Component::Normal(part) => cleaned.push(part),
-                Component::CurDir => {} // "." — harmless, drop it
+                Component::CurDir => {} // "." — harmless
                 Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                     return Err(FsError::PathTraversal(raw.to_string()).into());
                 }
@@ -594,17 +716,29 @@ impl AgentFs {
             return Err(FsError::PathTraversal(raw.to_string()).into());
         }
 
-        // Second pass: paths must be rooted at `notes/`. Bare filenames
-        // and paths under any other top-level directory (e.g.
-        // `outputs/...`) are out of bounds for `apply_ops`.
+        // Second pass: must be rooted at `notes/`.
         let tail = match cleaned.strip_prefix("notes") {
             Ok(rest) if !rest.as_os_str().is_empty() => rest.to_path_buf(),
-            // `notes` alone or `notes/` with no file — nothing to write.
             Ok(_) => return Err(FsError::PathOutsideNotes(raw.to_string()).into()),
             Err(_) => return Err(FsError::PathOutsideNotes(raw.to_string()).into()),
         };
 
-        Ok(self.root.join("notes").join(tail))
+        // Re-emit the tail as a `/`-separated key under
+        // `<prefix>notes/`. Components are guaranteed `Normal` by the
+        // first pass so `to_str` only fails on non-UTF-8, which we
+        // surface as a traversal error (no other reasonable mapping).
+        let mut parts = Vec::new();
+        for comp in tail.components() {
+            match comp {
+                Component::Normal(part) => match part.to_str() {
+                    Some(s) => parts.push(s.to_string()),
+                    None => return Err(FsError::PathTraversal(raw.to_string()).into()),
+                },
+                _ => return Err(FsError::PathTraversal(raw.to_string()).into()),
+            }
+        }
+        let joined = parts.join("/");
+        Ok(self.key(&format!("notes/{joined}")))
     }
 }
 
@@ -614,15 +748,18 @@ mod tests {
     use crate::decision::FsOp;
     use crate::evidence::EvidenceRecord;
     use crate::mandate::Mandate;
+    use crate::storage::MemoryStorage;
     use chrono::Utc;
     use serde_json::json;
     use std::time::Duration;
     use tempfile::TempDir;
 
-    fn fresh_fs() -> (TempDir, AgentFs, Mandate) {
+    async fn fresh_fs() -> (TempDir, AgentFs, Mandate) {
         let tmp = TempDir::new().unwrap();
         let mandate = Mandate::new("research foo", Duration::from_millis(1000), Some(10));
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+            .await
+            .unwrap();
         (tmp, fs, mandate)
     }
 
@@ -630,42 +767,46 @@ mod tests {
         EvidenceRecord::new(tool, args, result, Utc::now())
     }
 
-    #[test]
-    fn open_creates_layout_and_writes_mandate() {
-        let (tmp, _fs, mandate) = fresh_fs();
+    #[tokio::test]
+    async fn open_creates_layout_and_writes_mandate() {
+        let (tmp, _fs, mandate) = fresh_fs().await;
         let root = tmp.path();
+        // mandate.json present.
         assert!(root.join("mandate.json").is_file());
-        assert!(root.join("outputs").is_dir());
-        assert!(root.join("evidence").is_dir());
-        assert!(root.join("notes").is_dir());
-        assert!(root.join("claims").is_dir());
-
+        // Subdirectories are created lazily by `LocalStorage` on first
+        // write; they aren't materialised by `open` alone after the
+        // 2.5.3 facade swap. Verify the mandate write succeeded and
+        // round-trips instead.
         let bytes = std::fs::read(root.join("mandate.json")).unwrap();
         let back: Mandate = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, mandate);
     }
 
-    #[test]
-    fn open_is_idempotent_and_does_not_clobber_mandate() {
+    #[tokio::test]
+    async fn open_is_idempotent_and_does_not_clobber_mandate() {
         let tmp = TempDir::new().unwrap();
         let original = Mandate::new("first", Duration::from_millis(500), None);
-        let _fs = AgentFs::open(tmp.path().to_path_buf(), &original).unwrap();
+        let _fs = AgentFs::open(tmp.path().to_path_buf(), &original)
+            .await
+            .unwrap();
 
         // Re-open with a *different* mandate; the on-disk file must keep
         // the original.
         let other = Mandate::new("second", Duration::from_millis(999), Some(7));
-        let _fs2 = AgentFs::open(tmp.path().to_path_buf(), &other).unwrap();
+        let _fs2 = AgentFs::open(tmp.path().to_path_buf(), &other)
+            .await
+            .unwrap();
 
         let bytes = std::fs::read(tmp.path().join("mandate.json")).unwrap();
         let back: Mandate = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, original);
     }
 
-    #[test]
-    fn record_evidence_is_content_addressed_and_dedup_safe() {
-        let (tmp, fs, _m) = fresh_fs();
+    #[tokio::test]
+    async fn record_evidence_is_content_addressed_and_dedup_safe() {
+        let (tmp, fs, _m) = fresh_fs().await;
         let rec = record("echo", json!({"msg": "hi"}), json!({"echoed": "hi"}));
-        let id = fs.record_evidence(rec.clone()).unwrap();
+        let id = fs.record_evidence(rec.clone()).await.unwrap();
 
         // Filename matches the id.
         let path = tmp.path().join("evidence").join(format!("{}.json", id));
@@ -673,7 +814,7 @@ mod tests {
 
         // Second write of an identical record is a no-op — same id, no
         // duplicate, and the directory still has exactly one entry.
-        let id2 = fs.record_evidence(rec.clone()).unwrap();
+        let id2 = fs.record_evidence(rec.clone()).await.unwrap();
         assert_eq!(id, id2);
 
         let entries: Vec<_> = std::fs::read_dir(tmp.path().join("evidence"))
@@ -688,7 +829,7 @@ mod tests {
 
         // A different record produces a different id and a second file.
         let other = record("echo", json!({"msg": "bye"}), json!({"echoed": "bye"}));
-        let other_id = fs.record_evidence(other).unwrap();
+        let other_id = fs.record_evidence(other).await.unwrap();
         assert_ne!(id, other_id);
         let entries: Vec<_> = std::fs::read_dir(tmp.path().join("evidence"))
             .unwrap()
@@ -696,38 +837,43 @@ mod tests {
         assert_eq!(entries.len(), 2);
     }
 
-    #[test]
-    fn persist_output_rejects_empty_evidence() {
-        let (_tmp, fs, _m) = fresh_fs();
-        let err = fs.persist_output("hello", &[]).unwrap_err();
+    #[tokio::test]
+    async fn persist_output_rejects_empty_evidence() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        let err = fs.persist_output("hello", &[]).await.unwrap_err();
         let downcast = err.downcast_ref::<FsError>().expect("typed FsError");
         assert!(matches!(downcast, FsError::EmptyEvidence));
     }
 
-    #[test]
-    fn persist_output_rejects_unknown_evidence_id() {
-        let (tmp, fs, _m) = fresh_fs();
+    #[tokio::test]
+    async fn persist_output_rejects_unknown_evidence_id() {
+        let (tmp, fs, _m) = fresh_fs().await;
         let bogus = EvidenceId::from_hex("deadbeef".repeat(8)); // 64 hex chars
-        let err = fs.persist_output("hello", &[bogus.clone()]).unwrap_err();
+        let err = fs
+            .persist_output("hello", &[bogus.clone()])
+            .await
+            .unwrap_err();
         let downcast = err.downcast_ref::<FsError>().expect("typed FsError");
         match downcast {
             FsError::EvidenceNotFound(missing) => assert_eq!(missing, &bogus),
             other => panic!("expected EvidenceNotFound, got {other:?}"),
         }
-        // No output file should have been written.
-        let entries: Vec<_> = std::fs::read_dir(tmp.path().join("outputs"))
-            .unwrap()
-            .collect();
-        assert!(entries.is_empty());
+        // No output file should have been written — the outputs dir
+        // also won't have been created since the write never happened.
+        let outputs_dir = tmp.path().join("outputs");
+        if outputs_dir.exists() {
+            let entries: Vec<_> = std::fs::read_dir(outputs_dir).unwrap().collect();
+            assert!(entries.is_empty());
+        }
     }
 
-    #[test]
-    fn persist_output_writes_file_referencing_evidence() {
-        let (tmp, fs, _m) = fresh_fs();
+    #[tokio::test]
+    async fn persist_output_writes_file_referencing_evidence() {
+        let (tmp, fs, _m) = fresh_fs().await;
         let rec = record("echo", json!({"msg": "hi"}), json!({"echoed": "hi"}));
-        let id = fs.record_evidence(rec).unwrap();
+        let id = fs.record_evidence(rec).await.unwrap();
 
-        let out = fs.persist_output("hello", &[id.clone()]).unwrap();
+        let out = fs.persist_output("hello", &[id.clone()]).await.unwrap();
         assert_eq!(out.content, "hello");
         assert_eq!(out.evidence, vec![id.clone()]);
 
@@ -739,13 +885,14 @@ mod tests {
         assert!(back.evidence.contains(&id));
     }
 
-    #[test]
-    fn apply_ops_writes_under_notes() {
-        let (tmp, fs, _m) = fresh_fs();
+    #[tokio::test]
+    async fn apply_ops_writes_under_notes() {
+        let (tmp, fs, _m) = fresh_fs().await;
         fs.apply_ops(vec![FsOp::WriteFile {
             path: "notes/a.md".into(),
             content: "hi".into(),
         }])
+        .await
         .unwrap();
         let written = tmp.path().join("notes").join("a.md");
         assert_eq!(std::fs::read_to_string(&written).unwrap(), "hi");
@@ -755,6 +902,7 @@ mod tests {
             path: "notes/sub/c.md".into(),
             content: "deep".into(),
         }])
+        .await
         .unwrap();
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("notes").join("sub").join("c.md")).unwrap(),
@@ -765,23 +913,26 @@ mod tests {
         fs.apply_ops(vec![FsOp::DeleteFile {
             path: "notes/a.md".into(),
         }])
+        .await
         .unwrap();
         assert!(!written.exists());
         fs.apply_ops(vec![FsOp::DeleteFile {
             path: "notes/never-existed.md".into(),
         }])
+        .await
         .unwrap();
     }
 
-    #[test]
-    fn apply_ops_rejects_path_traversal() {
-        let (tmp, fs, _m) = fresh_fs();
+    #[tokio::test]
+    async fn apply_ops_rejects_path_traversal() {
+        let (tmp, fs, _m) = fresh_fs().await;
         for bad in ["../etc/passwd", "../../escape", "notes/../../escape"] {
             let err = fs
                 .apply_ops(vec![FsOp::WriteFile {
                     path: bad.into(),
                     content: "x".into(),
                 }])
+                .await
                 .unwrap_err();
             let downcast = err.downcast_ref::<FsError>().expect("typed FsError");
             assert!(
@@ -796,6 +947,7 @@ mod tests {
                 path: "/etc/passwd".into(),
                 content: "x".into(),
             }])
+            .await
             .unwrap_err();
         assert!(matches!(
             err.downcast_ref::<FsError>().unwrap(),
@@ -809,6 +961,7 @@ mod tests {
                 path: "outputs/forged.json".into(),
                 content: "x".into(),
             }])
+            .await
             .unwrap_err();
         assert!(matches!(
             err.downcast_ref::<FsError>().unwrap(),
@@ -816,15 +969,16 @@ mod tests {
         ));
 
         // None of the rejected ops should have produced files anywhere.
-        let outputs: Vec<_> = std::fs::read_dir(tmp.path().join("outputs"))
-            .unwrap()
-            .collect();
-        assert!(outputs.is_empty());
+        let outputs_dir = tmp.path().join("outputs");
+        if outputs_dir.exists() {
+            let entries: Vec<_> = std::fs::read_dir(outputs_dir).unwrap().collect();
+            assert!(entries.is_empty());
+        }
     }
 
-    #[test]
-    fn apply_ops_is_atomic_against_a_bad_path_in_the_middle() {
-        let (tmp, fs, _m) = fresh_fs();
+    #[tokio::test]
+    async fn apply_ops_is_atomic_against_a_bad_path_in_the_middle() {
+        let (tmp, fs, _m) = fresh_fs().await;
         let err = fs
             .apply_ops(vec![
                 FsOp::WriteFile {
@@ -836,28 +990,33 @@ mod tests {
                     content: "bad".into(),
                 },
             ])
+            .await
             .unwrap_err();
         assert!(err.downcast_ref::<FsError>().is_some());
         // Pre-flight validation rejects the batch before any write.
         assert!(!tmp.path().join("notes").join("good.md").exists());
     }
 
-    #[test]
-    fn list_recent_outputs_returns_window_in_filename_order() {
-        let (_tmp, fs, _m) = fresh_fs();
+    #[tokio::test]
+    async fn list_recent_outputs_returns_window_in_filename_order() {
+        let (_tmp, fs, _m) = fresh_fs().await;
         // Seed an evidence record we can attach to every output.
         let id = fs
             .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
+            .await
             .unwrap();
 
         let mut all_ids = Vec::new();
         for i in 0..10 {
-            let out = fs.persist_output(&format!("o-{i}"), &[id.clone()]).unwrap();
+            let out = fs
+                .persist_output(&format!("o-{i}"), &[id.clone()])
+                .await
+                .unwrap();
             all_ids.push(out.id);
         }
 
         // Last 8.
-        let recent = fs.list_recent_outputs(8).unwrap();
+        let recent = fs.list_recent_outputs(8).await.unwrap();
         assert_eq!(recent.len(), 8);
 
         // Returned outputs are in ascending filename (= ULID) order.
@@ -867,22 +1026,23 @@ mod tests {
         assert_eq!(ids, sorted);
 
         // n larger than available → all entries returned.
-        let all = fs.list_recent_outputs(100).unwrap();
+        let all = fs.list_recent_outputs(100).await.unwrap();
         assert_eq!(all.len(), 10);
 
         // n = 0 → empty.
-        let none = fs.list_recent_outputs(0).unwrap();
+        let none = fs.list_recent_outputs(0).await.unwrap();
         assert!(none.is_empty());
     }
 
-    #[test]
-    fn list_recent_evidence_returns_window_in_filename_order() {
-        let (_tmp, fs, _m) = fresh_fs();
+    #[tokio::test]
+    async fn list_recent_evidence_returns_window_in_filename_order() {
+        let (_tmp, fs, _m) = fresh_fs().await;
         for i in 0..10 {
             fs.record_evidence(record("echo", json!({ "i": i }), json!({ "i": i })))
+                .await
                 .unwrap();
         }
-        let recent = fs.list_recent_evidence(8).unwrap();
+        let recent = fs.list_recent_evidence(8).await.unwrap();
         assert_eq!(recent.len(), 8);
 
         let ids: Vec<_> = recent.iter().map(|r| r.id.as_str().to_string()).collect();
@@ -891,10 +1051,10 @@ mod tests {
         assert_eq!(ids, sorted, "evidence not returned in filename order");
     }
 
-    #[test]
-    fn persist_retirement_writes_file() {
-        let (tmp, fs, _m) = fresh_fs();
-        fs.persist_retirement("done").unwrap();
+    #[tokio::test]
+    async fn persist_retirement_writes_file() {
+        let (tmp, fs, _m) = fresh_fs().await;
+        fs.persist_retirement("done").await.unwrap();
         let path = tmp.path().join("retirement.json");
         assert!(path.is_file());
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -956,47 +1116,47 @@ mod tests {
         assert_eq!(s.len(), SLUG_BODY_MAX + 1 + 8);
     }
 
-    #[test]
-    fn write_claim_round_trip_via_read_claim() {
-        let (_tmp, fs, _m) = fresh_fs();
+    #[tokio::test]
+    async fn write_claim_round_trip_via_read_claim() {
+        let (_tmp, fs, _m) = fresh_fs().await;
         let claim = Claim {
             seed: "phase-2-clearance".into(),
             description: "Did drug X pass phase 2?".into(),
             status: ClaimStatus::Open,
             created_at: now(),
         };
-        fs.write_claim(&claim).unwrap();
+        fs.write_claim(&claim).await.unwrap();
 
-        let back = fs.read_claim("phase-2-clearance").unwrap();
+        let back = fs.read_claim("phase-2-clearance").await.unwrap();
         assert_eq!(back, Some(claim));
     }
 
-    #[test]
-    fn read_claim_returns_none_for_missing_seed() {
-        let (_tmp, fs, _m) = fresh_fs();
-        assert_eq!(fs.read_claim("never-written").unwrap(), None);
+    #[tokio::test]
+    async fn read_claim_returns_none_for_missing_seed() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        assert_eq!(fs.read_claim("never-written").await.unwrap(), None);
     }
 
-    #[test]
-    fn write_claim_overwrites_for_status_updates() {
-        let (_tmp, fs, _m) = fresh_fs();
+    #[tokio::test]
+    async fn write_claim_overwrites_for_status_updates() {
+        let (_tmp, fs, _m) = fresh_fs().await;
         let mut claim = Claim {
             seed: "drug-x-p2".into(),
             description: "?".into(),
             status: ClaimStatus::Open,
             created_at: now(),
         };
-        fs.write_claim(&claim).unwrap();
+        fs.write_claim(&claim).await.unwrap();
         claim.status = ClaimStatus::Resolved;
-        fs.write_claim(&claim).unwrap();
+        fs.write_claim(&claim).await.unwrap();
 
-        let back = fs.read_claim("drug-x-p2").unwrap().unwrap();
+        let back = fs.read_claim("drug-x-p2").await.unwrap().unwrap();
         assert_eq!(back.status, ClaimStatus::Resolved);
     }
 
-    #[test]
-    fn list_claims_returns_all_in_filename_order() {
-        let (_tmp, fs, _m) = fresh_fs();
+    #[tokio::test]
+    async fn list_claims_returns_all_in_filename_order() {
+        let (_tmp, fs, _m) = fresh_fs().await;
         for s in ["alpha", "bravo", "charlie"] {
             fs.write_claim(&Claim {
                 seed: s.into(),
@@ -1004,12 +1164,13 @@ mod tests {
                 status: ClaimStatus::Open,
                 created_at: now(),
             })
+            .await
             .unwrap();
         }
-        let listed = fs.list_claims().unwrap();
+        let listed = fs.list_claims().await.unwrap();
         assert_eq!(listed.len(), 3);
         // Filename order is stable: same call twice yields same order.
-        let again = fs.list_claims().unwrap();
+        let again = fs.list_claims().await.unwrap();
         assert_eq!(listed, again);
     }
 
@@ -1032,18 +1193,20 @@ mod tests {
     impl Decide for ClaimAwareMock {
         async fn decide(&self, _ctx: ContextBundle) -> anyhow::Result<Decision> {
             // Reuse a seed if a claim already exists for this topic.
-            let claims = self.fs.list_claims()?;
+            let claims = self.fs.list_claims().await?;
             let existing = claims.into_iter().find(|c| c.description == self.topic);
             let seed = match existing {
                 Some(c) => c.seed,
                 None => {
                     let seed = self.new_seed.clone();
-                    self.fs.write_claim(&Claim {
-                        seed: seed.clone(),
-                        description: self.topic.clone(),
-                        status: ClaimStatus::Open,
-                        created_at: now(),
-                    })?;
+                    self.fs
+                        .write_claim(&Claim {
+                            seed: seed.clone(),
+                            description: self.topic.clone(),
+                            status: ClaimStatus::Open,
+                            created_at: now(),
+                        })
+                        .await?;
                     seed
                 }
             };
@@ -1070,7 +1233,7 @@ mod tests {
 
     #[tokio::test]
     async fn seed_reuse_round_trip_returns_existing_claim_seed() {
-        let (_tmp, fs, mandate) = fresh_fs();
+        let (_tmp, fs, mandate) = fresh_fs().await;
 
         // Tick 0: claim already on disk from a prior tick.
         fs.write_claim(&Claim {
@@ -1079,6 +1242,7 @@ mod tests {
             status: ClaimStatus::Open,
             created_at: now(),
         })
+        .await
         .unwrap();
 
         let mock = ClaimAwareMock {
@@ -1098,14 +1262,14 @@ mod tests {
         }
 
         // Mock must not have minted a second claim file.
-        let listed = fs.list_claims().unwrap();
+        let listed = fs.list_claims().await.unwrap();
         assert_eq!(listed.len(), 1);
     }
 
     #[tokio::test]
     async fn new_seed_creation_path_writes_claim_and_emits_call_tool() {
-        let (_tmp, fs, mandate) = fresh_fs();
-        assert!(fs.list_claims().unwrap().is_empty());
+        let (_tmp, fs, mandate) = fresh_fs().await;
+        assert!(fs.list_claims().await.unwrap().is_empty());
 
         let mock = ClaimAwareMock {
             fs: fs.clone(),
@@ -1123,7 +1287,7 @@ mod tests {
         }
 
         // The claim file is now on disk and a future tick would find it.
-        let back = fs.read_claim("phase-2-clearance").unwrap().unwrap();
+        let back = fs.read_claim("phase-2-clearance").await.unwrap().unwrap();
         assert_eq!(back.description, "Did drug X pass phase 2?");
         assert_eq!(back.status, ClaimStatus::Open);
     }
@@ -1137,5 +1301,164 @@ mod tests {
         // deliberately.
         assert_eq!(ClaimSeed::new("phase-2"), ClaimSeed::new("phase-2"));
         assert_ne!(ClaimSeed::new("phase-2"), ClaimSeed::new("phase-3"));
+    }
+
+    // ---- JAR2-53: facade-level adversarial tests -----------------------
+
+    /// Mock `AgentStorage` that returns `Transient` for the next N
+    /// `put` calls, then delegates to an inner `MemoryStorage`. Lets
+    /// the agent-loop verify that a typed `StorageError::Transient`
+    /// surfaces through the `FsError::Storage` wrapper without being
+    /// degraded into a generic anyhow error.
+    struct FlakyPutStorage {
+        inner: MemoryStorage,
+        fail_remaining: tokio::sync::Mutex<u32>,
+    }
+
+    impl FlakyPutStorage {
+        fn new(fail_count: u32) -> Self {
+            Self {
+                inner: MemoryStorage::new(),
+                fail_remaining: tokio::sync::Mutex::new(fail_count),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentStorage for FlakyPutStorage {
+        async fn put(&self, key: &str, value: Bytes) -> crate::storage::StorageResult<()> {
+            let mut remaining = self.fail_remaining.lock().await;
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(crate::storage::StorageError::Transient(format!(
+                    "simulated transient on put({key})"
+                )));
+            }
+            drop(remaining);
+            self.inner.put(key, value).await
+        }
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            value: Bytes,
+        ) -> crate::storage::StorageResult<PutOutcome> {
+            self.inner.put_if_absent(key, value).await
+        }
+        async fn get(&self, key: &str) -> crate::storage::StorageResult<Option<Bytes>> {
+            self.inner.get(key).await
+        }
+        async fn get_many(
+            &self,
+            keys: &[&str],
+        ) -> crate::storage::StorageResult<Vec<Option<Bytes>>> {
+            self.inner.get_many(keys).await
+        }
+        async fn delete(&self, key: &str) -> crate::storage::StorageResult<()> {
+            self.inner.delete(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            after: Option<&str>,
+            limit: usize,
+        ) -> crate::storage::StorageResult<crate::storage::ListPage> {
+            self.inner.list(prefix, after, limit).await
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_fs_propagates_typed_storage_transient_error_through_fs_error() {
+        // Build an AgentFs over MemoryStorage first (so the mandate
+        // write succeeds), then swap in a FlakyPutStorage backed by a
+        // fresh memory store for the actual operation under test.
+        // Constructing the AgentFs directly against FlakyPutStorage(1)
+        // would consume the failure budget on the mandate write
+        // inside `new_with_storage`.
+        let mandate = Mandate::new("flaky", Duration::from_millis(100), Some(1));
+        let storage: Arc<dyn AgentStorage> = Arc::new(FlakyPutStorage::new(1));
+        // Pre-seed mandate.json so new_with_storage's existence check
+        // sees it and skips the put.
+        let mandate_bytes = serde_json::to_vec_pretty(&mandate).unwrap();
+        storage
+            .put("mandate.json", Bytes::from(mandate_bytes))
+            .await
+            .ok(); // first put consumes the failure
+        let fs = AgentFs::new_with_storage(storage, "", &mandate)
+            .await
+            .unwrap();
+
+        // Seed an evidence record so persist_output's evidence check
+        // resolves. `put_if_absent` is delegated straight to inner so
+        // this is unaffected by the put-failure counter.
+        let rec = record("echo", json!({"k": "v"}), json!({"r": "v"}));
+        let id = fs.record_evidence(rec).await.unwrap();
+
+        // The flaky counter was already exhausted on the pre-seed put;
+        // verify a normal write succeeds. Then exhaust a new flaky
+        // storage on an isolated AgentFs.
+        let _ = fs.persist_output("ok", &[id]).await.unwrap();
+
+        // Independent verification: a fresh flaky storage produces an
+        // FsError::Storage whose inner StorageError is Transient.
+        let flaky: Arc<dyn AgentStorage> = Arc::new(FlakyPutStorage::new(1));
+        let err = flaky.put("k", Bytes::from_static(b"v")).await.unwrap_err();
+        assert!(
+            matches!(err, crate::storage::StorageError::Transient(_)),
+            "expected Transient, got {err:?}"
+        );
+
+        // And: that error type survives the FsError::Storage wrap that
+        // `persist_retirement` (a plain `put`) performs.
+        let mandate2 = Mandate::new("flaky2", Duration::from_millis(100), Some(1));
+        let storage2: Arc<dyn AgentStorage> = Arc::new(FlakyPutStorage::new(2));
+        // First flaky consumes mandate.json write inside new_with_storage.
+        let fs2 = match AgentFs::new_with_storage(storage2, "", &mandate2).await {
+            Ok(f) => f,
+            Err(e) => {
+                let typed = e
+                    .downcast_ref::<FsError>()
+                    .expect("mandate.json write should surface FsError");
+                match typed {
+                    FsError::Storage { source, .. } => {
+                        assert!(matches!(source, crate::storage::StorageError::Transient(_)));
+                    }
+                    other => panic!("expected FsError::Storage, got {other:?}"),
+                }
+                return;
+            }
+        };
+        // If construction somehow succeeded, the second put (retirement)
+        // must surface the typed error.
+        let err = fs2.persist_retirement("bye").await.unwrap_err();
+        let typed = err
+            .downcast_ref::<FsError>()
+            .expect("expected FsError wrapping the storage error");
+        match typed {
+            FsError::Storage { source, .. } => {
+                assert!(matches!(source, crate::storage::StorageError::Transient(_)));
+            }
+            other => panic!("expected FsError::Storage, got {other:?}"),
+        }
+    }
+
+    /// `AgentFs::new_with_storage` accepts a `MemoryStorage` backend so
+    /// tests that don't want a tempdir can run hermetically. Smoke-check
+    /// the round-trip.
+    #[tokio::test]
+    async fn agent_fs_over_memory_storage_round_trips_basic_operations() {
+        let mandate = Mandate::new("mem", Duration::from_millis(100), Some(2));
+        let storage: Arc<dyn AgentStorage> = Arc::new(MemoryStorage::new());
+        let fs = AgentFs::new_with_storage(storage, "graphs/g1/agents/a1", &mandate)
+            .await
+            .unwrap();
+        // Prefix normalisation: trailing slash auto-appended.
+        assert_eq!(fs.prefix(), "graphs/g1/agents/a1/");
+
+        let rec = record("t", json!({}), json!({}));
+        let id = fs.record_evidence(rec).await.unwrap();
+        let out = fs.persist_output("hello", &[id]).await.unwrap();
+        let recent = fs.list_recent_outputs(8).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, out.id);
     }
 }

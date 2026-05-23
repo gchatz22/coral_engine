@@ -54,10 +54,12 @@ use jarvis_node::tools::{EchoTool, Tool, ToolRegistry};
 use jarvis_node::trigger::Trigger;
 use jarvis_node::trigger_queue::SignalSink;
 
-fn fresh_fs(idle_period: Duration) -> (TempDir, AgentFs, Mandate) {
+async fn fresh_fs(idle_period: Duration) -> (TempDir, AgentFs, Mandate) {
     let tmp = TempDir::new().expect("tempdir");
     let mandate = Mandate::new("loop smoke", idle_period, None);
-    let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).expect("open fs");
+    let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+        .await
+        .expect("open fs");
     (tmp, fs, mandate)
 }
 
@@ -82,7 +84,7 @@ fn registry_with_echo() -> ToolRegistry {
 async fn loop_wakes_on_injected_signal_and_retires() {
     // Idle period is huge so the test relies on the signal, not the
     // scheduled wake, to drive the first tick.
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_secs(3600));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_secs(3600)).await;
     let script = vec![Decision::Retire {
         reason: "signal-drove-me".into(),
     }];
@@ -121,7 +123,7 @@ async fn loop_wakes_on_deadline_when_no_signal_arrives() {
     // Short idle period so the deadline-arm fires with paused-time auto-
     // advance. Script retires on the first tick; if it ran, the deadline
     // fired, we drained a `ScheduledWake`, and decide returned.
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
     let script = vec![Decision::Retire {
         reason: "deadline-drove-me".into(),
     }];
@@ -146,7 +148,7 @@ async fn loop_wakes_on_deadline_when_no_signal_arrives() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn emit_output_with_valid_evidence_writes_file_under_outputs() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
     // Pre-seed an evidence record on disk so the EmitOutput's evidence id
     // resolves. Computing the id here keeps the test independent of how
     // the agent would have produced it.
@@ -156,7 +158,7 @@ async fn emit_output_with_valid_evidence_writes_file_under_outputs() {
         json!({"echoed": {"msg": "hi"}}),
         chrono::Utc::now(),
     );
-    let ev_id: EvidenceId = fs.record_evidence(rec).expect("seed evidence");
+    let ev_id: EvidenceId = fs.record_evidence(rec).await.expect("seed evidence");
 
     let script = vec![
         Decision::EmitOutput {
@@ -205,7 +207,7 @@ async fn emit_output_with_valid_evidence_writes_file_under_outputs() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn retire_writes_retirement_json_and_returns_reason() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
     let script = vec![Decision::Retire {
         reason: "graceful exit".into(),
     }];
@@ -237,7 +239,7 @@ async fn retire_writes_retirement_json_and_returns_reason() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn rewrite_fs_writes_file_under_notes() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
     let script = vec![
         Decision::RewriteFs {
             ops: vec![FsOp::WriteFile {
@@ -276,7 +278,7 @@ async fn call_tool_records_evidence_and_emit_output_consumes_it() {
     // Sanity sweep that exercises the CallTool arm end to end: the loop
     // calls echo, the resulting evidence is persisted, and a follow-up
     // EmitOutput with that evidence id succeeds.
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
     // Compute the id we expect echo to produce so we can reference it in
     // the EmitOutput decision.
     let args = json!({"msg": "hi"});
@@ -341,7 +343,9 @@ async fn max_ticks_caps_loop_iterations_and_writes_retirement() {
     // Ok(retired); the cap not firing produces Err.
     let tmp = TempDir::new().expect("tempdir");
     let mandate = Mandate::new("max-ticks-test", Duration::from_millis(50), Some(2));
-    let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).expect("open fs");
+    let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+        .await
+        .expect("open fs");
 
     let script = vec![
         Decision::Idle {
@@ -386,7 +390,7 @@ async fn max_ticks_caps_loop_iterations_and_writes_retirement() {
 /// Healthy throughout.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn invalid_call_tool_stages_correction_then_recovers() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
     let script = vec![
         // Tick 1: model picks a tool that is not registered. Apply-time
         // failure → record_failure(Inference) → counter=1 (under default
@@ -455,7 +459,7 @@ async fn invalid_call_tool_stages_correction_then_recovers() {
 /// continuation and the script's second decision retires.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn emit_output_with_empty_evidence_stages_correction() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
     let script = vec![
         Decision::EmitOutput {
             content: "no provenance".into(),
@@ -482,11 +486,17 @@ async fn emit_output_with_empty_evidence_stages_correction() {
     assert_eq!(reason, "recovered");
 
     // No output file written (the failed EmitOutput never persisted).
+    // Post-JAR2-53 `AgentFs::open` no longer proactively mkdirs
+    // `outputs/` — the directory only materialises on first write,
+    // which never happened here. Treat both an absent dir and an
+    // empty dir as "no output was persisted."
     let outputs_dir = tmp.path().join("outputs");
-    assert!(std::fs::read_dir(&outputs_dir)
-        .expect("read outputs")
-        .next()
-        .is_none());
+    if outputs_dir.exists() {
+        assert!(std::fs::read_dir(&outputs_dir)
+            .expect("read outputs")
+            .next()
+            .is_none());
+    }
 
     // Stayed Healthy — single failure under the default budget.
     let v: serde_json::Value = serde_json::from_slice(
@@ -502,7 +512,7 @@ async fn emit_output_with_empty_evidence_stages_correction() {
 /// `FsError` variants the apply-time correction path catches.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn emit_output_with_unknown_evidence_stages_correction() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
     let bogus = EvidenceId::from_hex("deadbeef".repeat(8));
     let script = vec![
         Decision::EmitOutput {
@@ -530,11 +540,17 @@ async fn emit_output_with_unknown_evidence_stages_correction() {
     assert_eq!(reason, "recovered");
 
     // No output file written (the failed EmitOutput never persisted).
+    // Post-JAR2-53 `AgentFs::open` no longer proactively mkdirs
+    // `outputs/` — the directory only materialises on first write,
+    // which never happened here. Treat both an absent dir and an
+    // empty dir as "no output was persisted."
     let outputs_dir = tmp.path().join("outputs");
-    assert!(std::fs::read_dir(&outputs_dir)
-        .expect("read outputs")
-        .next()
-        .is_none());
+    if outputs_dir.exists() {
+        assert!(std::fs::read_dir(&outputs_dir)
+            .expect("read outputs")
+            .next()
+            .is_none());
+    }
 
     // Stayed Healthy — single failure under the default budget.
     let v: serde_json::Value = serde_json::from_slice(
@@ -552,7 +568,7 @@ async fn emit_output_with_unknown_evidence_stages_correction() {
 /// incident.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn persistent_apply_time_failure_exhausts_budget_and_recovers_on_next_success() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
     // Default budget is `RetryBudget::new(1, 3)` → max_inference = 1, so
     // total apply-time attempts before exhaustion = 2 (original + 1
     // retry inside the same fresh-tick window).
@@ -681,7 +697,9 @@ async fn decide_err_transitions_to_unhealthy_and_keeps_loop_alive() {
     // Decide-Err while still bounding the test.
     let tmp = TempDir::new().expect("tempdir");
     let mandate = Mandate::new("decide-err", Duration::from_millis(50), Some(1));
-    let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).expect("open fs");
+    let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+        .await
+        .expect("open fs");
 
     // Empty script → `MockDecide::decide` returns `Err("script exhausted")`
     // on the first call. That is the Decide-Err we exercise here.
@@ -764,7 +782,7 @@ async fn decide_err_transitions_to_unhealthy_and_keeps_loop_alive() {
 /// failures within one continuous window exhaust.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn apply_failure_correction_budget_is_immune_to_concurrent_external_triggers() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
     let script = vec![
         // Tick 1 (fresh): the wrapper Decide injects an external trigger,
         // then returns this bad CallTool. record_failure ok (counter=1)
@@ -971,7 +989,7 @@ fn registry_with_flaky(name: &str, fail_count: u32) -> ToolRegistry {
 /// test below.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn tool_call_exhausts_retry_budget_trips_unhealthy() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
     // Tool fails forever within the lifetime of this test.
     let registry = registry_with_flaky("flaky", u32::MAX);
     let script = vec![
@@ -1064,7 +1082,7 @@ async fn tool_call_exhausts_retry_budget_trips_unhealthy() {
 /// `CallTool` succeeds and the tick is marked successful.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
     // Fail exactly once: tick 1 exhausts (budget=0 trips immediately),
     // tick 2's CallTool succeeds, mark_tick_success archives the
     // Unhealthy incident.
@@ -1203,7 +1221,7 @@ impl Decide for CapturingDecide {
 /// rediscover from scratch why its last decision failed.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn tool_call_failure_stages_correction_visible_on_next_tick_bundle() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
     // Tool fails twice: tick 1's CallTool errors (after the tool's
     // internal RetryPolicy gives up); tick 2's CallTool also errors but
     // the test exits before exhausting the budget — we only care that
@@ -1317,7 +1335,7 @@ async fn tool_call_failure_stages_correction_visible_on_next_tick_bundle() {
 /// tick saw the correction *and* emitted a different `Decision`.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn tool_call_failure_correction_then_different_decision_recovers_to_healthy() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
     // Two tools: `flaky` fails forever; `echo` always succeeds. The
     // script drives the model to call `flaky` first, see the correction,
     // and then call `echo` on the continuation.
@@ -1454,7 +1472,9 @@ async fn per_mandate_recent_outputs_cap_reaches_the_run_loop() {
             open_claims_max: 32,
         },
     };
-    let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).expect("open fs");
+    let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+        .await
+        .expect("open fs");
 
     // Seed 5 outputs by going through the FS directly (the production
     // path); each cites the same evidence record so the provenance contract
@@ -1466,13 +1486,15 @@ async fn per_mandate_recent_outputs_cap_reaches_the_run_loop() {
             json!({"v": 1}),
             Utc::now(),
         ))
+        .await
         .expect("record evidence");
     for i in 0..5 {
         fs.persist_output(&format!("seed-output-{i}"), &[ev_id.clone()])
+            .await
             .expect("persist output");
     }
     // Sanity: the FS layer agrees five outputs are on disk.
-    assert_eq!(fs.list_recent_outputs(usize::MAX).unwrap().len(), 5);
+    assert_eq!(fs.list_recent_outputs(usize::MAX).await.unwrap().len(), 5);
 
     // Single-tick script: retire on the first decide so we exit immediately
     // after observing the bundle.
@@ -1521,7 +1543,7 @@ async fn per_mandate_recent_outputs_cap_reaches_the_run_loop() {
 /// tick" path that the JAR2-37 workaround forced into N+1 ticks.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn parallel_call_tools_k3_all_succeed_persists_evidence_in_order() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
     // Three distinct evidence ids the EmitOutput will cite. EchoTool
     // produces a content-addressed record per `(name, args, result)`
     // triple, so picking three distinct args guarantees three distinct
@@ -1628,7 +1650,7 @@ async fn parallel_call_tools_k3_all_succeed_persists_evidence_in_order() {
 /// `agent.rs`.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn parallel_call_tools_k3_partial_failure_persists_successes_and_stages_correction() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
     // `echo` always succeeds; `flaky` always errors. Mix them in one
     // batch to exercise the partial-failure dispatch path.
     let mut registry = ToolRegistry::new();
@@ -1760,7 +1782,7 @@ async fn parallel_call_tools_k3_partial_failure_persists_successes_and_stages_co
 /// "K against budget" choice.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn parallel_call_tools_k3_all_fail_consumes_k_budget_slots_and_trips_unhealthy() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50));
+    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
     let registry = registry_with_flaky("flaky", u32::MAX);
 
     let script = vec![

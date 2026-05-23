@@ -290,7 +290,9 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
         Duration::from_millis(50),
         Some(8),
     );
-    let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).expect("open fs");
+    let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+        .await
+        .expect("open fs");
 
     let client = Arc::new(build_client(mock.base_url()));
     let decide = LlmDecide::new(client.clone(), CompleteOptions::default());

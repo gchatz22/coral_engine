@@ -133,6 +133,7 @@ async fn run() -> Result<()> {
     let triggers = load_triggers(&args.triggers)?;
 
     let agent_fs = AgentFs::open(args.fs_root.clone(), &mandate)
+        .await
         .with_context(|| format!("opening agent fs at {}", args.fs_root.display()))?;
 
     // Same convention as `node-run`: per-agent FS root doubles as the
