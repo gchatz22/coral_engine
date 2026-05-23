@@ -1,16 +1,16 @@
 [package]
 name = "jarvis_temporal"
 version = "0.0.0"
+# `temporalio-sdk` is `edition = "2024"`. Edition 2024 stabilised in Rust 1.85;
+# the workspace toolchain pin is 1.88 (see `rust-toolchain.toml`), so the SDK
+# compiles. We keep this crate on 2021 because the smoke is small and nothing
+# in it needs 2024 — staying on 2021 matches `jarvis_node` and avoids letting
+# the edition leak into a load-bearing decision that's really about the SDK.
 edition = "2021"
 rust-version = "1.88"
-description = "Temporal-hosted agent workflow runtime for the Jarvis Engine (stage 0 stub)."
+description = "Temporal-hosted agent workflow runtime for the Jarvis Engine (stage 0 SDK smoke)."
 license = "Apache-2.0 OR MIT"
 publish = false
-
-# Stage 0.1 (JAR2-40) lands this crate empty — it reserves the workspace
-# path so stage 0.2 (Temporal Rust SDK smoke, JAR2-?) can drop code in
-# without further restructuring. Intentionally has no dependencies; the
-# `temporalio-sdk` pull happens in 0.2.
 
 # Stage 0.3 (JAR2-42) adds a stub `worker` binary so the Dockerfile in
 # this crate has something concrete to build. The stub prints and exits;
@@ -18,3 +18,36 @@ publish = false
 [[bin]]
 name = "worker"
 path = "src/bin/worker.rs"
+
+# Stage 0.2 smoke (JAR2-41) — exercises the Temporal Rust SDK primitive set
+# (`scratch/agent_runtime.md` § 4) end-to-end against a locally-running
+# Temporal Server. The binary deletes itself when stage 3 lands the real
+# `AgentWorkflow` (see `scratch/temporal_staged_plan.md` § 5 stage 0). The
+# accompanying smoke doc lives at `scratch/temporal_rust_sdk_smoke.md`.
+[[bin]]
+name = "temporal-smoke"
+path = "src/bin/temporal_smoke.rs"
+
+[dependencies]
+# `temporalio-sdk` is in Public Preview at v0.4.0 (released 2026-04-29). The
+# SDK lib.rs documents itself as having a "very unstable" workflow API; the
+# smoke doc records what worked and what surprised us against this pin.
+# Pinned with `=` so a future `cargo update` doesn't silently shift the
+# SDK under us — stage 3 will revisit this pin deliberately.
+temporalio-sdk = "=0.4.0"
+temporalio-client = "=0.4.0"
+temporalio-common = "=0.4.0"
+temporalio-sdk-core = "=0.4.0"
+temporalio-macros = "=0.4.0"
+anyhow = "1"
+# The `#[activities]`, `#[workflow]`, `#[workflow_methods]` macros and the
+# `temporalio_sdk::workflows::select!` macro expand to paths under `futures` /
+# `futures_util` (notably `FutureExt::boxed`), so both must be in-scope
+# direct deps of the crate using them. Confirmed against macro expansion
+# error output, not just SDK example tomls.
+futures = "0.3"
+futures-util = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+url = "2"
