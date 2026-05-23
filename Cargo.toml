@@ -28,6 +28,14 @@ name = "node-run-mcp"
 path = "src/bin/node_run_mcp.rs"
 required-features = ["mcp"]
 
+[[bin]]
+name = "node-run-llm"
+path = "src/bin/node_run_llm.rs"
+# `required-features` would pin a single conjunction; cargo does not
+# support OR. Vendor + `mcp` are gated at runtime inside the binary
+# instead, mirroring `model-call`. See the "Feature gating" doc-comment
+# in `src/bin/node_run_llm.rs`.
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"

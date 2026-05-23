@@ -1,0 +1,55 @@
+{
+  "synthesized": true,
+  "vendor": "cohere",
+  "note": "JAR2-37 Bug-A regression fixture. Two-tick sequence that drives a tool-call -> tool-result roundtrip through the Cohere adapter. Pre-fix, the second tick's request body carried an assistant turn with `content: \"\"` and no other tool_calls (the LlmDecide retry path echos the bad assistant turn verbatim), which Cohere rejects with HTTP 400 `must have non-empty content or tool calls`. With the build_body fix, that assistant turn omits `content` entirely and Cohere accepts it. The fixture itself only scripts Cohere's *responses*; the regression is checked at the captured-wire-body layer in the corresponding test. Hand-written; the maintainer's COHERE_API_KEY can re-record via JARVIS_LIVE_LLM=1 once a tool-call-roundtrip live smoke is in place.",
+  "responses": [
+    {
+      "status": 200,
+      "body": {
+        "id": "cohere_msg_tool_1",
+        "finish_reason": "TOOL_CALL",
+        "message": {
+          "role": "assistant",
+          "content": [],
+          "tool_calls": [
+            {
+              "id": "tc_call_tool_42",
+              "type": "function",
+              "function": {
+                "name": "call_tool",
+                "arguments": "{\"name\":\"echo\",\"args\":{\"msg\":\"jar2-37 roundtrip\"},\"claim_seed\":\"roundtrip-seed\"}"
+              }
+            }
+          ]
+        },
+        "usage": {
+          "tokens": {"input_tokens": 144, "output_tokens": 67}
+        }
+      }
+    },
+    {
+      "status": 200,
+      "body": {
+        "id": "cohere_msg_tool_2",
+        "finish_reason": "COMPLETE",
+        "message": {
+          "role": "assistant",
+          "content": [],
+          "tool_calls": [
+            {
+              "id": "tc_emit_42",
+              "type": "function",
+              "function": {
+                "name": "emit_output",
+                "arguments": "{\"content\":\"echoed jar2-37 roundtrip via the echo tool\",\"evidence\":[\"feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface\"]}"
+              }
+            }
+          ]
+        },
+        "usage": {
+          "tokens": {"input_tokens": 198, "output_tokens": 52}
+        }
+      }
+    }
+  ]
+}

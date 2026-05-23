@@ -35,7 +35,9 @@ use jarvis_node::fs::AgentFs;
 use jarvis_node::health::{HealthTracker, RetryBudget};
 use jarvis_node::mandate::Mandate;
 use jarvis_node::model_client::cohere::CohereClient;
-use jarvis_node::model_client::{CompleteOptions, ModelClient, Vendor};
+use jarvis_node::model_client::{
+    CompleteOptions, CompleteRequest, ContentBlock, Message, ModelClient, Role, ToolCall, Vendor,
+};
 use jarvis_node::tools::{EchoTool, ToolRegistry};
 
 use jarvis_node::decide_llm::llm_decide::LlmDecide;
@@ -305,6 +307,109 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
             .and_then(|x| x.as_str()),
         Some("Inference"),
     );
+}
+
+// ---------- (d) Bug A regression: tool-call -> tool-result roundtrip ----------
+
+/// JAR2-37 Bug A regression. Pre-fix, an assistant turn carrying only
+/// `tool_use` blocks (no text) serialized as `{"role":"assistant",
+/// "content":"", "tool_calls":[...]}` and Cohere rejected the request
+/// with HTTP 400 `must have non-empty content or tool calls`. After the
+/// fix the `content` field is omitted on such turns and Cohere accepts.
+///
+/// The mock isn't doing the validation Cohere does — it serves whatever
+/// the fixture says — so the test pins the *captured request body* to
+/// the post-fix shape rather than trying to coax the mock into rejecting
+/// the pre-fix shape. The pre-fix code path (an `entry.insert("content", "")`)
+/// would have failed this body-shape assertion deterministically.
+#[tokio::test]
+async fn tool_call_roundtrip_assistant_turn_omits_empty_content() {
+    ensure_dummy_api_key();
+    let fixtures = load_fixture("cohere", "tool_call_roundtrip");
+    let mock = MockServer::spawn(fixtures).await;
+    let client = build_client(mock.base_url());
+
+    // Mirror the wire shape `LlmDecide`'s parse-retry path produces: the
+    // model's prior assistant turn was tool-call-only (no text), and the
+    // runtime is now appending the corresponding tool result and asking
+    // the model what to do next. This is the exact shape that fires the
+    // live HTTP 400 against Cohere's chat endpoint.
+    let req = CompleteRequest {
+        messages: vec![
+            Message::system("be terse"),
+            Message::user("Echo the message \"jar2-37 roundtrip\" via the echo tool."),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "tc_call_tool_42".into(),
+                    name: "call_tool".into(),
+                    input: json!({
+                        "name": "echo",
+                        "args": {"msg": "jar2-37 roundtrip"},
+                        "claim_seed": "roundtrip-seed",
+                    }),
+                }],
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "tc_call_tool_42".into(),
+                    content: "echoed: jar2-37 roundtrip".into(),
+                }],
+            },
+        ],
+        tools: vec![],
+        options: CompleteOptions::default(),
+    };
+
+    // Call the second fixture (the first is unused; queue it so the
+    // mock's FIFO matches the same shape the LlmDecide path uses).
+    // We actually only issue one HTTP call here, so drop the first
+    // queued response by sending one request that consumes it.
+    let _warmup = client
+        .complete(CompleteRequest {
+            messages: vec![Message::user("warmup")],
+            tools: vec![],
+            options: CompleteOptions::default(),
+        })
+        .await
+        .expect("warmup ok (consumes fixture 1)");
+
+    let resp = client
+        .complete(req)
+        .await
+        .expect("Cohere accepts tool-call -> tool-result roundtrip after the Bug-A fix");
+
+    // The model's reply on tick 2 is `emit_output` (per the fixture).
+    assert_eq!(resp.tool_calls.len(), 1);
+    let tc: &ToolCall = &resp.tool_calls[0];
+    assert_eq!(tc.name, "emit_output");
+
+    // The captured request body for the *second* call is what we care
+    // about. The pre-fix code path would have emitted
+    // `messages[2] = {"role": "assistant", "content": "", "tool_calls": [...]}`;
+    // the post-fix code path omits `content` entirely.
+    let captured = mock.captured();
+    assert_eq!(captured.len(), 2, "warmup + roundtrip = 2 requests");
+    let second: Value = captured[1].json();
+    let msgs = second["messages"].as_array().expect("messages array");
+    // system + user + assistant + tool = 4
+    assert_eq!(msgs.len(), 4, "messages: {msgs:?}");
+    assert_eq!(msgs[2]["role"], json!("assistant"));
+    assert!(
+        msgs[2].get("content").is_none(),
+        "assistant turn with only tool_calls must OMIT `content` (Cohere rejects empty-string content + tool_calls). got: {}",
+        msgs[2]
+    );
+    assert!(
+        msgs[2].get("tool_calls").is_some(),
+        "assistant turn must keep tool_calls"
+    );
+    assert_eq!(msgs[3]["role"], json!("tool"));
+    assert_eq!(msgs[3]["tool_call_id"], json!("tc_call_tool_42"));
+
+    assert_eq!(resp.stats.vendor, Vendor::Cohere);
+    assert_eq!(resp.stats.model, expected_model());
 }
 
 // ---------- live-gated smoke ----------
