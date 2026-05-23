@@ -1,0 +1,45 @@
+{
+  "synthesized": true,
+  "vendor": "cohere",
+  "note": "JAR2-38 parallel tool calls for Cohere. Single response with K=3 `tool_calls` entries under `message.tool_calls[]` (Cohere keeps tool calls out of `message.content`; the adapter synthesizes `ContentBlock::ToolUse` from each entry). Each `function.arguments` is a JSON-encoded string per the V2 chat API. The parser folds the three into a single `Decision::CallTools` and carries each `id` through as the per-call `tool_use_id`. Hand-written against src/model_client/cohere.rs::parse_response.",
+  "responses": [
+    {
+      "status": 200,
+      "body": {
+        "id": "cohere_msg_parallel_01",
+        "finish_reason": "TOOL_CALL",
+        "message": {
+          "role": "assistant",
+          "content": [],
+          "tool_calls": [
+            {
+              "id": "tc_read_a",
+              "type": "function",
+              "function": {
+                "name": "call_tool",
+                "arguments": "{\"name\":\"echo\",\"args\":{\"path\":\"a.md\"},\"claim_seed\":\"seed-a\"}"
+              }
+            },
+            {
+              "id": "tc_read_b",
+              "type": "function",
+              "function": {
+                "name": "call_tool",
+                "arguments": "{\"name\":\"echo\",\"args\":{\"path\":\"b.md\"},\"claim_seed\":\"seed-b\"}"
+              }
+            },
+            {
+              "id": "tc_read_c",
+              "type": "function",
+              "function": {
+                "name": "call_tool",
+                "arguments": "{\"name\":\"echo\",\"args\":{\"path\":\"c.md\"},\"claim_seed\":\"seed-c\"}"
+              }
+            }
+          ]
+        },
+        "usage": {"tokens": {"input_tokens": 192, "output_tokens": 168}}
+      }
+    }
+  ]
+}

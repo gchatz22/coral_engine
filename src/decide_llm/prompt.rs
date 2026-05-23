@@ -79,24 +79,20 @@ use crate::trigger::Trigger;
 /// *yours* so the model treats those entries as work it already did
 /// rather than ambient context.
 ///
-/// Invariant 3's "at most one tool call per response" clause is the
-/// prompt-side defense for JAR2-37 Bug B-narrow: the runtime is
-/// one-`Decision`-per-tick, so K parallel `tool_use` blocks in a single
-/// assistant response would parse as `MultipleCalls` and trigger a
-/// retry that replays unpaired `tool_use` blocks back to the vendor
-/// (HTTP 400). The Anthropic adapter additionally sets
-/// `tool_choice.disable_parallel_tool_use: true` at the request layer —
-/// belt-and-suspenders, because prompt instructions alone aren't enough
-/// for the live Anthropic case (observed parallel emissions even with
-/// "one decision per turn" already in the prompt). Cohere's V2 chat API
-/// has no equivalent flag (verified against the public schema as of
-/// 2026-05), so for Cohere this prompt invariant *is* the only lever.
+/// Invariant 3 now permits K parallel `call_tool` blocks in a single
+/// response — the JAR2-38 lift of the one-tool-per-tick limit. The
+/// runtime folds K `call_tool` `tool_use` blocks into a single
+/// `Decision::CallTools` and dispatches them in the same tick, then
+/// stages K paired `tool_result` blocks on the next prompt bundle.
+/// Terminal decision tools (`emit_output`, `rewrite_fs`, `idle`,
+/// `retire`) remain singular: mixing a terminal with `call_tool` or
+/// issuing two terminals in one response is rejected.
 const INVARIANTS: &str = "\
 Invariants:
 1. Provenance. Every `emit_output` decision must cite `evidence` ids that resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.
-2. One decision per turn. Reply by calling exactly one decision tool: `call_tool`, `emit_output`, `rewrite_fs`, `idle`, or `retire`.
-3. One tool call per response. If you need K tool calls, issue them one per response and wait for each result before the next. Parallel `tool_use` blocks in a single response will fail.
-4. Evidence comes from tool calls. The result of a `call_tool` becomes a fresh evidence record that later `emit_output` decisions can cite.
+2. One decision per turn. Reply by calling exactly one terminal decision tool (`emit_output`, `rewrite_fs`, `idle`, `retire`) OR one or more `call_tool` blocks dispatched together as a single parallel batch.
+3. Parallel call_tool is supported. K `call_tool` `tool_use` blocks in one response run together this tick; the next prompt carries the matching `tool_result` blocks. Do not mix `call_tool` with a terminal decision tool in the same response.
+4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` decisions can cite.
 5. Do not re-emit. Once you have emitted any Output on this run, your next decision must be `retire`. Do not emit a revised, paraphrased, or improved version of a prior Output. Outputs shown in the \"Recent outputs by you on this run\" window were emitted by you and count toward this rule.
 6. Retire is final. After the mandate's required Output has been emitted, `retire` is the only correct decision.";
 
@@ -444,9 +440,9 @@ mod tests {
              \n\
              Invariants:\n\
              1. Provenance. Every `emit_output` decision must cite `evidence` ids that resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.\n\
-             2. One decision per turn. Reply by calling exactly one decision tool: `call_tool`, `emit_output`, `rewrite_fs`, `idle`, or `retire`.\n\
-             3. One tool call per response. If you need K tool calls, issue them one per response and wait for each result before the next. Parallel `tool_use` blocks in a single response will fail.\n\
-             4. Evidence comes from tool calls. The result of a `call_tool` becomes a fresh evidence record that later `emit_output` decisions can cite.\n\
+             2. One decision per turn. Reply by calling exactly one terminal decision tool (`emit_output`, `rewrite_fs`, `idle`, `retire`) OR one or more `call_tool` blocks dispatched together as a single parallel batch.\n\
+             3. Parallel call_tool is supported. K `call_tool` `tool_use` blocks in one response run together this tick; the next prompt carries the matching `tool_result` blocks. Do not mix `call_tool` with a terminal decision tool in the same response.\n\
+             4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` decisions can cite.\n\
              5. Do not re-emit. Once you have emitted any Output on this run, your next decision must be `retire`. Do not emit a revised, paraphrased, or improved version of a prior Output. Outputs shown in the \"Recent outputs by you on this run\" window were emitted by you and count toward this rule.\n\
              6. Retire is final. After the mandate's required Output has been emitted, `retire` is the only correct decision."
         );

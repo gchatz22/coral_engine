@@ -91,6 +91,111 @@ fn read_json_dir(dir: &Path) -> Vec<Value> {
     out
 }
 
+/// JAR2-38 parallel-tool smoke for Cohere. Mirrors the Anthropic
+/// sibling: issues a K=3 parallel-call mandate and asserts the run
+/// completes Healthy within `max_ticks = 4` — pre-JAR2-38 the same
+/// mandate would need 5 sequential ticks and trip the cap.
+#[test]
+fn end_to_end_parallel_call_tools_against_server_everything() {
+    if std::env::var("JARVIS_SMOKE_LLM_MCP").is_err() {
+        eprintln!("smoke_llm_mcp_cohere::parallel: skipped (set JARVIS_SMOKE_LLM_MCP=1 to run)");
+        return;
+    }
+    if std::env::var("COHERE_API_KEY").is_err() {
+        eprintln!("smoke_llm_mcp_cohere::parallel: skipped (COHERE_API_KEY not set)");
+        return;
+    }
+
+    let parent_dir = TempDir::new().expect("tempdir");
+    let (cmd, args) = spawn_command();
+    let bin = env!("CARGO_BIN_EXE_node-run-llm");
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let config = format!("{manifest_dir}/examples/smoke_llm_mcp/config_parallel.json");
+    let triggers = format!("{manifest_dir}/examples/smoke_llm_mcp/triggers.jsonl");
+
+    let mut command = Command::new(bin);
+    command
+        .arg("--vendor")
+        .arg("cohere")
+        .arg(&config)
+        .arg(&triggers)
+        .arg(parent_dir.path())
+        .arg("--")
+        .arg(&cmd)
+        .args(&args);
+
+    let output = command.output().expect("spawn node-run-llm");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- node-run-llm stdout (parallel) ---\n{stdout}");
+    eprintln!("--- node-run-llm stderr (parallel) ---\n{stderr}");
+    assert!(
+        output.status.success(),
+        "node-run-llm exited with status {:?}",
+        output.status
+    );
+
+    let fs_root = parse_resolved_fs_root(&stdout);
+    let retirement_path = fs_root.join("retirement.json");
+    let retirement: Value =
+        serde_json::from_slice(&std::fs::read(&retirement_path).expect("read retirement"))
+            .expect("parse retirement");
+    let reason = retirement["reason"].as_str().expect("reason string");
+    assert!(
+        !reason.contains("max_ticks"),
+        "agent should retire on its own reason within the 4-tick cap, got: {reason}"
+    );
+
+    let evidence_dir = fs_root.join("evidence");
+    let evidence_count = std::fs::read_dir(&evidence_dir)
+        .expect("read evidence")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
+        .count();
+    assert!(
+        evidence_count >= 3,
+        "expected >= 3 evidence records (K=3 parallel calls), got {evidence_count}"
+    );
+
+    let outputs_dir = fs_root.join("outputs");
+    let outputs = read_json_dir(&outputs_dir);
+    assert!(
+        !outputs.is_empty(),
+        "expected >= 1 output under {}",
+        outputs_dir.display()
+    );
+    for out in &outputs {
+        let evidence_arr = out["evidence"]
+            .as_array()
+            .expect("Output.evidence is an array");
+        for ev in evidence_arr {
+            let id = ev.as_str().expect("evidence id string");
+            let path = evidence_dir.join(format!("{id}.json"));
+            assert!(
+                path.exists(),
+                "evidence id {id} from output does not resolve to {}",
+                path.display()
+            );
+        }
+    }
+
+    let health_path = fs_root.join("health.json");
+    let health: Value =
+        serde_json::from_slice(&std::fs::read(&health_path).expect("read health.json"))
+            .expect("parse health.json");
+    let state = &health["state"];
+    let healthy = state.as_str() == Some("Healthy")
+        || state.get("Healthy").is_some()
+        || state.as_object().is_some_and(|o| {
+            o.get("state").and_then(Value::as_str) == Some("Healthy")
+                || o.keys().any(|k| k == "Healthy")
+        });
+    assert!(
+        healthy,
+        "expected Healthy after parallel run, got: {health}"
+    );
+}
+
 #[test]
 fn end_to_end_llm_decide_against_server_everything() {
     if std::env::var("JARVIS_SMOKE_LLM_MCP").is_err() {

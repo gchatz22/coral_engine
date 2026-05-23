@@ -97,19 +97,19 @@ async fn happy_path_tick_drives_call_tool_then_emit_output() {
     let client = Arc::new(build_client(mock.base_url()));
     let decide = LlmDecide::new(client.clone(), CompleteOptions::default());
 
-    // Tick 1: model emits CallTool(echo, ...).
+    // Tick 1: model emits CallTools(vec![echo, ...]).
     let dec_1 = decide.decide(empty_bundle()).await.expect("tick 1 decide");
     match &dec_1 {
-        Decision::CallTool {
-            name,
-            args,
-            claim_seed,
-        } => {
-            assert_eq!(name, "echo");
-            assert_eq!(args, &json!({"msg": "hello jarvis"}));
-            assert_eq!(claim_seed.as_str(), "fixture-seed-1");
+        Decision::CallTools { calls } => {
+            assert_eq!(calls.len(), 1, "single-call happy path");
+            let c = &calls[0];
+            assert_eq!(c.name, "echo");
+            assert_eq!(c.args, json!({"msg": "hello jarvis"}));
+            assert_eq!(c.claim_seed.as_str(), "fixture-seed-1");
+            // Vendor `tool_use.id` from the fixture must propagate.
+            assert_eq!(c.tool_use_id.as_deref(), Some("toolu_call_tool_1"));
         }
-        other => panic!("expected CallTool, got {other:?}"),
+        other => panic!("expected CallTools, got {other:?}"),
     }
 
     // CallStats assertions per JAR2-20 follow-up scope.
@@ -250,9 +250,30 @@ async fn parse_retry_recovers_after_malformed_tool_use() {
         system_text.contains("could not be parsed"),
         "retry's system field must include the corrective phrase, got: {system_text}"
     );
-    // ...and the immediately-prior assistant turn must echo the bad tool_use.
+    // JAR2-38: the retry now interleaves a synthesized tool-result turn
+    // after the bad assistant echo so each `tool_use.id` has a matching
+    // `tool_result` (vendor API requirement). On Anthropic that
+    // rewraps as a `user` message carrying `tool_result` content. The
+    // assistant echo with the bad tool_use sits one slot before it.
+    // Walk back from the last message to confirm the shape:
+    //   msgs[last]   = user (synthesized tool_result envelope)
+    //   msgs[last-1] = assistant (bad tool_use echo)
     let last_msg = msgs.last().expect("retry has messages");
-    assert_eq!(last_msg["role"], json!("assistant"));
+    assert_eq!(
+        last_msg["role"],
+        json!("user"),
+        "JAR2-38: synthesized tool-result envelope rewrapped as user on Anthropic"
+    );
+    let tool_results = last_msg["content"].as_array().expect("content array");
+    assert!(
+        tool_results
+            .iter()
+            .any(|b| b["type"] == json!("tool_result")
+                && b["tool_use_id"] == json!("toolu_unknown_1")),
+        "synthesized tool_result must carry the bad tool_use's id, got: {last_msg}"
+    );
+    let echoed = &msgs[msgs.len() - 2];
+    assert_eq!(echoed["role"], json!("assistant"));
 }
 
 // ---------- (c) unhealthy → recovery via Agent::run ----------
@@ -359,6 +380,53 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
             .and_then(|x| x.as_str()),
         Some("Inference"),
         "Decide-Err from LlmDecide must produce an Inference incident"
+    );
+}
+
+// ---------- (d) JAR2-38: parallel tool calls ----------
+
+/// JAR2-38: a single Anthropic response carrying K=3 `tool_use` blocks
+/// for `call_tool` parses into one `Decision::CallTools` with three
+/// entries. Pins the per-block `tool_use.id` propagation contract.
+#[tokio::test]
+async fn parallel_tool_calls_k3_folds_into_single_call_tools_decision() {
+    ensure_dummy_api_key();
+    let fixtures = load_fixture("anthropic", "parallel_tool_calls");
+    let mock = MockServer::spawn(fixtures).await;
+
+    let client = Arc::new(build_client(mock.base_url()));
+    let decide = LlmDecide::new(client.clone(), CompleteOptions::default());
+
+    let dec = decide
+        .decide(empty_bundle())
+        .await
+        .expect("parallel decide");
+    match dec {
+        Decision::CallTools { calls } => {
+            assert_eq!(calls.len(), 3, "parser must fold K=3 `tool_use` blocks");
+            assert_eq!(calls[0].name, "echo");
+            assert_eq!(calls[0].args, json!({"path": "a.md"}));
+            assert_eq!(calls[0].claim_seed.as_str(), "seed-a");
+            assert_eq!(calls[0].tool_use_id.as_deref(), Some("toolu_read_a"));
+            assert_eq!(calls[1].tool_use_id.as_deref(), Some("toolu_read_b"));
+            assert_eq!(calls[2].tool_use_id.as_deref(), Some("toolu_read_c"));
+        }
+        other => panic!("expected CallTools, got {other:?}"),
+    }
+
+    // Exactly one upstream call — K=3 fits in one response, no retry.
+    let calls = decide.last_tick_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].vendor, Vendor::Anthropic);
+
+    // JAR2-38 removed the `tool_choice.disable_parallel_tool_use`
+    // workaround; the request body must no longer carry that flag.
+    let captured = mock.captured();
+    assert_eq!(captured.len(), 1);
+    let body: Value = captured[0].json();
+    assert!(
+        body.get("tool_choice").is_none(),
+        "JAR2-38: tool_choice block must be absent (workaround removed), got: {body}"
     );
 }
 

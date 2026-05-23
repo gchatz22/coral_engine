@@ -5,7 +5,7 @@
 # is sha256(canonical_json({"args":{"hello":"smoke"},"result":{"echoed":{"hello":"smoke"}},"tool":"echo"})).
 # Computed offline; recompute with `EvidenceId::new("echo", json!({"hello":"smoke"}), json!({"echoed":{"hello":"smoke"}}))`
 # if the canonical-JSON rules in src/evidence.rs ever change.
-{"type":"call_tool","name":"echo","args":{"hello":"smoke"},"claim_seed":"seed-1"}
+{"type":"call_tools","calls":[{"name":"echo","args":{"hello":"smoke"},"claim_seed":"seed-1"}]}
 # Tick 2: emit one output backed by that evidence id.
 {"type":"emit_output","content":"smoke test passed","evidence":["1d6a153a69d110156ca44ed281f859ca09d9875747e3ed16b9964c52632fd96e"]}
 # Tick 3: idle. The loop's max_ticks=3 cap retires the agent after this tick.

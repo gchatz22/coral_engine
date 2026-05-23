@@ -34,14 +34,19 @@ use std::time::Duration;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Decision {
-    /// Invoke a tool by name with JSON args. `claim_seed` is an opaque
-    /// hint the agent attaches so the resulting evidence can be linked to
-    /// the claim it was meant to support.
-    CallTool {
-        name: String,
-        args: serde_json::Value,
-        claim_seed: ClaimSeed,
-    },
+    /// Invoke one or more tools in parallel for the same tick. A
+    /// one-element vector preserves the original single-call semantics.
+    /// The run loop dispatches every entry in the same tick, persists one
+    /// `EvidenceRecord` per call, and stages the paired `tool_result`
+    /// blocks for the next prompt bundle.
+    ///
+    /// Struct (not tuple) variant because serde's
+    /// `#[serde(tag = "type")]` on this enum rejects tagged newtype
+    /// variants carrying a sequence — `CallTools(Vec<ToolCall>)` would
+    /// emit cleanly but fail to deserialize back. The named field keeps
+    /// the wire form `{"type":"call_tools","calls":[...]}` flat and
+    /// round-trippable.
+    CallTools { calls: Vec<ToolCall> },
     /// Emit a finished output. The run loop will refuse to persist an
     /// output whose evidence ids don't all resolve.
     EmitOutput {
@@ -58,6 +63,72 @@ pub enum Decision {
     },
     /// Stop running. The reason is persisted so retirement is auditable.
     Retire { reason: String },
+}
+
+/// One element of a `Decision::CallTools`. `claim_seed` is an opaque
+/// hint the agent attaches so the resulting evidence can be linked to
+/// the claim it was meant to support. `tool_use_id` is the vendor's
+/// `tool_use.id` from the model response that introduced this call —
+/// the kernel propagates it back through the next prompt's
+/// `tool_result` blocks so the assistant turn's `tool_use` ids stay
+/// paired with their results across the tick boundary, per both
+/// Anthropic's and Cohere's tool-use protocols.
+///
+/// Named `decision::ToolCall` to avoid confusion with the vendor-wire
+/// `model_client::ToolCall` shape (`{ id, name, arguments }`). The two
+/// types are deliberately distinct: this one is the kernel's intent;
+/// the vendor one is the parsed wire payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub name: String,
+    pub args: serde_json::Value,
+    pub claim_seed: ClaimSeed,
+    /// Vendor-supplied `tool_use.id` for the model response that emitted
+    /// this call. `None` when the decision was synthesized by a non-model
+    /// `Decide` (e.g. `MockDecide` in tests), in which case no
+    /// `tool_result` pairing is required because there is no preceding
+    /// assistant `tool_use` block to answer.
+    ///
+    /// Carried through the parser today; the current cross-tick prompt
+    /// path conveys tool results via `recent_evidence` (text bullets in
+    /// the next bundle), not via `tool_use`/`tool_result` block pairing.
+    /// This field is reserved for the future cross-tick rendering path
+    /// that would emit paired blocks across the tick boundary — kept on
+    /// the wire today so a fixture or replay captured at this version
+    /// stays useful after that path lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+}
+
+impl ToolCall {
+    /// Build a `ToolCall` with no vendor `tool_use_id`. Convenience for
+    /// tests and non-model `Decide` impls that don't have one to thread
+    /// through.
+    pub fn new(name: impl Into<String>, args: serde_json::Value, claim_seed: ClaimSeed) -> Self {
+        Self {
+            name: name.into(),
+            args,
+            claim_seed,
+            tool_use_id: None,
+        }
+    }
+
+    /// Build a `ToolCall` with a vendor-supplied `tool_use.id`. Used by
+    /// the `LlmDecide` parser when it has the id available from the
+    /// model's response.
+    pub fn with_tool_use_id(
+        name: impl Into<String>,
+        args: serde_json::Value,
+        claim_seed: ClaimSeed,
+        tool_use_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            args,
+            claim_seed,
+            tool_use_id: Some(tool_use_id.into()),
+        }
+    }
 }
 
 /// Opaque seed used to deterministically derive a claim id from a tool
@@ -260,15 +331,59 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn call_tool_round_trip() {
-        let d = Decision::CallTool {
-            name: "echo".into(),
-            args: json!({"msg": "hi"}),
-            claim_seed: ClaimSeed::new("seed-1"),
+    fn call_tools_single_call_round_trip() {
+        let d = Decision::CallTools {
+            calls: vec![ToolCall::new(
+                "echo",
+                json!({"msg": "hi"}),
+                ClaimSeed::new("seed-1"),
+            )],
         };
         let s = serde_json::to_string(&d).unwrap();
         let back: Decision = serde_json::from_str(&s).unwrap();
         assert_eq!(d, back);
+        // tool_use_id absent on the wire when None (skip_serializing_if).
+        assert!(!s.contains("tool_use_id"), "wire shape: {s}");
+        // Tagged enum: tag stays `call_tools` and the vec lives under
+        // `calls` — the field name is wire-stable.
+        assert!(s.contains("\"type\":\"call_tools\""), "wire shape: {s}");
+        assert!(s.contains("\"calls\":["), "wire shape: {s}");
+    }
+
+    #[test]
+    fn call_tools_multi_call_round_trip() {
+        let d = Decision::CallTools {
+            calls: vec![
+                ToolCall::with_tool_use_id(
+                    "read_a",
+                    json!({"path": "a.md"}),
+                    ClaimSeed::new("seed-a"),
+                    "toolu_a",
+                ),
+                ToolCall::with_tool_use_id(
+                    "read_b",
+                    json!({"path": "b.md"}),
+                    ClaimSeed::new("seed-b"),
+                    "toolu_b",
+                ),
+                ToolCall::with_tool_use_id(
+                    "read_c",
+                    json!({"path": "c.md"}),
+                    ClaimSeed::new("seed-c"),
+                    "toolu_c",
+                ),
+            ],
+        };
+        let s = serde_json::to_string(&d).unwrap();
+        let back: Decision = serde_json::from_str(&s).unwrap();
+        assert_eq!(d, back);
+        if let Decision::CallTools { calls } = back {
+            assert_eq!(calls.len(), 3);
+            assert_eq!(calls[0].tool_use_id.as_deref(), Some("toolu_a"));
+            assert_eq!(calls[2].name, "read_c");
+        } else {
+            panic!("expected CallTools");
+        }
     }
 
     #[test]

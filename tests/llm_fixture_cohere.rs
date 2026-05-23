@@ -88,19 +88,19 @@ async fn happy_path_tick_drives_call_tool_then_emit_output() {
     let client = Arc::new(build_client(mock.base_url()));
     let decide = LlmDecide::new(client.clone(), CompleteOptions::default());
 
-    // Tick 1: model emits CallTool(echo, ...).
+    // Tick 1: model emits CallTools(vec![echo, ...]).
     let dec_1 = decide.decide(empty_bundle()).await.expect("tick 1 decide");
     match &dec_1 {
-        Decision::CallTool {
-            name,
-            args,
-            claim_seed,
-        } => {
-            assert_eq!(name, "echo");
-            assert_eq!(args, &json!({"msg": "hello jarvis"}));
-            assert_eq!(claim_seed.as_str(), "fixture-seed-1");
+        Decision::CallTools { calls } => {
+            assert_eq!(calls.len(), 1, "single-call happy path");
+            let c = &calls[0];
+            assert_eq!(c.name, "echo");
+            assert_eq!(c.args, json!({"msg": "hello jarvis"}));
+            assert_eq!(c.claim_seed.as_str(), "fixture-seed-1");
+            // Vendor `tool_use.id` from the fixture must propagate.
+            assert_eq!(c.tool_use_id.as_deref(), Some("tc_call_tool_1"));
         }
-        other => panic!("expected CallTool, got {other:?}"),
+        other => panic!("expected CallTools, got {other:?}"),
     }
     let calls_1 = decide.last_tick_calls();
     assert_eq!(calls_1.len(), 1);
@@ -411,6 +411,43 @@ async fn tool_call_roundtrip_assistant_turn_omits_empty_content() {
 
     assert_eq!(resp.stats.vendor, Vendor::Cohere);
     assert_eq!(resp.stats.model, expected_model());
+}
+
+// ---------- (e) JAR2-38: parallel tool calls ----------
+
+/// JAR2-38: Cohere response carrying K=3 entries in `message.tool_calls`
+/// parses into one `Decision::CallTools` with three entries. The
+/// adapter synthesizes per-block `ContentBlock::ToolUse` from the wire
+/// shape; the parser keeps the per-call `tool_use_id` traceable through
+/// the propagation pipeline.
+#[tokio::test]
+async fn parallel_tool_calls_k3_folds_into_single_call_tools_decision() {
+    ensure_dummy_api_key();
+    let fixtures = load_fixture("cohere", "parallel_tool_calls");
+    let mock = MockServer::spawn(fixtures).await;
+
+    let client = Arc::new(build_client(mock.base_url()));
+    let decide = LlmDecide::new(client.clone(), CompleteOptions::default());
+
+    let dec = decide
+        .decide(empty_bundle())
+        .await
+        .expect("parallel decide");
+    match dec {
+        Decision::CallTools { calls } => {
+            assert_eq!(calls.len(), 3, "parser must fold K=3 tool_calls entries");
+            assert_eq!(calls[0].name, "echo");
+            assert_eq!(calls[0].args, json!({"path": "a.md"}));
+            assert_eq!(calls[0].claim_seed.as_str(), "seed-a");
+            assert_eq!(calls[0].tool_use_id.as_deref(), Some("tc_read_a"));
+            assert_eq!(calls[1].tool_use_id.as_deref(), Some("tc_read_b"));
+            assert_eq!(calls[2].tool_use_id.as_deref(), Some("tc_read_c"));
+        }
+        other => panic!("expected CallTools, got {other:?}"),
+    }
+    let calls = decide.last_tick_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].vendor, Vendor::Cohere);
 }
 
 // ---------- live-gated smoke ----------
