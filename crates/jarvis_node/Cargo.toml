@@ -39,6 +39,11 @@ path = "src/bin/node_run_llm.rs"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+# JAR2-51: `bytes::Bytes` is the agreed payload type for the `AgentStorage`
+# trait (see `scratch/agent_storage.md` § 13 decision 2). Arc-backed so
+# cheap to clone across layer transitions; standard across `aws-sdk-s3`,
+# `reqwest`, `tokio::io`, which keeps the future `S3Storage` impl friction-free.
+bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # JAR2-38: `futures::future::join_all` for concurrent dispatch of K
 # parallel tool calls in `agent::dispatch`. Only `join_all` is used; the
@@ -64,6 +69,13 @@ default = []
 llm-anthropic = ["dep:reqwest"]
 llm-cohere = ["dep:reqwest"]
 mcp = ["dep:rmcp"]
+# JAR2-51: opt-in to the in-memory `MemoryStorage` impl from non-test code.
+# Tests in any workspace crate always have access via `#[cfg(test)]`;
+# production binaries that want ephemeral / spike-testing behavior must
+# enable this feature explicitly, avoiding accidental shipping of
+# in-memory storage in a production build. See
+# `scratch/agent_storage.md` § 13 decision 6.
+memory-storage = []
 
 # Clippy 1.88 promoted a handful of style lints (notably `uninlined_format_args`)
 # that fire on patterns the 1.84 toolchain accepted. Allowing them keeps the
