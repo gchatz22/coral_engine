@@ -23,6 +23,39 @@ jobs:
   lint-and-test:
     name: build / clippy / fmt / test
     runs-on: ubuntu-latest
+    # JAR2-50: the `jarvis_graph` crate's `#[sqlx::test]`-based tests
+    # need a live Postgres. The service container below brings one up
+    # on `localhost:5432` matching the dev compose file's defaults so
+    # `cargo test` can use the same `DATABASE_URL` shape locally and in
+    # CI. Build still works without DATABASE_URL via the committed
+    # `.sqlx/` offline cache (`cargo sqlx prepare --workspace`).
+    services:
+      postgres:
+        image: postgres:16-alpine3.23
+        env:
+          POSTGRES_USER: jarvis
+          POSTGRES_PASSWORD: jarvis
+          POSTGRES_DB: jarvis_structural
+        ports:
+          - 5432:5432
+        # `sqlx::test` creates ephemeral per-test databases under the
+        # connected role, so the role needs CREATEDB. The superuser the
+        # image hands to POSTGRES_USER has it.
+        options: >-
+          --health-cmd "pg_isready -U jarvis -d jarvis_structural"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://jarvis:jarvis@localhost:5432/jarvis_structural
+      # `SQLX_OFFLINE=true` is set at job scope so EVERY cargo
+      # invocation uses the `.sqlx/` cache for the compile-time
+      # query!/query_as! checks. The runtime side of `#[sqlx::test]`
+      # still consults DATABASE_URL (the env var above), so the test
+      # bodies hit the live service container. Holding both at job
+      # scope keeps build / clippy / test consistent and avoids the
+      # "test step silently recompiles against live DB" failure mode.
+      SQLX_OFFLINE: "true"
     steps:
       - uses: actions/checkout@v4
 
@@ -53,6 +86,32 @@ jobs:
   feature-matrix:
     name: feature matrix
     runs-on: ubuntu-latest
+    # Same Postgres service container as the primary lint-and-test job:
+    # `--workspace` test invocations include `jarvis_graph`, whose
+    # `#[sqlx::test]` cases need a live DB. Build remains DB-free via
+    # the `.sqlx/` offline cache.
+    services:
+      postgres:
+        image: postgres:16-alpine3.23
+        env:
+          POSTGRES_USER: jarvis
+          POSTGRES_PASSWORD: jarvis
+          POSTGRES_DB: jarvis_structural
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jarvis -d jarvis_structural"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://jarvis:jarvis@localhost:5432/jarvis_structural
+      # See the matching note in the lint-and-test job: setting
+      # SQLX_OFFLINE at job scope makes the compile-time query check
+      # use the `.sqlx/` cache uniformly across build, clippy, and the
+      # test compile, while `#[sqlx::test]` still uses DATABASE_URL at
+      # runtime to talk to the service container.
+      SQLX_OFFLINE: "true"
     strategy:
       matrix:
         include:
