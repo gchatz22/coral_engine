@@ -3,3 +3,8 @@
 .envrc
 .env
 .claude/
+# Per-agent FS root used by the dev compose stack and the native worker.
+# The directory itself is checked in via `agent-fs/.gitkeep` so Docker
+# doesn't create it root-owned; everything inside is local state.
+/agent-fs/*
+!/agent-fs/.gitkeep

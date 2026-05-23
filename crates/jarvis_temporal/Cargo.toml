@@ -11,3 +11,10 @@ publish = false
 # path so stage 0.2 (Temporal Rust SDK smoke, JAR2-?) can drop code in
 # without further restructuring. Intentionally has no dependencies; the
 # `temporalio-sdk` pull happens in 0.2.
+
+# Stage 0.3 (JAR2-42) adds a stub `worker` binary so the Dockerfile in
+# this crate has something concrete to build. The stub prints and exits;
+# real workflow code lands in stage 3.
+[[bin]]
+name = "worker"
+path = "src/bin/worker.rs"
