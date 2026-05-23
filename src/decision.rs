@@ -21,7 +21,7 @@
 //!   can graduate to its own trait once real LLM activities arrive.
 
 use crate::evidence::{EvidenceId, EvidenceRecord};
-use crate::fs::AgentFs;
+use crate::fs::{AgentFs, Claim, ClaimStatus};
 use crate::mandate::{Mandate, Output};
 use crate::trigger::Trigger;
 use anyhow::anyhow;
@@ -109,6 +109,15 @@ pub struct ContextBundle {
     pub triggers: Vec<Trigger>,
     pub recent_outputs: Vec<Output>,
     pub recent_evidence: Vec<EvidenceRecord>,
+    /// Open claims (`claims/<slug>.json` with `status == Open`), capped by
+    /// `mandate.context_policy.open_claims_max`. Surfaced in the warm cache
+    /// so the seed-reuse convention (JAR2-28 / `scratch/claim_seed_persistence.md`)
+    /// works without a tool roundtrip every tick. Order is inherited from
+    /// `AgentFs::list_claims` (filename ascending) per
+    /// `scratch/context_assembly_v2.md` § 8. `#[serde(default)]` keeps the
+    /// wire format backward-compatible with pre-JAR2-36 bundles.
+    #[serde(default)]
+    pub open_claims: Vec<Claim>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correction: Option<CorrectionContext>,
 }
@@ -190,50 +199,20 @@ impl Decide for MockDecide {
     }
 }
 
-/// Bootstrap context window. The run loop reads at most this many recent
-/// outputs and evidence records into each `ContextBundle`.
-///
-/// Eight is the value called out by the ticket; if it ever needs tuning,
-/// promote to a field on `Mandate` or a kernel config rather than passing
-/// it through this signature.
-///
-/// # Why a fixed window today (v1 vs v2)
-///
-/// This is bootstrap scaffolding, not the long-term shape of context
-/// assembly. The v2 design (tracked in JAR2-10, "context-assembly v2")
-/// splits context into two complementary paths:
-///
-/// 1. **Warm cache** — what `assemble_context` grows into. Small,
-///    mandate-shaped, assembled by the runtime each tick and passed
-///    unconditionally into `Decide::decide`: current mandate, triggers,
-///    last few outputs, tail of conflict log. Shrinks vs. today, but
-///    doesn't go to zero — re-discovering "what was I doing" via tool
-///    calls every tick burns latency and cost on context most ticks
-///    need anyway.
-///
-/// 2. **Self-directed retrieval** — tools the agent calls during
-///    `decide` (`read_file`, `list_dir`, eventually a semantic-search
-///    MCP server over the agent's own FS). The agent picks what to
-///    pull. This is the FS-as-RAG path VISION § 4–5 calls for and what
-///    `agent_runtime.md` § 6 means by "mandate-specific
-///    selection/distillation".
-///
-/// `RECENT_WINDOW = 8` is a placeholder for piece (1): small enough
-/// that the bundle stays cheap, big enough to be non-empty for the
-/// MockDecide-driven loop tests in JAR2-7/8. The real policy (window
-/// per mandate, time-vs-filename ordering, indexed reads, the
-/// warm-cache/tools cut line) is empirical and waits on real model
-/// latency + MCP roundtrip data, which we won't have until those
-/// tickets land.
-const RECENT_WINDOW: usize = 8;
-
 /// Read FS state and package a `ContextBundle` for the given triggers.
 ///
-/// For the bootstrap this is a plain async fn (per the ticket's plan
-/// slice). Determinism: outputs and evidence are read via the FS helpers,
-/// which sort filenames lexically and return the last `RECENT_WINDOW`
-/// entries — see `AgentFs::list_recent_outputs` /
-/// `AgentFs::list_recent_evidence`.
+/// Window sizes are drawn from `cfg.context_policy`
+/// (`crate::mandate::ContextPolicy`): per-mandate tuning replaces the
+/// JAR2-6 hardcoded `RECENT_WINDOW = 8` constant retired in JAR2-36.
+/// Defaults reproduce the pre-JAR2-36 behavior so existing graphs are
+/// unaffected.
+///
+/// Determinism: outputs and evidence are read via the FS helpers, which
+/// sort filenames lexically and return the last N entries — see
+/// `AgentFs::list_recent_outputs` / `AgentFs::list_recent_evidence`. Open
+/// claims are drawn from `AgentFs::list_claims` in its native filename
+/// order; phase 1 inherits that ordering per
+/// `scratch/context_assembly_v2.md` § 8.
 ///
 /// `correction` carries continuation state from the run loop when the
 /// previous tick produced an unsatisfiable `Decision`. When `Some`, the
@@ -244,13 +223,32 @@ pub async fn assemble_context(
     cfg: &Mandate,
     correction: Option<CorrectionContext>,
 ) -> anyhow::Result<ContextBundle> {
-    let recent_outputs = fs.list_recent_outputs(RECENT_WINDOW)?;
-    let recent_evidence = fs.list_recent_evidence(RECENT_WINDOW)?;
+    let policy = &cfg.context_policy;
+    let recent_outputs = fs.list_recent_outputs(policy.recent_outputs)?;
+    let recent_evidence = fs.list_recent_evidence(policy.recent_evidence)?;
+    let open_claims: Vec<Claim> = fs
+        .list_claims()?
+        .into_iter()
+        .filter(|c| c.status == ClaimStatus::Open)
+        .take(policy.open_claims_max)
+        .collect();
+    // Field counts feed the JAR2-36 measurement spike + ongoing
+    // observability — keeps the warm cache shape inspectable without
+    // dumping potentially large bodies into the log.
+    tracing::debug!(
+        triggers = triggers.len(),
+        recent_outputs = recent_outputs.len(),
+        recent_evidence = recent_evidence.len(),
+        open_claims = open_claims.len(),
+        correction = correction.is_some(),
+        "assemble_context bundle field counts"
+    );
     Ok(ContextBundle {
         mandate: cfg.clone(),
         triggers: triggers.to_vec(),
         recent_outputs,
         recent_evidence,
+        open_claims,
         correction,
     })
 }
@@ -398,6 +396,7 @@ mod tests {
             triggers: vec![],
             recent_outputs: vec![],
             recent_evidence: vec![],
+            open_claims: vec![],
             correction: None,
         }
     }
@@ -488,10 +487,14 @@ mod tests {
         let mandate = dummy_mandate();
         let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
 
-        // Seed some evidence and outputs. We write more than RECENT_WINDOW
-        // of each so the windowing path is also exercised.
+        // Seed more than the default window so the windowing path is also
+        // exercised. The default `ContextPolicy::recent_outputs` /
+        // `recent_evidence` is 8 (pinned in `mandate.rs::tests`); we write
+        // two extra of each.
+        let default_window = mandate.context_policy.recent_outputs;
+        assert_eq!(default_window, mandate.context_policy.recent_evidence);
         let mut ev_ids = Vec::new();
-        for i in 0..(RECENT_WINDOW + 2) {
+        for i in 0..(default_window + 2) {
             let rec = EvidenceRecord::new(
                 "echo",
                 serde_json::json!({ "i": i }),
@@ -517,10 +520,13 @@ mod tests {
         // Determinism across calls: same inputs, same output order.
         assert_eq!(a.recent_outputs, b.recent_outputs);
         assert_eq!(a.recent_evidence, b.recent_evidence);
+        assert_eq!(a.open_claims, b.open_claims);
+        assert_eq!(a.triggers, b.triggers);
+        assert_eq!(a.correction, b.correction);
 
         // Window is honored.
-        assert_eq!(a.recent_outputs.len(), RECENT_WINDOW);
-        assert_eq!(a.recent_evidence.len(), RECENT_WINDOW);
+        assert_eq!(a.recent_outputs.len(), default_window);
+        assert_eq!(a.recent_evidence.len(), default_window);
 
         // Sanity: evidence records sort by their (hex) id; outputs by their
         // ulid filename. Both should be ascending, so the last entry is the
@@ -533,5 +539,181 @@ mod tests {
         let original = ev_sorted.clone();
         ev_sorted.sort();
         assert_eq!(original, ev_sorted, "evidence not in sorted order");
+    }
+
+    // ---- JAR2-36: ContextPolicy plumbing -------------------------------
+
+    use crate::fs::{Claim, ClaimStatus};
+    use crate::mandate::ContextPolicy;
+
+    #[tokio::test]
+    async fn assemble_context_honors_per_mandate_recent_outputs_cap() {
+        let tmp = TempDir::new().unwrap();
+        let mandate = Mandate {
+            text: "tiny window".into(),
+            idle_period: Duration::from_millis(100),
+            max_ticks: Some(1),
+            retry_policy: None,
+            context_policy: ContextPolicy {
+                recent_outputs: 2,
+                recent_evidence: 8,
+                open_claims_max: 32,
+            },
+        };
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+
+        let id = fs
+            .record_evidence(EvidenceRecord::new(
+                "echo",
+                serde_json::json!({"k": 1}),
+                serde_json::json!({"v": 1}),
+                ts(),
+            ))
+            .unwrap();
+        for i in 0..5 {
+            fs.persist_output(&format!("o-{i}"), &[id.clone()]).unwrap();
+        }
+
+        let bundle = assemble_context(&fs, &[], &mandate, None).await.unwrap();
+        assert_eq!(
+            bundle.recent_outputs.len(),
+            2,
+            "per-mandate recent_outputs cap not honored"
+        );
+    }
+
+    #[tokio::test]
+    async fn assemble_context_honors_per_mandate_recent_evidence_cap() {
+        let tmp = TempDir::new().unwrap();
+        let mandate = Mandate {
+            text: "tiny evidence window".into(),
+            idle_period: Duration::from_millis(100),
+            max_ticks: Some(1),
+            retry_policy: None,
+            context_policy: ContextPolicy {
+                recent_outputs: 8,
+                recent_evidence: 3,
+                open_claims_max: 32,
+            },
+        };
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+        for i in 0..6 {
+            fs.record_evidence(EvidenceRecord::new(
+                "echo",
+                serde_json::json!({"i": i}),
+                serde_json::json!({"i": i}),
+                ts(),
+            ))
+            .unwrap();
+        }
+
+        let bundle = assemble_context(&fs, &[], &mandate, None).await.unwrap();
+        assert_eq!(bundle.recent_evidence.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn assemble_context_surfaces_only_open_claims_capped_in_filename_order() {
+        let tmp = TempDir::new().unwrap();
+        let mandate = Mandate {
+            text: "claims window".into(),
+            idle_period: Duration::from_millis(100),
+            max_ticks: Some(1),
+            retry_policy: None,
+            context_policy: ContextPolicy {
+                recent_outputs: 8,
+                recent_evidence: 8,
+                open_claims_max: 2,
+            },
+        };
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+
+        // Seed claims in mixed states so the filter has work to do. Use
+        // alphabetic seeds so the on-disk slug order is alphabetic-prefix
+        // (suffix hashes break exact equality of the slug body across
+        // seeds, but the slug body order is what dominates).
+        let claims = vec![
+            ("alpha", ClaimStatus::Open),
+            ("bravo", ClaimStatus::Resolved),
+            ("charlie", ClaimStatus::Open),
+            ("delta", ClaimStatus::Abandoned),
+            ("echo-claim", ClaimStatus::Open),
+        ];
+        for (seed, status) in &claims {
+            fs.write_claim(&Claim {
+                seed: (*seed).into(),
+                description: format!("desc-{seed}"),
+                status: *status,
+                created_at: ts(),
+            })
+            .unwrap();
+        }
+
+        let bundle = assemble_context(&fs, &[], &mandate, None).await.unwrap();
+
+        // Cap is honored.
+        assert_eq!(bundle.open_claims.len(), 2);
+        // Every surfaced claim is Open.
+        for c in &bundle.open_claims {
+            assert_eq!(c.status, ClaimStatus::Open, "non-Open claim leaked through");
+        }
+        // Order matches the AgentFs::list_claims (filename ascending)
+        // restricted to Open. We reproduce that ordering here and compare.
+        let expected: Vec<Claim> = fs
+            .list_claims()
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.status == ClaimStatus::Open)
+            .take(2)
+            .collect();
+        assert_eq!(bundle.open_claims, expected);
+    }
+
+    #[tokio::test]
+    async fn assemble_context_empty_claims_yields_empty_open_claims() {
+        let tmp = TempDir::new().unwrap();
+        let mandate = dummy_mandate();
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+        let bundle = assemble_context(&fs, &[], &mandate, None).await.unwrap();
+        assert!(bundle.open_claims.is_empty());
+    }
+
+    #[tokio::test]
+    async fn assemble_context_is_deterministic_across_repeat_calls_with_full_bundle() {
+        // Determinism is the load-bearing property — re-asserted under the
+        // JAR2-36 policy fields with every window populated.
+        let tmp = TempDir::new().unwrap();
+        let mandate = dummy_mandate();
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+
+        let ev = fs
+            .record_evidence(EvidenceRecord::new(
+                "echo",
+                serde_json::json!({"k": 1}),
+                serde_json::json!({"v": 1}),
+                ts(),
+            ))
+            .unwrap();
+        fs.persist_output("o-1", &[ev.clone()]).unwrap();
+        fs.write_claim(&Claim {
+            seed: "claim-1".into(),
+            description: "d".into(),
+            status: ClaimStatus::Open,
+            created_at: ts(),
+        })
+        .unwrap();
+
+        let triggers = vec![Trigger::ScheduledWake];
+        let correction = Some(CorrectionContext::new("e"));
+        let a = assemble_context(&fs, &triggers, &mandate, correction.clone())
+            .await
+            .unwrap();
+        let b = assemble_context(&fs, &triggers, &mandate, correction)
+            .await
+            .unwrap();
+        assert_eq!(a.recent_outputs, b.recent_outputs);
+        assert_eq!(a.recent_evidence, b.recent_evidence);
+        assert_eq!(a.open_claims, b.open_claims);
+        assert_eq!(a.triggers, b.triggers);
+        assert_eq!(a.correction, b.correction);
     }
 }

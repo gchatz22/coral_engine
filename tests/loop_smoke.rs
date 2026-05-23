@@ -47,7 +47,7 @@ use jarvis_node::decision::{ClaimSeed, ContextBundle, Decide, Decision, FsOp, Mo
 use jarvis_node::evidence::{EvidenceId, EvidenceRecord};
 use jarvis_node::fs::AgentFs;
 use jarvis_node::health::{HealthTracker, RetryBudget};
-use jarvis_node::mandate::Mandate;
+use jarvis_node::mandate::{ContextPolicy, Mandate};
 use jarvis_node::tools::{EchoTool, Tool, ToolRegistry};
 use jarvis_node::trigger::Trigger;
 use jarvis_node::trigger_queue::SignalSink;
@@ -1404,4 +1404,84 @@ async fn tool_call_failure_correction_then_different_decision_recovers_to_health
         1,
         "exactly one evidence record expected (echo's), got: {evs:?}"
     );
+}
+
+// ---- JAR2-36: per-mandate ContextPolicy plumbing ------------------------
+
+/// Per-mandate `recent_outputs` cap reaches the run loop end-to-end.
+///
+/// Pre-seed 5 outputs on disk, then run an agent whose mandate's
+/// `ContextPolicy::recent_outputs = 2`. The bundle the run loop hands
+/// `Decide::decide` on the first tick must carry at most 2 outputs — not
+/// the pre-JAR2-36 hardcoded `RECENT_WINDOW = 8` count.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn per_mandate_recent_outputs_cap_reaches_the_run_loop() {
+    let tmp = TempDir::new().expect("tempdir");
+    let mandate = Mandate {
+        text: "tiny window".into(),
+        idle_period: Duration::from_millis(50),
+        max_ticks: Some(1),
+        retry_policy: None,
+        context_policy: ContextPolicy {
+            recent_outputs: 2,
+            recent_evidence: 8,
+            open_claims_max: 32,
+        },
+    };
+    let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).expect("open fs");
+
+    // Seed 5 outputs by going through the FS directly (the production
+    // path); each cites the same evidence record so the provenance contract
+    // is satisfied.
+    let ev_id = fs
+        .record_evidence(EvidenceRecord::new(
+            "echo",
+            json!({"k": 1}),
+            json!({"v": 1}),
+            Utc::now(),
+        ))
+        .expect("record evidence");
+    for i in 0..5 {
+        fs.persist_output(&format!("seed-output-{i}"), &[ev_id.clone()])
+            .expect("persist output");
+    }
+    // Sanity: the FS layer agrees five outputs are on disk.
+    assert_eq!(fs.list_recent_outputs(usize::MAX).unwrap().len(), 5);
+
+    // Single-tick script: retire on the first decide so we exit immediately
+    // after observing the bundle.
+    let seen: Arc<Mutex<Vec<ContextBundle>>> = Arc::new(Mutex::new(Vec::new()));
+    let decide = CapturingDecide {
+        inner: MockDecide::new(vec![Decision::Retire {
+            reason: "saw-bundle".into(),
+        }]),
+        seen: seen.clone(),
+    };
+    let agent = Agent::new(
+        mandate,
+        fs,
+        decide,
+        registry_with_echo(),
+        fresh_health(tmp.path()),
+    );
+
+    let handle = tokio::spawn(agent.run());
+    let RetireReason(reason) = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("agent did not retire in time")
+        .expect("join")
+        .expect("run ok");
+    assert_eq!(reason, "saw-bundle");
+
+    let captured = seen.lock().unwrap().clone();
+    assert_eq!(captured.len(), 1, "expected exactly one decide()");
+    let bundle = &captured[0];
+    assert_eq!(
+        bundle.recent_outputs.len(),
+        2,
+        "per-mandate recent_outputs cap should have shrunk the bundle from 5 to 2"
+    );
+    // The cap is also reflected on the bundle's mandate snapshot (the
+    // bundle clones the mandate verbatim).
+    assert_eq!(bundle.mandate.context_policy.recent_outputs, 2);
 }

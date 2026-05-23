@@ -65,6 +65,12 @@ impl RetryPolicy {
 /// behaviour of any `McpTool`s registered for this agent (see
 /// `ToolRegistry::register_mcp_server_with_policy`). `None` keeps the
 /// `RetryPolicy::default()` semantics JAR2-25 wired at construction.
+///
+/// `context_policy` tunes how `assemble_context` shapes the warm
+/// `ContextBundle` for this mandate (window sizes for recent outputs /
+/// evidence, cap on open-claims surfaced into the bundle). Defaults
+/// reproduce the pre-JAR2-36 hardcoded `RECENT_WINDOW = 8` behavior so
+/// existing graphs round-trip unchanged.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mandate {
     pub text: String,
@@ -78,17 +84,78 @@ pub struct Mandate {
     /// JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_policy: Option<RetryPolicy>,
+    /// Per-mandate context-assembly policy. `#[serde(default)]` keeps the
+    /// wire format backward-compatible with pre-JAR2-36 mandate JSON; a
+    /// missing field deserializes to `ContextPolicy::default()`, which
+    /// matches the pre-JAR2-36 hardcoded window sizes.
+    #[serde(default)]
+    pub context_policy: ContextPolicy,
 }
 
 impl Mandate {
     /// Convenience constructor. Retry policy defaults to `None` (uses
-    /// `RetryPolicy::default()` at tool-construction time).
+    /// `RetryPolicy::default()` at tool-construction time) and context
+    /// policy defaults to `ContextPolicy::default()`.
     pub fn new(text: impl Into<String>, idle_period: Duration, max_ticks: Option<u64>) -> Self {
         Self {
             text: text.into(),
             idle_period,
             max_ticks,
             retry_policy: None,
+            context_policy: ContextPolicy::default(),
+        }
+    }
+}
+
+/// Tuning knobs that shape warm-cache assembly for a given mandate. See
+/// `scratch/context_assembly_v2.md` § 3 + § 6 for the design rationale and
+/// `scratch/context_assembly_v1_measurements.md` for the empirical basis of
+/// the default values below.
+///
+/// Defaults match pre-JAR2-36 behavior (`RECENT_WINDOW = 8`) for
+/// `recent_outputs` / `recent_evidence` so existing graphs round-trip
+/// unchanged. `open_claims_max` is new in JAR2-36; its default is the
+/// strawman value from the design doc, retained after the measurement spike
+/// found no recorded-fixture mandate accumulating more than a handful of
+/// claims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextPolicy {
+    /// Max recent outputs to surface in the warm `ContextBundle`. Reads
+    /// from `AgentFs::list_recent_outputs(recent_outputs)`.
+    #[serde(default = "default_recent_outputs")]
+    pub recent_outputs: usize,
+    /// Max recent evidence records to surface in the warm `ContextBundle`.
+    /// Reads from `AgentFs::list_recent_evidence(recent_evidence)`.
+    #[serde(default = "default_recent_evidence")]
+    pub recent_evidence: usize,
+    /// Max open claims (`status == Open`) to surface in the warm
+    /// `ContextBundle`. Drawn from `AgentFs::list_claims` in its native
+    /// filename order; phase 1 inherits that ordering per
+    /// `scratch/context_assembly_v2.md` § 8.
+    #[serde(default = "default_open_claims_max")]
+    pub open_claims_max: usize,
+}
+
+// Defaults pinned in `scratch/context_assembly_v1_measurements.md`. The
+// recent_* values match the pre-JAR2-36 `RECENT_WINDOW = 8` constant so
+// existing graphs are unaffected; `open_claims_max` is the design-doc
+// strawman, unchanged after the spike.
+fn default_recent_outputs() -> usize {
+    8
+}
+fn default_recent_evidence() -> usize {
+    8
+}
+fn default_open_claims_max() -> usize {
+    32
+}
+
+impl Default for ContextPolicy {
+    fn default() -> Self {
+        Self {
+            recent_outputs: default_recent_outputs(),
+            recent_evidence: default_recent_evidence(),
+            open_claims_max: default_open_claims_max(),
         }
     }
 }
@@ -205,6 +272,7 @@ mod tests {
             idle_period: Duration::from_millis(100),
             max_ticks: Some(1),
             retry_policy: Some(RetryPolicy::new(5, Duration::from_millis(10))),
+            context_policy: ContextPolicy::default(),
         };
         let s = serde_json::to_string(&m).unwrap();
         // Verify both subfields land on the wire under stable names.
@@ -230,6 +298,73 @@ mod tests {
         assert_eq!(back.text, "old");
         assert_eq!(back.idle_period, Duration::from_millis(250));
         assert_eq!(back.max_ticks, None);
+        // Pre-JAR2-36 mandate JSON also had no `context_policy`. The
+        // `#[serde(default)]` on the field fills in `ContextPolicy::default()`.
+        assert_eq!(back.context_policy, ContextPolicy::default());
+    }
+
+    #[test]
+    fn context_policy_default_values_match_pre_jar2_36_behavior() {
+        // Pinned: the warm-cache defaults must reproduce the pre-JAR2-36
+        // `RECENT_WINDOW = 8` behavior so existing graphs are unaffected.
+        // `open_claims_max` is the design-doc strawman, retained after the
+        // measurement spike (see `scratch/context_assembly_v1_measurements.md`).
+        let p = ContextPolicy::default();
+        assert_eq!(p.recent_outputs, 8);
+        assert_eq!(p.recent_evidence, 8);
+        assert_eq!(p.open_claims_max, 32);
+    }
+
+    #[test]
+    fn context_policy_round_trip_through_serde() {
+        let p = ContextPolicy {
+            recent_outputs: 2,
+            recent_evidence: 4,
+            open_claims_max: 16,
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: ContextPolicy = serde_json::from_str(&s).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn context_policy_deserializes_empty_object_to_defaults() {
+        // Each field carries its own `#[serde(default = "...")]`, so an
+        // empty `{}` must fill every knob with the default value. This is
+        // the round-trip safety net for YAML graph snippets that omit some
+        // of the knobs but not others.
+        let back: ContextPolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(back, ContextPolicy::default());
+    }
+
+    #[test]
+    fn context_policy_deserializes_partial_object_with_per_field_defaults() {
+        let back: ContextPolicy = serde_json::from_str(r#"{"recent_outputs": 1}"#).unwrap();
+        assert_eq!(back.recent_outputs, 1);
+        assert_eq!(back.recent_evidence, default_recent_evidence());
+        assert_eq!(back.open_claims_max, default_open_claims_max());
+    }
+
+    #[test]
+    fn mandate_round_trip_with_context_policy_override() {
+        let m = Mandate {
+            text: "tune context".into(),
+            idle_period: Duration::from_millis(100),
+            max_ticks: Some(1),
+            retry_policy: None,
+            context_policy: ContextPolicy {
+                recent_outputs: 2,
+                recent_evidence: 3,
+                open_claims_max: 4,
+            },
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(
+            s.contains("\"recent_outputs\":2"),
+            "expected recent_outputs on wire, got {s}"
+        );
+        let back: Mandate = serde_json::from_str(&s).unwrap();
+        assert_eq!(m, back);
     }
 
     #[test]

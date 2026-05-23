@@ -453,6 +453,7 @@ mod tests {
             triggers: vec![],
             recent_outputs: vec![],
             recent_evidence: vec![],
+            open_claims: vec![],
             correction: None,
         }
     }
