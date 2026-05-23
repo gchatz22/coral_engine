@@ -55,6 +55,9 @@
 //!
 //! [`MIGRATOR.run(&pool).await`]: sqlx::migrate::Migrator::run
 
+pub mod types;
+pub use types::{AgentRecord, Edge, Graph, ToolRecord};
+
 /// Embedded migration set under `migrations/`. Apps call
 /// `MIGRATOR.run(&pool).await` to apply the schema; the macro reads the
 /// migration files at compile time so the binary doesn't need them on
