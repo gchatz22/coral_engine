@@ -53,9 +53,32 @@
 //! ephemeral per-test database, so unit tests don't have to call it
 //! themselves.
 //!
+//! ## Compile-time-checked queries (`sqlx` offline mode)
+//!
+//! The CRUD API in [`store`] uses `sqlx::query!` / `sqlx::query_as!`
+//! macros that verify SQL against the schema at compile time. The
+//! `.sqlx/` directory at the workspace root caches the macro
+//! expansions so `cargo build` works without a live `DATABASE_URL` (CI
+//! relies on this).
+//!
+//! Regenerate the cache after schema or query changes:
+//!
+//! ```sh
+//! cargo install sqlx-cli --no-default-features --features postgres,rustls
+//! # Then, with the dev Postgres up and migrations applied:
+//! export DATABASE_URL=postgres://jarvis:jarvis@localhost:5432/jarvis_structural
+//! cd crates/jarvis_graph && sqlx migrate run
+//! cd ../.. && cargo sqlx prepare --workspace
+//! ```
+//!
+//! Commit the `.sqlx/` directory along with the code change — CI does
+//! not have a build-time Postgres.
+//!
 //! [`MIGRATOR.run(&pool).await`]: sqlx::migrate::Migrator::run
 
+pub mod store;
 pub mod types;
+pub use store::GraphStore;
 pub use types::{AgentRecord, Edge, Graph, ToolRecord};
 
 /// Embedded migration set under `migrations/`. Apps call
