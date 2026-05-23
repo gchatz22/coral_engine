@@ -33,16 +33,16 @@ jobs:
           components: rustfmt, clippy
 
       - name: cargo build
-        run: cargo build --all-targets --locked
+        run: cargo build --workspace --all-targets --locked
 
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
       - name: cargo test
-        run: cargo test --all-targets --locked
+        run: cargo test --workspace --all-targets --locked
 
   feature-matrix:
     name: feature matrix
@@ -50,13 +50,13 @@ jobs:
     strategy:
       matrix:
         include:
-          - features: "llm-anthropic"
+          - features: "jarvis_node/llm-anthropic"
             name: "llm-anthropic"
-          - features: "llm-cohere"
+          - features: "jarvis_node/llm-cohere"
             name: "llm-cohere"
-          - features: "mcp"
+          - features: "jarvis_node/mcp"
             name: "mcp"
-          - features: "llm-anthropic,llm-cohere,mcp"
+          - features: "jarvis_node/llm-anthropic,jarvis_node/llm-cohere,jarvis_node/mcp"
             name: "all features"
     steps:
       - uses: actions/checkout@v4
@@ -66,11 +66,14 @@ jobs:
         with:
           toolchain: "1.88"
 
+      # Features live on `jarvis_node`, not the workspace. After the
+      # JAR2-40 split, cross-crate selection takes the `<crate>/<feature>`
+      # form from any workspace-aware invocation.
       - name: cargo build [${{ matrix.name }}]
-        run: cargo build --all-targets --locked --features "${{ matrix.features }}"
+        run: cargo build --workspace --all-targets --locked --features "${{ matrix.features }}"
 
       - name: cargo test [${{ matrix.name }}]
-        run: cargo test --all-targets --locked --features "${{ matrix.features }}"
+        run: cargo test --workspace --all-targets --locked --features "${{ matrix.features }}"
 
   mcp-smoke:
     # Activates tests/smoke_mcp_server_everything.rs, which is gated behind
@@ -101,7 +104,7 @@ jobs:
         run: |
           mkdir -p ci-logs
           set -o pipefail
-          cargo test --features mcp --test smoke_mcp_server_everything --locked -- --nocapture \
+          cargo test -p jarvis_node --features mcp --test smoke_mcp_server_everything --locked -- --nocapture \
             2>&1 | tee ci-logs/mcp-smoke.log
 
       - name: Upload mcp-smoke logs on failure
@@ -138,7 +141,7 @@ jobs:
         run: |
           mkdir -p ci-logs
           set -o pipefail
-          cargo run --locked --bin node-run -- \
+          cargo run --locked -p jarvis_node --bin node-run -- \
             examples/smoke/config.json \
             examples/smoke/triggers.jsonl \
             "${RUNNER_TEMP}/jarvis-smoke-fs" \
@@ -156,7 +159,7 @@ jobs:
       - name: Run node-run-mcp against examples/smoke_mcp fixture
         run: |
           set -o pipefail
-          cargo run --locked --features mcp --bin node-run-mcp -- \
+          cargo run --locked -p jarvis_node --features jarvis_node/mcp --bin node-run-mcp -- \
             examples/smoke_mcp/config.json \
             examples/smoke_mcp/triggers.jsonl \
             "${RUNNER_TEMP}/jarvis-smoke-mcp-fs" \
