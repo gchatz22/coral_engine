@@ -7,6 +7,7 @@
 members = [
     "crates/jarvis_node",
     "crates/jarvis_temporal",
+    "crates/jarvis_graph",
 ]
 # Edition 2021 (and onward) defaults to resolver 2 only for single-crate
 # packages; workspace roots silently fall back to resolver 1 unless

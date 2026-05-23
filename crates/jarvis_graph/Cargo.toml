@@ -1,0 +1,57 @@
+[package]
+name = "jarvis_graph"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Structural DB for the Jarvis Engine: graphs, agents, edges, tools, authored mandates (stage 1 stub)."
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[lib]
+name = "jarvis_graph"
+path = "src/lib.rs"
+
+[dependencies]
+# `sqlx` is pinned with `=` to match the convention `jarvis_temporal` set
+# for stage-0 critical-path deps — a future `cargo update` should not
+# silently shift the DB driver under us. Bump deliberately when there's
+# a reason to.
+#
+# Features chosen for stage 1:
+# - `runtime-tokio-rustls`: stay on the same async runtime + TLS stack as
+#   the rest of the workspace (`jarvis_node` uses `reqwest` rustls; no
+#   reason to drag in `native-tls` here).
+# - `postgres`: target DB per `scratch/temporal_ops.md` § 4.
+# - `macros`: enables `query!` / `query_as!` compile-time-checked
+#   queries (stage 1.4 uses these; offline mode via `.sqlx/` makes them
+#   work in CI without a live DB at build time).
+# - `migrate`: enables `sqlx::migrate!()` so apps can apply the
+#   schema programmatically (stage 1.2 wires this).
+# - `chrono`, `uuid`, `json`: column-type support for the schema landing
+#   in stage 1.2 (`TIMESTAMPTZ`, `uuid`, `jsonb`).
+sqlx = { version = "=0.8.6", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "macros",
+    "migrate",
+    "chrono",
+    "uuid",
+    "json",
+] }
+
+# Match `jarvis_node`'s `chrono` shape exactly — `default-features = false`
+# + `clock` + `serde` — so a future workspace-deps consolidation is a
+# one-line move and we don't trip duplicate-version unification.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# Stage-1 lint posture matches `jarvis_node` — see its `Cargo.toml` for
+# the rationale (clippy 1.88 promoted a handful of style lints; keep the
+# diff small until there's a reason to broadly modernize formatting).
+[lints.clippy]
+uninlined_format_args = "allow"
