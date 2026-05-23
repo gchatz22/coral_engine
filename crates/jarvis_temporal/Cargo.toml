@@ -1,0 +1,13 @@
+[package]
+name = "jarvis_temporal"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Temporal-hosted agent workflow runtime for the Jarvis Engine (stage 0 stub)."
+license = "Apache-2.0 OR MIT"
+publish = false
+
+# Stage 0.1 (JAR2-40) lands this crate empty — it reserves the workspace
+# path so stage 0.2 (Temporal Rust SDK smoke, JAR2-?) can drop code in
+# without further restructuring. Intentionally has no dependencies; the
+# `temporalio-sdk` pull happens in 0.2.

@@ -117,10 +117,13 @@ fn end_to_end_parallel_call_tools_against_server_everything() {
     let parent_dir = TempDir::new().expect("tempdir");
     let (cmd, args) = spawn_command();
     let bin = env!("CARGO_BIN_EXE_node-run-llm");
+    // Post-JAR2-40 workspace split: `CARGO_MANIFEST_DIR` is now
+    // `<root>/crates/jarvis_node`; the runbook `examples/` fixture
+    // dirs still live at the workspace root, so step out two levels.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     // The JAR2-38 parallel mandate, distinct from the single-call one.
-    let config = format!("{manifest_dir}/examples/smoke_llm_mcp/config_parallel.json");
-    let triggers = format!("{manifest_dir}/examples/smoke_llm_mcp/triggers.jsonl");
+    let config = format!("{manifest_dir}/../../examples/smoke_llm_mcp/config_parallel.json");
+    let triggers = format!("{manifest_dir}/../../examples/smoke_llm_mcp/triggers.jsonl");
 
     let mut command = Command::new(bin);
     command
@@ -244,9 +247,11 @@ fn end_to_end_llm_decide_against_server_everything() {
     // overhead from inside the test.
     let bin = env!("CARGO_BIN_EXE_node-run-llm");
 
+    // See note in `parallel_smoke_llm_mcp_anthropic`: examples/ lives
+    // at the workspace root, two levels up from this crate.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let config = format!("{manifest_dir}/examples/smoke_llm_mcp/config.json");
-    let triggers = format!("{manifest_dir}/examples/smoke_llm_mcp/triggers.jsonl");
+    let config = format!("{manifest_dir}/../../examples/smoke_llm_mcp/config.json");
+    let triggers = format!("{manifest_dir}/../../examples/smoke_llm_mcp/triggers.jsonl");
 
     let mut command = Command::new(bin);
     command
