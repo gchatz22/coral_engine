@@ -64,6 +64,7 @@ fn empty_bundle() -> ContextBundle {
         triggers: vec![],
         recent_outputs: vec![],
         recent_evidence: vec![],
+        open_claims: vec![],
         correction: None,
     }
 }
@@ -445,6 +446,7 @@ async fn happy_path_tick_live_smoke() {
         triggers: vec![jarvis_node::trigger::Trigger::ScheduledWake],
         recent_outputs: vec![],
         recent_evidence: vec![],
+        open_claims: vec![],
         correction: None,
     };
     let dec = decide

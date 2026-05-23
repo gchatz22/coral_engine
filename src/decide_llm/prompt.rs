@@ -57,6 +57,7 @@
 
 use crate::decision::{ContextBundle, CorrectionContext};
 use crate::evidence::EvidenceRecord;
+use crate::fs::Claim;
 use crate::mandate::{Mandate, Output};
 use crate::model_client::Message;
 use crate::trigger::Trigger;
@@ -106,10 +107,10 @@ Invariants:
 /// `CompleteRequest::messages`. The caller is responsible for filling
 /// `CompleteRequest::tools` with `decide_llm::schema::decision_tools()`.
 pub fn render(bundle: &ContextBundle) -> Vec<Message> {
-    // Capacity is at most 5: system + correction + triggers + outputs +
-    // evidence. Pre-allocating saves a couple of small reallocs in the
-    // common case without committing to a fixed shape.
-    let mut out = Vec::with_capacity(5);
+    // Capacity is at most 6: system + correction + triggers + outputs +
+    // evidence + open_claims. Pre-allocating saves a couple of small
+    // reallocs in the common case without committing to a fixed shape.
+    let mut out = Vec::with_capacity(6);
     out.push(Message::system(render_system(&bundle.mandate)));
     if let Some(c) = &bundle.correction {
         out.push(Message::user(render_correction(c)));
@@ -122,6 +123,9 @@ pub fn render(bundle: &ContextBundle) -> Vec<Message> {
     }
     if !bundle.recent_evidence.is_empty() {
         out.push(Message::user(render_evidence(&bundle.recent_evidence)));
+    }
+    if !bundle.open_claims.is_empty() {
+        out.push(Message::user(render_open_claims(&bundle.open_claims)));
     }
     out
 }
@@ -212,6 +216,30 @@ fn render_evidence(evidence: &[EvidenceRecord]) -> String {
     s
 }
 
+/// Render the open-claims window.
+///
+/// Each entry shows the `seed` (the canonical claim id the agent attaches
+/// to `Decision::CallTool { claim_seed }`) and the human-readable
+/// `description` the agent stored when minting the seed. `status` is
+/// elided because the runtime pre-filters to `Open`. `created_at` is
+/// elided for the same reason recent-output / recent-evidence timestamps
+/// are: precise wall-clock time does not change what the model should do
+/// this tick. The window's purpose is the JAR2-28 seed-reuse convention —
+/// the model should consult this list before minting a fresh
+/// `ClaimSeed` for conceptual work it has already opened. See
+/// `scratch/claim_seed_persistence.md` for the convention and
+/// `scratch/context_assembly_v2.md` § 3 for the warm-cache rationale.
+fn render_open_claims(claims: &[Claim]) -> String {
+    let mut s = format!("# Open claims ({})", claims.len());
+    for c in claims {
+        s.push_str("\n\n- seed: ");
+        s.push_str(&serde_json::to_string(&c.seed).expect("string serializes"));
+        s.push_str("\n  description: ");
+        s.push_str(&serde_json::to_string(&c.description).expect("string serializes"));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     //! Snapshot tests for `render`.
@@ -270,6 +298,7 @@ mod tests {
             triggers: vec![],
             recent_outputs: vec![],
             recent_evidence: vec![],
+            open_claims: vec![],
             correction: None,
         }
     }
@@ -307,6 +336,7 @@ mod tests {
             triggers: vec![Trigger::ScheduledWake],
             recent_outputs: vec![Output::new("draft", vec![ev.id.clone()], ts())],
             recent_evidence: vec![ev],
+            open_claims: vec![],
             correction: None,
         };
         let a = render(&bundle);
@@ -552,6 +582,7 @@ mod tests {
             triggers: vec![Trigger::ScheduledWake],
             recent_outputs: vec![Output::new("draft", vec![ev.id.clone()], ts())],
             recent_evidence: vec![ev],
+            open_claims: vec![],
             correction: None,
         };
         let msgs = render(&bundle);
@@ -605,6 +636,7 @@ mod tests {
             triggers: vec![Trigger::ScheduledWake],
             recent_outputs: vec![Output::new("draft", vec![ev.id.clone()], ts())],
             recent_evidence: vec![ev],
+            open_claims: vec![],
             correction: Some(CorrectionContext::new(
                 "emit_output: evidence list is empty (provenance contract)",
             )),
@@ -622,6 +654,76 @@ mod tests {
         assert!(text(&msgs[3]).starts_with("# Recent outputs"));
         assert_eq!(msgs[4].role, Role::User);
         assert!(text(&msgs[4]).starts_with("# Recent evidence"));
+    }
+
+    // ---- JAR2-36: open_claims rendering --------------------------------
+
+    use crate::fs::{Claim, ClaimStatus};
+
+    fn open_claim(seed: &str, description: &str) -> Claim {
+        Claim {
+            seed: seed.into(),
+            description: description.into(),
+            status: ClaimStatus::Open,
+            created_at: ts(),
+        }
+    }
+
+    /// Snapshot: open_claims renders as a `# Open claims` user message
+    /// with one bullet per claim, showing `seed` and `description`.
+    #[test]
+    fn snapshot_open_claims_window() {
+        let bundle = ContextBundle {
+            open_claims: vec![
+                open_claim("phase-2-clearance", "Did drug X pass phase 2?"),
+                open_claim("acme-revenue-q3", "What did Acme book in Q3?"),
+            ],
+            ..empty_bundle()
+        };
+        let msgs = render(&bundle);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1].role, Role::User);
+        assert_eq!(
+            text(&msgs[1]),
+            "# Open claims (2)\n\
+             \n\
+             - seed: \"phase-2-clearance\"\n  description: \"Did drug X pass phase 2?\"\n\
+             \n\
+             - seed: \"acme-revenue-q3\"\n  description: \"What did Acme book in Q3?\""
+        );
+    }
+
+    /// Position: open_claims renders after recent_evidence when both are
+    /// present. The model treats recent_outputs/recent_evidence as the
+    /// "what just happened" pair; open_claims is separate lifetime state.
+    #[test]
+    fn open_claims_renders_after_evidence_when_both_present() {
+        let ev = EvidenceRecord::new("echo", json!({"k": 1}), json!({"v": 2}), ts());
+        let bundle = ContextBundle {
+            mandate: mandate(),
+            triggers: vec![Trigger::ScheduledWake],
+            recent_outputs: vec![Output::new("draft", vec![ev.id.clone()], ts())],
+            recent_evidence: vec![ev],
+            open_claims: vec![open_claim("c", "d")],
+            correction: None,
+        };
+        let msgs = render(&bundle);
+        // 1 system + 4 windows = 5
+        assert_eq!(msgs.len(), 5);
+        assert!(text(&msgs[1]).starts_with("# Triggers"));
+        assert!(text(&msgs[2]).starts_with("# Recent outputs"));
+        assert!(text(&msgs[3]).starts_with("# Recent evidence"));
+        assert!(text(&msgs[4]).starts_with("# Open claims"));
+    }
+
+    /// Empty open_claims must not emit a `# Open claims (0)` placeholder —
+    /// the prompt budget is precious and "(none)" surfaces no signal.
+    #[test]
+    fn empty_open_claims_emits_no_window() {
+        let bundle = empty_bundle();
+        let msgs = render(&bundle);
+        assert_eq!(msgs.len(), 1, "expected system message only");
+        assert!(!text(&msgs[0]).contains("Open claims"));
     }
 
     /// Strings with characters that need JSON escaping (quotes, newlines)
