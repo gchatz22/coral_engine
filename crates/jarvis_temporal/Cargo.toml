@@ -68,6 +68,12 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 url = "2"
 
 [dev-dependencies]
+# JAR2-69 — the unit test for `install_agent_storage` / `agent_storage`
+# in `src/worker.rs` needs `MemoryStorage`, which is gated behind the
+# `memory-storage` feature on `jarvis_node`. Dev-only dep override
+# turns the feature on for the test build without dragging
+# `MemoryStorage` into production worker binaries.
+jarvis_node = { path = "../jarvis_node", features = ["memory-storage"] }
 # Only the unit tests in `workflow.rs` need a concrete codec to prove the
 # `Serialize`/`Deserialize` derives are present on every placeholder
 # type. Temporal's wire-level payload codec at runtime handles the
