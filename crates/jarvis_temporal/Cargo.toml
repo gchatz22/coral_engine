@@ -74,7 +74,27 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
 url = "2"
 
+[features]
+# JAR2-62 — pass-through to `jarvis_node`'s vendor features so the
+# `worker` binary can be built against one or both LLM vendors. The
+# library itself (`worker.rs`, `activities.rs`) is feature-agnostic:
+# it traffics in `Arc<dyn Decide>`, which is always available because
+# the `Decide` trait lives in `jarvis_node::decision` (un-gated).
+# Only `bin/worker.rs` reaches for vendor-specific `ModelClient`
+# constructors and is itself `#[cfg]`-gated on these features. See
+# `src/bin/worker.rs` for the dispatch shape (mirrors
+# `jarvis_node/src/bin/node_run_llm.rs`).
+default = []
+llm-anthropic = ["jarvis_node/llm-anthropic"]
+llm-cohere = ["jarvis_node/llm-cohere"]
+
 [dev-dependencies]
+# JAR2-62 — `async-trait` is needed to impl the `jarvis_node::decision::Decide`
+# trait (itself `#[async_trait]`-annotated) on a test-only `ErrDecide`
+# helper in `src/activities.rs`. Dev-only because the production
+# activity body holds an `Arc<dyn Decide>` and never impls the trait
+# itself.
+async-trait = "0.1"
 # JAR2-69 — the unit test for `install_agent_storage` / `agent_storage`
 # in `src/worker.rs` needs `MemoryStorage`, which is gated behind the
 # `memory-storage` feature on `jarvis_node`. Dev-only dep override
