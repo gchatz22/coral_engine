@@ -108,3 +108,8 @@ jarvis_node = { path = "../jarvis_node", features = ["memory-storage"] }
 # serialization itself — we don't need `serde_json` at runtime, just in
 # tests as a cheap, hermetic round-trip check.
 serde_json = "1"
+# JAR2-64 — `persist_output_impl` hermetic tests plant `EvidenceRecord`s
+# whose constructor takes a `chrono::DateTime<Utc>`. Test-only dep so
+# production worker binaries don't pull `chrono` into their runtime
+# graph.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
