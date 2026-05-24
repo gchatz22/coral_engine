@@ -17,6 +17,13 @@
 //! input/output types are real — JAR2-61..66 subagents replace bodies
 //! without touching the wire shape.
 //!
+//! As of JAR2-64, `persist_output` carries its real body: opens an
+//! [`jarvis_node::fs::AgentFs`] over the process-wide [`AgentStorage`]
+//! backend and delegates to `AgentFs::persist_output`. The body extracts
+//! into the free helper [`persist_output_impl`] so hermetic tests can
+//! exercise the FS-touching logic without an `ActivityContext` or the
+//! `OnceLock` install path.
+//!
 //! ## Test injection
 //!
 //! `decide_next_action` consults a static `OnceLock<Mutex<VecDeque<Decision>>>`
@@ -55,6 +62,7 @@ use jarvis_node::evidence::EvidenceId;
 use jarvis_node::fs::AgentFs;
 use jarvis_node::mandate::{Mandate, OutputId};
 use jarvis_node::model_client::ModelError;
+use jarvis_node::storage::AgentStorage;
 use jarvis_node::trigger::{HumanOp, MandatePatch, Trigger};
 use serde::{Deserialize, Serialize};
 use temporalio_macros::activities;
@@ -232,6 +240,49 @@ fn pop_scripted_decision() -> Option<Decision> {
         .lock()
         .expect("DECISION_SCRIPT mutex poisoned")
         .pop_front()
+}
+
+// ---------------------------------------------------------------------------
+// Activity body helpers
+//
+// Free functions extracted from the activity bodies so hermetic tests can
+// exercise the FS-touching logic without constructing an `ActivityContext`
+// (which has no `Default` impl and a non-trivial Core-tied constructor) or
+// installing the process-wide `OnceLock<AgentStorage>` (which would race
+// the `worker::install_then_access_*` test that already installs it in
+// the lib test binary). The activity body is a 3-line wrapper around
+// these helpers; the helpers carry the real shape.
+
+/// Stage 3.8 helper — open an `AgentFs` over `storage` at `prefix` and
+/// persist `content` as an output whose provenance trail is `evidence`.
+/// Returns the minted `OutputId` (a fresh ULID — see the
+/// `persist_output` doc comment for the idempotency caveat).
+///
+/// `AgentFs::persist_output` rejects:
+/// - Empty `evidence` (`FsError::EmptyEvidence`).
+/// - Any cited id whose `evidence/<id>.json` is absent
+///   (`FsError::EvidenceNotFound`).
+///
+/// Both errors propagate via `?` through `anyhow::Error` →
+/// `ActivityError::Application`. The workflow body's next-tick
+/// correction-context staging (JAR2-60 `dispatch_call_tools`) is the
+/// agent-loop's mechanism for surfacing these failures to the LLM; the
+/// activity itself just reports.
+pub(crate) async fn persist_output_impl(
+    storage: Arc<dyn AgentStorage>,
+    prefix: &str,
+    content: &str,
+    evidence: &[EvidenceId],
+) -> anyhow::Result<OutputId> {
+    // Placeholder mandate matches `assemble_context`'s stub — `AgentFs`
+    // only writes `mandate.json` when absent, so the real mandate
+    // persisted by JAR2-61's `assemble_context` (or a prior boot of
+    // this same agent) is not clobbered when this activity opens the
+    // FS to persist an output.
+    let mandate = Mandate::new("", Duration::ZERO, None);
+    let fs = AgentFs::new_with_storage(storage, prefix, &mandate).await?;
+    let output = fs.persist_output(content, evidence).await?;
+    Ok(output.id)
 }
 
 // ---------------------------------------------------------------------------
@@ -482,15 +533,43 @@ impl AgentActivities {
         }
     }
 
-    /// Stage 3.8 (JAR2-64). Stub returns a fresh placeholder `OutputId`
-    /// (a new ULID — `OutputId::new()`). JAR2-64 replaces the body with
-    /// `AgentFs::persist_output`.
+    /// Stage 3.8 (JAR2-64). Real body: opens an [`AgentFs`] over the
+    /// process-wide [`AgentStorage`] backend (installed by the worker
+    /// boot or a test harness) at the agent's prefix, then delegates to
+    /// [`AgentFs::persist_output`] — which enforces the provenance
+    /// contract from JAR2-4 (every cited `EvidenceId` must resolve to a
+    /// file in `evidence/`) and updates the outputs tail-index from
+    /// JAR2-54.
+    ///
+    /// **Mandate placeholder.** `AgentFs::new_with_storage` only writes
+    /// `mandate.json` if the file is absent; the placeholder here is a
+    /// no-op when JAR2-61's `assemble_context` has already persisted the
+    /// real mandate. Sibling JAR2-61 will swap `PersistOutputInput.cfg`
+    /// to the real `Mandate` shape; until that lands, this body matches
+    /// the same placeholder `assemble_context` uses today.
+    ///
+    /// **Idempotency caveat.** Per the JAR2-64 ticket the activity is
+    /// "idempotent for free" because `OutputId` was assumed to be
+    /// content-addressed — but `OutputId::new()` in `jarvis_node::mandate`
+    /// is a random ULID, so a Temporal retry of a successful FS write +
+    /// failed activity ack will mint a fresh id and write a second
+    /// file. Out of scope for JAR2-64 (smallest correct diff: swap the
+    /// body, not redesign `OutputId`); flagged as a follow-up in the PR
+    /// summary.
     #[activity]
     pub async fn persist_output(
         _ctx: ActivityContext,
-        _input: PersistOutputInput,
+        input: PersistOutputInput,
     ) -> Result<OutputId, ActivityError> {
-        Ok(OutputId::new())
+        let storage = agent_storage();
+        let id = persist_output_impl(
+            storage,
+            &input.fs_handle.prefix,
+            &input.content,
+            &input.evidence,
+        )
+        .await?;
+        Ok(id)
     }
 
     /// Stage 3.9 (JAR2-65). Stub is a no-op. JAR2-65 replaces the body
@@ -985,5 +1064,142 @@ mod tests {
             panic!("expected ActivityError::Application");
         };
         assert!(failure.is_non_retryable());
+    }
+
+    // -----------------------------------------------------------------
+    // JAR2-64 — `persist_output_impl` hermetic coverage.
+    //
+    // The tests below exercise the activity-body logic through the
+    // extracted free helper so they don't need an `ActivityContext`
+    // (no `Default` impl, non-trivial Core-tied construction) or the
+    // process-wide `OnceLock<AgentStorage>` install path (which
+    // `worker::install_then_access_*` already touches in the same
+    // test binary). Each test creates its own `MemoryStorage` and
+    // exercises the storage-prefix shape `<graph_id>/<agent_id>/`.
+
+    use chrono::Utc;
+    use jarvis_node::evidence::EvidenceRecord;
+    use jarvis_node::fs::FsError;
+    use jarvis_node::storage::MemoryStorage;
+
+    /// Plant an evidence record under `prefix` so a subsequent
+    /// `persist_output_impl` referencing the returned id passes the
+    /// provenance check. Shared between the happy-path test and the
+    /// failure tests so the planting shape doesn't drift between them.
+    async fn plant_evidence(
+        storage: Arc<dyn jarvis_node::storage::AgentStorage>,
+        prefix: &str,
+        tool: &str,
+        args: serde_json::Value,
+        result: serde_json::Value,
+    ) -> EvidenceId {
+        // Open an `AgentFs` over the *same* storage Arc + prefix the
+        // activity body will open against. This is the load-bearing
+        // shape: a separate `MemoryStorage` instance would never share
+        // evidence with the activity's view because `MemoryStorage` is
+        // in-process state, not a connected backend.
+        let mandate = Mandate::new("plant", Duration::from_millis(0), None);
+        let fs = AgentFs::new_with_storage(storage, prefix, &mandate)
+            .await
+            .expect("open planting AgentFs");
+        let rec = EvidenceRecord::new(tool, args, result, Utc::now());
+        fs.record_evidence(rec).await.expect("plant evidence")
+    }
+
+    #[tokio::test]
+    async fn persist_output_impl_writes_output_with_resolved_evidence() {
+        let storage: Arc<dyn jarvis_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
+        let prefix = "graphs/g1/agents/a1/";
+
+        // Plant two evidence records the output will cite.
+        let id_a = plant_evidence(
+            storage.clone(),
+            prefix,
+            "tool_a",
+            json!({"q": "alpha"}),
+            json!({"r": 1}),
+        )
+        .await;
+        let id_b = plant_evidence(
+            storage.clone(),
+            prefix,
+            "tool_b",
+            json!({"q": "beta"}),
+            json!({"r": 2}),
+        )
+        .await;
+        assert_ne!(id_a, id_b);
+
+        let out_id = persist_output_impl(
+            storage.clone(),
+            prefix,
+            "claim X",
+            &[id_a.clone(), id_b.clone()],
+        )
+        .await
+        .expect("persist_output_impl ok");
+
+        // Inspect what landed via a fresh `AgentFs` view over the same
+        // storage. `list_recent_outputs` exercises the tail-index path
+        // from JAR2-54 too — proving the activity body inherits that
+        // wiring for free.
+        let mandate = Mandate::new("inspect", Duration::from_millis(0), None);
+        let fs = AgentFs::new_with_storage(storage, prefix, &mandate)
+            .await
+            .unwrap();
+        let outs = fs.list_recent_outputs(8).await.expect("list outputs");
+        assert_eq!(outs.len(), 1, "expected exactly one output on disk");
+        let on_disk = &outs[0];
+        assert_eq!(
+            on_disk.id, out_id,
+            "OutputId returned must match on-disk file"
+        );
+        assert_eq!(on_disk.content, "claim X");
+        assert!(
+            on_disk.evidence.contains(&id_a) && on_disk.evidence.contains(&id_b),
+            "output must cite both planted evidence ids"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_output_impl_rejects_unresolved_evidence_id() {
+        let storage: Arc<dyn jarvis_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
+        let prefix = "graphs/g1/agents/a-missing/";
+
+        // Reference an evidence id that was never planted — the
+        // `AgentFs::persist_output` provenance check fires.
+        let bogus = EvidenceId::new("tool_x", &json!({}), &json!({"never": "written"}));
+        let err = persist_output_impl(storage.clone(), prefix, "claim Y", &[bogus.clone()])
+            .await
+            .expect_err("must fail on unresolved evidence id");
+        let typed = err.downcast_ref::<FsError>().expect("typed FsError");
+        match typed {
+            FsError::EvidenceNotFound(missing) => assert_eq!(missing, &bogus),
+            other => panic!("expected EvidenceNotFound, got {other:?}"),
+        }
+
+        // No output written.
+        let mandate = Mandate::new("inspect", Duration::from_millis(0), None);
+        let fs = AgentFs::new_with_storage(storage, prefix, &mandate)
+            .await
+            .unwrap();
+        let outs = fs.list_recent_outputs(8).await.unwrap();
+        assert!(outs.is_empty(), "no output should have been written");
+    }
+
+    #[tokio::test]
+    async fn persist_output_impl_rejects_empty_evidence_list() {
+        // Provenance contract from JAR2-4: an output with no evidence
+        // is rejected before the file write. The activity body
+        // inherits this — Temporal sees the error, the workflow's
+        // next-tick correction-context staging gets the message.
+        let storage: Arc<dyn jarvis_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
+        let prefix = "graphs/g1/agents/a-empty/";
+
+        let err = persist_output_impl(storage, prefix, "claim Z", &[])
+            .await
+            .expect_err("must fail on empty evidence");
+        let typed = err.downcast_ref::<FsError>().expect("typed FsError");
+        assert!(matches!(typed, FsError::EmptyEvidence));
     }
 }
