@@ -1,17 +1,26 @@
-//! `jarvis_temporal` — stage 0.2 Temporal Rust SDK smoke.
+//! `jarvis_temporal` — Temporal-hosted agent workflow runtime.
 //!
-//! This crate currently hosts only the `temporal-smoke` binary (see
-//! `src/bin/temporal_smoke.rs`). The smoke exercises the SDK primitive
-//! set `scratch/agent_runtime.md` § 4 depends on so we discover gaps
-//! before stage 3 commits to the substrate. Findings live in
-//! `scratch/temporal_rust_sdk_smoke.md`.
+//! ## Library surface
 //!
-//! The smoke deletes itself when stage 3 lands the real `AgentWorkflow`
-//! per `scratch/temporal_staged_plan.md` § 5 stage 0 — nothing in this
-//! crate is intended as production code.
+//! - [`workflow`] (JAR2-58, stage 3.2) — `AgentWorkflow` skeleton:
+//!   workflow type, `AgentInput`/`AgentResult` shapes, URL-shaped
+//!   workflow ID helper. The body continues-as-new once and exits;
+//!   real loop body lives in JAR2-60.
+//! - [`worker`] (JAR2-58) — shared registration helpers
+//!   ([`worker::build_worker`], [`worker::NoopActivities`],
+//!   [`worker::DEFAULT_TASK_QUEUE`]) used by both the `worker` binary
+//!   and the integration tests under `tests/`.
 //!
-//! The library surface intentionally stays empty: tests live alongside
-//! the binary so the smoke is self-contained, and stage 3 will pick the
-//! library shape it actually needs (`AgentWorkflow`, activity bodies,
-//! worker binary) rather than inheriting whatever the smoke leaves
-//! behind.
+//! ## Binaries
+//!
+//! - `worker` (JAR2-58 onward) — Temporal worker that registers
+//!   [`workflow::AgentWorkflow`] + a noop activity set. Run against a
+//!   Temporal Server (`temporal server start-dev`).
+//! - `temporal-smoke` (JAR2-41, stage 0.2) — primitive smoke binary
+//!   exercised against the live SDK. Retained as a working reference
+//!   until stage 3 is fully built out; deletes itself per
+//!   `scratch/temporal_staged_plan.md` § 5 stage 0 when the real
+//!   workflow surface is complete.
+
+pub mod worker;
+pub mod workflow;
