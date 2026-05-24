@@ -1220,6 +1220,7 @@ dependencies = [
  "anyhow",
  "futures",
  "futures-util",
+ "jarvis_node",
  "serde",
  "serde_json",
  "temporalio-client",
