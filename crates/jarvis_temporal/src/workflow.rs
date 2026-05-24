@@ -1,6 +1,7 @@
 //! Stage 3.2 (JAR2-58) — `AgentWorkflow` skeleton.
 //! Stage 3.3 (JAR2-59) — signal handlers + `inspect_state` update.
 //! Stage 3.4 (JAR2-60) — per-tick orchestration loop body.
+//! Stage 3.11 (JAR2-67) — typed [`Carryover`] + real continue-as-new.
 //!
 //! This module owns the workflow type, the input/output shapes, the
 //! signal/update surface, and the per-tick loop that orchestrates the
@@ -29,10 +30,9 @@
 //!   SDK-blessed `ctx.continue_as_new_suggested()` signal. The first run
 //!   no longer continues-as-new immediately; instead the loop runs until
 //!   the SDK suggests continuation (history pressure), at which point the
-//!   workflow continues-as-new with a placeholder `Carryover` (JAR2-67
-//!   fills in the real shape). The `Option<Carryover>` field stays on
-//!   `AgentInput` for wire compatibility but is now informational only
-//!   ("`Some` ⇒ this run was reached via continue-as-new").
+//!   workflow continues-as-new with a real typed [`Carryover`] (filled
+//!   in by JAR2-67, which lands the carryover schema + encode/hydrate
+//!   helpers).
 //!
 //! - **Adds** six activity invocations via [`crate::activities::AgentActivities`].
 //!   Every body is a stub returning canned `Ok(...)` so the loop runs
@@ -78,7 +78,8 @@
 use std::time::Duration;
 
 use jarvis_node::decision::{ContextBundle, CorrectionContext, Decision, ToolCall};
-use jarvis_node::mandate::Mandate;
+use jarvis_node::evidence::EvidenceId;
+use jarvis_node::mandate::{Mandate, OutputId};
 use jarvis_node::trigger::{HumanOp, MandatePatch, Trigger};
 use serde::{Deserialize, Serialize};
 use temporalio_macros::{workflow, workflow_methods};
@@ -128,29 +129,144 @@ pub struct FsHandle {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParentRef {}
 
+/// Scheduler-state subset of the [`Carryover`].
+///
+/// Today this is just `next_wake` — the per-mandate idle cadence the
+/// previous run pinned via `Decision::Idle { next_after }`. Wrapping it
+/// in a struct (rather than carrying a bare `Option<Duration>` on
+/// `Carryover`) reserves the slot for the per-mandate cursor work in
+/// later stages (scheduler v2, parent-side fan-out cadence) without
+/// renaming a field on the wire.
+///
+/// **Deliberately no `last_tick_at` timestamp.** `ctx.workflow_time()`
+/// is deterministic per-replay but a wall-clock timestamp on the
+/// carryover would only be observed at encode time on the post-CAN
+/// run's replay — and adds zero scheduling value over `next_wake`
+/// alone, since the new run pins its own first-tick wake the same way
+/// the very first run does (defaulting to [`INITIAL_NEXT_WAKE`] when
+/// `next_wake` is `None`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerCursor {
+    /// The `next_wake` cadence the previous run had pinned. Restored
+    /// onto [`AgentWorkflow::next_wake`] on hydrate; `None` means the
+    /// previous run never saw a `Decision::Idle` (so the new run
+    /// defaults to the [`INITIAL_NEXT_WAKE`] floor on its first tick,
+    /// same as a brand-new workflow).
+    pub next_wake: Option<Duration>,
+}
+
+/// Stage-5 child-workflow handle placeholder.
+///
+/// Empty struct because stage 3 does not have a parent-child topology
+/// (see `scratch/temporal_staged_plan.md` § 5 stage 5). The
+/// `Carryover.child_handles` vector is structurally always empty
+/// today; carrying it across CAN is a no-op until stage 5 fills in
+/// the field. `#[non_exhaustive]` reserves room for future fields
+/// (`workflow_id`, `run_id`, `parent_signal_path`, …) without a wire
+/// break.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ChildRef {}
+
 /// Typed continue-as-new carryover.
 ///
-/// **Placeholder.** JAR2-67 ships the real shape (trigger queue,
-/// scheduler cursor, child handles, last output id, mid-tick evidence).
-/// Stage 3.4 (JAR2-60) uses `Carryover::default()` as the placeholder
-/// argument to `ctx.continue_as_new(...)` when
-/// `ctx.continue_as_new_suggested()` fires — the workflow gets a fresh
-/// run with empty state, which is correct for the stub-activities loop
-/// because no in-flight semantic state crosses the boundary yet.
+/// Per `scratch/agent_runtime.md` § 9, the carryover is *not*
+/// conversation history or tool results (those survive trivially via
+/// the per-agent FS, which is external to Temporal history). It is a
+/// small, typed, deterministically-rebuildable subset of in-workflow
+/// state that would otherwise be lost when `ctx.continue_as_new(...)`
+/// terminates the current run and starts a fresh one.
+///
+/// Every field maps to a workflow-state field that the run loop
+/// observes or mutates. The mapping is:
+///
+/// | Carryover field | Workflow-state field | Lifecycle |
+/// |---|---|---|
+/// | `pending_triggers` | [`AgentWorkflow::pending_triggers`] | Drained at top of each tick |
+/// | `pending_human_ops` | [`AgentWorkflow::pending_human_ops`] | Drained at top of each tick |
+/// | `pending_mandate_patches` | [`AgentWorkflow::pending_mandate_patches`] | Drained at top of each tick |
+/// | `retirement_request` | [`AgentWorkflow::retirement_request`] | Drained at top of each tick (short-circuits) |
+/// | `staged_correction` | [`AgentWorkflow::staged_correction`] | Threaded into next `assemble_context` |
+/// | `scheduler_cursor` | [`AgentWorkflow::next_wake`] | Honored by the wake gate |
+/// | `last_output_id` | [`AgentWorkflow::last_output_id`] | Latest persisted `EmitOutput` id |
+/// | `mid_tick_evidence` | [`AgentWorkflow::mid_tick_evidence`] | EvidenceIds collected mid-tick |
+/// | `cumulative_*_observed` | matching `AgentWorkflow::cumulative_*_observed` | Observability across CAN boundary |
+/// | `child_handles` | (stage 5) | Always empty today |
+///
+/// **`staged_correction` is preserved across CAN** (the ticket's spec
+/// list omitted it; we include it because dropping it would lose one
+/// tick of correction context the previous run had already staged for
+/// the next tick — visible behavior change). It's a `CorrectionContext`
+/// itself, which is `Serialize`/`Deserialize` via `jarvis_node::decision`.
+///
+/// **`mid_tick_evidence` is structurally empty today** because the
+/// CAN check happens at end-of-tick, after every activity has returned.
+/// The field exists for stage 4+'s mid-tick checkpointing; today it
+/// round-trips as `Vec::new()`.
+///
+/// **`cumulative_*_observed` survive CAN.** Without this, a snapshot
+/// taken on the post-CAN run would report `cumulative_triggers_observed
+/// == 0` even though the workflow lifetime had observed N signals on
+/// the pre-CAN run — breaking the JAR2-59 semantics of "did we
+/// observe a signal across the workflow's lifetime?".
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Carryover {}
+pub struct Carryover {
+    /// `external_signal` payloads that arrived after the previous run's
+    /// last drain. Restored to [`AgentWorkflow::pending_triggers`] on
+    /// hydrate so the new run's first wake fires on them.
+    pub pending_triggers: Vec<Trigger>,
+    /// `human_override` payloads pending consumption.
+    pub pending_human_ops: Vec<HumanOp>,
+    /// `mandate_update` payloads pending consumption.
+    pub pending_mandate_patches: Vec<MandatePatch>,
+    /// Set by the `retire` signal handler; if `Some(_)` on hydrate, the
+    /// new run's first tick short-circuits to `persist_retirement`.
+    pub retirement_request: Option<String>,
+    /// One-tick correction context staged by the previous tick's
+    /// `Decision::CallTools` failure handling. Threaded into the next
+    /// `assemble_context` activity input on the new run.
+    pub staged_correction: Option<CorrectionContext>,
+    /// Wraps [`AgentWorkflow::next_wake`]. The field is a struct rather
+    /// than a bare `Option<Duration>` so future scheduler state can
+    /// slot in without a wire break (see [`SchedulerCursor`] doc).
+    pub scheduler_cursor: SchedulerCursor,
+    /// Stage-5 placeholder — always `Vec::new()` today (see
+    /// [`ChildRef`] doc).
+    pub child_handles: Vec<ChildRef>,
+    /// `EmitOutput`-side last-persisted output id. Today the workflow
+    /// body does not consume this (`persist_output` activity writes the
+    /// output without echoing the id back into workflow state), but
+    /// carrying it across CAN unlocks stage 6.5's TUI snapshot field
+    /// `recent_output_ids` and stage 4's parent → child output
+    /// chaining. Today round-trips as `None`.
+    pub last_output_id: Option<OutputId>,
+    /// EvidenceIds collected by activities partway through a tick that
+    /// CAN fires *during*. Empty in stage 3 — CAN is checked at
+    /// end-of-tick — but reserved on the wire for stage 4+'s mid-tick
+    /// checkpointing.
+    pub mid_tick_evidence: Vec<EvidenceId>,
+    /// Cumulative count of `Trigger`s observed via `external_signal`
+    /// across the **workflow's lifetime** (including all prior CAN
+    /// runs). Critical: without this, the [`AgentSnapshot`]
+    /// `cumulative_triggers_observed` field on a post-CAN snapshot
+    /// would only reflect signals received on the current run, not the
+    /// lifetime view JAR2-59 promised.
+    pub cumulative_triggers_observed: u64,
+    pub cumulative_human_ops_observed: u64,
+    pub cumulative_mandate_patches_observed: u64,
+}
 
 /// Input handed to `AgentWorkflow::run` at start (and at every
 /// continue-as-new).
 ///
-/// The four-field shape matches the stage 3.2 ticket exactly so JAR2-67
-/// (real carryover) can fill `carryover` without renaming.
-///
-/// Stage 3.4 (JAR2-60) note on `carryover`: the field is now
-/// informational only — `Some(_)` means "this run was reached via
-/// `continue_as_new`", `None` means "first run". The loop body no longer
-/// branches on it; the JAR2-58 once-marker sentinel has been replaced by
-/// `ctx.continue_as_new_suggested()`.
+/// Stage 3.11 (JAR2-67): `carryover` is now a *load-bearing* field, not
+/// informational. On hydrate the workflow body decodes it via
+/// [`AgentWorkflow::hydrate_from_carryover`] back onto workflow state so
+/// pending signal queues, retirement requests, `next_wake`, the
+/// `staged_correction` from the previous tick, and the cumulative
+/// observability counters all survive a CAN boundary. `None` means
+/// "first run of this workflow" — the workflow starts from `Default`
+/// state, identical to JAR2-58's first-run shape.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInput {
     pub cfg: AgentConfig,
@@ -291,9 +407,11 @@ pub struct AgentWorkflow {
     /// Wall-clock the next idle `ctx.timer(...)` waits for. Updated by
     /// `Decision::Idle { next_after }`. `None` on the very first tick of
     /// a run (the loop starts with [`INITIAL_NEXT_WAKE`] = 1ms so the
-    /// first tick fires immediately) and after every continue-as-new
-    /// (the workflow gets a fresh `Default` state on the new run).
-    /// `Some(_)` once a `Decision::Idle` has pinned a cadence.
+    /// first tick fires immediately). JAR2-67: a continue-as-new
+    /// preserves the prior run's `next_wake` via
+    /// [`Carryover::scheduler_cursor`], so a post-CAN run resumes with
+    /// the cadence the pre-CAN run had pinned (`None` only if the
+    /// pre-CAN run never observed a `Decision::Idle`).
     next_wake: Option<Duration>,
     /// Correction context staged by the previous tick when its tool
     /// batch returned failures. Threaded into the next
@@ -312,6 +430,18 @@ pub struct AgentWorkflow {
     /// Cumulative count of [`MandatePatch`]es observed via
     /// `mandate_update`. Same rationale.
     cumulative_mandate_patches_observed: u64,
+    /// JAR2-67: last `persist_output` `OutputId` observed by this
+    /// workflow run. Today the `persist_output` activity does not echo
+    /// the id back into workflow state (the field stays `None`); the
+    /// slot exists so the [`Carryover`] round-trip is structurally
+    /// complete and stage 4+'s parent → child output chaining doesn't
+    /// require a wire change.
+    last_output_id: Option<OutputId>,
+    /// JAR2-67: evidence ids collected by activities mid-tick. Empty
+    /// in stage 3 — the CAN check fires at end-of-tick after every
+    /// activity has returned — but reserved for stage 4+'s mid-tick
+    /// checkpointing.
+    mid_tick_evidence: Vec<EvidenceId>,
 }
 
 #[workflow_methods]
@@ -368,15 +498,44 @@ impl AgentWorkflow {
 
     /// Workflow entry point — the per-tick loop body.
     ///
-    /// Reads top-to-bottom: drain → assemble → decide → dispatch →
-    /// (maybe) continue-as-new. Every external action (FS read/write,
-    /// LLM call, tool dispatch) lives in an activity; the workflow body
-    /// is pure orchestration.
+    /// Reads top-to-bottom: hydrate carryover (if any) → loop {wake →
+    /// drain → assemble → decide → dispatch → (maybe) continue-as-new}.
+    /// Every external action (FS read/write, LLM call, tool dispatch)
+    /// lives in an activity; the workflow body is pure orchestration.
+    ///
+    /// JAR2-67 wires the real continue-as-new shape:
+    ///
+    /// 1. On entry, if `input.carryover.is_some()`, the workflow state
+    ///    is hydrated from it via [`hydrate_from_carryover`]. This is
+    ///    the only place [`Carryover`] is decoded.
+    /// 2. At end-of-tick (after the activity for the current decision
+    ///    returned, *and only on non-retirement ticks*),
+    ///    [`temporalio_sdk::WorkflowContext::continue_as_new_suggested`]
+    ///    is consulted. If true, the workflow's current state is
+    ///    encoded into a fresh [`Carryover`] via [`encode_carryover`]
+    ///    and passed to `ctx.continue_as_new(&next_input, opts)`, which
+    ///    returns `Err(WorkflowTermination::continue_as_new(...))` —
+    ///    `?` propagates the termination out of the workflow body.
+    ///
+    /// **Retirement structurally cannot trigger CAN.** Both retirement
+    /// paths (`drained.retirement` short-circuit at the top of the
+    /// loop, and `Decision::Retire { reason }` at the bottom of the
+    /// `match`) `return retire(...).await` before the CAN check, which
+    /// lives only after the non-retire arms of the `match`.
     #[run]
     pub async fn run(
         ctx: &mut WorkflowContext<Self>,
         input: AgentInput,
     ) -> WorkflowResult<AgentResult> {
+        // JAR2-67: hydrate workflow state from carryover before the loop
+        // begins, so the very first wake/drain sees every pre-CAN
+        // pending signal, the prior `next_wake`, and the prior
+        // `staged_correction`. `None` means "first run of this
+        // workflow" — the workflow stays on its `Default` state, which
+        // is the JAR2-58 first-run shape.
+        if let Some(c) = input.carryover.clone() {
+            ctx.state_mut(|s| s.hydrate_from_carryover(c));
+        }
         loop {
             // Wake gate: triggers arrived, retirement requested, or the
             // idle deadline elapsed. Block-scoped so the `&self` borrows
@@ -384,9 +543,8 @@ impl AgentWorkflow {
             wait_for_tick(ctx).await;
 
             // Drain in-workflow state. The retirement short-circuit fires
-            // before any activity invocation. JAR2-67 may move this drain
-            // into the assemble_context activity if the carryover wants
-            // the buckets visible across continue-as-new.
+            // before any activity invocation, AND before any CAN check,
+            // so a `retire` signal can never trigger a continue-as-new.
             let drained = ctx.state_mut(drain_buckets);
             if let Some(reason) = drained.retirement {
                 return retire(ctx, &input.fs_handle, reason).await;
@@ -414,17 +572,79 @@ impl AgentWorkflow {
                 }
             }
 
-            // continue_as_new when the SDK suggests it (history
-            // pressure). JAR2-67 fills in the real `Carryover`.
+            // JAR2-67: continue-as-new when the SDK suggests it
+            // (history pressure). This is the *only* trigger — there
+            // is no manual history-length counter and no once-marker
+            // sentinel. Note the early-`return` retirement arms above:
+            // CAN is structurally never reached on a retirement tick.
             if ctx.continue_as_new_suggested() {
+                let carryover = ctx.state(|s| s.encode_carryover());
                 let next = AgentInput {
-                    carryover: Some(Carryover::default()),
+                    carryover: Some(carryover),
                     ..input
                 };
                 ctx.continue_as_new(&next, ContinueAsNewOptions::default())?;
                 unreachable!("continue_as_new should have terminated this run");
             }
         }
+    }
+}
+
+impl AgentWorkflow {
+    /// Encode the workflow's per-tick state into a [`Carryover`] for
+    /// transmission across a `continue_as_new` boundary.
+    ///
+    /// `&self` (not `&mut self`) so the encode is observation-only;
+    /// the live workflow run will terminate immediately after `ctx.continue_as_new(...)`
+    /// returns, so there is no value in clearing local state.
+    ///
+    /// JAR2-67 invariant: every workflow-state field that affects
+    /// observable behavior — pending signal queues, retirement
+    /// request, staged correction, next-wake cadence, cumulative
+    /// observability counters — round-trips via this function.
+    pub(crate) fn encode_carryover(&self) -> Carryover {
+        Carryover {
+            pending_triggers: self.pending_triggers.clone(),
+            pending_human_ops: self.pending_human_ops.clone(),
+            pending_mandate_patches: self.pending_mandate_patches.clone(),
+            retirement_request: self.retirement_request.clone(),
+            staged_correction: self.staged_correction.clone(),
+            scheduler_cursor: SchedulerCursor {
+                next_wake: self.next_wake,
+            },
+            child_handles: Vec::new(),
+            last_output_id: self.last_output_id,
+            mid_tick_evidence: self.mid_tick_evidence.clone(),
+            cumulative_triggers_observed: self.cumulative_triggers_observed,
+            cumulative_human_ops_observed: self.cumulative_human_ops_observed,
+            cumulative_mandate_patches_observed: self.cumulative_mandate_patches_observed,
+        }
+    }
+
+    /// Decode a [`Carryover`] back onto the workflow's mutable state.
+    ///
+    /// Symmetric inverse of [`Self::encode_carryover`]. Called exactly
+    /// once at the top of [`Self::run`] when `input.carryover.is_some()`.
+    /// The workflow's [`Default`] starting state is the JAR2-58
+    /// first-run shape; hydrate overwrites those fields with the
+    /// carryover's values.
+    ///
+    /// `child_handles` is consumed but ignored — stage 3 has no
+    /// parent-child topology (see [`ChildRef`]).
+    pub(crate) fn hydrate_from_carryover(&mut self, c: Carryover) {
+        self.pending_triggers = c.pending_triggers;
+        self.pending_human_ops = c.pending_human_ops;
+        self.pending_mandate_patches = c.pending_mandate_patches;
+        self.retirement_request = c.retirement_request;
+        self.staged_correction = c.staged_correction;
+        self.next_wake = c.scheduler_cursor.next_wake;
+        self.last_output_id = c.last_output_id;
+        self.mid_tick_evidence = c.mid_tick_evidence;
+        self.cumulative_triggers_observed = c.cumulative_triggers_observed;
+        self.cumulative_human_ops_observed = c.cumulative_human_ops_observed;
+        self.cumulative_mandate_patches_observed = c.cumulative_mandate_patches_observed;
+        // `child_handles` is structurally empty in stage 3 — ignored.
+        let _ = c.child_handles;
     }
 }
 
@@ -623,8 +843,8 @@ struct DrainedBuckets {
 /// `cumulative_*_observed` counters are bumped by the signal handlers at
 /// receipt time (not here at drain time) so a snapshot taken between a
 /// signal landing and the next loop tick still reflects the arrival.
-/// Counters do not survive a continue-as-new — `Carryover` is empty
-/// today (JAR2-67 may carry them).
+/// JAR2-67: counters now survive a continue-as-new via
+/// [`Carryover::cumulative_triggers_observed`] et al.
 fn drain_buckets(s: &mut AgentWorkflow) -> DrainedBuckets {
     DrainedBuckets {
         triggers: std::mem::take(&mut s.pending_triggers),
@@ -955,6 +1175,208 @@ mod tests {
         assert!(s.contains("503"), "got: {s}");
         // serde_json::Value's Display renders the JSON form.
         assert!(s.contains("\"q\""), "got: {s}");
+    }
+
+    // ------------------------------------------------------------------
+    // JAR2-67: Carryover tests — round-trip + cumulative counter bridging.
+    // ------------------------------------------------------------------
+
+    /// Build a [`Carryover`] with non-default values for every field —
+    /// the JSON round-trip and hydrate/encode tests below all build
+    /// against this fixture so a future field addition automatically
+    /// shows up as a test miss if not represented.
+    fn fully_populated_carryover() -> Carryover {
+        Carryover {
+            pending_triggers: vec![
+                Trigger::ScheduledWake,
+                Trigger::External {
+                    kind: "webhook".into(),
+                    payload: serde_json::json!({"k": "v"}),
+                },
+            ],
+            pending_human_ops: vec![HumanOp::new(serde_json::json!({"action": "pause"}))],
+            pending_mandate_patches: vec![MandatePatch::new(serde_json::json!({"model": "gpt-x"}))],
+            retirement_request: Some("op asked".into()),
+            staged_correction: Some(CorrectionContext::new("prior tool failure")),
+            scheduler_cursor: SchedulerCursor {
+                next_wake: Some(Duration::from_millis(250)),
+            },
+            child_handles: Vec::new(),
+            last_output_id: Some(OutputId::new()),
+            mid_tick_evidence: vec![EvidenceId::from_hex("0123456789abcdef")],
+            cumulative_triggers_observed: 5,
+            cumulative_human_ops_observed: 7,
+            cumulative_mandate_patches_observed: 11,
+        }
+    }
+
+    #[test]
+    fn carryover_default_roundtrips_through_json() {
+        // The first-CAN-from-cleanly-default-state case — the carryover
+        // is `Carryover::default()`. Pin that the empty wire form is
+        // deserialisable back into the same `Default` value.
+        let c = Carryover::default();
+        let json = serde_json::to_string(&c).expect("serialize default Carryover");
+        let back: Carryover = serde_json::from_str(&json).expect("deserialize default Carryover");
+        assert_eq!(c, back);
+    }
+
+    #[test]
+    fn carryover_fully_populated_roundtrips_through_json() {
+        // JAR2-67 § "Hard guardrails" 3: Carryover is serde
+        // round-trippable end-to-end. Every field exercised, no
+        // `#[serde(default)]` on individual fields (the wire shape
+        // changes atomically with the type, per the no-back-compat
+        // memory).
+        let c = fully_populated_carryover();
+        let json = serde_json::to_string(&c).expect("serialize populated Carryover");
+        let back: Carryover = serde_json::from_str(&json).expect("deserialize populated Carryover");
+        assert_eq!(c, back);
+    }
+
+    #[test]
+    fn agent_input_with_populated_carryover_roundtrips_through_json() {
+        // Workflow start receives the carryover wrapped in
+        // `AgentInput`; this ensures the outer envelope's serde shape
+        // round-trips with a non-empty carryover (the JAR2-58 test
+        // only covered an empty default).
+        let input = AgentInput {
+            cfg: AgentConfig::default(),
+            fs_handle: FsHandle {
+                prefix: "g1/a1".into(),
+            },
+            parent_handle: None,
+            carryover: Some(fully_populated_carryover()),
+        };
+        let json = serde_json::to_string(&input).unwrap();
+        let back: AgentInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(input, back);
+    }
+
+    #[test]
+    fn encode_then_hydrate_is_identity_on_workflow_state() {
+        // Seed every workflow-state field that the carryover claims to
+        // round-trip; encode; hydrate into a fresh `AgentWorkflow`;
+        // assert the per-field projection matches. This is the local
+        // analogue of the live CAN test — same invariant, no Temporal
+        // round-trip.
+        let mut original = AgentWorkflow::default();
+        original.pending_triggers.push(Trigger::ScheduledWake);
+        original
+            .pending_human_ops
+            .push(HumanOp::new(serde_json::json!({"a": 1})));
+        original
+            .pending_mandate_patches
+            .push(MandatePatch::new(serde_json::json!({"m": 1})));
+        original.retirement_request = Some("op asked".into());
+        original.staged_correction = Some(CorrectionContext::new("prior failure"));
+        original.next_wake = Some(Duration::from_millis(123));
+        original.cumulative_triggers_observed = 9;
+        original.cumulative_human_ops_observed = 13;
+        original.cumulative_mandate_patches_observed = 17;
+        original.last_output_id = Some(OutputId::new());
+
+        let c = original.encode_carryover();
+        let mut hydrated = AgentWorkflow::default();
+        hydrated.hydrate_from_carryover(c);
+
+        assert_eq!(hydrated.pending_triggers, original.pending_triggers);
+        assert_eq!(hydrated.pending_human_ops, original.pending_human_ops);
+        assert_eq!(
+            hydrated.pending_mandate_patches,
+            original.pending_mandate_patches
+        );
+        assert_eq!(hydrated.retirement_request, original.retirement_request);
+        assert_eq!(hydrated.staged_correction, original.staged_correction);
+        assert_eq!(hydrated.next_wake, original.next_wake);
+        assert_eq!(
+            hydrated.cumulative_triggers_observed,
+            original.cumulative_triggers_observed
+        );
+        assert_eq!(
+            hydrated.cumulative_human_ops_observed,
+            original.cumulative_human_ops_observed
+        );
+        assert_eq!(
+            hydrated.cumulative_mandate_patches_observed,
+            original.cumulative_mandate_patches_observed
+        );
+        assert_eq!(hydrated.last_output_id, original.last_output_id);
+    }
+
+    #[test]
+    fn hydrate_then_signal_handler_bumps_counter_past_carryover_value() {
+        // JAR2-67 § "Hard guardrails" 4 / ticket "Cumulative counter
+        // bridging" — the cumulative_*_observed counters must bridge
+        // a CAN boundary. We can't construct a `SyncWorkflowContext`
+        // in a unit test (it's SDK-private), so simulate the signal
+        // handler's effect by replicating its `push + saturating_add`
+        // bookkeeping. The handler's body is one line; the load-
+        // bearing invariant is that the *value the counter starts
+        // from* is the carryover's value, not zero.
+        let pre_can = Carryover {
+            cumulative_triggers_observed: 5,
+            cumulative_human_ops_observed: 6,
+            cumulative_mandate_patches_observed: 7,
+            ..Carryover::default()
+        };
+        let mut wf = AgentWorkflow::default();
+        wf.hydrate_from_carryover(pre_can);
+
+        // Simulate the `external_signal` handler body.
+        wf.pending_triggers.push(Trigger::ScheduledWake);
+        wf.cumulative_triggers_observed = wf.cumulative_triggers_observed.saturating_add(1);
+
+        // Cumulative view: 5 (pre-CAN) + 1 (post-CAN signal) = 6,
+        // NOT 1. This is the load-bearing assertion: counter survived
+        // the boundary AND the new signal lands on top of it.
+        assert_eq!(
+            wf.cumulative_triggers_observed, 6,
+            "post-CAN signal must increment past the carried value"
+        );
+        // The other counters are unchanged but still reflect their
+        // pre-CAN values, not 0.
+        assert_eq!(wf.cumulative_human_ops_observed, 6);
+        assert_eq!(wf.cumulative_mandate_patches_observed, 7);
+
+        // And the snapshot the live update returns sees the bridged
+        // value too — this is the JAR2-59 "did the signal land
+        // across the workflow's lifetime?" contract.
+        let snap = AgentSnapshot::from_state(&wf);
+        assert_eq!(snap.cumulative_triggers_observed, 6);
+        assert_eq!(snap.cumulative_human_ops_observed, 6);
+        assert_eq!(snap.cumulative_mandate_patches_observed, 7);
+    }
+
+    #[test]
+    fn carryover_from_default_workflow_is_default() {
+        // A workflow that has never observed a signal, never ticked,
+        // never staged a correction encodes to `Carryover::default()`.
+        // Pin that no field accidentally picks up a non-default value
+        // from `AgentWorkflow::default()`'s shape.
+        let wf = AgentWorkflow::default();
+        let c = wf.encode_carryover();
+        assert_eq!(c, Carryover::default());
+    }
+
+    #[test]
+    fn scheduler_cursor_default_has_no_next_wake() {
+        // The first-tick floor [`INITIAL_NEXT_WAKE`] is applied by the
+        // wake gate when `next_wake.is_none()`, NOT by the
+        // SchedulerCursor itself. Default cursor must surface a None.
+        let c = SchedulerCursor::default();
+        assert!(c.next_wake.is_none());
+    }
+
+    #[test]
+    fn child_handles_empty_on_stage_3_carryover() {
+        // Stage 3 has no parent-child topology — every carryover
+        // produced by the workflow body must have an empty
+        // `child_handles`. Stage 5 fills this in.
+        let mut wf = AgentWorkflow::default();
+        wf.pending_triggers.push(Trigger::ScheduledWake);
+        let c = wf.encode_carryover();
+        assert!(c.child_handles.is_empty());
     }
 
     #[test]

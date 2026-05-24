@@ -416,20 +416,34 @@ async fn drive(
     let mut persist_output_schedules = 0usize;
     let mut persist_retirement_schedules = 0usize;
     let mut apply_fs_ops_schedules = 0usize;
+    // JAR2-67 regression: a workflow that retires via `Decision::Retire`
+    // (or the `retire` signal short-circuit) MUST NOT emit a
+    // `WorkflowExecutionContinuedAsNew` event. The CAN check lives
+    // structurally after the retirement-return arms in
+    // `AgentWorkflow::run`, so counting CAN events in this short
+    // Idle→CallTools→EmitOutput→RewriteFs→Retire script is the most
+    // direct end-to-end assertion of that guarantee.
+    let mut continued_as_new_events = 0usize;
     let mut all_activity_type_names: Vec<String> = Vec::new();
     for ev in history.events() {
-        if let Some(Attributes::ActivityTaskScheduledEventAttributes(a)) = &ev.attributes {
-            if let Some(ty) = &a.activity_type {
-                all_activity_type_names.push(ty.name.clone());
-                let unqualified = ty.name.rsplit("::").next().unwrap_or(ty.name.as_str());
-                match unqualified {
-                    "execute_tool" => execute_tool_schedules += 1,
-                    "persist_output" => persist_output_schedules += 1,
-                    "persist_retirement" => persist_retirement_schedules += 1,
-                    "apply_fs_ops" => apply_fs_ops_schedules += 1,
-                    _ => {}
+        match &ev.attributes {
+            Some(Attributes::ActivityTaskScheduledEventAttributes(a)) => {
+                if let Some(ty) = &a.activity_type {
+                    all_activity_type_names.push(ty.name.clone());
+                    let unqualified = ty.name.rsplit("::").next().unwrap_or(ty.name.as_str());
+                    match unqualified {
+                        "execute_tool" => execute_tool_schedules += 1,
+                        "persist_output" => persist_output_schedules += 1,
+                        "persist_retirement" => persist_retirement_schedules += 1,
+                        "apply_fs_ops" => apply_fs_ops_schedules += 1,
+                        _ => {}
+                    }
                 }
             }
+            Some(Attributes::WorkflowExecutionContinuedAsNewEventAttributes(_)) => {
+                continued_as_new_events += 1;
+            }
+            _ => {}
         }
     }
     eprintln!("workflow_loop: observed activity-type names: {all_activity_type_names:?}");
@@ -454,6 +468,12 @@ async fn drive(
     assert!(
         persist_retirement_schedules >= 1,
         "expected at least 1 persist_retirement invocation, got {persist_retirement_schedules}"
+    );
+    assert_eq!(
+        continued_as_new_events, 0,
+        "JAR2-67: a retiring workflow must NOT emit a \
+         WorkflowExecutionContinuedAsNew event (the CAN check sits after \
+         the retirement-return arms in run()), got {continued_as_new_events}"
     );
 
     // JAR2-66: the real `persist_retirement` activity body wrote
