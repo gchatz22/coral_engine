@@ -78,6 +78,7 @@
 use std::time::Duration;
 
 use jarvis_node::decision::{ContextBundle, CorrectionContext, Decision, ToolCall};
+use jarvis_node::mandate::Mandate;
 use jarvis_node::trigger::{HumanOp, MandatePatch, Trigger};
 use serde::{Deserialize, Serialize};
 use temporalio_macros::{workflow, workflow_methods};
@@ -543,6 +544,20 @@ async fn emit_output(
 }
 
 /// Invoke the `apply_fs_ops` activity for a `Decision::RewriteFs`.
+///
+/// JAR2-65: the activity body needs a [`Mandate`] to reify an
+/// `AgentFs` against the worker-shared storage backend. `AgentConfig` is
+/// still the JAR2-58 placeholder unit struct (`AgentConfig {}`); when a
+/// later stage threads the resolved mandate into `AgentConfig`, this
+/// call site swaps the placeholder for `input.cfg.mandate.clone()` and
+/// no other code changes.
+///
+/// `Mandate::new("", Duration::ZERO, None)` is decorative because
+/// `AgentFs::new_with_storage` only writes `mandate.json` when absent,
+/// and `apply_fs_ops` runs only against agents whose `mandate.json`
+/// already exists on disk (assemble_context wrote it on tick 1). The
+/// activity body never reads the mandate — it only forwards it to
+/// `new_with_storage`, which short-circuits the write.
 async fn rewrite_fs(
     ctx: &WorkflowContext<AgentWorkflow>,
     fs_handle: &FsHandle,
@@ -552,6 +567,7 @@ async fn rewrite_fs(
         AgentActivities::apply_fs_ops,
         ApplyFsOpsInput {
             fs_handle: fs_handle.clone(),
+            mandate: Mandate::new("", Duration::ZERO, None),
             ops,
         },
         activity_opts(),

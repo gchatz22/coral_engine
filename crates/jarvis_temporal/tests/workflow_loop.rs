@@ -60,7 +60,7 @@ use temporalio_common::protos::temporal::api::history::v1::history_event::Attrib
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
-use jarvis_node::decision::{ClaimSeed, Decision, ToolCall};
+use jarvis_node::decision::{ClaimSeed, Decision, FsOp, ToolCall};
 use jarvis_node::evidence::EvidenceRecord;
 use jarvis_node::fs::AgentFs;
 use jarvis_node::mandate::Mandate;
@@ -218,9 +218,8 @@ async fn run_live_test() -> Result<()> {
 
     // Per-run agent prefix the workflow's `FsHandle` will scope to.
     // Embedding the run suffix keeps reruns against the shared
-    // `MemoryStorage` from colliding on `<prefix>/retirement.json` and
-    // `<prefix>/outputs/...`. JAR2-66 introduced this scoping for the
-    // retirement.json path; JAR2-64 reuses it for output planting.
+    // `MemoryStorage` from colliding on `<prefix>/retirement.json`,
+    // `<prefix>/outputs/...`, and `<prefix>/notes/...`.
     let agent_prefix = format!("graphs/g-loop-test/agents/a-loop-test-{suffix}");
     let driver_prefix = agent_prefix.clone();
 
@@ -252,7 +251,8 @@ async fn run_live_test() -> Result<()> {
     // Install the scripted decision sequence BEFORE the worker starts —
     // by the time the first `decide_next_action` activity body fires,
     // the script is in place. Sequence covers the four cases the
-    // ticket calls out: Idle → CallTools(3 parallel) → EmitOutput → Retire.
+    // ticket cluster cares about: Idle → CallTools(3 parallel) →
+    // EmitOutput (JAR2-64) → RewriteFs (JAR2-65) → Retire.
     set_decision_script(vec![
         Decision::Idle {
             next_after: Duration::from_millis(50),
@@ -267,6 +267,12 @@ async fn run_live_test() -> Result<()> {
         Decision::EmitOutput {
             content: "workflow_loop test: scripted output".into(),
             evidence: vec![planted_id.clone()],
+        },
+        Decision::RewriteFs {
+            ops: vec![FsOp::WriteFile {
+                path: "notes/loop-test.md".into(),
+                content: "from workflow_loop live test".into(),
+            }],
         },
         Decision::Retire {
             reason: "workflow_loop test: scripted retire".into(),
@@ -342,7 +348,8 @@ async fn drive(
     // prefix — the workflow body passes it into every activity input,
     // and JAR2-66's `persist_retirement` writes to
     // `<prefix>/retirement.json`, JAR2-64's `persist_output` to
-    // `<prefix>/outputs/<ulid>.json`.
+    // `<prefix>/outputs/<ulid>.json`, and JAR2-65's `apply_fs_ops` to
+    // `<prefix>/notes/loop-test.md`.
     let input = AgentInput {
         fs_handle: jarvis_temporal::workflow::FsHandle {
             prefix: agent_prefix.into(),
@@ -408,6 +415,7 @@ async fn drive(
     let mut execute_tool_schedules = 0usize;
     let mut persist_output_schedules = 0usize;
     let mut persist_retirement_schedules = 0usize;
+    let mut apply_fs_ops_schedules = 0usize;
     let mut all_activity_type_names: Vec<String> = Vec::new();
     for ev in history.events() {
         if let Some(Attributes::ActivityTaskScheduledEventAttributes(a)) = &ev.attributes {
@@ -418,6 +426,7 @@ async fn drive(
                     "execute_tool" => execute_tool_schedules += 1,
                     "persist_output" => persist_output_schedules += 1,
                     "persist_retirement" => persist_retirement_schedules += 1,
+                    "apply_fs_ops" => apply_fs_ops_schedules += 1,
                     _ => {}
                 }
             }
@@ -427,6 +436,7 @@ async fn drive(
     eprintln!(
         "workflow_loop: execute_tool={execute_tool_schedules}, \
          persist_output={persist_output_schedules}, \
+         apply_fs_ops={apply_fs_ops_schedules}, \
          persist_retirement={persist_retirement_schedules}"
     );
     assert_eq!(
@@ -436,6 +446,10 @@ async fn drive(
     assert!(
         persist_output_schedules >= 1,
         "expected at least 1 persist_output invocation, got {persist_output_schedules}"
+    );
+    assert!(
+        apply_fs_ops_schedules >= 1,
+        "expected at least 1 apply_fs_ops invocation, got {apply_fs_ops_schedules}"
     );
     assert!(
         persist_retirement_schedules >= 1,
@@ -534,6 +548,18 @@ async fn drive(
         on_disk.id,
         on_disk.evidence.len()
     );
+
+    // JAR2-65: the `RewriteFs` step of the script writes
+    // `<prefix>/notes/loop-test.md`. Pull it from the same shared
+    // `MemoryStorage` backend the activity wrote into.
+    let notes_key = format!("{agent_prefix}/notes/loop-test.md");
+    let blob = storage
+        .get(&notes_key)
+        .await
+        .with_context(|| format!("storage.get({notes_key}) after live RewriteFs"))?
+        .ok_or_else(|| anyhow::anyhow!("expected {notes_key} on disk after RewriteFs decision"))?;
+    let body = std::str::from_utf8(blob.as_ref()).context("notes/loop-test.md body utf-8")?;
+    assert_eq!(body, "from workflow_loop live test");
 
     Ok(())
 }
