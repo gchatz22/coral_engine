@@ -45,6 +45,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use jarvis_node::agent_core;
 use jarvis_node::decision::{ContextBundle, CorrectionContext, Decision, FsOp, ToolCall};
 use jarvis_node::evidence::EvidenceId;
 use jarvis_node::fs::AgentFs;
@@ -67,28 +68,38 @@ use crate::workflow::{AgentConfig, FsHandle};
 
 /// Input to [`AgentActivities::assemble_context`]. Carries the per-tick
 /// drained signal buckets (`triggers`, `human_ops`, `mandate_patches`) plus
-/// the resolved cfg + FS handle + prior-tick correction so the activity
-/// can call into `agent_core::drain_triggers` once the real body lands
-/// in JAR2-61.
+/// the resolved [`Mandate`] + FS handle + prior-tick correction so the
+/// activity can call into [`jarvis_node::agent_core::drain_triggers`].
+///
+/// JAR2-61 promoted the prior `cfg: AgentConfig` placeholder to a real
+/// `mandate: Mandate` — `drain_triggers` requires a concrete `&Mandate`
+/// to seed the `ContextBundle` and to write `mandate.json` on first FS
+/// open. The other activity inputs (`ExecuteToolInput`, `PersistOutputInput`)
+/// still carry the `AgentConfig` placeholder; siblings JAR2-62..66 will
+/// promote each as their real bodies need it. No `Default` derive — the
+/// real `Mandate` has no `Default` and the placeholder construction lives
+/// at the workflow-body call site.
 ///
 /// `mandate_patches` are surfaced here so JAR2-61 can apply them to the
 /// per-agent FS before assembling the bundle (the workflow body itself
 /// must not touch FS — see `scratch/temporal_staged_plan.md` § 2.5
 /// "Drain triggers (typed, ordered)" and the JAR2-60 ticket's notes on
-/// the drain/assemble merge in `agent_core`).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// the drain/assemble merge in `agent_core`). Today the activity logs the
+/// patch count and drops them on the floor; stage 6 wires the consumption.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssembleContextInput {
-    pub cfg: AgentConfig,
+    pub mandate: Mandate,
     pub fs_handle: FsHandle,
     pub triggers: Vec<Trigger>,
-    /// Human overrides drained alongside `triggers`. JAR2-61 will either
-    /// fold them into the `Trigger::HumanOverride` taxonomy at assemble
-    /// time or thread them through `CorrectionContext` — the workflow
-    /// doesn't decide; it just delivers.
+    /// Human overrides drained alongside `triggers`. JAR2-61 folds these
+    /// into the `Trigger::HumanOverride` taxonomy before calling
+    /// `drain_triggers`, appending them after the regular triggers so the
+    /// ordering matches the in-process loop (which sees the same signal
+    /// stream serialized through one mpsc receiver).
     pub human_ops: Vec<HumanOp>,
     /// Mandate patches drained from the workflow's `pending_mandate_patches`
     /// bucket. Stage 6 owns the consumption (apply patch → write FS →
-    /// re-resolve routing); the workflow body just hands them off.
+    /// re-resolve routing); the activity just records the count today.
     pub mandate_patches: Vec<MandatePatch>,
     /// Correction context staged by the previous tick — `Some` when the
     /// previous `DispatchOutcome` was `NeedsCorrection` or `ToolError`.
@@ -247,29 +258,58 @@ pub struct AgentActivities;
 
 #[activities]
 impl AgentActivities {
-    /// Stage 3.5 (JAR2-61). Stub returns an empty `ContextBundle` with a
-    /// placeholder `Mandate` so the downstream `decide_next_action`
-    /// activity has a payload to serialize.
+    /// Stage 3.5 (JAR2-61). Build a per-tick [`AgentFs`] over the
+    /// worker-shared `AgentStorage` (JAR2-69) at the input's prefix, fold
+    /// drained `human_ops` into the `Trigger::HumanOverride` taxonomy,
+    /// then delegate to [`agent_core::drain_triggers`] for the
+    /// FS-assemble that yields the warm `ContextBundle`.
     ///
-    /// `Mandate::new("", Duration::ZERO, None)` is the cheapest valid
-    /// construction — `ContextBundle.mandate: Mandate` is non-`Default`
-    /// so we cannot fall back to `..Default::default()` here. JAR2-61
-    /// replaces the body with a call to `agent_core::drain_triggers`.
+    /// **Mandate patches.** Drained off the `mandate_update` signal
+    /// queue and surfaced on the input for stage 6 — the activity logs
+    /// the count and drops them today. Wiring the consumption (apply
+    /// patch → re-resolve routing → re-open FS) is JAR2-67+ territory.
+    ///
+    /// **FS open is idempotent** — `AgentFs::new_with_storage` only
+    /// writes `mandate.json` when absent, so passing the workflow's
+    /// mandate through on every tick is correct. The cost is one storage
+    /// `get` per tick + a one-time put on first open per agent.
+    ///
+    /// **`tokio` async is fine here** — activity bodies live outside
+    /// workflow-replay determinism rules; the workflow itself is the
+    /// piece that may only use `temporalio_sdk::workflows::*` primitives.
     #[activity]
     pub async fn assemble_context(
         _ctx: ActivityContext,
-        _input: AssembleContextInput,
+        input: AssembleContextInput,
     ) -> Result<AssembleContextOutput, ActivityError> {
-        Ok(AssembleContextOutput {
-            bundle: ContextBundle {
-                mandate: Mandate::new("", Duration::ZERO, None),
-                triggers: Vec::new(),
-                recent_outputs: Vec::new(),
-                recent_evidence: Vec::new(),
-                open_claims: Vec::new(),
-                correction: None,
-            },
-        })
+        let storage = crate::worker::agent_storage();
+        let fs = AgentFs::new_with_storage(storage, input.fs_handle.prefix.clone(), &input.mandate)
+            .await?;
+
+        // Fold drained `human_ops` into the trigger stream as
+        // `Trigger::HumanOverride { op }`. Appended after the regular
+        // triggers so ordering matches the in-process loop (which sees
+        // every signal serialized through one mpsc receiver in arrival
+        // order).
+        let mut triggers = input.triggers;
+        triggers.extend(
+            input
+                .human_ops
+                .into_iter()
+                .map(|op| Trigger::HumanOverride { op }),
+        );
+
+        if !input.mandate_patches.is_empty() {
+            tracing::debug!(
+                count = input.mandate_patches.len(),
+                "assemble_context: dropping mandate_patches (stage 6 territory)"
+            );
+        }
+
+        let bundle =
+            agent_core::drain_triggers(triggers, &fs, &input.mandate, input.prior_correction)
+                .await?;
+        Ok(AssembleContextOutput { bundle })
     }
 
     /// Stage 3.6 (JAR2-62). Stub pops from the test-injected
@@ -461,12 +501,21 @@ mod tests {
     }
 
     #[test]
-    fn assemble_context_input_default_is_empty() {
-        // `Default` is required by the AgentInput round-trip test in
-        // `workflow.rs`; lock the empty-bucket shape so a future
-        // refactor that, say, adds a non-`Default` field has to think
-        // about the bucket init explicitly.
-        let i = AssembleContextInput::default();
+    fn assemble_context_input_empty_buckets_pin_shape() {
+        // JAR2-61 dropped the `Default` derive on `AssembleContextInput`
+        // when promoting `cfg: AgentConfig` → `mandate: Mandate` (the
+        // real `Mandate` has no `Default`). The empty-bucket invariant
+        // is preserved via explicit construction so a future refactor
+        // that adds a non-`Default` field has to think about the bucket
+        // init the same way.
+        let i = AssembleContextInput {
+            mandate: Mandate::new("", Duration::ZERO, None),
+            fs_handle: FsHandle::default(),
+            triggers: Vec::new(),
+            human_ops: Vec::new(),
+            mandate_patches: Vec::new(),
+            prior_correction: None,
+        };
         assert!(i.triggers.is_empty());
         assert!(i.human_ops.is_empty());
         assert!(i.mandate_patches.is_empty());
@@ -476,7 +525,7 @@ mod tests {
     #[test]
     fn assemble_context_input_round_trips_through_json() {
         let i = AssembleContextInput {
-            cfg: AgentConfig::default(),
+            mandate: Mandate::new("test", Duration::from_millis(100), Some(4)),
             fs_handle: FsHandle {
                 prefix: "g1/a1".into(),
             },
