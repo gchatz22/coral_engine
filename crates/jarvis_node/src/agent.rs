@@ -83,14 +83,13 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use futures::future::join_all;
 use serde_json::json;
 use tokio::time::sleep_until;
 use tracing::{debug, info_span, warn, Instrument};
 
-use crate::decision::{assemble_context, CorrectionContext, Decide, Decision, ToolCall};
-use crate::evidence::EvidenceId;
-use crate::fs::{AgentFs, FsError};
+use crate::agent_core::{self, DispatchOutcome};
+use crate::decision::{CorrectionContext, Decide};
+use crate::fs::AgentFs;
 use crate::health::{
     Attempt, FailingCall, FailureKind, HealthError, HealthIncident, HealthTracker,
 };
@@ -255,9 +254,17 @@ impl<D: Decide> Agent<D> {
                 }
                 debug!(count = drained.len(), is_correction, "drained triggers");
 
+                // JAR2-57: per-tick logic now lives behind the
+                // `agent_core` seam. `drain_triggers` packages the
+                // already-drained vec into a `ContextBundle`; `decide`
+                // calls into the `Decide` impl; `dispatch` applies the
+                // resulting `Decision` and returns a typed
+                // `DispatchOutcome`. The in-process host below maps that
+                // outcome into budget / health / correction state.
                 let bundle =
-                    assemble_context(&fs, &drained, &cfg, pending_correction.clone()).await?;
-                let decision = match decide.decide(bundle).await {
+                    agent_core::drain_triggers(drained, &fs, &cfg, pending_correction.clone())
+                        .await?;
+                let decision = match agent_core::decide(bundle, &decide).await {
                     Ok(d) => d,
                     Err(e) => {
                         // Decide-side Err: LlmDecide already did its
@@ -294,15 +301,15 @@ impl<D: Decide> Agent<D> {
                     }
                 };
 
-                match dispatch(&fs, &tools, &mut scheduler, decision).await? {
-                    ApplyOutcome::Continue => {
+                match agent_core::dispatch(&fs, &tools, &mut scheduler, decision).await? {
+                    DispatchOutcome::Continue => {
                         health.mark_tick_success(Utc::now())?;
                         retry_trail.clear();
                         pending_correction = None;
                         Ok(TickOutcome::Continue)
                     }
-                    ApplyOutcome::Retire(reason) => Ok(TickOutcome::Retire(reason)),
-                    ApplyOutcome::NeedsCorrection(desc) => {
+                    DispatchOutcome::Retired(reason) => Ok(TickOutcome::Retire(reason)),
+                    DispatchOutcome::NeedsCorrection(desc) => {
                         let attempt = Attempt {
                             attempt: (retry_trail.len() as u32) + 1,
                             at: Utc::now(),
@@ -341,7 +348,7 @@ impl<D: Decide> Agent<D> {
                             Err(other) => Err(other.into()),
                         }
                     }
-                    ApplyOutcome::ToolError { failures } => {
+                    DispatchOutcome::ToolError { failures } => {
                         // JAR2-25: the tool's internal retry policy
                         // (`McpTool::call`) has already exhausted its
                         // `RetryPolicy::max_attempts` attempts before
@@ -384,7 +391,7 @@ impl<D: Decide> Agent<D> {
                         // `Some`, so K failures here plus M more on the
                         // continuation count K+M against the same
                         // window.
-                        let desc = tool_failure_correction_text(&failures);
+                        let desc = agent_core::tool_failure_correction_text(&failures);
                         let mut budget_exhausted: Option<FailureKind> = None;
                         let mut last_error = String::new();
                         for f in &failures {
@@ -477,238 +484,6 @@ enum TickOutcome {
     Retire(RetireReason),
 }
 
-/// Outcome of trying to apply one `Decision`.
-///
-/// `NeedsCorrection` is the JAR2-19 case: the decision parsed cleanly but
-/// the runtime cannot satisfy it (unregistered tool, unresolvable
-/// evidence). The contained string is the human-readable failure
-/// description; it ends up in both the next bundle's
-/// `CorrectionContext::failure` and the `HealthIncident` retry trail.
-///
-/// `ToolError` is the JAR2-25 case: the tool exists and was invoked, but
-/// its internal retry policy (`McpTool::call` / equivalent) exhausted on
-/// transient errors. The agent feeds this into the per-tick
-/// `FailureKind::ToolCall` budget rather than the inference budget. Per
-/// JAR2-30 it also stages a `CorrectionContext` describing the tool
-/// call (name, args, error) so the model can self-correct on the next
-/// tick — symmetric to the `NeedsCorrection` path.
-///
-/// JAR2-38: `ToolError` now carries a *batch* of failed calls because a
-/// single `Decision::CallTools` may issue K tool calls in parallel.
-/// Successful sibling calls in the same batch already had their
-/// evidence persisted to disk before this outcome is constructed —
-/// **we do not unwind on partial failure**. The corrective context
-/// quotes each failed call's tool/args/error so the model can target a
-/// retry; the per-call accounting against the
-/// `FailureKind::ToolCall` budget is *one slot per failed call*
-/// (K failures → K against budget), per JAR2-38's "K against budget"
-/// default. The run-loop dispatch site (`agent::run`) implements that
-/// accounting and documents the choice next to the call site.
-enum ApplyOutcome {
-    Continue,
-    Retire(RetireReason),
-    NeedsCorrection(String),
-    ToolError {
-        /// One entry per failed call in the parallel batch. Order matches
-        /// the original `Decision::CallTools` vec — i.e. the deterministic
-        /// per-call-index order the dispatch site relies on for both
-        /// evidence persistence and per-failure budget accounting.
-        failures: Vec<ToolFailure>,
-    },
-}
-
-/// One failed call in a `Decision::CallTools` batch. `tool` and `args`
-/// echo what the model asked for so the corrective message can tell the
-/// model exactly what failed; `error` is the underlying error string from
-/// `ToolRegistry::call`.
-#[derive(Debug, Clone)]
-struct ToolFailure {
-    tool: String,
-    args: serde_json::Value,
-    error: String,
-}
-
-/// Apply a single `Decision`. Recoverable apply-time failures surface as
-/// [`ApplyOutcome::NeedsCorrection`]; everything else either continues,
-/// retires, or bubbles via `?`.
-async fn dispatch(
-    fs: &AgentFs,
-    tools: &ToolRegistry,
-    scheduler: &mut Scheduler,
-    decision: Decision,
-) -> Result<ApplyOutcome> {
-    match decision {
-        Decision::CallTools { calls } => dispatch_call_tools(fs, tools, calls).await,
-        Decision::EmitOutput { content, evidence } => {
-            debug!(evidence_count = evidence.len(), "decision: emit_output");
-            match fs.persist_output(&content, &evidence).await {
-                Ok(_) => Ok(ApplyOutcome::Continue),
-                Err(e) => match e.downcast_ref::<FsError>() {
-                    Some(FsError::EmptyEvidence) => Ok(ApplyOutcome::NeedsCorrection(
-                        "emit_output: evidence list is empty (provenance contract)".into(),
-                    )),
-                    Some(FsError::EvidenceNotFound(id)) => {
-                        let id: EvidenceId = id.clone();
-                        Ok(ApplyOutcome::NeedsCorrection(format!(
-                            "emit_output: evidence {id} not found on disk"
-                        )))
-                    }
-                    _ => Err(e),
-                },
-            }
-        }
-        Decision::RewriteFs { ops } => {
-            debug!(op_count = ops.len(), "decision: rewrite_fs");
-            fs.apply_ops(ops).await?;
-            Ok(ApplyOutcome::Continue)
-        }
-        Decision::Idle { next_after } => {
-            debug!(
-                next_after_ms = next_after.as_millis() as u64,
-                "decision: idle"
-            );
-            scheduler.set_next_after(next_after);
-            Ok(ApplyOutcome::Continue)
-        }
-        Decision::Retire { reason } => {
-            debug!(%reason, "decision: retire");
-            fs.persist_retirement(&reason).await?;
-            Ok(ApplyOutcome::Retire(RetireReason(reason)))
-        }
-    }
-}
-
-/// JAR2-38: dispatch the K calls in a `Decision::CallTools` together.
-///
-/// Order of operations matters for both correctness and determinism:
-///
-/// 1. **Pre-check every tool name.** If any call names a tool the registry
-///    does not know, surface a single `NeedsCorrection` that lists every
-///    missing name and dispatch *none* of the batch. This matches the
-///    JAR2-19 invariant that "no tool registered" is an inference-level
-///    correctable error rather than a tool-call failure — and refusing to
-///    dispatch the sibling calls keeps evidence persistence consistent
-///    with the rejection.
-/// 2. **Dispatch all K concurrently** via `futures::future::join_all`,
-///    capturing every result rather than short-circuiting on the first
-///    error. The agent loop's K-against-budget accounting needs every
-///    failure, not just the first one.
-/// 3. **Persist successful evidence in input order.** `join_all` resolves
-///    futures concurrently but `into_iter().enumerate()` over the result
-///    vec preserves the original index, so the **write order** of the
-///    `evidence/<sha256>.json` files matches the `Decision::CallTools`
-///    vec position. The on-disk *listing* order is still lex-sorted by
-///    sha256 (evidence is content-addressed; the FS layer doesn't carry
-///    write-order metadata), so `AgentFs::list_recent_evidence` returns
-///    records in hash order rather than dispatch order — that's a
-///    separate ordering domain from the one this step pins.
-/// 4. **Successful evidence is kept even when some sibling calls fail.**
-///    The model can cite a partial-success evidence id on a later tick;
-///    rolling back would discard load-bearing observations of the world.
-///    The corrective context describes only the failures so the model
-///    knows what to retry.
-async fn dispatch_call_tools(
-    fs: &AgentFs,
-    tools: &ToolRegistry,
-    calls: Vec<ToolCall>,
-) -> Result<ApplyOutcome> {
-    debug!(count = calls.len(), "decision: call_tools");
-
-    // Step 1: pre-check tool-name registration for every call. A single
-    // unknown name takes the whole batch through the inference
-    // correction loop (JAR2-19 semantics).
-    let unknown: Vec<&str> = calls
-        .iter()
-        .filter(|c| !tools.contains(&c.name))
-        .map(|c| c.name.as_str())
-        .collect();
-    if !unknown.is_empty() {
-        return Ok(ApplyOutcome::NeedsCorrection(format!(
-            "call_tools: no tool registered under name(s) {unknown:?}"
-        )));
-    }
-
-    // Step 2: dispatch all K calls concurrently. We borrow `tools` for
-    // the duration of every future (no `Arc::clone` needed because
-    // `ToolRegistry` isn't `Clone`; the futures live for the duration of
-    // this `await` and `tools` outlives them).
-    let futures = calls.iter().map(|c| {
-        let name = &c.name;
-        let args = c.args.clone();
-        async move { tools.call(name, args).await }
-    });
-    let results = join_all(futures).await;
-
-    // Step 3+4: classify each result, persist successful evidence in
-    // input order, collect failures into a batch outcome.
-    let mut failures: Vec<ToolFailure> = Vec::new();
-    for (i, result) in results.into_iter().enumerate() {
-        let call = &calls[i];
-        match result {
-            Ok(ev) => {
-                fs.record_evidence(ev).await?;
-            }
-            Err(e) => {
-                failures.push(ToolFailure {
-                    tool: call.name.clone(),
-                    args: call.args.clone(),
-                    error: format!("{e:#}"),
-                });
-            }
-        }
-    }
-
-    if failures.is_empty() {
-        Ok(ApplyOutcome::Continue)
-    } else {
-        Ok(ApplyOutcome::ToolError { failures })
-    }
-}
-
-/// Build the human-readable failure description for the
-/// `CorrectionContext` staged after a tool-call exhaustion (JAR2-30).
-///
-/// JAR2-38: now accepts a batch of failed calls. For K=1 the wording
-/// matches the original single-tool phrasing; for K>1 the message
-/// lists every failed call so the model sees what each sibling did and
-/// failed with.
-///
-/// Promoted to a named helper so the unit test below can assert against
-/// the exact same string the run loop emits, and so a future cosmetic
-/// change to the wording lands in one place.
-fn tool_failure_correction_text(failures: &[ToolFailure]) -> String {
-    if failures.len() == 1 {
-        let f = &failures[0];
-        let args_text =
-            serde_json::to_string(&f.args).unwrap_or_else(|_| "<unserializable args>".to_string());
-        return format!(
-            "call_tool {tool:?} failed after exhausting retries: {error}. \
-             Args were {args_text}. Reply with a different decision \
-             (different args, a different tool, an idle, or a retire).",
-            tool = f.tool,
-            error = f.error,
-        );
-    }
-    let mut s = format!(
-        "{} parallel call_tool(s) failed after exhausting retries:",
-        failures.len()
-    );
-    for f in failures {
-        let args_text =
-            serde_json::to_string(&f.args).unwrap_or_else(|_| "<unserializable args>".to_string());
-        s.push_str(&format!(
-            "\n- {tool:?}: {error}. Args were {args_text}.",
-            tool = f.tool,
-            error = f.error,
-        ));
-    }
-    s.push_str(
-        "\nReply with a different decision (different args, different tools, \
-         an idle, or a retire).",
-    );
-    s
-}
-
 // ---------- JAR2-33: post-run / between-tick CallStats accessor ----------
 //
 // The accessor and its supporting `StatsHandle` are scoped to
@@ -795,88 +570,17 @@ impl Agent<LlmDecide> {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for the JAR2-30 corrective-text helper.
+    //! Unit tests for `Agent::run`-scoped surfaces.
+    //!
+    //! JAR2-57: the JAR2-30 corrective-text helper (and its
+    //! `tool_failure_correction_text_*` deep tests) moved to
+    //! [`crate::agent_core::tests`] alongside the helper itself. The
+    //! stats-accessor tests below stay here because they test
+    //! `Agent<LlmDecide>` accessors that are still defined in this
+    //! module.
     //!
     //! Integration coverage for the end-to-end exhaustion → correction →
     //! recovery flow lives in `tests/loop_smoke.rs`.
-
-    use super::*;
-    use serde_json::json;
-
-    fn failure(tool: &str, args: serde_json::Value, error: &str) -> ToolFailure {
-        ToolFailure {
-            tool: tool.into(),
-            args,
-            error: error.into(),
-        }
-    }
-
-    #[test]
-    fn tool_failure_correction_text_quotes_tool_name_and_includes_args_and_error() {
-        let s = tool_failure_correction_text(&[failure(
-            "search_web",
-            json!({"q": "what", "n": 3}),
-            "503 Service Unavailable",
-        )]);
-        // Tool name is quoted so the model parses it as a token, not as
-        // free text to summarize.
-        assert!(
-            s.contains("\"search_web\""),
-            "tool name should be JSON-quoted, got: {s}"
-        );
-        // Args round-trip as JSON so the model sees exactly what it sent.
-        // Key order is BTreeMap-sorted (see prompt.rs's determinism notes).
-        assert!(
-            s.contains("{\"n\":3,\"q\":\"what\"}"),
-            "args should be rendered as JSON with sorted keys, got: {s}"
-        );
-        // Error string is preserved verbatim.
-        assert!(
-            s.contains("503 Service Unavailable"),
-            "error should be preserved, got: {s}"
-        );
-        // Standing instruction at the end mirrors JAR2-19's "reply by
-        // calling exactly one decision tool" framing so the model has a
-        // clear next-step cue.
-        assert!(
-            s.contains("Reply with a different decision"),
-            "should end with next-step cue, got: {s}"
-        );
-    }
-
-    #[test]
-    fn tool_failure_correction_text_handles_non_object_args() {
-        // `call_tool`'s `args` is `serde_json::Value`; defensively the
-        // helper must not assume an object — a model could supply a list
-        // or even a primitive. Surface whatever it serializes to.
-        let s = tool_failure_correction_text(&[failure("noop", json!([1, 2, 3]), "boom")]);
-        assert!(s.contains("[1,2,3]"), "got: {s}");
-    }
-
-    #[test]
-    fn tool_failure_correction_text_handles_null_args() {
-        let s = tool_failure_correction_text(&[failure("noop", json!(null), "boom")]);
-        assert!(s.contains("null"), "got: {s}");
-    }
-
-    /// JAR2-38: when the batch carries K>1 failures, the corrective text
-    /// must enumerate each one (tool + args + error) so the model can
-    /// target a retry without re-deriving the failure from a generic
-    /// summary.
-    #[test]
-    fn tool_failure_correction_text_enumerates_batch_failures() {
-        let s = tool_failure_correction_text(&[
-            failure("read_a", json!({"path": "a.md"}), "ENOENT"),
-            failure("read_b", json!({"path": "b.md"}), "ENOENT"),
-            failure("read_c", json!({"path": "c.md"}), "permission denied"),
-        ]);
-        assert!(s.contains("3 parallel"), "should announce K count: {s}");
-        for name in ["\"read_a\"", "\"read_b\"", "\"read_c\""] {
-            assert!(s.contains(name), "missing tool {name}: {s}");
-        }
-        assert!(s.contains("permission denied"), "got: {s}");
-        assert!(s.contains("Reply with a different decision"), "got: {s}");
-    }
 
     // ---------- JAR2-33: stats accessor unit tests ----------
 
@@ -887,13 +591,19 @@ mod tests {
         //! the JAR2-21 fixture suites (see
         //! `tests/llm_fixture_anthropic.rs::unhealthy_then_recovery_cycle_via_agent_run`
         //! and the Cohere mirror).
-        use super::*;
+        use crate::agent::*;
+        use crate::fs::AgentFs;
+        use crate::health::HealthTracker;
+        use crate::mandate::Mandate;
         use crate::model_client::{
             CallStats, CompleteOptions, CompleteRequest, CompleteResponse, ContentBlock,
             ModelClient, ModelError, ToolCall, Usage, Vendor,
         };
+        use crate::tools::ToolRegistry;
         use async_trait::async_trait;
+        use chrono::Utc;
         use serde_json::json;
+        use std::sync::Arc;
         use std::sync::Mutex as StdMutex;
 
         /// Minimal scripted `ModelClient`: pops the next `CompleteResponse`
