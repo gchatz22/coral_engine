@@ -12,9 +12,9 @@ description = "Temporal-hosted agent workflow runtime for the Jarvis Engine (sta
 license = "Apache-2.0 OR MIT"
 publish = false
 
-# Stage 0.3 (JAR2-42) adds a stub `worker` binary so the Dockerfile in
-# this crate has something concrete to build. The stub prints and exits;
-# real workflow code lands in stage 3.
+# Stage 3.2 (JAR2-58) replaces the stage-0.3 stub. The `worker` binary now
+# spins up a Temporal worker registering `AgentWorkflow` + a noop activity
+# set; real workflow body + activities land in JAR2-60..66.
 [[bin]]
 name = "worker"
 path = "src/bin/worker.rs"
@@ -47,7 +47,19 @@ anyhow = "1"
 # error output, not just SDK example tomls.
 futures = "0.3"
 futures-util = "0.3"
+# `AgentInput`, `AgentResult`, and placeholder types in `workflow.rs` need to
+# round-trip through Temporal's payload codec, which uses serde under the
+# hood. `derive` covers the macro forms each type uses.
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
 url = "2"
+
+[dev-dependencies]
+# Only the unit tests in `workflow.rs` need a concrete codec to prove the
+# `Serialize`/`Deserialize` derives are present on every placeholder
+# type. Temporal's wire-level payload codec at runtime handles the
+# serialization itself — we don't need `serde_json` at runtime, just in
+# tests as a cheap, hermetic round-trip check.
+serde_json = "1"
