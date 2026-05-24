@@ -129,6 +129,7 @@ async fn run() -> Result<()> {
     let triggers = load_triggers(&triggers_path)?;
 
     let agent_fs = AgentFs::open(fs_root.clone(), &mandate)
+        .await
         .with_context(|| format!("opening agent fs at {}", fs_root.display()))?;
 
     // The health tracker shares the same on-disk root as the FS — that is

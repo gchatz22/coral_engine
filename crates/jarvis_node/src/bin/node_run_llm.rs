@@ -280,6 +280,7 @@ async fn run_inner(args: Args) -> Result<()> {
     println!("node-run-llm: fs_root={}", resolved_fs_root.display());
 
     let agent_fs = AgentFs::open(resolved_fs_root.clone(), &mandate)
+        .await
         .with_context(|| format!("opening agent fs at {}", resolved_fs_root.display()))?;
 
     // Same convention as `node-run-mcp`: per-agent FS root doubles as the

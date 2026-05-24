@@ -295,10 +295,11 @@ pub async fn assemble_context(
     correction: Option<CorrectionContext>,
 ) -> anyhow::Result<ContextBundle> {
     let policy = &cfg.context_policy;
-    let recent_outputs = fs.list_recent_outputs(policy.recent_outputs)?;
-    let recent_evidence = fs.list_recent_evidence(policy.recent_evidence)?;
+    let recent_outputs = fs.list_recent_outputs(policy.recent_outputs).await?;
+    let recent_evidence = fs.list_recent_evidence(policy.recent_evidence).await?;
     let open_claims: Vec<Claim> = fs
-        .list_claims()?
+        .list_claims()
+        .await?
         .into_iter()
         .filter(|c| c.status == ClaimStatus::Open)
         .take(policy.open_claims_max)
@@ -563,7 +564,9 @@ mod tests {
     async fn assemble_context_includes_passed_in_triggers_verbatim() {
         let tmp = TempDir::new().unwrap();
         let mandate = dummy_mandate();
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+            .await
+            .unwrap();
 
         let triggers = vec![
             Trigger::ScheduledWake,
@@ -587,7 +590,9 @@ mod tests {
     async fn assemble_context_threads_correction_into_bundle() {
         let tmp = TempDir::new().unwrap();
         let mandate = dummy_mandate();
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+            .await
+            .unwrap();
 
         let correction = CorrectionContext::new("call_tool: no tool registered under name \"x\"");
         let bundle = assemble_context(&fs, &[], &mandate, Some(correction.clone()))
@@ -600,7 +605,9 @@ mod tests {
     async fn assemble_context_reads_outputs_and_evidence_deterministically() {
         let tmp = TempDir::new().unwrap();
         let mandate = dummy_mandate();
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+            .await
+            .unwrap();
 
         // Seed more than the default window so the windowing path is also
         // exercised. The default `ContextPolicy::recent_outputs` /
@@ -616,11 +623,12 @@ mod tests {
                 serde_json::json!({ "echoed": i }),
                 ts(),
             );
-            let id = fs.record_evidence(rec).unwrap();
+            let id = fs.record_evidence(rec).await.unwrap();
             ev_ids.push(id);
         }
         for (i, id) in ev_ids.iter().enumerate() {
             fs.persist_output(&format!("out-{i}"), &[id.clone()])
+                .await
                 .unwrap();
         }
 
@@ -675,7 +683,9 @@ mod tests {
                 open_claims_max: 32,
             },
         };
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+            .await
+            .unwrap();
 
         let id = fs
             .record_evidence(EvidenceRecord::new(
@@ -684,9 +694,12 @@ mod tests {
                 serde_json::json!({"v": 1}),
                 ts(),
             ))
+            .await
             .unwrap();
         for i in 0..5 {
-            fs.persist_output(&format!("o-{i}"), &[id.clone()]).unwrap();
+            fs.persist_output(&format!("o-{i}"), &[id.clone()])
+                .await
+                .unwrap();
         }
 
         let bundle = assemble_context(&fs, &[], &mandate, None).await.unwrap();
@@ -711,7 +724,9 @@ mod tests {
                 open_claims_max: 32,
             },
         };
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+            .await
+            .unwrap();
         for i in 0..6 {
             fs.record_evidence(EvidenceRecord::new(
                 "echo",
@@ -719,6 +734,7 @@ mod tests {
                 serde_json::json!({"i": i}),
                 ts(),
             ))
+            .await
             .unwrap();
         }
 
@@ -740,7 +756,9 @@ mod tests {
                 open_claims_max: 2,
             },
         };
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+            .await
+            .unwrap();
 
         // Seed claims in mixed states so the filter has work to do. Use
         // alphabetic seeds so the on-disk slug order is alphabetic-prefix
@@ -760,6 +778,7 @@ mod tests {
                 status: *status,
                 created_at: ts(),
             })
+            .await
             .unwrap();
         }
 
@@ -775,6 +794,7 @@ mod tests {
         // restricted to Open. We reproduce that ordering here and compare.
         let expected: Vec<Claim> = fs
             .list_claims()
+            .await
             .unwrap()
             .into_iter()
             .filter(|c| c.status == ClaimStatus::Open)
@@ -787,7 +807,9 @@ mod tests {
     async fn assemble_context_empty_claims_yields_empty_open_claims() {
         let tmp = TempDir::new().unwrap();
         let mandate = dummy_mandate();
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+            .await
+            .unwrap();
         let bundle = assemble_context(&fs, &[], &mandate, None).await.unwrap();
         assert!(bundle.open_claims.is_empty());
     }
@@ -798,7 +820,9 @@ mod tests {
         // JAR2-36 policy fields with every window populated.
         let tmp = TempDir::new().unwrap();
         let mandate = dummy_mandate();
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate).unwrap();
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+            .await
+            .unwrap();
 
         let ev = fs
             .record_evidence(EvidenceRecord::new(
@@ -807,14 +831,16 @@ mod tests {
                 serde_json::json!({"v": 1}),
                 ts(),
             ))
+            .await
             .unwrap();
-        fs.persist_output("o-1", &[ev.clone()]).unwrap();
+        fs.persist_output("o-1", &[ev.clone()]).await.unwrap();
         fs.write_claim(&Claim {
             seed: "claim-1".into(),
             description: "d".into(),
             status: ClaimStatus::Open,
             created_at: ts(),
         })
+        .await
         .unwrap();
 
         let triggers = vec![Trigger::ScheduledWake];
