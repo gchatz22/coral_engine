@@ -429,6 +429,16 @@ impl AgentActivities {
     /// `assemble_context`) wrote first. Matches the same trick the
     /// `assemble_context` stub uses to construct its placeholder
     /// `ContextBundle.mandate`.
+    ///
+    /// **Heartbeats deferred.** `ActivityContext::record_heartbeat`
+    /// exists on the pinned SDK (verified against
+    /// `temporalio-sdk-0.4.0/src/activities.rs:170`), but with
+    /// today's bootstrap tool surface — `EchoTool` (microseconds) and
+    /// `McpTool` (sub-second under the default retry policy of
+    /// 3×50ms) — neither approaches the workflow-set 30s
+    /// start-to-close timeout. Add a heartbeat loop here when a
+    /// tool's expected duration approaches or exceeds the timeout
+    /// (e.g. JAR2-68's MCP-server wiring with a long-running fetch).
     #[activity]
     pub async fn execute_tool(
         _ctx: ActivityContext,
