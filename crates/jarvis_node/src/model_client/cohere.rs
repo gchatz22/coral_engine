@@ -913,33 +913,46 @@ mod tests {
     }
 
     #[test]
-    fn new_uses_cohere_model_env_when_set() {
-        unsafe {
-            std::env::set_var(MODEL_ENV, "command-r-plus-08-2024");
-        }
-        let client = CohereClient::new();
-        unsafe {
-            std::env::remove_var(MODEL_ENV);
-        }
-        assert_eq!(client.model(), "command-r-plus-08-2024");
-    }
-
-    #[test]
-    fn new_falls_back_to_default_when_cohere_model_env_unset_or_empty() {
+    fn new_reads_cohere_model_env_for_unset_empty_and_value() {
+        // Was previously two tests (set-then-read, unset/empty-then-read)
+        // that mutated the process-global `COHERE_MODEL` env in parallel —
+        // Rust's default harness runs tests in the same binary concurrently,
+        // so the pair raced intermittently in CI. Merging into one
+        // sequential body removes the race without adding a serialization dep.
+        // Same fix as `anthropic.rs` — kept symmetric.
+        //
         // Empty must behave like unset — `.envrc` defaults often ship as ""
         // before someone fills them in, and we don't want that to send an
         // empty string to the API.
         unsafe {
             std::env::remove_var(MODEL_ENV);
         }
-        assert_eq!(CohereClient::new().model(), DEFAULT_MODEL);
+        assert_eq!(
+            CohereClient::new().model(),
+            DEFAULT_MODEL,
+            "unset → default"
+        );
+
         unsafe {
             std::env::set_var(MODEL_ENV, "");
         }
-        let client = CohereClient::new();
+        assert_eq!(
+            CohereClient::new().model(),
+            DEFAULT_MODEL,
+            "empty → default"
+        );
+
+        unsafe {
+            std::env::set_var(MODEL_ENV, "command-r-plus-08-2024");
+        }
+        assert_eq!(
+            CohereClient::new().model(),
+            "command-r-plus-08-2024",
+            "value → that value"
+        );
+
         unsafe {
             std::env::remove_var(MODEL_ENV);
         }
-        assert_eq!(client.model(), DEFAULT_MODEL);
     }
 }
