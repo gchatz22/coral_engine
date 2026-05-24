@@ -20,13 +20,17 @@
 //! ## Test injection
 //!
 //! `decide_next_action` consults a static `OnceLock<Mutex<VecDeque<Decision>>>`
-//! before falling back to the canned `Decision::Idle { next_after: 1s }`.
-//! Tests call [`set_decision_script`] before starting the workflow; the
+//! before reaching for the installed [`Decide`] implementation. Tests
+//! call [`set_decision_script`] before starting the workflow; the
 //! activity pops from the script in order. This is the workflow-side
 //! analogue of `agent_core`'s `MockDecide` — same scripted behaviour,
 //! but reachable from inside an activity body (which must be a free
 //! function over a value-typed registered instance per SDK constraint
-//! § 3.4 of `temporal_rust_sdk_smoke.md`).
+//! § 3.4 of `temporal_rust_sdk_smoke.md`). When the script is empty
+//! the activity falls through to `worker::decide_impl()` (JAR2-62) and
+//! calls the installed `Decide::decide` once. Tests that don't install
+//! a real `Decide` must script every decision the workflow body will
+//! ask for — see `tests/workflow_loop.rs` for the canonical example.
 //!
 //! ## SDK constraints baked in
 //!
@@ -41,19 +45,20 @@
 //!   `ActivityImplementer` for the bare type.
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 use jarvis_node::agent_core;
-use jarvis_node::decision::{ContextBundle, CorrectionContext, Decision, FsOp, ToolCall};
+use jarvis_node::decision::{ContextBundle, CorrectionContext, Decide, Decision, FsOp, ToolCall};
 use jarvis_node::evidence::EvidenceId;
 use jarvis_node::fs::AgentFs;
 use jarvis_node::mandate::{Mandate, OutputId};
+use jarvis_node::model_client::ModelError;
 use jarvis_node::trigger::{HumanOp, MandatePatch, Trigger};
 use serde::{Deserialize, Serialize};
 use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
+use temporalio_sdk::ApplicationFailure;
 
 use crate::worker::agent_storage;
 use crate::workflow::{AgentConfig, FsHandle};
@@ -312,18 +317,61 @@ impl AgentActivities {
         Ok(AssembleContextOutput { bundle })
     }
 
-    /// Stage 3.6 (JAR2-62). Stub pops from the test-injected
-    /// [`DECISION_SCRIPT`]; falls back to `Decision::Idle { next_after: 1s }`
-    /// when the script is empty. JAR2-62 replaces the body with
-    /// `LlmDecide::decide`.
+    /// Stage 3.6 (JAR2-62). Wraps the process-wide [`Decide`] impl
+    /// installed via [`crate::worker::install_decide`] (typically an
+    /// `LlmDecide` over a vendor `ModelClient`).
+    ///
+    /// **Script-first.** The activity consults the test-injected
+    /// [`DECISION_SCRIPT`] *before* reaching for the installed
+    /// implementation. This is load-bearing: the live `workflow_loop`
+    /// test scripts every decision the workflow will ask for, and a
+    /// real LLM call would defeat both the test's determinism and the
+    /// CI envelope (no API keys, no network). The static-script
+    /// injection path predates JAR2-62 and must keep working — see
+    /// `tests/workflow_loop.rs` for the call site.
+    ///
+    /// **Error classification.** When the installed `Decide`
+    /// implementation returns an `anyhow::Error`, the activity
+    /// classifies it by downcasting to `&ModelError` (the typed error
+    /// the `LlmDecide` adapter passes through from
+    /// `ModelClient::complete`):
+    ///
+    /// - `ModelError::Transport` / `ModelError::RateLimit` →
+    ///   **retryable**. The Temporal worker will reschedule the
+    ///   activity per the workflow-side `ActivityOptions::retry_policy`
+    ///   (default Temporal policy today; per-activity tuning is a
+    ///   follow-up — see PR summary).
+    /// - `ModelError::Auth` / `ModelError::Parse` /
+    ///   `ModelError::Other` → **non-retryable**. Bad credentials,
+    ///   malformed responses, and vendor-specific 4xxs don't get
+    ///   better by retrying.
+    /// - Downcast fails (e.g. `LlmDecide`'s "parse failed on all N
+    ///   attempts" `anyhow!` after exhausting the inner correction
+    ///   loop) → **non-retryable**. Validation failures bubble as
+    ///   activity-layer failures so the workflow body can stage a
+    ///   correction context on the next tick rather than retrying the
+    ///   same broken decision in place (guardrail 3 of the ticket).
+    ///
+    /// **Heartbeats** are deliberately omitted in this revision. The
+    /// activity timeout is 30s (`workflow::ACTIVITY_TIMEOUT`), which
+    /// comfortably brackets a normal LLM call (sub-10s for short
+    /// prompts); a long-running streaming variant would need
+    /// heartbeats, but the batch-shape `ModelClient` doesn't.
     #[activity]
     pub async fn decide_next_action(
         _ctx: ActivityContext,
-        _input: DecideInput,
+        input: DecideInput,
     ) -> Result<Decision, ActivityError> {
-        Ok(pop_scripted_decision().unwrap_or(Decision::Idle {
-            next_after: Duration::from_secs(1),
-        }))
+        // Script-first (guardrail 5). If a scripted decision is
+        // queued, return it without touching the installed `Decide`.
+        if let Some(d) = pop_scripted_decision() {
+            return Ok(d);
+        }
+
+        let decide = crate::worker::decide_impl();
+        decide_with(decide.as_ref(), input)
+            .await
+            .map_err(classify_decide_error)
     }
 
     /// Stage 3.7 (JAR2-63). Stub returns a deterministic placeholder
@@ -435,6 +483,63 @@ pub async fn persist_retirement_inner(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// JAR2-62 helpers — pulled out of the activity body so unit tests can call
+// the inner shape directly without faking an `ActivityContext`. The split
+// also keeps the `#[activity]`-decorated body short.
+
+/// Call the supplied [`Decide`] with the activity's input. Separated
+/// from [`AgentActivities::decide_next_action`] so the hermetic test in
+/// this module can exercise the wiring against an arbitrary `Decide`
+/// (typically a `MockDecide`) without going through the
+/// `worker::decide_impl()` static — the unit test injects its own
+/// dependency.
+async fn decide_with(decide: &dyn Decide, input: DecideInput) -> anyhow::Result<Decision> {
+    decide.decide(input.bundle).await
+}
+
+/// Map an `anyhow::Error` from `Decide::decide` to a Temporal
+/// [`ActivityError`] with retryability flagged per the categorization
+/// rules in [`AgentActivities::decide_next_action`].
+///
+/// The downcast to `&ModelError` is the contract `LlmDecide` exposes:
+/// its `model_err_to_anyhow` helper wraps the typed `ModelError` via
+/// `anyhow::Error::new` (see `decide_llm/llm_decide.rs::model_err_to_anyhow`),
+/// so the source chain preserves the category. Non-`ModelError` causes
+/// — `LlmDecide`'s "parse failed on all attempts" `anyhow!`, or any
+/// other `Decide` impl's bespoke error — fall through to the
+/// non-retryable default. That matches guardrail 3 of the ticket:
+/// validation failures don't retry at the activity layer, they become
+/// correction contexts in the next workflow tick.
+fn classify_decide_error(err: anyhow::Error) -> ActivityError {
+    let retryable = matches!(
+        err.downcast_ref::<ModelError>(),
+        Some(ModelError::Transport(_)) | Some(ModelError::RateLimit(_))
+    );
+    let failure = if retryable {
+        ApplicationFailure::new(err)
+    } else {
+        ApplicationFailure::non_retryable(err)
+    };
+    ActivityError::application(failure)
+}
+
+// Compile-time witness that `crate::worker::decide_impl()` returns
+// exactly `Arc<dyn Decide>`. Catches any future refactor that changes
+// the worker-side signature out from under us — the activity body
+// passes the result through `Arc::as_ref` to `decide_with`, which
+// only works if the function returns an `Arc`-shaped trait object.
+// The closure is never invoked; `let _ = ...` only references the
+// function item, so the static analysis fires at compile time and
+// nothing runs at startup. (Important: invoking `decide_impl()` here
+// would panic when no `Decide` is installed.)
+const _: fn() = || {
+    fn assert_arc_dyn_decide() -> Arc<dyn Decide> {
+        crate::worker::decide_impl()
+    }
+    let _ = assert_arc_dyn_decide;
+};
+
 #[cfg(test)]
 mod tests {
     //! Hermetic unit coverage for the activity surface.
@@ -448,13 +553,30 @@ mod tests {
     //! workflow against a Temporal Server.
 
     use super::*;
+    use jarvis_node::decision::MockDecide;
     use serde_json::json;
+    use std::time::Duration;
 
     // Serializes the two tests below that mutate the process-wide
     // `DECISION_SCRIPT` static. Without this they race under cargo's
     // default parallel runner (CI hit it; locally they happened to
     // schedule far enough apart to pass).
     static SCRIPT_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Build an empty `ContextBundle` for tests that exercise the
+    /// activity body. `Mandate::new("", Duration::ZERO, None)` is the
+    /// cheapest valid construction (mirrors the stub fallback in
+    /// `assemble_context`).
+    fn empty_bundle() -> ContextBundle {
+        ContextBundle {
+            mandate: Mandate::new("", Duration::ZERO, None),
+            triggers: Vec::new(),
+            recent_outputs: Vec::new(),
+            recent_evidence: Vec::new(),
+            open_claims: Vec::new(),
+            correction: None,
+        }
+    }
 
     #[test]
     fn decision_script_round_trips_in_order() {
@@ -614,5 +736,168 @@ mod tests {
         };
         let s = serde_json::to_string(&i).unwrap();
         let _back: PersistRetirementInput = serde_json::from_str(&s).unwrap();
+    }
+
+    // ---------- JAR2-62: decide_with + classify_decide_error -------------
+
+    /// Bespoke `Decide` impl that returns the supplied error verbatim on
+    /// every `decide` call. Lets us drive the activity body's error
+    /// classification path without standing up a full `LlmDecide` over
+    /// a `MockModelClient` (cross-crate; lives in `decide_llm` tests).
+    struct ErrDecide {
+        make_err: fn() -> anyhow::Error,
+    }
+
+    #[async_trait::async_trait]
+    impl Decide for ErrDecide {
+        async fn decide(&self, _ctx: ContextBundle) -> anyhow::Result<Decision> {
+            Err((self.make_err)())
+        }
+    }
+
+    /// Happy path: `decide_with` forwards the bundle to the trait
+    /// method and returns the trait's decision verbatim. Uses
+    /// `MockDecide` (the in-tree scripted impl from
+    /// `jarvis_node::decision`) so this test never touches a real
+    /// vendor or its features.
+    #[tokio::test]
+    async fn decide_with_returns_trait_decision_on_success() {
+        let want = Decision::Idle {
+            next_after: Duration::from_millis(250),
+        };
+        let decide: Arc<dyn Decide> = Arc::new(MockDecide::new(vec![want.clone()]));
+        let input = DecideInput {
+            bundle: empty_bundle(),
+        };
+        let got = decide_with(decide.as_ref(), input).await.unwrap();
+        assert_eq!(got, want);
+    }
+
+    /// Transport failures classify as retryable. The activity body
+    /// surfaces this via `ActivityError::Application(_)` carrying an
+    /// `ApplicationFailure` with `is_non_retryable() == false`, so
+    /// Temporal's default retry policy will reschedule.
+    #[test]
+    fn classify_decide_error_transport_is_retryable() {
+        let err = anyhow::Error::new(ModelError::Transport("DNS failure".into()));
+        let activity_err = classify_decide_error(err);
+        let ActivityError::Application(failure) = activity_err else {
+            panic!("expected ActivityError::Application");
+        };
+        assert!(
+            !failure.is_non_retryable(),
+            "Transport errors must be retryable"
+        );
+    }
+
+    /// Rate-limit failures classify as retryable. Same shape as
+    /// Transport; vendor-side backoff handling lives outside the
+    /// activity (and is out of scope for JAR2-62 — see PR summary
+    /// about the missing per-activity retry policy).
+    #[test]
+    fn classify_decide_error_rate_limit_is_retryable() {
+        let err = anyhow::Error::new(ModelError::RateLimit("slow down".into()));
+        let activity_err = classify_decide_error(err);
+        let ActivityError::Application(failure) = activity_err else {
+            panic!("expected ActivityError::Application");
+        };
+        assert!(
+            !failure.is_non_retryable(),
+            "RateLimit errors must be retryable"
+        );
+    }
+
+    /// Auth failures classify as non-retryable. Bad credentials don't
+    /// fix themselves; surface to the workflow body as a terminal
+    /// activity failure on the first attempt.
+    #[test]
+    fn classify_decide_error_auth_is_non_retryable() {
+        let err = anyhow::Error::new(ModelError::Auth("ANTHROPIC_API_KEY missing".into()));
+        let activity_err = classify_decide_error(err);
+        let ActivityError::Application(failure) = activity_err else {
+            panic!("expected ActivityError::Application");
+        };
+        assert!(
+            failure.is_non_retryable(),
+            "Auth errors must be non-retryable"
+        );
+    }
+
+    /// `Parse` and `Other` failures classify as non-retryable. Bad
+    /// response shapes and vendor-specific 4xxs don't get better by
+    /// retrying; the workflow body's next-tick correction is the right
+    /// place to surface them.
+    #[test]
+    fn classify_decide_error_parse_and_other_are_non_retryable() {
+        for err in [
+            anyhow::Error::new(ModelError::Parse("bad JSON".into())),
+            anyhow::Error::new(ModelError::Other("4xx".into())),
+        ] {
+            let activity_err = classify_decide_error(err);
+            let ActivityError::Application(failure) = activity_err else {
+                panic!("expected ActivityError::Application");
+            };
+            assert!(
+                failure.is_non_retryable(),
+                "Parse/Other errors must be non-retryable"
+            );
+        }
+    }
+
+    /// Non-`ModelError` causes (e.g. `LlmDecide`'s parse-exhaustion
+    /// `anyhow!(...)`) classify as non-retryable. Guardrail 3:
+    /// validation failures don't retry at the activity layer; they
+    /// become correction contexts on the next workflow tick.
+    #[test]
+    fn classify_decide_error_non_model_error_is_non_retryable() {
+        let err = anyhow::anyhow!("LlmDecide: parse failed on all 2 attempt(s)");
+        let activity_err = classify_decide_error(err);
+        let ActivityError::Application(failure) = activity_err else {
+            panic!("expected ActivityError::Application");
+        };
+        assert!(
+            failure.is_non_retryable(),
+            "non-ModelError causes must be non-retryable"
+        );
+    }
+
+    /// End-to-end of the `decide_with` + `classify_decide_error` pair:
+    /// when the trait returns a transport-flavored error, the call
+    /// site lands on a retryable `ApplicationFailure`. Closes the loop
+    /// with the same shape the `#[activity]` body uses.
+    #[tokio::test]
+    async fn decide_with_then_classify_transport_yields_retryable_failure() {
+        let decide: Arc<dyn Decide> = Arc::new(ErrDecide {
+            make_err: || anyhow::Error::new(ModelError::Transport("downstream 503".into())),
+        });
+        let input = DecideInput {
+            bundle: empty_bundle(),
+        };
+        let raw = decide_with(decide.as_ref(), input).await.unwrap_err();
+        let activity_err = classify_decide_error(raw);
+        let ActivityError::Application(failure) = activity_err else {
+            panic!("expected ActivityError::Application");
+        };
+        assert!(!failure.is_non_retryable());
+    }
+
+    /// End-to-end with a parse-exhaustion `anyhow!` (the canonical
+    /// `LlmDecide` validation-failure shape). The activity layer must
+    /// surface this as non-retryable so the workflow body's correction
+    /// path takes over on the next tick.
+    #[tokio::test]
+    async fn decide_with_then_classify_validation_yields_non_retryable_failure() {
+        let decide: Arc<dyn Decide> = Arc::new(ErrDecide {
+            make_err: || anyhow::anyhow!("LlmDecide: parse failed on all 2 attempts"),
+        });
+        let input = DecideInput {
+            bundle: empty_bundle(),
+        };
+        let raw = decide_with(decide.as_ref(), input).await.unwrap_err();
+        let activity_err = classify_decide_error(raw);
+        let ActivityError::Application(failure) = activity_err else {
+            panic!("expected ActivityError::Application");
+        };
+        assert!(failure.is_non_retryable());
     }
 }
