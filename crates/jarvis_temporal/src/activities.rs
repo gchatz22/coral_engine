@@ -46,6 +46,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use jarvis_node::agent_core;
@@ -374,25 +375,101 @@ impl AgentActivities {
             .map_err(classify_decide_error)
     }
 
-    /// Stage 3.7 (JAR2-63). Stub returns a deterministic placeholder
-    /// `EvidenceId` so the workflow's per-call accounting has a token to
-    /// stash in history. JAR2-63 replaces the body with
-    /// `ToolRegistry::call` + `AgentFs::record_evidence`.
+    /// Stage 3.7 (JAR2-63). Real body: dispatches one `ToolCall` through
+    /// the process-wide [`ToolRegistry`] (installed at worker boot via
+    /// [`crate::worker::install_tool_registry`]) and, on success,
+    /// persists the resulting `EvidenceRecord` via the per-agent
+    /// `AgentFs` facade backed by the installed
+    /// [`crate::worker::agent_storage`].
+    ///
+    /// One activity invocation per `ToolCall`; the workflow body fans
+    /// out N calls via `workflows::join_all` and stages a
+    /// `CorrectionContext` for next tick when any of them surface as
+    /// `Failure`. See [`crate::workflow::dispatch_call_tools`].
+    ///
+    /// **Retry layering.** Tool calls themselves are dispatched
+    /// single-shot from this activity — `McpTool` (the production
+    /// `ToolRegistry` entry built by `register_mcp_server_with_policy`)
+    /// already runs its own `RetryPolicy` loop inside `Tool::call`
+    /// (`crates/jarvis_node/src/mcp/tool.rs` `call_with_retry`). Adding
+    /// a second retry loop here would compound those retries
+    /// multiplicatively. The per-call surface this activity returns —
+    /// `Success { evidence_id }` or `Failure { failure }` — already
+    /// matches the in-process `agent_core::dispatch_call_tools`
+    /// post-retry shape. The outer Temporal retry on activity errors
+    /// (heartbeat timeout, worker crash) stays safe because evidence
+    /// is content-addressed: a retried activity invocation with the
+    /// same `(tool, args, result)` triple resolves to the same
+    /// `EvidenceId` and `AgentFs::record_evidence` is idempotent via
+    /// `put_if_absent` (`crates/jarvis_node/src/fs.rs`).
+    ///
+    /// **Tool error → Failure (not ActivityError).** A tool that
+    /// errors after its own retry exhaustion does **not** surface as
+    /// `ActivityError` (which would trip Temporal's outer retry —
+    /// pointless work, given the inner retry already gave up). It
+    /// returns `Ok(ToolCallOutcome::Failure { failure })` so the
+    /// workflow body folds it into a `CorrectionContext` and the next
+    /// tick's LLM sees the failure. This mirrors the in-process
+    /// `DispatchOutcome::ToolError` semantics from
+    /// `agent_core::dispatch_call_tools` (`scratch/temporal_staged_plan.md`
+    /// § 2.5; JAR2-38). A tool name unknown to the registry takes the
+    /// same path; the in-process loop returned `NeedsCorrection` for
+    /// that case via a batch-wide pre-check, but at the per-call
+    /// granularity the unknown-name failure is observationally
+    /// identical to any other call-time error from the LLM's
+    /// perspective.
+    ///
+    /// **Mandate placeholder.** `ExecuteToolInput.cfg` is the
+    /// JAR2-60-era `AgentConfig {}` empty struct; promotion to
+    /// `Mandate` lands later in the stack. `AgentFs::new_with_storage`
+    /// still wants a `&Mandate` to seed an `mandate.json` write on
+    /// first open — but that write is idempotent (read-then-PUT-only-
+    /// if-absent), so a placeholder mandate here cannot corrupt
+    /// whatever the agent's mandate-bearing path (e.g. JAR2-61's
+    /// `assemble_context`) wrote first. Matches the same trick the
+    /// `assemble_context` stub uses to construct its placeholder
+    /// `ContextBundle.mandate`.
     #[activity]
     pub async fn execute_tool(
         _ctx: ActivityContext,
         input: ExecuteToolInput,
     ) -> Result<ToolCallOutcome, ActivityError> {
-        // Deterministic placeholder id seeded from the call's name + args
-        // so two stub invocations with identical inputs collide on the
-        // same id — matches the content-addressed semantics of the real
-        // EvidenceId without doing any I/O.
-        let evidence_id = EvidenceId::new(
-            &input.call.name,
-            &input.call.args,
-            &serde_json::json!({"stub": "execute_tool"}),
-        );
-        Ok(ToolCallOutcome::Success { evidence_id })
+        let registry = crate::worker::tool_registry();
+        // One-shot dispatch — the tool implementation owns its retry
+        // policy (see McpTool::call). Wrapping in another retry here
+        // would compound them multiplicatively.
+        let call_result = registry
+            .call(&input.call.name, input.call.args.clone())
+            .await;
+        match call_result {
+            Ok(record) => {
+                // Persist evidence via the per-agent AgentFs facade.
+                // Construction is idempotent against the prefix's
+                // mandate file (read-then-PUT-only-if-absent), so the
+                // placeholder mandate below cannot overwrite a real
+                // mandate already on disk.
+                let storage = crate::worker::agent_storage();
+                let placeholder_mandate = Mandate::new("", Duration::ZERO, None);
+                let fs = AgentFs::new_with_storage(
+                    storage,
+                    input.fs_handle.prefix.clone(),
+                    &placeholder_mandate,
+                )
+                .await
+                .map_err(|e| ActivityError::from(anyhow::anyhow!("agent_fs open failed: {e:#}")))?;
+                let evidence_id = fs.record_evidence(record).await.map_err(|e| {
+                    ActivityError::from(anyhow::anyhow!("record_evidence failed: {e:#}"))
+                })?;
+                Ok(ToolCallOutcome::Success { evidence_id })
+            }
+            Err(e) => Ok(ToolCallOutcome::Failure {
+                failure: ToolCallFailure {
+                    tool: input.call.name.clone(),
+                    args: input.call.args.clone(),
+                    error: format!("{e:#}"),
+                },
+            }),
+        }
     }
 
     /// Stage 3.8 (JAR2-64). Stub returns a fresh placeholder `OutputId`
@@ -555,7 +632,6 @@ mod tests {
     use super::*;
     use jarvis_node::decision::MockDecide;
     use serde_json::json;
-    use std::time::Duration;
 
     // Serializes the two tests below that mutate the process-wide
     // `DECISION_SCRIPT` static. Without this they race under cargo's

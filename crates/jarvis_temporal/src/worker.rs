@@ -11,6 +11,8 @@
 //! library compiles regardless of which vendor features are turned on.
 //! `bin/worker.rs` is the only place that picks the concrete
 //! [`LlmDecide`] vendor and is itself `#[cfg]`-gated.
+//! Stage 3.7 (JAR2-63) — process-wide [`ToolRegistry`] install/access for
+//! the `execute_tool` activity body. Mirrors the JAR2-69 storage pair.
 //!
 //! Lives in the library so both the `worker` binary and integration
 //! tests (in `tests/`) share the same registration call site.
@@ -26,6 +28,7 @@ use std::sync::{Arc, OnceLock};
 use anyhow::Result;
 use jarvis_node::decision::Decide;
 use jarvis_node::storage::AgentStorage;
+use jarvis_node::tools::ToolRegistry;
 use temporalio_client::Client;
 use temporalio_sdk::{Worker, WorkerOptions};
 use temporalio_sdk_core::CoreRuntime;
@@ -137,6 +140,54 @@ pub fn decide_impl() -> Arc<dyn Decide> {
         .expect("decide_impl() accessed before install_decide()")
 }
 
+/// Process-wide [`ToolRegistry`] consulted by the `execute_tool` activity
+/// body (JAR2-63). Installed once at worker boot via
+/// [`install_tool_registry`] and accessed via [`tool_registry`].
+///
+/// Same OnceLock pattern as [`AGENT_STORAGE`] above — the activity macro
+/// owns the registered activity value, so shared state has to live
+/// behind a `static` rather than be threaded through the activity impl
+/// block (`scratch/temporal_rust_sdk_smoke.md` § 3.4).
+static TOOL_REGISTRY: OnceLock<Arc<ToolRegistry>> = OnceLock::new();
+
+/// Install the process-wide [`ToolRegistry`] used by the `execute_tool`
+/// activity.
+///
+/// The worker binary builds a registry at boot (registering the configured
+/// `EchoTool` + any MCP servers from env vars) and calls this before
+/// `worker.run()`. Test harnesses build a tiny in-memory registry
+/// (`EchoTool` plus per-test aliases) and call this in their setup.
+///
+/// **Panics** on double install. Same loud-on-misuse rationale as
+/// [`install_agent_storage`]: two registries in one process would
+/// disagree on which tool a given name routes to, and silent shadowing
+/// would be far worse than a crash.
+pub fn install_tool_registry(registry: Arc<ToolRegistry>) {
+    TOOL_REGISTRY
+        .set(registry)
+        .map_err(|_| ())
+        .expect("install_tool_registry called twice; one process, one registry");
+}
+
+/// Access the installed [`ToolRegistry`].
+///
+/// Returns a cheap [`Arc`] clone — the `execute_tool` activity body
+/// calls `registry.call(&input.call.name, input.call.args)` per
+/// invocation. The registry itself is `Send + Sync` (tools are
+/// `Arc<dyn Tool>`), so concurrent activity invocations share one
+/// instance.
+///
+/// **Panics** if [`install_tool_registry`] hasn't been called. Same
+/// structural-safety argument as [`agent_storage`]: activities only
+/// run after the worker has booted, which installs before
+/// `worker.run()`.
+pub fn tool_registry() -> Arc<ToolRegistry> {
+    TOOL_REGISTRY
+        .get()
+        .cloned()
+        .expect("tool_registry() accessed before install_tool_registry()")
+}
+
 /// Build a worker registering [`AgentWorkflow`] + [`AgentActivities`] on
 /// the given task queue.
 ///
@@ -180,6 +231,7 @@ mod tests {
     use super::*;
     use jarvis_node::decision::{Decide, Decision, MockDecide};
     use jarvis_node::storage::MemoryStorage;
+    use jarvis_node::tools::{EchoTool, ToolRegistry};
     use std::time::Duration;
 
     #[test]
@@ -219,5 +271,28 @@ mod tests {
             install_decide(Arc::new(MockDecide::new(vec![])));
         });
         assert!(result.is_err(), "double install_decide should panic");
+    }
+
+    /// JAR2-63 mirror of `install_then_access_then_double_install_panics`
+    /// — the install/access/double-install invariants for the
+    /// process-wide `ToolRegistry` are exactly the same as for
+    /// `AgentStorage`. One process-scoped test covers all three
+    /// behaviours since the underlying `OnceLock` can only be set once
+    /// per process.
+    #[test]
+    fn install_tool_registry_then_access_then_double_install_panics() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool))
+            .expect("register echo tool");
+        install_tool_registry(Arc::new(reg));
+
+        let r = tool_registry();
+        // OnceLock holds one strong ref, we hold one.
+        assert!(Arc::strong_count(&r) >= 2);
+
+        let result = std::panic::catch_unwind(|| {
+            install_tool_registry(Arc::new(ToolRegistry::new()));
+        });
+        assert!(result.is_err(), "double install_tool_registry should panic");
     }
 }

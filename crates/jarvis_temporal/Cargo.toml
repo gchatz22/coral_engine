@@ -91,9 +91,10 @@ llm-cohere = ["jarvis_node/llm-cohere"]
 [dev-dependencies]
 # JAR2-62 — `async-trait` is needed to impl the `jarvis_node::decision::Decide`
 # trait (itself `#[async_trait]`-annotated) on a test-only `ErrDecide`
-# helper in `src/activities.rs`. Dev-only because the production
-# activity body holds an `Arc<dyn Decide>` and never impls the trait
-# itself.
+# helper in `src/activities.rs`. JAR2-63 also uses it for
+# `AliasEchoTool`/`FailingTool` test impls of `jarvis_node::tools::Tool`
+# (also `#[async_trait]`-annotated). Dev-only because production
+# activity bodies never impl these traits themselves.
 async-trait = "0.1"
 # JAR2-69 — the unit test for `install_agent_storage` / `agent_storage`
 # in `src/worker.rs` needs `MemoryStorage`, which is gated behind the
