@@ -24,19 +24,28 @@
 //! - `TEMPORAL_TASK_QUEUE` — default
 //!   [`jarvis_temporal::worker::DEFAULT_TASK_QUEUE`]. Workflow starts
 //!   must use the same task queue or workers will not pick them up.
+//! - `AGENT_FS_ROOT` — per-agent FS root, default `./agent-fs`. Resolved
+//!   on boot into a `LocalStorage` backend installed via
+//!   [`jarvis_temporal::worker::install_agent_storage`]. Stage 3.5+
+//!   activity bodies reach for it via
+//!   [`jarvis_temporal::worker::agent_storage`].
 
 use std::env;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use jarvis_node::storage::LocalStorage;
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 use tracing::info;
 
-use jarvis_temporal::worker::{build_worker, DEFAULT_TASK_QUEUE};
+use jarvis_temporal::worker::{build_worker, install_agent_storage, DEFAULT_TASK_QUEUE};
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
 const DEFAULT_NAMESPACE: &str = "default";
+const DEFAULT_FS_ROOT: &str = "./agent-fs";
 
 async fn build_client() -> Result<Client> {
     let address = env::var("TEMPORAL_ADDRESS").unwrap_or_else(|_| DEFAULT_ADDRESS.into());
@@ -62,6 +71,18 @@ async fn main() -> Result<()> {
         .try_init();
 
     let task_queue = env::var("TEMPORAL_TASK_QUEUE").unwrap_or_else(|_| DEFAULT_TASK_QUEUE.into());
+
+    // Install the process-wide AgentStorage before the worker starts
+    // polling. JAR2-61..66 activity bodies will reach for it via
+    // jarvis_temporal::worker::agent_storage().
+    let fs_root = env::var("AGENT_FS_ROOT").unwrap_or_else(|_| DEFAULT_FS_ROOT.into());
+    let fs_root_path = PathBuf::from(&fs_root);
+    let storage = Arc::new(
+        LocalStorage::new(fs_root_path.clone())
+            .with_context(|| format!("opening LocalStorage at {fs_root}"))?,
+    );
+    install_agent_storage(storage);
+    info!(fs_root = fs_root.as_str(), "installed AgentStorage backend");
 
     let telemetry_options = TelemetryOptions::builder().build();
     let runtime = CoreRuntime::new_assume_tokio(
