@@ -351,8 +351,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // Serializes the two tests below that mutate the process-wide
+    // `DECISION_SCRIPT` static. Without this they race under cargo's
+    // default parallel runner (CI hit it; locally they happened to
+    // schedule far enough apart to pass).
+    static SCRIPT_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn decision_script_round_trips_in_order() {
+        let _g = SCRIPT_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         // Reset (subsequent tests inherit process state).
         set_decision_script(vec![]);
 
@@ -379,6 +386,7 @@ mod tests {
 
     #[test]
     fn decision_script_resets_between_tests() {
+        let _g = SCRIPT_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         set_decision_script(vec![Decision::Retire {
             reason: "first".into(),
         }]);
