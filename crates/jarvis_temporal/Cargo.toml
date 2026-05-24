@@ -62,6 +62,13 @@ serde = { version = "1", features = ["derive"] }
 # library crate needs serde_json as a direct runtime dep. Was a
 # dev-only dep pre-JAR2-60; promoted here.
 serde_json = "1"
+# JAR2-66 — the `persist_retirement` activity body sources a deterministic
+# `retired_at: DateTime<Utc>` from `ActivityContext::info().scheduled_time`
+# (a `SystemTime`) and passes it to `AgentFs::persist_retirement`. The
+# conversion uses `DateTime::<Utc>::from(SystemTime)` from chrono. Feature
+# `clock` enables `Utc::now()` for the fallback when the SDK hasn't filled
+# in `scheduled_time` (test harnesses).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }

@@ -44,14 +44,17 @@ use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use jarvis_node::decision::{ContextBundle, CorrectionContext, Decision, FsOp, ToolCall};
 use jarvis_node::evidence::EvidenceId;
+use jarvis_node::fs::AgentFs;
 use jarvis_node::mandate::{Mandate, OutputId};
 use jarvis_node::trigger::{HumanOp, MandatePatch, Trigger};
 use serde::{Deserialize, Serialize};
 use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 
+use crate::worker::agent_storage;
 use crate::workflow::{AgentConfig, FsHandle};
 
 // ---------------------------------------------------------------------------
@@ -325,15 +328,71 @@ impl AgentActivities {
         Ok(())
     }
 
-    /// Stage 3.10 (JAR2-66). Stub is a no-op. JAR2-66 replaces the body
-    /// with `AgentFs::persist_retirement`.
+    /// Stage 3.10 (JAR2-66). Real body — write `retirement.json` via
+    /// [`AgentFs::persist_retirement`] using a deterministic timestamp
+    /// drawn from `ctx.info().scheduled_time`.
+    ///
+    /// # Why `AgentFs::attach` (not `new_with_storage`)
+    ///
+    /// `new_with_storage` reads-or-writes `mandate.json` to confirm the
+    /// per-agent FS is initialized. At the retirement-signal short-
+    /// circuit (workflow.rs `Decision::Retire` arm or the `retire`
+    /// signal short-circuit ahead of `assemble_context`) no `Mandate`
+    /// is in scope — the workflow body never loaded one. `attach` is
+    /// the strictly weaker constructor that skips the mandate write
+    /// and the tail-index reconciliation. The retirement path writes
+    /// exactly one key (`retirement.json`) and exits, so neither side
+    /// effect is required.
+    ///
+    /// # Why `scheduled_time` (not `Utc::now()`)
+    ///
+    /// `Utc::now()` inside an activity body is wall-clock time at
+    /// execution. If the activity fails and Temporal retries it, the
+    /// retry attempt's `Utc::now()` differs from the first attempt's.
+    /// Two attempts that both reach the `put` call would write
+    /// different bytes to `retirement.json` — defeating the workflow-
+    /// replay byte-identicality property the rest of the kernel
+    /// promises. `ctx.info().scheduled_time` is stamped from workflow
+    /// history (when the workflow *scheduled* the activity), so it is
+    /// stable across retries.
+    ///
+    /// Fallback path: if `scheduled_time` is `None` (test harnesses
+    /// that bypass the worker's activity-info plumbing, or an SDK that
+    /// hasn't filled it in), we synthesize `Utc::now()` so the body
+    /// still completes. This costs the replay-determinism property in
+    /// that edge case; loud telemetry would make sense once
+    /// observability lands (out of scope here per JAR2-66 guardrail 1).
     #[activity]
     pub async fn persist_retirement(
-        _ctx: ActivityContext,
-        _input: PersistRetirementInput,
+        ctx: ActivityContext,
+        input: PersistRetirementInput,
     ) -> Result<(), ActivityError> {
+        persist_retirement_inner(&input, ctx.info().scheduled_time).await?;
         Ok(())
     }
+}
+
+/// Body of [`AgentActivities::persist_retirement`], factored out so the
+/// hermetic test in this file can call it without constructing an
+/// `ActivityContext` (whose `pub fn new(...)` takes an `Arc<CoreWorker>`
+/// — only reachable from inside a worker).
+///
+/// Sources the storage backend from [`agent_storage`] (the process-wide
+/// `OnceLock` installed at worker boot per JAR2-69) and the timestamp
+/// from `scheduled_time` — both load-bearing for the activity contract.
+/// See the activity-method doc for why `scheduled_time` and not
+/// `Utc::now()`.
+pub async fn persist_retirement_inner(
+    input: &PersistRetirementInput,
+    scheduled_time: Option<std::time::SystemTime>,
+) -> anyhow::Result<()> {
+    let storage = agent_storage();
+    let fs = AgentFs::attach(storage, &input.fs_handle.prefix);
+    let retired_at: DateTime<Utc> = scheduled_time
+        .map(DateTime::<Utc>::from)
+        .unwrap_or_else(Utc::now);
+    fs.persist_retirement(&input.reason, retired_at).await?;
+    Ok(())
 }
 
 #[cfg(test)]

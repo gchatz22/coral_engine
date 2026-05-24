@@ -38,6 +38,7 @@
 //! `CallTools` → `join_all` → `persist_retirement` path executed.
 
 use std::env;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -50,12 +51,35 @@ use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
 use jarvis_node::decision::{ClaimSeed, Decision, ToolCall};
+use jarvis_node::storage::{AgentStorage, MemoryStorage};
 use jarvis_temporal::activities::set_decision_script;
-use jarvis_temporal::worker::build_worker;
+use jarvis_temporal::worker::{build_worker, install_agent_storage};
 use jarvis_temporal::workflow::{agent_workflow_id, AgentInput, AgentResult, AgentWorkflow};
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
 const DEFAULT_NAMESPACE: &str = "default";
+
+/// Process-wide handle to the `MemoryStorage` the test worker uses for
+/// every activity body that reaches for `worker::agent_storage()`
+/// (JAR2-66's `persist_retirement` is the first one). Installed once
+/// per test process via [`install_or_reuse_test_storage`] — the
+/// underlying `OnceLock` in `worker.rs::AGENT_STORAGE` panics on
+/// double-install by design.
+static SHARED_TEST_STORAGE: OnceLock<Arc<MemoryStorage>> = OnceLock::new();
+
+/// Install a process-wide `MemoryStorage` the first time this is
+/// called and return a concretely-typed `Arc<MemoryStorage>` clone for
+/// post-workflow key inspection. Subsequent calls (e.g. a second test
+/// in this binary) reuse the same backend.
+fn install_or_reuse_test_storage() -> Arc<MemoryStorage> {
+    SHARED_TEST_STORAGE
+        .get_or_init(|| {
+            let storage: Arc<MemoryStorage> = Arc::new(MemoryStorage::new());
+            install_agent_storage(storage.clone() as Arc<dyn AgentStorage>);
+            storage
+        })
+        .clone()
+}
 
 fn run_suffix() -> String {
     SystemTime::now()
@@ -117,6 +141,15 @@ async fn run_live_test() -> Result<()> {
         },
     ]);
 
+    // JAR2-66: the `persist_retirement` activity body calls
+    // `worker::agent_storage()`, which panics if no backend has been
+    // installed. Pre-JAR2-66 the activity was a no-op stub so this test
+    // worked without the install. Wire a `MemoryStorage` here so the
+    // worker can serve the activity, and keep the typed Arc clone so
+    // the post-workflow assertion below can `get` the resulting
+    // `retirement.json`.
+    let storage = install_or_reuse_test_storage();
+
     let telemetry_options = TelemetryOptions::builder().build();
     let runtime = CoreRuntime::new_assume_tokio(
         RuntimeOptions::builder()
@@ -129,6 +162,13 @@ async fn run_live_test() -> Result<()> {
     let shutdown = worker.shutdown_handle();
 
     let driver_task_queue = task_queue.clone();
+    // Per-run agent prefix the workflow's `FsHandle` will scope to.
+    // Embedding the run suffix keeps reruns of this test against the
+    // same shared `MemoryStorage` from colliding on
+    // `<prefix>retirement.json`.
+    let agent_prefix = format!("graphs/g-loop-test/agents/a-loop-test-{suffix}");
+    let driver_prefix = agent_prefix.clone();
+    let driver_storage = storage.clone();
     let driver = tokio::spawn(async move {
         let workflow_id = format!(
             "{}-{suffix}",
@@ -146,7 +186,14 @@ async fn run_live_test() -> Result<()> {
             }
         }
         let _guard = ShutdownGuard(shutdown);
-        drive(client, &driver_task_queue, &workflow_id).await
+        drive(
+            client,
+            &driver_task_queue,
+            &workflow_id,
+            &driver_prefix,
+            driver_storage,
+        )
+        .await
     });
 
     // 60-second timeout matches JAR2-58's test ceiling; the workflow
@@ -162,11 +209,27 @@ async fn run_live_test() -> Result<()> {
     Ok(())
 }
 
-async fn drive(client: Client, task_queue: &str, workflow_id: &str) -> Result<()> {
+async fn drive(
+    client: Client,
+    task_queue: &str,
+    workflow_id: &str,
+    agent_prefix: &str,
+    storage: Arc<MemoryStorage>,
+) -> Result<()> {
+    // Build an `AgentInput` that scopes the per-agent FS to a per-run
+    // prefix — the workflow body passes it into every activity input,
+    // and JAR2-66's `persist_retirement` writes to
+    // `<prefix>/retirement.json` (the file we assert exists below).
+    let input = AgentInput {
+        fs_handle: jarvis_temporal::workflow::FsHandle {
+            prefix: agent_prefix.into(),
+        },
+        ..AgentInput::default()
+    };
     let handle = client
         .start_workflow(
             AgentWorkflow::run,
-            AgentInput::default(),
+            input,
             WorkflowStartOptions::new(task_queue, workflow_id).build(),
         )
         .await
@@ -246,5 +309,60 @@ async fn drive(client: Client, task_queue: &str, workflow_id: &str) -> Result<()
         persist_retirement_schedules >= 1,
         "expected at least 1 persist_retirement invocation, got {persist_retirement_schedules}"
     );
+
+    // JAR2-66: the real `persist_retirement` activity body wrote
+    // `<prefix>/retirement.json` via the shared MemoryStorage. Assert
+    // the file lands with the scripted reason and a UTC-shaped
+    // timestamp. Sourcing the bytes via the typed `Arc<MemoryStorage>`
+    // we kept from the install — same backend the worker's activity
+    // body wrote into through `worker::agent_storage()`.
+    let key = format!("{agent_prefix}/retirement.json");
+    let bytes = storage
+        .get(&key)
+        .await
+        .context("MemoryStorage::get on retirement.json")?
+        .ok_or_else(|| anyhow::anyhow!("retirement.json absent at key {key}"))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&bytes).context("retirement.json is not JSON")?;
+    let reason_on_disk = v
+        .get("reason")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow::anyhow!("retirement.json missing reason"))?;
+    assert!(
+        reason_on_disk.contains("scripted retire"),
+        "retirement.json carries wrong reason: {reason_on_disk:?}"
+    );
+    let retired_at = v
+        .get("retired_at")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow::anyhow!("retirement.json missing retired_at"))?;
+    // chrono RFC 3339 form. The activity body sources the timestamp
+    // from `ctx.info().scheduled_time` (deterministic from workflow
+    // history) so a worker retry produces byte-identical bytes —
+    // JAR2-66 § "Why scheduled_time" in activities.rs.
+    assert!(
+        retired_at.ends_with("+00:00") || retired_at.ends_with('Z'),
+        "retired_at not UTC-shaped: {retired_at:?}"
+    );
+
+    // mandate.json must NOT have been written by the retirement path
+    // — `AgentFs::attach` (used by the activity body) skips it. The
+    // workflow doesn't currently call `assemble_context` against
+    // `new_with_storage` either (stubs ignore storage today), so the
+    // key should be absent. Once JAR2-61's real `assemble_context`
+    // lands and reads/writes mandate.json, this assertion will need to
+    // move to a more targeted shape; flagging here so the next ticket
+    // doesn't trip on it silently.
+    let mandate_key = format!("{agent_prefix}/mandate.json");
+    let mandate = storage
+        .get(&mandate_key)
+        .await
+        .context("MemoryStorage::get on mandate.json")?;
+    assert!(
+        mandate.is_none(),
+        "retirement path must not materialise mandate.json (got {} bytes)",
+        mandate.as_ref().map(|b| b.len()).unwrap_or(0),
+    );
+
     Ok(())
 }

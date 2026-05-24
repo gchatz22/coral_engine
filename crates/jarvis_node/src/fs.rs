@@ -464,6 +464,35 @@ impl AgentFs {
         Ok(me)
     }
 
+    /// Build an `AgentFs` over `storage` at `prefix` **without** the
+    /// mandate.json read/write or the tail-index reconciliation that
+    /// [`AgentFs::new_with_storage`] performs.
+    ///
+    /// Use when the caller needs the facade purely to write a known key
+    /// (e.g. `retirement.json` from the Temporal `persist_retirement`
+    /// activity) and either:
+    ///
+    /// - has no `Mandate` available in scope (the retirement-signal
+    ///   short-circuit fires before `assemble_context` runs, so no
+    ///   mandate is loaded into workflow state); **or**
+    /// - wants to skip the per-attach LIST that drives tail-index
+    ///   reconciliation when the operation doesn't touch
+    ///   `outputs/` / `evidence/`.
+    ///
+    /// `attach` is **strictly weaker** than `new_with_storage`: it makes
+    /// no I/O calls itself. Callers must not use it for paths that rely
+    /// on the tail-index invariants (`list_recent_outputs`,
+    /// `list_recent_evidence`) on a fresh per-call FS — those need
+    /// `new_with_storage`'s reconcile step. The retirement path writes
+    /// one key and exits, so the missing reconciliation is irrelevant.
+    pub fn attach(storage: Arc<dyn AgentStorage>, prefix: impl Into<String>) -> Self {
+        let mut prefix = prefix.into();
+        if !prefix.is_empty() && !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        Self { storage, prefix }
+    }
+
     /// Reconcile a tail object against the on-disk reality under its
     /// indexed prefix. Called once per `new_with_storage` to recover
     /// from any prior crash that PUT an object without updating the
@@ -748,12 +777,26 @@ impl AgentFs {
             .await
     }
 
-    /// Write `retirement.json` with the supplied reason and the current
-    /// UTC timestamp. Overwrites any prior retirement record.
-    pub async fn persist_retirement(&self, reason: &str) -> anyhow::Result<()> {
+    /// Write `retirement.json` with the supplied reason and `retired_at`
+    /// timestamp. Overwrites any prior retirement record.
+    ///
+    /// **`retired_at` is supplied by the caller**, not stamped here. The
+    /// in-process agent loop (`agent_core::dispatch`) passes `Utc::now()`;
+    /// the Temporal workflow path (`jarvis_temporal::activities::persist_retirement`)
+    /// passes a deterministic timestamp sourced from the activity's
+    /// scheduled-time so replay produces byte-identical bytes — see
+    /// JAR2-66 for the rationale (`scratch/temporal_rust_sdk_smoke.md`
+    /// § 2 row 4: workflow-time must be deterministic from history,
+    /// `Utc::now()` inside an activity body is fine but on retry would
+    /// drift, so we anchor on the SDK's stored timestamp instead).
+    pub async fn persist_retirement(
+        &self,
+        reason: &str,
+        retired_at: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
         let record = RetirementRecord {
             reason: reason.to_string(),
-            retired_at: Utc::now(),
+            retired_at,
         };
         let key = self.key("retirement.json");
         let bytes = serde_json::to_vec_pretty(&record)?;
@@ -1437,12 +1480,75 @@ mod tests {
     #[tokio::test]
     async fn persist_retirement_writes_file() {
         let (tmp, fs, _m) = fresh_fs().await;
-        fs.persist_retirement("done").await.unwrap();
+        let pinned = DateTime::parse_from_rfc3339("2026-05-24T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        fs.persist_retirement("done", pinned).await.unwrap();
         let path = tmp.path().join("retirement.json");
         assert!(path.is_file());
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(v.get("reason").and_then(|x| x.as_str()), Some("done"));
-        assert!(v.get("retired_at").and_then(|x| x.as_str()).is_some());
+        // `retired_at` is the caller-supplied timestamp, exactly — pin
+        // it so a regression that re-stamps `Utc::now()` internally
+        // (defeating workflow-replay determinism) fails loudly.
+        // chrono's serde format for `DateTime<Utc>` emits `Z` for the
+        // UTC offset (compact RFC 3339 form), not `+00:00`.
+        assert_eq!(
+            v.get("retired_at").and_then(|x| x.as_str()),
+            Some("2026-05-24T12:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_skips_mandate_and_writes_retirement() {
+        // `AgentFs::attach` is the no-mandate, no-reconcile constructor
+        // used by the Temporal `persist_retirement` activity body where
+        // no `Mandate` is in scope (the retirement-signal short-circuit
+        // runs before `assemble_context`).
+        let storage: Arc<dyn AgentStorage> = Arc::new(MemoryStorage::new());
+        let fs = AgentFs::attach(Arc::clone(&storage), "graphs/g1/agents/a1");
+        let pinned = DateTime::parse_from_rfc3339("2026-05-24T13:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        fs.persist_retirement("attached", pinned).await.unwrap();
+
+        // mandate.json is *not* created — attach skipped it.
+        let mandate = storage
+            .get("graphs/g1/agents/a1/mandate.json")
+            .await
+            .unwrap();
+        assert!(
+            mandate.is_none(),
+            "attach must not write mandate.json (no mandate in scope)"
+        );
+
+        // retirement.json lives under the prefix and carries the
+        // caller-supplied retired_at byte-for-byte.
+        let key = "graphs/g1/agents/a1/retirement.json";
+        let bytes = storage.get(key).await.unwrap().expect("retirement.json");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v.get("reason").and_then(|x| x.as_str()), Some("attached"));
+        assert_eq!(
+            v.get("retired_at").and_then(|x| x.as_str()),
+            Some("2026-05-24T13:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_normalizes_prefix_with_trailing_slash() {
+        // `new_with_storage` appends `/` to non-empty prefixes; `attach`
+        // must follow the same rule so callers passing
+        // `"graphs/g1/agents/a1"` and `"graphs/g1/agents/a1/"` land in
+        // the same place.
+        let storage: Arc<dyn AgentStorage> = Arc::new(MemoryStorage::new());
+        let bare = AgentFs::attach(Arc::clone(&storage), "graphs/g1/agents/a1");
+        let with_slash = AgentFs::attach(Arc::clone(&storage), "graphs/g1/agents/a1/");
+        // The prefix() accessor exposes the normalized form.
+        assert_eq!(bare.prefix(), with_slash.prefix());
+        assert_eq!(bare.prefix(), "graphs/g1/agents/a1/");
+        // Empty prefix stays empty (no spurious leading slash).
+        let empty = AgentFs::attach(Arc::clone(&storage), "");
+        assert_eq!(empty.prefix(), "");
     }
 
     // ---- JAR2-28: claim_seed persistence -------------------------------
@@ -1812,7 +1918,7 @@ mod tests {
         };
         // If construction somehow succeeded, the second put (retirement)
         // must surface the typed error.
-        let err = fs2.persist_retirement("bye").await.unwrap_err();
+        let err = fs2.persist_retirement("bye", Utc::now()).await.unwrap_err();
         let typed = err
             .downcast_ref::<FsError>()
             .expect("expected FsError wrapping the storage error");
