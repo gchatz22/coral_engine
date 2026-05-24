@@ -48,10 +48,13 @@ expected_args=$(jq -cS . <<< "$args")
     || fail "evidence.args: expected $expected_args, got $got_args"
 
 # 4. outputs/<ulid>.json — filename is random, body fields are stable.
-out_count=$(find "$fs_root/outputs" -mindepth 1 -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' ')
+# JAR2-54 introduced a co-located tail-index sidecar (`outputs/_tail.json`,
+# per `scratch/agent_storage.md` § 7.1). Exclude underscore-prefixed
+# bookkeeping files so the count and selector keep matching the ULID output.
+out_count=$(find "$fs_root/outputs" -mindepth 1 -maxdepth 1 -type f -name '*.json' -not -name '_*' | wc -l | tr -d ' ')
 [[ "$out_count" == "1" ]] \
-    || fail "expected exactly 1 file under outputs/, found $out_count"
-out_file=$(find "$fs_root/outputs" -mindepth 1 -maxdepth 1 -type f -name '*.json' | head -n1)
+    || fail "expected exactly 1 ULID file under outputs/ (excluding _* sidecars), found $out_count"
+out_file=$(find "$fs_root/outputs" -mindepth 1 -maxdepth 1 -type f -name '*.json' -not -name '_*' | head -n1)
 got_content=$(jq -r '.content' "$out_file")
 [[ "$got_content" == "$content" ]] \
     || fail "output.content: expected '$content', got '$got_content'"

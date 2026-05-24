@@ -31,7 +31,7 @@
 //! start_paused = true)]` so the runtime auto-advances when the only
 //! pending task is a sleep, making the deadline-arm tests deterministic.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -78,6 +78,28 @@ fn registry_with_echo() -> ToolRegistry {
     let mut r = ToolRegistry::new();
     r.register(Arc::new(EchoTool)).expect("register echo");
     r
+}
+
+/// Read `dir` and return the files that are *agent record files* —
+/// excluding the JAR2-54 tail-index sidecar (`_tail.json`). Returns
+/// an empty Vec for a missing dir to match the post-JAR2-53 lazy-
+/// directory-creation behavior. Used by every assertion that counts
+/// "how many outputs/evidence files were written" — the tail file is
+/// an index artefact, not a record.
+fn agent_record_files(dir: &Path) -> Vec<PathBuf> {
+    if !dir.exists() {
+        return Vec::new();
+    }
+    std::fs::read_dir(dir)
+        .expect("read agent record dir")
+        .map(|e| e.expect("dirent").path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n != "_tail.json")
+                .unwrap_or(true)
+        })
+        .collect()
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -186,10 +208,7 @@ async fn emit_output_with_valid_evidence_writes_file_under_outputs() {
 
     // Exactly one file under outputs/, and it references the evidence id.
     let outputs_dir = tmp.path().join("outputs");
-    let entries: Vec<_> = std::fs::read_dir(&outputs_dir)
-        .expect("read outputs")
-        .map(|e| e.expect("dirent").path())
-        .collect();
+    let entries = agent_record_files(&outputs_dir);
     assert_eq!(entries.len(), 1, "expected exactly one output file");
     let bytes = std::fs::read(&entries[0]).expect("read output");
     let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
@@ -325,10 +344,7 @@ async fn call_tool_records_evidence_and_emit_output_consumes_it() {
 
     // Output file written by the EmitOutput arm references that evidence.
     let outputs_dir = tmp.path().join("outputs");
-    let entries: Vec<_> = std::fs::read_dir(&outputs_dir)
-        .expect("read outputs")
-        .map(|e| e.expect("dirent").path())
-        .collect();
+    let entries = agent_record_files(&outputs_dir);
     assert_eq!(entries.len(), 1);
 }
 
@@ -428,15 +444,11 @@ async fn invalid_call_tool_stages_correction_then_recovers() {
     // produced an evidence record. The registry rejected the lookup
     // before any tool ran, so `evidence/` is either absent or empty.
     let evidence_dir = tmp.path().join("evidence");
-    if evidence_dir.exists() {
-        let entries: Vec<_> = std::fs::read_dir(&evidence_dir)
-            .expect("read evidence")
-            .collect();
-        assert!(
-            entries.is_empty(),
-            "no evidence should have been recorded for an unregistered tool"
-        );
-    }
+    let entries = agent_record_files(&evidence_dir);
+    assert!(
+        entries.is_empty(),
+        "no evidence should have been recorded for an unregistered tool"
+    );
 
     // Health stays Healthy across the correction cycle — budget was
     // consumed (counter=1) but never exhausted.
@@ -1066,12 +1078,11 @@ async fn tool_call_exhausts_retry_budget_trips_unhealthy() {
     );
     // No evidence record was persisted for the failed call.
     let evidence_dir = tmp.path().join("evidence");
-    if evidence_dir.exists() {
-        assert!(
-            std::fs::read_dir(&evidence_dir).unwrap().next().is_none(),
-            "no evidence should have been recorded for an errored tool call"
-        );
-    }
+    assert!(
+        agent_record_files(&evidence_dir).is_empty(),
+        "no evidence should have been recorded for the failed call: {:?}",
+        agent_record_files(&evidence_dir)
+    );
 }
 
 /// JAR2-25 acceptance test: after the per-tick tool-call budget exhausts
@@ -1175,10 +1186,7 @@ async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
         evidence_dir.is_dir(),
         "evidence dir should exist after recovery"
     );
-    let evs: Vec<_> = std::fs::read_dir(&evidence_dir)
-        .expect("read evidence")
-        .map(|e| e.expect("dirent").path())
-        .collect();
+    let evs = agent_record_files(&evidence_dir);
     assert_eq!(
         evs.len(),
         1,
@@ -1439,10 +1447,7 @@ async fn tool_call_failure_correction_then_different_decision_recovers_to_health
     // Recovery tick's successful CallTool must have persisted exactly
     // one evidence record (from echo). The flaky tool produced none.
     let evidence_dir = tmp.path().join("evidence");
-    let evs: Vec<_> = std::fs::read_dir(&evidence_dir)
-        .expect("read evidence")
-        .map(|e| e.expect("dirent").path())
-        .collect();
+    let evs = agent_record_files(&evidence_dir);
     assert_eq!(
         evs.len(),
         1,
@@ -1609,9 +1614,9 @@ async fn parallel_call_tools_k3_all_succeed_persists_evidence_in_order() {
 
     // Three evidence files on disk, one per call.
     let evidence_dir = tmp.path().join("evidence");
-    let evs: Vec<_> = std::fs::read_dir(&evidence_dir)
-        .expect("read evidence")
-        .map(|e| e.expect("dirent").file_name().into_string().unwrap())
+    let evs: Vec<String> = agent_record_files(&evidence_dir)
+        .into_iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
         .collect();
     assert_eq!(evs.len(), 3, "expected 3 evidence files, got: {evs:?}");
     for id in [&ev_a, &ev_b, &ev_c] {
@@ -1624,10 +1629,7 @@ async fn parallel_call_tools_k3_all_succeed_persists_evidence_in_order() {
 
     // EmitOutput succeeded — one output file referencing all three ids.
     let outputs_dir = tmp.path().join("outputs");
-    let outs: Vec<_> = std::fs::read_dir(&outputs_dir)
-        .expect("read outputs")
-        .map(|e| e.expect("dirent").path())
-        .collect();
+    let outs = agent_record_files(&outputs_dir);
     assert_eq!(outs.len(), 1);
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&outs[0]).unwrap()).unwrap();
     let ev_arr = v["evidence"].as_array().expect("evidence array");
@@ -1728,9 +1730,9 @@ async fn parallel_call_tools_k3_partial_failure_persists_successes_and_stages_co
     let echo_a_id = EvidenceId::new("echo", &json!({"k": "a"}), &json!({"echoed": {"k": "a"}}));
     let echo_c_id = EvidenceId::new("echo", &json!({"k": "c"}), &json!({"echoed": {"k": "c"}}));
     let evidence_dir = tmp.path().join("evidence");
-    let evs: Vec<String> = std::fs::read_dir(&evidence_dir)
-        .expect("read evidence")
-        .map(|e| e.expect("dirent").file_name().into_string().unwrap())
+    let evs: Vec<String> = agent_record_files(&evidence_dir)
+        .into_iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
         .collect();
     assert_eq!(
         evs.len(),
