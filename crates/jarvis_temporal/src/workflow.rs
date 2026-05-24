@@ -458,8 +458,16 @@ async fn wait_for_tick(ctx: &WorkflowContext<AgentWorkflow>) {
 }
 
 /// Invoke the `assemble_context` activity with the per-tick drained
-/// buckets. Stub today; JAR2-61 wires the real body that calls
-/// `agent_core::drain_triggers`.
+/// buckets. JAR2-61 wired the real activity body; this builder constructs
+/// the typed input the activity consumes.
+///
+/// JAR2-61 note on the `mandate` argument: `AgentInput` still carries the
+/// placeholder `AgentConfig` rather than a real [`Mandate`] (JAR2-67's
+/// carryover work owns the upgrade), so the workflow body synthesizes a
+/// minimal placeholder mandate here and ships it through to the activity.
+/// `AgentFs::new_with_storage` is idempotent on `mandate.json` — passing a
+/// placeholder is harmless on agents that already have a written mandate,
+/// and is the bootstrap shape for fresh agents until JAR2-67 lands.
 async fn assemble(
     ctx: &WorkflowContext<AgentWorkflow>,
     input: &AgentInput,
@@ -469,7 +477,7 @@ async fn assemble(
         .start_activity(
             AgentActivities::assemble_context,
             AssembleContextInput {
-                cfg: input.cfg.clone(),
+                mandate: placeholder_mandate(&input.cfg),
                 fs_handle: input.fs_handle.clone(),
                 triggers: drained.triggers,
                 human_ops: drained.human_ops,
@@ -480,6 +488,21 @@ async fn assemble(
         )
         .await?;
     Ok(out.bundle)
+}
+
+/// Build a placeholder [`Mandate`] from the workflow's [`AgentConfig`].
+///
+/// Today `AgentConfig` is an empty placeholder struct (stage 3 hasn't
+/// resolved the three-layer mandate routing yet — see
+/// `scratch/temporal_staged_plan.md` § 8 decision 4). When JAR2-67 ships
+/// real continue-as-new carryover or stage 6 wires the structural DB →
+/// mandate resolver, this helper goes away in favor of an
+/// `input.mandate: Mandate` field on `AgentInput`. Until then the
+/// `assemble_context` activity needs *some* `Mandate` to seed
+/// `ContextBundle.mandate` + `AgentFs::new_with_storage`, so we
+/// synthesize a minimal one here.
+fn placeholder_mandate(_cfg: &AgentConfig) -> jarvis_node::mandate::Mandate {
+    jarvis_node::mandate::Mandate::new("", Duration::ZERO, None)
 }
 
 /// Invoke the `decide_next_action` activity. Stub consults the

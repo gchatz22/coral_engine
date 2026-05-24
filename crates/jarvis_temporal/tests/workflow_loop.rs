@@ -121,6 +121,12 @@ async fn run_live_test() -> Result<()> {
     let suffix = run_suffix();
     let task_queue = format!("jarvis-agents-loop-test-{suffix}");
 
+    // JAR2-66 (main) added `install_or_reuse_test_storage()` below
+    // (line ~171) which installs the process-wide `MemoryStorage` for
+    // every per-tick `worker::agent_storage()` lookup the real
+    // assemble_context body needs. JAR2-61's earlier `catch_unwind`-wrapped
+    // install at this site is dropped on rebase — the helper covers it.
+
     // Install the scripted decision sequence BEFORE the worker starts —
     // by the time the first `decide_next_action` activity body fires,
     // the script is in place. Sequence covers the three cases the
