@@ -213,7 +213,7 @@ impl<D: Decide> Agent<D> {
             if let Some(max) = cfg.max_ticks {
                 if tick >= max {
                     let reason = format!("max_ticks ({}) reached", max);
-                    fs.persist_retirement(&reason).await?;
+                    fs.persist_retirement(&reason, Utc::now()).await?;
                     return Ok(RetireReason(reason));
                 }
             }

@@ -78,6 +78,7 @@
 //! workflow host's needs become concrete.
 
 use anyhow::Result;
+use chrono::Utc;
 use futures::future::join_all;
 use tracing::debug;
 
@@ -238,7 +239,7 @@ pub async fn dispatch(
         }
         Decision::Retire { reason } => {
             debug!(%reason, "decision: retire");
-            fs.persist_retirement(&reason).await?;
+            fs.persist_retirement(&reason, Utc::now()).await?;
             Ok(DispatchOutcome::Retired(RetireReason(reason)))
         }
     }
