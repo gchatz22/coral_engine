@@ -37,6 +37,25 @@ impl HumanOp {
     }
 }
 
+/// Opaque newtype around the JSON payload describing a mandate patch.
+///
+/// Carried by the `mandate_update` signal on the workflow host (JAR2-59)
+/// — operators ship updated routing/budget/tooling preferences mid-flight
+/// and the agent picks them up on the next tick. The kernel does not yet
+/// enforce a schema; stage 6 wires the consumption path and stage 1's
+/// three-layer resolution (`scratch/temporal_staged_plan.md` § 4 decision
+/// 4) defines what fields are legal. Today this is structural plumbing
+/// only — semantics are deferred.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MandatePatch(pub serde_json::Value);
+
+impl MandatePatch {
+    pub fn new(value: serde_json::Value) -> Self {
+        MandatePatch(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,6 +97,17 @@ mod tests {
         // `transparent` means we should see the inner JSON object, not a
         // wrapping struct.
         assert_eq!(s, r#"{"k":"v"}"#);
+    }
+
+    #[test]
+    fn mandate_patch_is_transparent() {
+        // Same opaque-JSON contract as `HumanOp`. Lock today's behaviour
+        // so the signal payload over the wire matches the inner JSON.
+        let p = MandatePatch::new(json!({"model": "gpt-x"}));
+        let s = serde_json::to_string(&p).unwrap();
+        assert_eq!(s, r#"{"model":"gpt-x"}"#);
+        let back: MandatePatch = serde_json::from_str(&s).unwrap();
+        assert_eq!(p, back);
     }
 
     #[test]

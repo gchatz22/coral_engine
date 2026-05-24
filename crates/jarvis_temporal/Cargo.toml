@@ -29,6 +29,12 @@ name = "temporal-smoke"
 path = "src/bin/temporal_smoke.rs"
 
 [dependencies]
+# JAR2-59 — signal handler payload types live with the rest of the
+# operator-facing core (`Trigger`, `HumanOp`, `MandatePatch`). Importing
+# them here keeps `jarvis_temporal` as the *host* and `jarvis_node` as
+# the *type owner*. See `crates/jarvis_temporal/src/workflow.rs` signal
+# handler doc for the placement decision.
+jarvis_node = { path = "../jarvis_node" }
 # `temporalio-sdk` is in Public Preview at v0.4.0 (released 2026-04-29). The
 # SDK lib.rs documents itself as having a "very unstable" workflow API; the
 # smoke doc records what worked and what surprised us against this pin.
