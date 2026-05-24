@@ -31,6 +31,9 @@ use bytes::Bytes;
 use std::io;
 use thiserror::Error;
 
+pub mod local;
+pub use local::LocalStorage;
+
 #[cfg(any(test, feature = "memory-storage"))]
 pub mod memory;
 
