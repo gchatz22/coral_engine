@@ -7,27 +7,40 @@
 //! 1. Starts a Temporal worker registering `AgentWorkflow`.
 //! 2. Starts an `AgentWorkflow` instance with `AgentInput::default()`
 //!    under a unique workflow ID (epoch-ms suffixed).
-//! 3. Lets the workflow continue-as-new (the post-CAN run waits up to
-//!    `POST_CAN_RETIREMENT_WAIT` for a `retire` signal).
-//! 4. Sends one signal of each type: `external_signal(Trigger)`,
-//!    `human_override(HumanOp)`, `mandate_update(MandatePatch)`.
-//! 5. Calls `inspect_state` and asserts the returned snapshot reflects
-//!    all three signals (counts of 1 each, no retirement yet).
-//! 6. Sends `retire(String)` and re-inspects, asserting the retirement
-//!    reason landed.
-//! 7. Awaits `get_result` — the workflow exits cleanly because the
-//!    retire signal fires the `wait_condition` arm of the post-CAN
-//!    `select!`.
+//! 3. Sends a `retire` signal. The JAR2-60 loop body wakes on
+//!    `retirement_request.is_some()` (or a per-tick timer) and
+//!    short-circuits to the retirement path before draining any
+//!    buckets, so subsequent inspect_state can still observe the
+//!    retirement_request landing.
+//! 4. Sends one signal of each non-retire type:
+//!    `external_signal(Trigger)`, `human_override(HumanOp)`,
+//!    `mandate_update(MandatePatch)`. These race the loop's drain —
+//!    we don't assert bucket counts here because the JAR2-60 loop
+//!    drains non-retire buckets at every tick (see JAR2-60 PR body
+//!    "JAR2-59 conflict surfacing").
+//! 5. Calls `inspect_state` and asserts the retirement_request landed.
+//! 6. Awaits `get_result` — the workflow exits cleanly via the
+//!    retirement short-circuit.
 //!
-//! Each step is asserted independently so a failure points at the
-//! specific signal arm that didn't land.
+//! ## JAR2-60 adaptation
+//!
+//! Before JAR2-60, the workflow body was a single `wait_condition + timer`
+//! race; signal payloads stayed in their buckets indefinitely, and
+//! inspect_state observing `pending_triggers_count: 1` was meaningful.
+//! After JAR2-60, the loop drains those buckets at the top of every
+//! tick. The test's "did the signal land?" intent is preserved by
+//! asserting the cumulative counters [`AgentSnapshot::cumulative_triggers_observed`]
+//! / `cumulative_human_ops_observed` / `cumulative_mandate_patches_observed`,
+//! which `drain_buckets` increments by the drained batch size. Each
+//! signal is observed by the loop at some point — whether the bucket
+//! was already drained by the time inspect_state landed is irrelevant
+//! to the cumulative view.
 //!
 //! ## Timing
 //!
-//! The post-CAN run has a `POST_CAN_RETIREMENT_WAIT` ceiling (10s in
-//! `workflow.rs`). The test sends all signals + inspects + sends retire
-//! within that window. Local Temporal Server completes the full flow in
-//! well under 5s; we cap the entire test at 60s for stall detection.
+//! The JAR2-60 loop short-circuits on the first wake observing
+//! `retirement_request.is_some()`. We cap the entire test at 60s for
+//! stall detection.
 //!
 //! ## SDK constraints (see `scratch/temporal_rust_sdk_smoke.md` § 3)
 //!
@@ -143,12 +156,12 @@ async fn drive(client: Client, task_queue: &str, workflow_id: &str) -> Result<()
         .await
         .context("start_workflow(AgentWorkflow)")?;
 
-    // ---- Send one signal of each non-retire type. The first-run
-    //      body fires `continue_as_new` after a 1ms timer, so by the
-    //      time the signals arrive the workflow is on its post-CAN run
-    //      and waiting in the retirement `select!`. Temporal queues
-    //      signals delivered during the CAN gap; we don't need to time
-    //      this precisely.
+    // ---- Send all four signals as quickly as possible. The JAR2-60
+    //      loop body drains non-retire buckets at every tick; by the
+    //      time the inspect update lands, the loop will have observed
+    //      the retirement_request (which the snapshot reads BEFORE the
+    //      short-circuit returns, because `inspect_state` is a sync
+    //      update racing the workflow task) and short-circuited.
     let external_trigger = Trigger::External {
         kind: "test_signal".into(),
         payload: serde_json::json!({"hello": "world"}),
@@ -185,38 +198,6 @@ async fn drive(client: Client, task_queue: &str, workflow_id: &str) -> Result<()
         .context("signal AgentWorkflow::mandate_update")?;
     eprintln!("signal_handlers: sent mandate_update");
 
-    // ---- inspect_state: assert all three buckets reflect the signals
-    //      and retirement has not yet been requested.
-    let snap_before_retire: AgentSnapshot = handle
-        .execute_update(
-            AgentWorkflow::inspect_state,
-            (),
-            WorkflowExecuteUpdateOptions::default(),
-        )
-        .await
-        .context("execute_update inspect_state (pre-retire)")?;
-    eprintln!("signal_handlers: pre-retire snapshot = {snap_before_retire:?}");
-    assert_eq!(
-        snap_before_retire.pending_triggers_count, 1,
-        "external_signal should push exactly 1 trigger onto pending_triggers"
-    );
-    assert_eq!(
-        snap_before_retire.pending_human_ops_count, 1,
-        "human_override should push exactly 1 op onto pending_human_ops"
-    );
-    assert_eq!(
-        snap_before_retire.pending_mandate_patches_count, 1,
-        "mandate_update should push exactly 1 patch onto pending_mandate_patches"
-    );
-    assert!(
-        snap_before_retire.retirement_request.is_none(),
-        "retirement_request should be None until the retire signal lands"
-    );
-
-    // ---- Send retire. The post-CAN body's `wait_condition` arm fires
-    //      and the workflow exits. We re-inspect first to assert the
-    //      reason was recorded; the `get_result` below proves the body
-    //      observed the bucket and returned.
     handle
         .signal(
             AgentWorkflow::retire,
@@ -227,12 +208,19 @@ async fn drive(client: Client, task_queue: &str, workflow_id: &str) -> Result<()
         .context("signal AgentWorkflow::retire")?;
     eprintln!("signal_handlers: sent retire");
 
-    // Retire signal delivery and post-CAN exit race the next
-    // `inspect_state`; in practice the update lands first because the
-    // signal handler and update handler are serialized through the
-    // workflow's task queue. If the workflow exits before this update
-    // resolves we get an `execute_update` error — that's a real bug, so
-    // bubble it up (don't swallow).
+    // ---- inspect_state: assert the retirement_request landed AND the
+    //      three non-retire signals were observed via the cumulative
+    //      counters. The pending_* bucket counts may race the loop's
+    //      drain and so are NOT asserted exactly — the cumulative
+    //      counters are the JAR2-60-stable view of "did the signal
+    //      land?" (incremented by `drain_buckets` for every drained
+    //      batch).
+    //
+    //      The update may race the workflow's post-retirement exit; in
+    //      practice the update lands first because signals + updates
+    //      serialize through the workflow task queue. If the workflow
+    //      exits before the update resolves the SDK returns a typed
+    //      error — bubble it up.
     let snap_after_retire: AgentSnapshot = handle
         .execute_update(
             AgentWorkflow::inspect_state,
@@ -247,12 +235,38 @@ async fn drive(client: Client, task_queue: &str, workflow_id: &str) -> Result<()
         Some("test asked"),
         "retire signal should record reason on retirement_request"
     );
+    // Cumulative counters: each non-retire signal was observed at
+    // least once. Comparing `>= 1` instead of `== 1` because the loop
+    // may have run multiple ticks between signal arrival and inspect
+    // (`INITIAL_NEXT_WAKE` is 1ms — plenty of room for several
+    // iterations) and a re-armed empty bucket might bump the counter
+    // by 0 each time but the first drain captures the signal.
+    assert!(
+        snap_after_retire.cumulative_triggers_observed >= 1,
+        "external_signal should be observed at least once: {snap_after_retire:?}"
+    );
+    assert!(
+        snap_after_retire.cumulative_human_ops_observed >= 1,
+        "human_override should be observed at least once: {snap_after_retire:?}"
+    );
+    assert!(
+        snap_after_retire.cumulative_mandate_patches_observed >= 1,
+        "mandate_update should be observed at least once: {snap_after_retire:?}"
+    );
 
-    // ---- Workflow exits cleanly via the retirement arm.
-    let _result: jarvis_temporal::workflow::AgentResult = handle
+    // ---- Workflow exits cleanly via the retirement arm. AgentResult is
+    //      now a tagged enum; matching on `Retired { reason }` proves
+    //      the loop body went through `persist_retirement` and returned
+    //      with the right reason.
+    let result = handle
         .get_result(WorkflowGetResultOptions::default())
         .await
         .context("AgentWorkflow.get_result")?;
+    let jarvis_temporal::workflow::AgentResult::Retired { reason } = result;
+    assert_eq!(
+        reason, "test asked",
+        "workflow should return the retire signal's reason verbatim"
+    );
     eprintln!("signal_handlers: workflow {workflow_id} exited cleanly after retire");
     Ok(())
 }

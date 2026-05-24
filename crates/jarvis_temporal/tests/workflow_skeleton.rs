@@ -7,17 +7,27 @@
 //! 1. Connects to a Temporal Server at `TEMPORAL_ADDRESS` (default
 //!    `http://localhost:7233`).
 //! 2. Starts an in-process worker registering `AgentWorkflow` +
-//!    `NoopActivities` on a unique task queue (suffixed by epoch-ms so
+//!    `AgentActivities` on a unique task queue (suffixed by epoch-ms so
 //!    parallel test runs don't collide).
-//! 3. Starts `AgentWorkflow` with `AgentInput::default()` (carryover =
-//!    None) under the URL-shaped workflow ID
-//!    `graphs/<graph_id>/agents/<agent_id>` (suffixed with epoch-ms to
-//!    avoid `WorkflowExecutionAlreadyStarted` between iterative runs).
-//! 4. Awaits the workflow result. The body returns `Ok(_)` ONLY on the
-//!    continue-as-new run, so any successful `get_result` is proof that
-//!    continue-as-new fired at least once and the post-CAN run
-//!    terminated cleanly. (No history-event query needed — the
-//!    if/else in `AgentWorkflow::run` makes the invariant structural.)
+//! 3. Starts `AgentWorkflow` with `AgentInput::default()` under the
+//!    URL-shaped workflow ID `graphs/<graph_id>/agents/<agent_id>`.
+//! 4. Sends a `retire` signal after a short delay.
+//! 5. Awaits the workflow result. The new JAR2-60 loop body short-
+//!    circuits to the retirement path when the `retire` signal lands,
+//!    so a successful `get_result` is proof that the loop drained the
+//!    bucket and the `persist_retirement` activity completed.
+//!
+//! ## JAR2-60 adaptation (kept honest, not weakened)
+//!
+//! The JAR2-58 placeholder body terminated on its own (continue-as-new
+//! once, then time out). The JAR2-60 loop runs indefinitely against the
+//! stub `Decision::Idle { 1s }` fallback; it terminates only on a
+//! `Decision::Retire` (from `decide_next_action`) or the `retire`
+//! signal. The original test's intent ("wiring works end-to-end → the
+//! workflow exits cleanly") is preserved by sending `retire`; the path
+//! to exit shifts from "post-CAN timer ceiling" to "retire signal
+//! observed by the loop's `wait_condition` predicate". See JAR2-60 PR
+//! body for the conflict surfacing.
 //!
 //! ## SDK constraints (see `scratch/temporal_rust_sdk_smoke.md`)
 //!
@@ -35,7 +45,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use temporalio_client::{
     Client, ClientOptions, Connection, ConnectionOptions, WorkflowGetResultOptions,
-    WorkflowStartOptions,
+    WorkflowSignalOptions, WorkflowStartOptions,
 };
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
@@ -69,10 +79,11 @@ async fn build_client() -> Result<Client> {
     Ok(client)
 }
 
-/// The live test. Runs an in-process worker + workflow client and
-/// asserts the workflow runs to completion (which structurally proves
-/// continue-as-new fired). Multi-threaded runtime because the worker
-/// and the driver task need to run concurrently.
+/// The live test. Runs an in-process worker + workflow client, sends a
+/// `retire` signal, and asserts the workflow runs to completion via the
+/// JAR2-60 loop's retirement-signal short-circuit. Multi-threaded
+/// runtime because the worker and the driver task need to run
+/// concurrently.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_skeleton_continues_as_new_and_exits() {
     if env::var("TEMPORAL_LIVE_TEST").ok().as_deref() != Some("1") {
@@ -141,17 +152,33 @@ async fn drive(client: Client, task_queue: &str, workflow_id: &str) -> Result<()
         .await
         .context("start_workflow(AgentWorkflow)")?;
 
-    // The body returns `Ok(_)` only on the continue-as-new run; the
-    // first run terminates via `continue_as_new` (which returns
-    // `Err(WorkflowTermination::...)` to the SDK). So receiving any
-    // `Ok` here is structural proof that continue-as-new fired and the
-    // post-CAN run terminated cleanly.
-    // Type inference flows from the workflow's `WorkflowResult<AgentResult>`
-    // return — `get_result()` takes no generic argument.
+    // The JAR2-60 loop body runs until either `Decision::Retire` or the
+    // `retire` signal arrives. With the stubbed `decide_next_action`
+    // returning `Idle { 1s }` (no script installed for this test), the
+    // signal is what terminates the workflow. The short sleep gives
+    // the worker time to register and start the first iteration; the
+    // SDK queues signals that arrive before the workflow registers, so
+    // strictly speaking we don't need it — but it keeps the eprintln
+    // order legible during local debugging.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    handle
+        .signal(
+            AgentWorkflow::retire,
+            "workflow_skeleton test: shutdown".to_string(),
+            WorkflowSignalOptions::default(),
+        )
+        .await
+        .context("signal AgentWorkflow::retire")?;
+    eprintln!("workflow_skeleton: sent retire signal");
+
+    // Receiving any `Ok` here is proof that the loop body observed the
+    // retirement signal and the `persist_retirement` activity
+    // completed. Type inference flows from the workflow's
+    // `WorkflowResult<AgentResult>` return.
     let _result: jarvis_temporal::workflow::AgentResult = handle
         .get_result(WorkflowGetResultOptions::default())
         .await
         .context("AgentWorkflow.get_result")?;
-    eprintln!("workflow_skeleton: workflow {workflow_id} terminated cleanly post-CAN");
+    eprintln!("workflow_skeleton: workflow {workflow_id} terminated cleanly via retire signal");
     Ok(())
 }
