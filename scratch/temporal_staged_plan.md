@@ -21,30 +21,45 @@ Today's `Agent::run` (in `src/agent.rs`) is ~700 lines of "race triggers vs dead
 We factor along that seam. The proposed shape:
 
 ```
-AgentCore — pure, no async runtime, no mpsc, no signal source.
+AgentCore — no async runtime, no mpsc, no signal source. Pure of those host
+            concerns; NOT pure of FS/tool side effects — dispatch IS the
+            in-process applier, called only by Agent::run.
   - drain_triggers(in: Vec<Trigger>, fs, cfg, prior_correction) -> ContextBundle
   - decide(bundle, &Decide impl) -> Result<Decision>
-  - dispatch(decision, fs, &Tools, &CorrectionTracker) -> DispatchOutcome
+  - dispatch(&AgentFs, &ToolRegistry, &mut Scheduler, decision) -> DispatchOutcome
     where DispatchOutcome ∈ {
-      Continue { next_idle, recorded_evidence: Vec<EvidenceId> },
-      Correction { ctx: CorrectionContext },
-      Retired { reason },
+      Continue,                                  // loop continues
+      NeedsCorrection(String),                   // stage a correction for next tick
+      ToolError { failures: Vec<ToolFailure> },  // K-call partial failure (JAR2-38)
+      Retired(RetireReason),                     // terminal
     }
+    Body calls fs.persist_output / fs.apply_ops / fs.persist_retirement /
+    fs.record_evidence / tools.call / scheduler.set_next_after inline; the
+    returned DispatchOutcome is the loop's continuation state machine.
 
 AgentWorkflow — Temporal workflow, hosts the loop:
   - signal handlers route Trigger into workflow state
-  - workflow body: wait_condition(triggers_pending, timeout=next_wake) → AgentCore::drain → activity(assemble_context) → activity(decide) → activity(execute_tool) per CallTool → activity(persist_output) → ...
+  - workflow body matches on Decision directly (NOT via AgentCore::dispatch):
+      wait_condition(triggers_pending, timeout=next_wake)
+      → AgentCore::drain_triggers (pure, in-workflow)
+      → activity(assemble_context)
+      → activity(decide_next_action)
+      → match Decision { CallTools => N × activity(execute_tool), EmitOutput =>
+        activity(persist_output), RewriteFs => activity(apply_fs_ops),
+        Retire => activity(persist_retirement), Idle => update next_wake }
   - continue_as_new on history threshold
   - small typed carryover
 
-Agent::run — in-process loop (existing), refactored to call AgentCore.
+Agent::run — in-process loop (existing), refactored to call AgentCore::dispatch.
   - Stays alive for hermetic tests and the existing node-run/node-run-llm smokes.
   - Source of truth for "how the loop behaves" until AgentWorkflow ships; then becomes the test driver.
 ```
 
-`AgentCore`'s functions are sync-or-async-pure (no `tokio::select!`, no channels). The async runtime concerns and the signal source are properties of the host (`AgentWorkflow` or `Agent::run`), not the core. This makes the workflow easy to write (the workflow code is small because the logic is in the core), keeps the in-process loop alive as a fast test driver, and gives us a clean cutover when we're ready: route real traffic through `AgentWorkflow`, keep `Agent::run` only for `cargo test`.
+The seam that survives across hosts is **`Decision` (input, shared)** + **`DispatchOutcome`'s continuation variants (shared semantic intent: Continue / NeedsCorrection / ToolError / Retired)**. `AgentCore::dispatch` itself is the in-process loop's implementation of that semantic; the workflow host has its own implementation that maps `Decision` to activities directly and never calls `AgentCore::dispatch`. `drain_triggers` and `decide` are genuinely pure of FS/tool effects and are shared by both hosts; `dispatch` is host-specific code that happens to live in `jarvis_node` so the in-process loop can be a thin wrapper.
 
-**Stage 3 is mostly a refactor of `Agent::run` into `AgentCore` + a new `AgentWorkflow` that calls it.** The size is not "rewrite the agent loop" — it's "factor the agent loop and host it twice." That's a key piece of context for sizing.
+The async runtime concerns and the signal source are properties of the host (`AgentWorkflow` or `Agent::run`), not the core. This gives us a clean cutover when we're ready: route real traffic through `AgentWorkflow`, keep `Agent::run` only for `cargo test`.
+
+**Stage 3 is mostly a refactor of `Agent::run` into `AgentCore` (drain + decide + in-process dispatch) + a new `AgentWorkflow` that orchestrates `Decision` via activities.** The size is not "rewrite the agent loop" — it's "factor the agent loop, share what generalises (drain/decide/Decision/continuation semantics), and let each host own its own side-effect orchestration." That's a key piece of context for sizing.
 
 ---
 
@@ -87,7 +102,7 @@ If the **worker process itself crashes** anywhere in 1–7, Temporal replays fro
 
 **Replayability implication for the workflow code.** Workflow code (the orchestrator inside `AgentWorkflow`) must be **deterministic across replay** — no `std::time::now()`, no random, no file I/O, no network. All non-determinism lives in activities. This is a Temporal hard rule; we obey it by making the workflow code small and the activities do everything else.
 
-This principle is why `AgentCore::dispatch` from § 2 is structured the way it is: it doesn't *call* the side-effectful operations, it *returns* a description of what to do (a `DispatchOutcome` variant). The host (workflow or in-process loop) then maps that to activity calls. The core stays pure; the host owns the durability boundaries.
+This principle shapes how `AgentWorkflow` is structured — it matches on `Decision` directly and routes each variant to its own activity, so each side effect lands inside a durable boundary. `AgentCore::dispatch` is the in-process host's parallel implementation (calls FS/tools inline, no activities, no durability), kept around for hermetic tests and the existing `node-run`/`node-run-llm` smokes. What's shared across hosts is **`Decision`** (the LLM-shaped action description, the same input on both sides) and **the continuation-state semantics** (Continue / NeedsCorrection / ToolError / Retired — surface as `DispatchOutcome` in-process, as workflow-state mutations + signal-queue updates in the workflow host). The earlier framing in § 2 — "dispatch returns a description; the host maps it to activity calls" — was abandoned at implementation because the workflow host doesn't go through `dispatch` at all and a pure-translator dispatch would have no consumers.
 
 ---
 
