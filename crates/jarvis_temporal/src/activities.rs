@@ -191,9 +191,25 @@ pub struct PersistOutputInput {
 }
 
 /// Input to [`AgentActivities::apply_fs_ops`].
+///
+/// JAR2-65 carries a `Mandate` because [`jarvis_node::fs::AgentFs::new_with_storage`]
+/// requires one to reify an `AgentFs` against the shared storage. The
+/// mandate is decorative for this call path — `AgentFs::new_with_storage`
+/// only writes `mandate.json` when absent, and `apply_fs_ops` runs only
+/// against agents that have already gone through `assemble_context` at
+/// least once (so `mandate.json` already exists on disk). Carrying the
+/// real mandate, rather than fishing it out of disk inside the activity,
+/// keeps the activity body single-storage-roundtrip.
+///
+/// **Today** the workflow body passes a placeholder
+/// `Mandate::new("", Duration::ZERO, None)` because `AgentConfig` is the
+/// JAR2-58 placeholder unit struct. When `AgentConfig` grows a real
+/// mandate field (later stage), only the workflow call site changes —
+/// this input shape stays the same.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApplyFsOpsInput {
     pub fs_handle: FsHandle,
+    pub mandate: Mandate,
     pub ops: Vec<FsOp>,
 }
 
@@ -240,6 +256,23 @@ fn pop_scripted_decision() -> Option<Decision> {
         .lock()
         .expect("DECISION_SCRIPT mutex poisoned")
         .pop_front()
+}
+
+/// Substantive body of [`AgentActivities::apply_fs_ops`], factored out so
+/// hermetic unit tests can drive it against a `MemoryStorage` backend
+/// directly without the live-test-only `ActivityContext` indirection.
+///
+/// Builds an `AgentFs` over `storage` at the per-agent prefix and forwards
+/// the op batch. Returns `anyhow::Result<()>` so the activity-level `?`
+/// lifts the error into `ActivityError::Application(...)` via the SDK's
+/// blanket impl.
+async fn apply_fs_ops_impl(
+    storage: std::sync::Arc<dyn jarvis_node::storage::AgentStorage>,
+    input: ApplyFsOpsInput,
+) -> anyhow::Result<()> {
+    let fs = AgentFs::new_with_storage(storage, &input.fs_handle.prefix, &input.mandate).await?;
+    fs.apply_ops(input.ops).await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -572,13 +605,36 @@ impl AgentActivities {
         Ok(id)
     }
 
-    /// Stage 3.9 (JAR2-65). Stub is a no-op. JAR2-65 replaces the body
-    /// with `AgentFs::apply_ops`.
+    /// Stage 3.9 (JAR2-65). Reify an [`AgentFs`] over the worker-shared
+    /// storage at the agent's prefix and apply the batch of [`FsOp`]s.
+    ///
+    /// Path validation (no traversal, must live under `notes/`) is
+    /// enforced inside [`AgentFs::apply_ops`]; this body does no
+    /// re-validation. The activity has no idempotency primitive of its
+    /// own — Temporal retries (heartbeat timeout, worker restart) re-run
+    /// the activity body, but `FsOp` is deterministic state: replaying
+    /// the same set of writes/deletes against the same prefix produces
+    /// the same file state. Mutable, not content-addressed; effectively
+    /// idempotent for the load-bearing case (Temporal-retry).
+    ///
+    /// Error mapping: [`apply_fs_ops_impl`] returns `anyhow::Result<()>`,
+    /// which `?` lifts into `ActivityError::Application(...)` via the
+    /// SDK's blanket `From<E> for ActivityError where E: Into<anyhow::Error>`.
+    /// Typed `FsError::PathTraversal` / `FsError::PathOutsideNotes` /
+    /// `FsError::Storage` all surface as application failures, which is
+    /// what Temporal expects from an activity-level reject.
+    ///
+    /// Body delegates to the free-function [`apply_fs_ops_impl`] so the
+    /// unit tests at the bottom of this module can exercise the storage
+    /// roundtrip without needing to construct an `ActivityContext`
+    /// (which requires an `Arc<CoreWorker>` and is therefore not
+    /// hermetically buildable in a `#[test]`).
     #[activity]
     pub async fn apply_fs_ops(
         _ctx: ActivityContext,
-        _input: ApplyFsOpsInput,
+        input: ApplyFsOpsInput,
     ) -> Result<(), ActivityError> {
+        apply_fs_ops_impl(crate::worker::agent_storage(), input).await?;
         Ok(())
     }
 
@@ -882,6 +938,7 @@ mod tests {
             fs_handle: FsHandle {
                 prefix: "g1/a1".into(),
             },
+            mandate: Mandate::new("test", Duration::from_millis(100), None),
             ops: vec![FsOp::WriteFile {
                 path: "n/x.md".into(),
                 content: "hi".into(),
@@ -1005,6 +1062,119 @@ mod tests {
             assert!(
                 failure.is_non_retryable(),
                 "Parse/Other errors must be non-retryable"
+            );
+        }
+    }
+
+    // ---- JAR2-65: apply_fs_ops hermetic coverage -----------------------
+    //
+    // Exercise the substantive `apply_fs_ops_impl` body against a
+    // `MemoryStorage` backend. Bypasses `worker::agent_storage()` (the
+    // process-wide `OnceLock` is consumed by `worker::tests`) and the
+    // `ActivityContext` (unconstructable without `Arc<CoreWorker>`).
+    // Both happy-path and traversal-rejection are covered here; the live
+    // path through Temporal is in `tests/workflow_loop.rs`.
+    //
+    // Imports `AgentStorage`/`Arc` already in scope via `use super::*`;
+    // `FsError` and `MemoryStorage` are imported by JAR2-64's tests
+    // block further down — no duplicate `use` here.
+
+    fn fresh_storage_and_input(ops: Vec<FsOp>) -> (Arc<dyn AgentStorage>, ApplyFsOpsInput) {
+        let storage: Arc<dyn AgentStorage> = Arc::new(MemoryStorage::new());
+        let input = ApplyFsOpsInput {
+            fs_handle: FsHandle {
+                prefix: "graphs/g/agents/a".into(),
+            },
+            mandate: Mandate::new("hermetic", Duration::from_millis(100), None),
+            ops,
+        };
+        (storage, input)
+    }
+
+    #[tokio::test]
+    async fn apply_fs_ops_writes_both_notes_files_under_prefix() {
+        let (storage, input) = fresh_storage_and_input(vec![
+            FsOp::WriteFile {
+                path: "notes/a.md".into(),
+                content: "alpha".into(),
+            },
+            FsOp::WriteFile {
+                path: "notes/sub/b.md".into(),
+                content: "bravo".into(),
+            },
+        ]);
+
+        apply_fs_ops_impl(storage.clone(), input)
+            .await
+            .expect("apply_fs_ops_impl");
+
+        // Both files land at the agent-prefixed `notes/` key. Hit the
+        // backend directly so we don't accidentally couple the assertion
+        // to `AgentFs` read methods.
+        let a = storage
+            .get("graphs/g/agents/a/notes/a.md")
+            .await
+            .expect("get a")
+            .expect("a present");
+        assert_eq!(a.as_ref(), b"alpha");
+        let b = storage
+            .get("graphs/g/agents/a/notes/sub/b.md")
+            .await
+            .expect("get b")
+            .expect("b present");
+        assert_eq!(b.as_ref(), b"bravo");
+    }
+
+    #[tokio::test]
+    async fn apply_fs_ops_rejects_traversal_and_leaves_fs_untouched() {
+        // First write a known-good note so we can prove the second
+        // batch's traversal op didn't clobber it.
+        let (storage, seed_input) = fresh_storage_and_input(vec![FsOp::WriteFile {
+            path: "notes/keep.md".into(),
+            content: "preserved".into(),
+        }]);
+        apply_fs_ops_impl(storage.clone(), seed_input)
+            .await
+            .expect("seed apply_fs_ops_impl");
+
+        let traversal_input = ApplyFsOpsInput {
+            fs_handle: FsHandle {
+                prefix: "graphs/g/agents/a".into(),
+            },
+            mandate: Mandate::new("hermetic", Duration::from_millis(100), None),
+            ops: vec![FsOp::WriteFile {
+                path: "../outside.md".into(),
+                content: "escape".into(),
+            }],
+        };
+        let err = apply_fs_ops_impl(storage.clone(), traversal_input)
+            .await
+            .expect_err("traversal op must reject");
+        let downcast = err.downcast_ref::<FsError>().expect("typed FsError");
+        assert!(
+            matches!(downcast, FsError::PathTraversal(_)),
+            "expected PathTraversal, got {downcast:?}"
+        );
+
+        // Original file unchanged.
+        let still_there = storage
+            .get("graphs/g/agents/a/notes/keep.md")
+            .await
+            .expect("get keep")
+            .expect("keep present");
+        assert_eq!(still_there.as_ref(), b"preserved");
+
+        // No `../outside.md`-shaped key landed under the agent prefix
+        // (or at the root). Scan via `list` because escape keys could
+        // appear anywhere.
+        let all = storage
+            .list("", None, usize::MAX)
+            .await
+            .expect("list all keys");
+        for key in &all.keys {
+            assert!(
+                !key.contains("outside"),
+                "traversal write leaked to backend: {key}"
             );
         }
     }
@@ -1201,5 +1371,64 @@ mod tests {
             .expect_err("must fail on empty evidence");
         let typed = err.downcast_ref::<FsError>().expect("typed FsError");
         assert!(matches!(typed, FsError::EmptyEvidence));
+    }
+
+    // ---- JAR2-65: apply_fs_ops additional coverage (path validation + replay) ----
+
+    #[tokio::test]
+    async fn apply_fs_ops_rejects_path_outside_notes() {
+        let (storage, input) = fresh_storage_and_input(vec![FsOp::WriteFile {
+            path: "outputs/x.json".into(),
+            content: "wrong dir".into(),
+        }]);
+        let err = apply_fs_ops_impl(storage.clone(), input)
+            .await
+            .expect_err("non-notes path must reject");
+        let downcast = err.downcast_ref::<FsError>().expect("typed FsError");
+        assert!(
+            matches!(downcast, FsError::PathOutsideNotes(_)),
+            "expected PathOutsideNotes, got {downcast:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_fs_ops_replay_is_idempotent_for_writes() {
+        // Models the Temporal retry path: same input, applied twice,
+        // must leave file state identical.
+        let (storage, _) = fresh_storage_and_input(vec![]);
+        let ops_a = vec![
+            FsOp::WriteFile {
+                path: "notes/a.md".into(),
+                content: "v1".into(),
+            },
+            FsOp::WriteFile {
+                path: "notes/b.md".into(),
+                content: "v1".into(),
+            },
+        ];
+        let input_a = ApplyFsOpsInput {
+            fs_handle: FsHandle {
+                prefix: "graphs/g/agents/a".into(),
+            },
+            mandate: Mandate::new("hermetic", Duration::from_millis(100), None),
+            ops: ops_a,
+        };
+        apply_fs_ops_impl(storage.clone(), input_a.clone())
+            .await
+            .unwrap();
+        apply_fs_ops_impl(storage.clone(), input_a).await.unwrap();
+
+        let a = storage
+            .get("graphs/g/agents/a/notes/a.md")
+            .await
+            .unwrap()
+            .unwrap();
+        let b = storage
+            .get("graphs/g/agents/a/notes/b.md")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.as_ref(), b"v1");
+        assert_eq!(b.as_ref(), b"v1");
     }
 }
