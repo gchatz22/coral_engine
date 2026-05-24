@@ -51,6 +51,24 @@
 //! with neither feature still compiles, but errors at boot when it
 //! can't find a vendor to install. Mirrors
 //! `jarvis_node/src/bin/node_run_llm.rs`'s feature-gating shape.
+//!
+//! ## Tool registry (JAR2-63)
+//!
+//! On boot the worker builds a [`ToolRegistry`] with the bootstrap
+//! [`EchoTool`] registered under its default name (`"echo"`) and
+//! installs it via
+//! [`jarvis_temporal::worker::install_tool_registry`]. The `execute_tool`
+//! activity body fetches it via
+//! [`jarvis_temporal::worker::tool_registry`] per invocation.
+//!
+//! **MCP server wiring is a follow-up.** Mirroring `node_run_mcp.rs`'s
+//! `ToolRegistry::register_mcp_server_with_policy` requires the `mcp`
+//! cargo feature on `jarvis_node`, which `jarvis_temporal` does not yet
+//! enable (kept off for the bootstrap to match the rest of the test
+//! surface). Threading MCP server spawn configs through env vars and
+//! enabling the feature lands in the JAR2-68 close-the-project smoke;
+//! today's worker only serves the `echo` tool, which is enough for the
+//! JAR2-60 + JAR2-63 live tests.
 
 use std::env;
 use std::path::PathBuf;
@@ -69,13 +87,14 @@ use jarvis_node::model_client::CompleteOptions;
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 use jarvis_node::model_client::ModelClient;
 use jarvis_node::storage::LocalStorage;
+use jarvis_node::tools::{EchoTool, ToolRegistry};
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 use tracing::info;
 
 use jarvis_temporal::worker::{
-    build_worker, install_agent_storage, install_decide, DEFAULT_TASK_QUEUE,
+    build_worker, install_agent_storage, install_decide, install_tool_registry, DEFAULT_TASK_QUEUE,
 };
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
@@ -136,6 +155,16 @@ async fn main() -> Result<()> {
     let (vendor_tag, decide) = build_decide()?;
     install_decide(decide);
     info!(vendor = vendor_tag, "installed Decide backend");
+
+    // JAR2-63: install the process-wide ToolRegistry the `execute_tool`
+    // activity dispatches through. Bootstrap registers only EchoTool;
+    // MCP server wiring lands later in the stack (see module doc).
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Arc::new(EchoTool))
+        .context("registering EchoTool in worker boot ToolRegistry")?;
+    install_tool_registry(Arc::new(registry));
+    info!("installed ToolRegistry with tools: echo");
 
     let telemetry_options = TelemetryOptions::builder().build();
     let runtime = CoreRuntime::new_assume_tokio(
