@@ -17,6 +17,11 @@ pub mod mandate;
 pub mod mcp;
 pub mod model_client;
 pub mod scheduler;
+// JAR2-51: pluggable per-agent storage abstraction. Today's `AgentFs`
+// (`src/fs.rs`) becomes a facade over `Arc<dyn AgentStorage>` in JAR2-53;
+// `LocalStorage` (the on-disk backend) lands in JAR2-52. See
+// `scratch/agent_storage.md` for the design.
+pub mod storage;
 pub mod tools;
 pub mod trigger;
 pub mod trigger_queue;
