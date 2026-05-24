@@ -7,6 +7,10 @@
 //! later tickets (JAR2-4+).
 
 pub mod agent;
+// JAR2-57 (stage 3.1): pure per-tick logic — `drain_triggers`, `decide`,
+// `dispatch` + `DispatchOutcome`. Hosted by today's `Agent::run` and (in
+// stage 3.4+) by `AgentWorkflow`. See `agent_core.rs` module doc.
+pub mod agent_core;
 pub mod decide_llm;
 pub mod decision;
 pub mod evidence;
