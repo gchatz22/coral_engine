@@ -132,6 +132,19 @@ llm-cohere = ["jarvis_temporal/llm-cohere"]
 # `jarvis_run_workflow`'s test layout).
 tempfile = "3"
 
+# JAR2-74 — the `jarvis_apply_smoke.rs` integration test impls
+# `Tool` for an inline test double (`EchoLike`); `Tool::call` is an
+# async-trait method, so the impl block needs the `#[async_trait]`
+# attribute. Mirrors `jarvis_temporal`'s dev-dep on the same crate
+# for the same reason in `tests/workflow_smoke.rs`.
+async-trait = "0.1"
+# JAR2-74 — the integration test uses `MemoryStorage` as the storage
+# backend, which is gated behind the `memory-storage` feature on
+# `jarvis_node`. Dev-only override turns the feature on for the test
+# build without dragging it into the production `jarvis-apply` binary.
+# Mirrors the analogous override in `jarvis_temporal/Cargo.toml`.
+jarvis_node = { path = "../jarvis_node", features = ["memory-storage"] }
+
 # Stage-1 lint posture matches `jarvis_node` — see its `Cargo.toml` for
 # the rationale (clippy 1.88 promoted a handful of style lints; keep the
 # diff small until there's a reason to broadly modernize formatting).

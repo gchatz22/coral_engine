@@ -316,6 +316,31 @@ jobs:
           cargo test --locked -p jarvis_temporal --test workflow_smoke -- --nocapture \
             2>&1 | tee ci-logs/workflow-smoke.log
 
+      # JAR2-74 — Stage 4.3 sibling smoke. Drives the same scripted-Decide
+      # sequence as `workflow_smoke` but routes the `AgentInput` + seed
+      # triggers through `jarvis_graph::yaml::{parse_and_validate,
+      # into_agent_input, yaml_seed_triggers}` against
+      # `examples/smoke_llm_temporal/graph.yaml`. End-state assertion
+      # (same three durable artifacts) pins the YAML's content to the
+      # legacy JAR2-68 fixture pair. No Postgres dependency: the test
+      # skips `GraphStore::create_from_yaml` (DB write is covered by
+      # JAR2-73's own `#[sqlx::test]` cases in the lint-and-test job).
+      - name: Run jarvis-apply smoke
+        env:
+          TEMPORAL_LIVE_TEST: "1"
+          # `jarvis_graph`'s lib carries compile-time-checked `sqlx::query!`
+          # macros (via `GraphStore`). Compiling the test binary brings the
+          # lib along, so we need either a live DB or the committed `.sqlx/`
+          # cache. The `temporal-workflow-smoke` job intentionally has no
+          # Postgres service container (the runtime path skips
+          # `create_from_yaml`), so route the build through the offline
+          # cache — same shape `lint-and-test` uses at job scope.
+          SQLX_OFFLINE: "true"
+        run: |
+          set -o pipefail
+          cargo test --locked -p jarvis_graph --test jarvis_apply_smoke -- --nocapture \
+            2>&1 | tee ci-logs/jarvis-apply-smoke.log
+
       - name: Upload workflow smoke logs on failure
         if: failure()
         uses: actions/upload-artifact@v4

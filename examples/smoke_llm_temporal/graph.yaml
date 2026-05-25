@@ -1,0 +1,43 @@
+# Stage 4.3 (JAR2-74) — single-file fixture that supersedes
+# `config.json` + `triggers.jsonl`. Both legacy files are retained
+# (the `jarvis-run-workflow` binary still consumes them); see README.md
+# for the deprecation note.
+#
+# This YAML round-trips through `jarvis_graph::yaml::parse_and_validate`
+# and feeds `jarvis_graph::yaml::{into_agent_input, yaml_seed_triggers}`
+# the same `Mandate` + initial `Trigger::External` values JAR2-68's
+# fixture pair encodes:
+#   - mandate.text   == config.json["text"]    (single-line scalar)
+#   - mandate.idle_period == 1000ms            (config.json: 1000)
+#   - mandate.max_ticks   == 8                 (config.json: 8)
+#   - seed.triggers[0]    == triggers.jsonl line 1's external envelope
+apiVersion: jarvis.engine/v1alpha1
+kind: Graph
+metadata:
+  name: smoke-llm-temporal
+  description: |
+    Stage 4.3 fixture for the workflow-driven smoke. Mirrors the
+    JAR2-68 `config.json` + `triggers.jsonl` pair into a single
+    operator-authored `graph.yaml` for `jarvis apply`.
+tools:
+  - id: echo
+    kind: builtin
+    builtin: echo
+agents:
+  - id: root
+    mandate:
+      # Single-line double-quoted scalar — YAML is a superset of JSON,
+      # so the JSON-style escapes here parse to the exact same string
+      # as `config.json`'s `text` field. This is the byte-for-byte
+      # parity the JAR2-74 integration test asserts.
+      text: "Your task: call the `echo` tool exactly once with arguments {\"msg\": \"hello from temporal\"}, then on the next tick emit an Output via the `emit_output` decision whose `content` is a short summary citing the resulting evidence id, then retire. Do not call any other tool; do not loop; do not idle except as a last resort."
+      idle_period: 1s
+      max_ticks: 8
+    tools: [echo]
+seed:
+  triggers:
+    - agent: root
+      at: start
+      external:
+        kind: kickoff
+        payload: {}
