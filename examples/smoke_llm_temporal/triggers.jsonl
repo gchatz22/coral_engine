@@ -1,0 +1,6 @@
+# Single kickoff trigger for the JAR2-68 workflow-driven smoke. Without
+# this the workflow's first tick drains an empty trigger queue and
+# `decide_next_action` sends the LLM a zero-length user message, which
+# vendors (Cohere observed; Anthropic likely the same) reject with HTTP
+# 400. Mirrors `examples/smoke_llm_mcp/triggers.jsonl`'s shape.
+{"delay_ms": 0, "trigger": {"type": "external", "kind": "kickoff", "payload": {}}}

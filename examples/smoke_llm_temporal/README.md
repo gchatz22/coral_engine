@@ -12,6 +12,12 @@ stays untouched").
 - `config.json` — `Mandate` JSON consumed by the `jarvis-run-workflow`
   binary. Asks the LLM to call `echo`, then emit an output citing the
   resulting evidence, then retire.
+- `triggers.jsonl` — Single kickoff `External` trigger that wakes the
+  agent on its first tick. Required because the workflow's
+  `wait_condition(triggers_pending) || timer(next_wake)` race would
+  otherwise drain an empty queue → `assemble_context` returns an empty
+  bundle → `decide_next_action` sends the LLM a zero-length user
+  message → vendor 400. Mirrors `smoke_llm_mcp/triggers.jsonl`.
 
 ## Run
 
@@ -21,7 +27,8 @@ Bring up a Temporal Server (`temporal server start-dev`), then:
 ANTHROPIC_API_KEY=sk-... \
 cargo run --features "llm-anthropic" --bin jarvis-run-workflow -- \
     examples/smoke_llm_temporal/config.json \
-    /tmp/jarvis-smoke-temporal-fs
+    /tmp/jarvis-smoke-temporal-fs \
+    examples/smoke_llm_temporal/triggers.jsonl
 ```
 
 The binary stamps a fresh timestamped subdirectory under the supplied
