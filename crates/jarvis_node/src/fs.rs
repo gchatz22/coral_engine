@@ -18,7 +18,7 @@
 //!
 //! ```text
 //! <prefix>mandate.json          — what the agent is told to do
-//! <prefix>outputs/<ulid>.json   — produced artifacts; the agent's claims
+//! <prefix>outputs/<sha256>.json — produced artifacts; the agent's claims
 //! <prefix>evidence/<sha256>.json — raw record of every tool call
 //! <prefix>notes/                — private working memory
 //! <prefix>claims/<slug>.json    — claim_seed registry (JAR2-28)
@@ -46,7 +46,7 @@
 //! (see [`FsError::EmptyEvidence`] and [`FsError::EvidenceNotFound`]).
 //! There is no path through the system that produces a claim without a
 //! trail. Outputs are also **immutable** — once written, the file at
-//! `outputs/<ulid>.json` does not change. A reader can quote it; a parent
+//! `outputs/<sha256>.json` does not change. A reader can quote it; a parent
 //! can pin its id; a human auditor can dispute it. To revise a claim, an
 //! agent emits a *new* output that supersedes the old one.
 //!
@@ -129,7 +129,11 @@
 //! 1. **Restart safety.** Anything trying to start an agent at this root
 //!    again sees `retirement.json` as a hard "no — this agent's life is
 //!    over." Without it, a crash-recovery loop could resurrect a finished
-//!    agent and start re-emitting outputs.
+//!    agent and start re-emitting outputs. (With content-addressed
+//!    `OutputId`s as of JAR2-70, re-emitting an identical claim would
+//!    collapse to the same file rather than duplicate — but a retired
+//!    agent shouldn't be running at all, so the marker is still load-
+//!    bearing.)
 //! 2. **Audit.** Why did this agent stop? "Mandate satisfied," "parent
 //!    retired me," "user retired me," "max_ticks reached." Important
 //!    context when reconstructing what the graph did weeks later.
@@ -442,7 +446,7 @@ impl AgentFs {
         }
 
         // JAR2-54 tail-index reconciliation. A prior process may have
-        // crashed between an `outputs/<ulid>.json` PUT and the
+        // crashed between an `outputs/<sha256>.json` PUT and the
         // corresponding `_tail.json` PUT, leaving the tail lagging.
         // `read_recent_window_with_tail` trusts a tail with
         // `entries.len() < TAIL_K` as "complete" for O(1) reads — that
@@ -657,9 +661,23 @@ impl AgentFs {
         }
     }
 
-    /// Persist an `Output` under `<prefix>outputs/<ulid>.json`,
+    /// Persist an `Output` under `<prefix>outputs/<sha256>.json`,
     /// enforcing the provenance contract: at least one evidence id,
     /// and every id must resolve to a record.
+    ///
+    /// **Idempotent under retries (JAR2-70).** `OutputId::new` is
+    /// content-addressed over `(content, evidence)`, so two calls with
+    /// the same arguments target the same key. We use
+    /// [`crate::storage::AgentStorage::put_if_absent`] — a second call
+    /// returns `Existed` and skips the tail-index update, so the
+    /// `_tail.json` `added_at` for the entry stays at the first-write
+    /// timestamp and the `entries` list does not double-count.
+    ///
+    /// `created_at` is **not** part of the hash, so the bytes written
+    /// on the first call (`output.created_at = Utc::now()` at that
+    /// moment) are the bytes that stay on disk; a retry's freshly
+    /// minted `created_at` is silently discarded by `put_if_absent`.
+    /// This matches `record_evidence`'s dedup contract.
     pub async fn persist_output(
         &self,
         content: &str,
@@ -679,16 +697,24 @@ impl AgentFs {
         let filename = format!("{}.json", output.id);
         let key = self.key(&format!("outputs/{filename}"));
         let bytes = serde_json::to_vec_pretty(&output)?;
-        self.storage
-            .put(&key, Bytes::from(bytes))
+        let outcome: PutOutcome = self
+            .storage
+            .put_if_absent(&key, Bytes::from(bytes))
             .await
             .map_err(|e| FsError::storage(&key, e))?;
-        // Update the outputs tail-index. Order matters: the file is
-        // PUT first, *then* the tail. If a crash happens between the
-        // two PUTs, the file is recoverable via the LIST-fallback in
+        // Update the outputs tail-index only on first write — a
+        // replayed `persist_output` for an already-seen id (a retry,
+        // or a second tick emitting the same `(content, evidence)`)
+        // would otherwise shuffle the entry to the front with a fresh
+        // `added_at`, polluting recency semantics with retry
+        // artefacts. Order matters: the file is PUT first, *then* the
+        // tail. If a crash happens between the two PUTs, the file is
+        // recoverable via the LIST-fallback in
         // `read_recent_window_with_tail` — see § 7.1 of
         // `scratch/agent_storage.md` for the recovery argument.
-        self.append_to_tail(OUTPUTS_TAIL_SUFFIX, filename).await?;
+        if matches!(outcome, PutOutcome::Created) {
+            self.append_to_tail(OUTPUTS_TAIL_SUFFIX, filename).await?;
+        }
         Ok(output)
     }
 
@@ -730,26 +756,30 @@ impl AgentFs {
 
     /// Return the most recent (up to) `n` `Output`s on disk.
     ///
-    /// Order is ascending filename — and since output filenames are
-    /// ULIDs (lexically sort by creation time), the returned vector is
-    /// the lex-greatest `n` filenames present. That makes "lex sort of
-    /// the entire history's last `n`" identical to "the `n` most
-    /// recently written entries", which is what the tail-index
-    /// promises. As a result the outputs tail-fast-path is always
-    /// correctness-preserving when present, even when the tail is at
-    /// `TAIL_K` capacity — older outputs that fell off the tail have
-    /// lex-smaller ULIDs and cannot be in the "lex-greatest `n`" for
-    /// `n ≤ TAIL_K`.
+    /// Order is ascending filename. As of JAR2-70 output filenames are
+    /// sha256 digests (content-addressed over `(content, evidence)`),
+    /// which carry no temporal meaning — so the lex-greatest `n` across
+    /// the whole history is *not* the same set as the `n` most recently
+    /// written. The tail-fast-path therefore only kicks in when the
+    /// tail object is provably complete (i.e. the tail holds fewer
+    /// than `TAIL_K` entries, which means every output file ever
+    /// written under this agent is in the tail). For agents that
+    /// accumulate more than `TAIL_K` outputs the LIST fallback gives
+    /// the existing lex-window semantics.
     ///
-    /// Per `scratch/agent_storage.md` § 7.1: when `n > TAIL_K` we fall
-    /// through to the full LIST. Crash-recovery: if a previous
-    /// `persist_output` PUT the file but crashed before the tail
-    /// update, the file isn't in the tail; `read_recent_window_with_tail`
-    /// detects the lag and falls back to LIST automatically. See the
-    /// `tail_lag_recovery_*` tests.
+    /// This matches the evidence path's behavior exactly — see
+    /// [`AgentFs::list_recent_evidence`] for the rationale. Pre-JAR2-70
+    /// outputs were ULID-named and the fast path stayed safe at
+    /// `TAIL_K` capacity; content-addressing trades that asymmetry for
+    /// `persist_output` idempotency under retries.
+    ///
+    /// Crash-recovery: if a previous `persist_output` PUT the file but
+    /// crashed before the tail update, the file isn't in the tail;
+    /// `read_recent_window_with_tail` detects the lag and falls back
+    /// to LIST automatically. See the `tail_lag_recovery_*` tests.
     pub async fn list_recent_outputs(&self, n: usize) -> anyhow::Result<Vec<Output>> {
         let prefix = self.key("outputs/");
-        self.read_recent_window_with_tail::<Output>(&prefix, OUTPUTS_TAIL_SUFFIX, n, true)
+        self.read_recent_window_with_tail::<Output>(&prefix, OUTPUTS_TAIL_SUFFIX, n, false)
             .await
     }
 
@@ -916,8 +946,10 @@ impl AgentFs {
     /// object key under that prefix's parent agent prefix (e.g.
     /// `outputs/_tail.json`). `n` is the requested window. `lex_monotonic`
     /// indicates whether "most recently written" is the same set as
-    /// "lex-greatest" for this indexed prefix — `true` for outputs
-    /// (ULID filenames), `false` for evidence (sha256 filenames).
+    /// "lex-greatest" for this indexed prefix — `false` for both
+    /// outputs and evidence post-JAR2-70 (both content-addressed),
+    /// kept as a parameter for backends or future prefixes that may
+    /// reintroduce a monotonic naming scheme.
     ///
     /// Decision matrix:
     ///
@@ -1445,8 +1477,11 @@ mod tests {
         let recent = fs.list_recent_outputs(8).await.unwrap();
         assert_eq!(recent.len(), 8);
 
-        // Returned outputs are in ascending filename (= ULID) order.
-        let ids: Vec<_> = recent.iter().map(|o| o.id).collect();
+        // Returned outputs are in ascending filename (= sha256) order.
+        // Post-JAR2-70 the filename has no temporal meaning, so this is
+        // a lex-sort assertion only — recency semantics live on the
+        // tail object's `added_at`, not the filename.
+        let ids: Vec<_> = recent.iter().map(|o| o.id.clone()).collect();
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted);
@@ -1458,6 +1493,85 @@ mod tests {
         // n = 0 → empty.
         let none = fs.list_recent_outputs(0).await.unwrap();
         assert!(none.is_empty());
+    }
+
+    /// JAR2-70 — `persist_output` is idempotent over `(content, evidence)`:
+    /// two calls with the same arguments produce one file and one
+    /// tail-index entry, with the tail's `added_at` pinned at the first
+    /// write (no shuffle on the retry).
+    #[tokio::test]
+    async fn persist_output_is_idempotent_for_identical_content_and_evidence() {
+        let (tmp, fs, _m) = fresh_fs().await;
+        let id = fs
+            .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
+            .await
+            .unwrap();
+
+        let first = fs
+            .persist_output("the same claim", &[id.clone()])
+            .await
+            .unwrap();
+        // Capture the first tail object's added_at for the new entry.
+        let tail_path = tmp.path().join("outputs").join("_tail.json");
+        let tail_first: TailObject =
+            serde_json::from_slice(&std::fs::read(&tail_path).unwrap()).unwrap();
+        assert_eq!(tail_first.entries.len(), 1);
+        let added_at_first = tail_first.entries[0].added_at;
+
+        // Ensure wall-clock advances enough for a fresh Utc::now() to
+        // differ from the first one — otherwise the test would pass
+        // trivially even if we did re-stamp added_at.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let second = fs
+            .persist_output("the same claim", &[id.clone()])
+            .await
+            .unwrap();
+
+        // Same content + evidence → same content-addressed OutputId.
+        assert_eq!(first.id, second.id);
+
+        // Exactly one file under outputs/ (sha256 dedup at the storage
+        // layer — `put_if_absent` returned Existed).
+        let output_files: Vec<_> = std::fs::read_dir(tmp.path().join("outputs"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n != "_tail.json")
+            .collect();
+        assert_eq!(
+            output_files.len(),
+            1,
+            "duplicate persist_output created extra file: {output_files:?}"
+        );
+
+        // Tail object has exactly one entry, with the original
+        // `added_at` — the retry path skipped the tail update.
+        let tail_after: TailObject =
+            serde_json::from_slice(&std::fs::read(&tail_path).unwrap()).unwrap();
+        assert_eq!(tail_after.entries.len(), 1);
+        assert_eq!(
+            tail_after.entries[0].added_at, added_at_first,
+            "tail added_at must not move on a retry/dedup write"
+        );
+
+        // list_recent_outputs surfaces a single output, not two.
+        let recent = fs.list_recent_outputs(8).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, first.id);
+
+        // Sanity: a *different* content with the same evidence still
+        // mints a fresh id and lands a second file.
+        let third = fs
+            .persist_output("a different claim", &[id.clone()])
+            .await
+            .unwrap();
+        assert_ne!(third.id, first.id);
+        let output_files: Vec<_> = std::fs::read_dir(tmp.path().join("outputs"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n != "_tail.json")
+            .collect();
+        assert_eq!(output_files.len(), 2);
     }
 
     #[tokio::test]
@@ -1980,7 +2094,8 @@ mod tests {
 
     /// The tail trims to `TAIL_K`. Write `TAIL_K + 16` outputs and
     /// assert the on-disk tail has exactly `TAIL_K` entries with the
-    /// newest at index 0.
+    /// newest at index 0 (by `added_at`, not filename — sha256-named
+    /// post-JAR2-70 carries no temporal meaning).
     #[tokio::test]
     async fn tail_index_trims_to_tail_k() {
         let (tmp, fs, _m) = fresh_fs().await;
@@ -1996,14 +2111,22 @@ mod tests {
         let bytes = std::fs::read(tmp.path().join("outputs").join("_tail.json")).unwrap();
         let parsed: TailObject = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.entries.len(), TAIL_K);
-        // Newest first: entry 0's filename should be lex-greater than
-        // entry 1's (ULID monotonicity).
-        assert!(parsed.entries[0].filename > parsed.entries[1].filename);
+        // Newest first by `added_at`: index 0 is the most recently
+        // appended entry. Filename ordering carries no temporal
+        // meaning under content-addressing, so we assert on the
+        // timestamp the tail records explicitly.
+        assert!(
+            parsed.entries[0].added_at >= parsed.entries[1].added_at,
+            "tail must be reverse-chronological on added_at"
+        );
     }
 
-    /// `list_recent_outputs(N)` returns the same ULID-lex-ascending
+    /// `list_recent_outputs(N)` returns the same lex-ascending
     /// window as the pre-2.5.4 LIST path would have, even after the
-    /// tail has trimmed older entries.
+    /// tail has trimmed older entries. Under JAR2-70's sha256
+    /// filenames this asserts the LIST-fallback lex-window — the
+    /// tail-fast-path is bypassed because `lex_monotonic=false` and
+    /// the tail is at capacity (recency != lex ordering).
     #[tokio::test]
     async fn list_recent_outputs_after_trim_matches_lex_window() {
         let (_tmp, fs, _m) = fresh_fs().await;
@@ -2022,10 +2145,10 @@ mod tests {
             all_ids.push(o.id);
         }
         all_ids.sort();
-        let want_last_8: Vec<_> = all_ids.iter().rev().take(8).rev().copied().collect();
+        let want_last_8: Vec<_> = all_ids.iter().rev().take(8).rev().cloned().collect();
 
         let got = fs.list_recent_outputs(8).await.unwrap();
-        let got_ids: Vec<_> = got.iter().map(|o| o.id).collect();
+        let got_ids: Vec<_> = got.iter().map(|o| o.id.clone()).collect();
         assert_eq!(got_ids, want_last_8);
     }
 
@@ -2056,7 +2179,7 @@ mod tests {
         fs.storage().delete("outputs/_tail.json").await.unwrap();
 
         let got = fs.list_recent_outputs(8).await.unwrap();
-        let ids: Vec<_> = got.iter().map(|o| o.id).collect();
+        let ids: Vec<_> = got.iter().map(|o| o.id.clone()).collect();
         assert!(
             ids.contains(&orphan.id),
             "orphan output should be recovered via LIST fallback when tail is missing"
@@ -2083,7 +2206,7 @@ mod tests {
     }
 
     /// Crash recovery — tail lags on-disk reality (the real § 7.1
-    /// scenario). A previous process PUT `outputs/<ulid>.json` but
+    /// scenario). A previous process PUT `outputs/<sha256>.json` but
     /// crashed before updating the tail. The tail has fewer entries
     /// than disk; the in-process read path's `entries.len() < TAIL_K`
     /// trust would silently drop the orphan. Open-time reconciliation
@@ -2144,7 +2267,7 @@ mod tests {
             .await
             .unwrap();
         let got = fs.list_recent_outputs(8).await.unwrap();
-        let ids: Vec<_> = got.iter().map(|o| o.id).collect();
+        let ids: Vec<_> = got.iter().map(|o| o.id.clone()).collect();
         assert!(
             ids.contains(&orphan.id),
             "orphan output must surface after open-time reconcile"
@@ -2228,13 +2351,20 @@ mod tests {
         assert!(got.is_empty());
     }
 
-    /// Microbench: `list_recent_outputs(8)` over 10_000 outputs
-    /// completes well inside a generous bound when the tail-index is
-    /// hot. The pre-2.5.4 path scaled O(total) and would scan + sort
-    /// 10k filenames every call; the tail path is one GET of a
-    /// ≤ 8 KB object plus a `get_many` of ≤ 8 entries. Marked
-    /// `#[ignore]` so CI stays fast — run via
-    /// `cargo test --release -p jarvis_node tail_index_outputs_is_o1_at_10k -- --ignored`.
+    /// Microbench: `list_recent_outputs(8)` over 10_000 outputs.
+    ///
+    /// **JAR2-70 caveat.** Pre-JAR2-70, output filenames were ULIDs
+    /// (lex-monotonic with write time) and the tail-fast-path stayed
+    /// O(1) regardless of total output count. Post-JAR2-70, output
+    /// filenames are sha256 digests — non-monotonic — so once the
+    /// tail is at `TAIL_K` capacity, `list_recent_outputs` falls back
+    /// to the LIST path and the bench measures the LIST cost, not
+    /// the tail-fast-path. The bench is retained as a regression
+    /// guard against the LIST path silently degrading further; the
+    /// O(1) property the original bench asserted no longer holds at
+    /// the prefix level and would need a different naming scheme
+    /// (or a sidecar recency index) to restore. Bound relaxed so the
+    /// `#[ignore]`d bench still passes under the LIST path.
     #[tokio::test]
     #[ignore = "microbench: long-running"]
     async fn tail_index_outputs_is_o1_at_10k() {
@@ -2252,14 +2382,14 @@ mod tests {
         let got = fs.list_recent_outputs(8).await.unwrap();
         let elapsed = start.elapsed();
         assert_eq!(got.len(), 8);
-        // Generous wall-clock bound: anything well under 100 ms at
-        // 10 k entries demonstrates O(1) tail behaviour (a true
-        // O(total) scan + sort + 8 individual reads on this size
-        // would visibly exceed it). Tuned to be unambiguous, not
-        // tight.
+        // Relaxed bound post-JAR2-70 — LIST fallback over 10 k
+        // sha256 filenames + sort + 8-entry get_many. Tuned to be
+        // unambiguous, not tight; primary purpose is a regression
+        // guard against the LIST path slipping into something
+        // outrageously slow.
         assert!(
-            elapsed < std::time::Duration::from_millis(100),
-            "list_recent_outputs(8) over 10k outputs took {elapsed:?}; expected O(1)"
+            elapsed < std::time::Duration::from_secs(5),
+            "list_recent_outputs(8) over 10k outputs took {elapsed:?}; bound exceeded"
         );
     }
 }
