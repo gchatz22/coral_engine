@@ -215,11 +215,14 @@ impl GraphStore {
     /// CREATE-only; the reconciliation alternative (compare-and-update,
     /// or `--prune`) is locked to Stage 5+ per the parent ticket
     /// (<JAR2-71>). The collision is detected via a
-    /// `SELECT 1 FROM graphs WHERE name = $1` inside the transaction;
-    /// the `graphs.name` column has no `UNIQUE` constraint today, so
-    /// catching SQLSTATE 23505 would not bite. A schema migration to
-    /// add the constraint is a follow-up — see the PR body for the
-    /// noted JAR2-74+ ticket.
+    /// `SELECT 1 FROM graphs WHERE name = $1` inside the transaction —
+    /// the fast path for the common, operator-driven case. As of JAR2-77
+    /// `graphs.name` also carries a DB-level UNIQUE constraint
+    /// (`graphs_name_unique`), and the INSERT below additionally catches
+    /// the resulting Postgres SQLSTATE 23505 and maps it to the same
+    /// `GraphAlreadyExists` variant — defense in depth for the two-
+    /// concurrent-applies race the SELECT-then-INSERT alone cannot
+    /// rule out.
     ///
     /// Caller invariant: `graph` must already have passed
     /// [`crate::yaml::validate`] (or [`crate::yaml::parse_and_validate`]),
@@ -256,7 +259,7 @@ impl GraphStore {
 
         // --- graph row -------------------------------------------------
         let graph_id = Uuid::new_v4();
-        let graph_row = sqlx::query_as!(
+        let graph_row = match sqlx::query_as!(
             Graph,
             r#"
             INSERT INTO graphs (id, name, metadata)
@@ -272,7 +275,32 @@ impl GraphStore {
             serde_json::json!({}),
         )
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        {
+            Ok(row) => row,
+            // JAR2-77 — the SELECT above is the fast path for the
+            // common, operator-driven case. The `graphs_name_unique`
+            // constraint (migration `0002_graphs_name_unique.sql`) is
+            // the DB-level backstop for the two-concurrent-applies
+            // race: two SELECTs can both miss, but only one INSERT
+            // wins; the loser's `fetch_one` resolves to
+            // `sqlx::Error::Database` with SQLSTATE 23505 (Postgres
+            // unique-violation). Surface it as the same typed
+            // `GraphAlreadyExists` variant the fast path uses so the
+            // caller (the `jarvis-apply` binary) renders one clean
+            // error message regardless of which check fired.
+            //
+            // The transaction is dropped on the `return` below, which
+            // Postgres rolls back implicitly — no agent / tool rows
+            // can leak from this branch because the only writes so
+            // far are the failed INSERT itself.
+            Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {
+                return Err(GraphStoreError::GraphAlreadyExists {
+                    name: graph.metadata.name.clone(),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         // --- agent row (v1: exactly one) -------------------------------
         let agent_yaml = &graph.agents[0];
@@ -815,6 +843,95 @@ seed:
             }
             other => panic!("expected GraphAlreadyExists, got {other:?}"),
         }
+        Ok(())
+    }
+
+    /// JAR2-77 — concurrent-race regression: spawn N tasks that all try
+    /// to `create_from_yaml` the same graph against the same pool, and
+    /// assert exactly one wins.
+    ///
+    /// Today's SELECT-then-INSERT fast path is sufficient for the
+    /// operator-driven case (single caller, no concurrency), but two
+    /// concurrent applies *could* both pass the SELECT before either
+    /// INSERT lands. The DB-level UNIQUE constraint
+    /// (`graphs_name_unique`, migration `0002`) is what makes the
+    /// race structurally impossible; this test exercises it by racing
+    /// N=8 spawned tasks and verifying:
+    ///
+    /// 1. Exactly one task returned `Ok`.
+    /// 2. The remaining `N-1` tasks returned
+    ///    `Err(GraphStoreError::GraphAlreadyExists { name })` —
+    ///    *regardless* of whether the SELECT fast path or the SQLSTATE
+    ///    23505 catch surfaced the collision. The caller-visible error
+    ///    shape is identical, which is the contract `jarvis-apply`
+    ///    relies on.
+    /// 3. No other error variant leaked (a `Sqlx(_)` here would mean
+    ///    the unique-violation catch didn't fire).
+    ///
+    /// N=8 is small enough to keep the test cheap but large enough to
+    /// reliably interleave the SELECTs (Postgres handles each spawned
+    /// task on its own connection from the `PgPool`).
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn create_from_yaml_concurrent_apply_exactly_one_wins(pool: PgPool) -> sqlx::Result<()> {
+        const N: usize = 8;
+        let store = GraphStore::new(pool);
+        let graph = crate::yaml::parse_and_validate(HAPPY_YAML).expect("validator green");
+        let expected_name = graph.metadata.name.clone();
+
+        // Spawn N concurrent applies of the same YAML. Each task owns
+        // its own `GraphStore` clone (cheap — `PgPool` is `Arc`-shaped)
+        // and its own parsed `GraphYaml` clone so the tasks share no
+        // state beyond the pool. `JoinSet` is the dep-free
+        // alternative to `futures::join_all` (no `futures` in the
+        // crate's `[dependencies]`).
+        let mut joinset: tokio::task::JoinSet<Result<Graph, crate::GraphStoreError>> =
+            tokio::task::JoinSet::new();
+        for _ in 0..N {
+            let store = store.clone();
+            let graph = graph.clone();
+            joinset.spawn(async move { store.create_from_yaml(&graph).await });
+        }
+
+        let mut ok_count = 0usize;
+        let mut already_exists_count = 0usize;
+        while let Some(joined) = joinset.join_next().await {
+            let res = joined.expect("spawned task did not panic");
+            match res {
+                Ok(g) => {
+                    assert_eq!(g.name, expected_name);
+                    ok_count += 1;
+                }
+                Err(crate::GraphStoreError::GraphAlreadyExists { name }) => {
+                    assert_eq!(name, expected_name);
+                    already_exists_count += 1;
+                }
+                Err(other) => {
+                    panic!("expected Ok or GraphAlreadyExists from concurrent apply, got {other:?}")
+                }
+            }
+        }
+
+        assert_eq!(
+            ok_count, 1,
+            "exactly one concurrent apply must win; got {ok_count}",
+        );
+        assert_eq!(
+            already_exists_count,
+            N - 1,
+            "the other {} applies must return GraphAlreadyExists; got {}",
+            N - 1,
+            already_exists_count,
+        );
+
+        // Belt-and-braces: the DB should hold exactly one row.
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM graphs WHERE name = $1")
+            .bind(&expected_name)
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(
+            row.0, 1,
+            "graphs table must hold exactly one row for {expected_name:?}"
+        );
         Ok(())
     }
 
