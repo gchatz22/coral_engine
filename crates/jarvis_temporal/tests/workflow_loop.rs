@@ -515,8 +515,13 @@ async fn drive(
     // constructing an `AgentFs` because `AgentFs::new_with_storage`
     // would re-run tail reconciliation — pointless work that obscures
     // the assertion.
+    // JAR2-68 fix: evidence keys live at `<agent_prefix>/evidence/<sha>.json`
+    // (see `AgentFs::evidence_key`). Listing the bare `"evidence/"` prefix
+    // matched zero keys against the agent-scoped storage layout; scope
+    // the list to the per-agent prefix.
+    let evidence_prefix = format!("{agent_prefix}/evidence/");
     let page = storage
-        .list("evidence/", None, usize::MAX)
+        .list(&evidence_prefix, None, usize::MAX)
         .await
         .context("listing evidence/ from shared storage")?;
     let evidence_records: Vec<_> = page

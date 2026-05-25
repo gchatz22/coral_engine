@@ -40,6 +40,7 @@
 //!   `jarvis_temporal::worker::build_worker` (§ 3.5).
 
 use std::env;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -50,7 +51,11 @@ use temporalio_client::{
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
-use jarvis_temporal::worker::build_worker;
+use jarvis_node::decision::Decision;
+use jarvis_node::storage::{AgentStorage, MemoryStorage};
+use jarvis_node::tools::{EchoTool, ToolRegistry};
+use jarvis_temporal::activities::set_decision_script;
+use jarvis_temporal::worker::{build_worker, install_agent_storage, install_tool_registry};
 use jarvis_temporal::workflow::{agent_workflow_id, AgentInput, AgentWorkflow};
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
@@ -97,7 +102,29 @@ async fn workflow_skeleton_continues_as_new_and_exits() {
     run_live_test().await.expect("live workflow_skeleton test");
 }
 
+/// JAR2-68: install a process-wide `AgentStorage` + `ToolRegistry` once
+/// per process. Required because JAR2-66's `persist_retirement` activity
+/// body (fired by the retire-signal short-circuit) reaches for
+/// `agent_storage()`. Pre-JAR2-66 the stub didn't need this.
+fn ensure_installed_for_skeleton_test() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let storage: Arc<dyn AgentStorage> = Arc::new(MemoryStorage::new());
+        install_agent_storage(storage);
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool)).expect("register EchoTool");
+        install_tool_registry(Arc::new(reg));
+    });
+}
+
 async fn run_live_test() -> Result<()> {
+    ensure_installed_for_skeleton_test();
+    // JAR2-68: install a long-Idle script so `decide_next_action` returns
+    // without reaching for the (un-installed) live `Decide` impl. See
+    // the matching note in `tests/signal_handlers.rs::run_live_test`.
+    set_decision_script(vec![Decision::Idle {
+        next_after: Duration::from_secs(60),
+    }]);
     let suffix = run_suffix();
     let task_queue = format!("jarvis-agents-test-{suffix}");
 

@@ -252,3 +252,73 @@ jobs:
             ci-logs/
             ${{ runner.temp }}/jarvis-smoke-fs/
             ${{ runner.temp }}/jarvis-smoke-mcp-fs/
+
+  temporal-workflow-smoke:
+    # JAR2-68 — workflow-driven smoke against `temporal server start-dev`.
+    # Closes the Stage 3 Temporal project: drives an `AgentWorkflow`
+    # end-to-end through Idle → CallTools(echo) → EmitOutput → Retire,
+    # asserts the same three durable artifacts `node-run-llm` produces
+    # in-process (outputs, retirement, decisions). Scripted-Decide
+    # (hermetic) — no LLM keys required. Live-vendor verification stays
+    # manual via the `jarvis-run-workflow` binary.
+    name: temporal workflow smoke (live)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install protoc
+        # `temporalio-sdk` pulls `prost-wkt-types`; matches the
+        # lint-and-test job's pre-flight.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install temporal CLI
+        # `start-dev` ships in the Temporal CLI (`temporal` binary).
+        # Pinned tarball release; the binary is statically linked.
+        run: |
+          curl -sSf https://temporal.download/cli.sh | sh
+          sudo install -m 0755 "$HOME/.temporalio/bin/temporal" /usr/local/bin/temporal
+          temporal --version
+
+      - name: Start Temporal dev server
+        # `--headless` skips the Web UI; we only need the gRPC frontend on
+        # :7233. `--log-level error` keeps the CI log small. The server
+        # process is left running in the background; the runner's tear-
+        # down kills it on job exit.
+        run: |
+          temporal server start-dev --headless --log-level error &
+          # Poll the gRPC port until the server is listening (typical
+          # boot: <2s). Cap at 30s so a stalled boot fails the step
+          # cleanly rather than running into the workflow timeout.
+          for i in $(seq 1 30); do
+            if nc -z localhost 7233; then
+              echo "temporal server reachable after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "temporal server did not become reachable in 30s" >&2
+          exit 1
+
+      - name: Run workflow smoke
+        env:
+          TEMPORAL_LIVE_TEST: "1"
+        run: |
+          mkdir -p ci-logs
+          set -o pipefail
+          cargo test --locked -p jarvis_temporal --test workflow_smoke -- --nocapture \
+            2>&1 | tee ci-logs/workflow-smoke.log
+
+      - name: Upload workflow smoke logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: temporal-workflow-smoke-logs
+          path: ci-logs/

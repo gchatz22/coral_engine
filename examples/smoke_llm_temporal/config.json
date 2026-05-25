@@ -1,0 +1,5 @@
+{
+  "text": "Your task: call the `echo` tool exactly once with arguments {\"msg\": \"hello from temporal\"}, then on the next tick emit an Output via the `emit_output` decision whose `content` is a short summary citing the resulting evidence id, then retire. Do not call any other tool; do not loop; do not idle except as a last resort.",
+  "idle_period": 1000,
+  "max_ticks": 8
+}

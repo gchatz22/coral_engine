@@ -28,6 +28,18 @@ path = "src/bin/worker.rs"
 name = "temporal-smoke"
 path = "src/bin/temporal_smoke.rs"
 
+# JAR2-68 — live-vendor workflow-driven smoke. Mirrors
+# `jarvis_node/bin/node_run_llm.rs` but boots the Temporal-hosted
+# runtime: starts a worker, drives an `AgentWorkflow` via the Temporal
+# client, asserts the same FS artifacts (output + retirement + decisions)
+# `node-run-llm` produces in-process. Gated on at least one LLM vendor
+# feature at runtime via `build_decide_from_env`; the binary still
+# compiles in a feature-less workspace build (errors at boot when no
+# vendor is compiled in).
+[[bin]]
+name = "jarvis-run-workflow"
+path = "src/bin/jarvis_run_workflow.rs"
+
 [dependencies]
 # JAR2-59 — signal handler payload types live with the rest of the
 # operator-facing core (`Trigger`, `HumanOp`, `MandatePatch`). Importing
@@ -69,6 +81,18 @@ serde_json = "1"
 # `clock` enables `Utc::now()` for the fallback when the SDK hasn't filled
 # in `scheduled_time` (test harnesses).
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# JAR2-68 — the `append_decision_log` activity body PUTs `<tick>.jsonl`
+# bytes via [`AgentStorage::put`], which takes `bytes::Bytes`. `bytes`
+# was already in the dep graph transitively (tokio, temporalio); add it
+# as a direct dep so the activity body can construct `Bytes` without
+# pulling it through a re-export.
+bytes = "1"
+# JAR2-68 — `bin/jarvis_run_workflow.rs` stamps a per-invocation
+# timestamped subdirectory under the supplied `<fs_root>` parent, with
+# a ULID fallback for same-millisecond collisions (mirror of
+# `jarvis_node/bin/node_run_llm.rs::resolve_fs_root`). The library
+# half doesn't pull `ulid`; the binary does.
+ulid = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
@@ -113,3 +137,9 @@ serde_json = "1"
 # production worker binaries don't pull `chrono` into their runtime
 # graph.
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# JAR2-68 — `bin/jarvis_run_workflow.rs` unit tests need `tempfile` to
+# exercise `resolve_fs_root`'s "creates missing parent" assertion. The
+# binary's tests run under `cargo test`, so the dep lives in
+# `[dev-dependencies]` and stays out of the live worker binary's
+# runtime graph.
+tempfile = "3"

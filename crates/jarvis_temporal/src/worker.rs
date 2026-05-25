@@ -23,15 +23,35 @@
 //! shared storage via [`agent_storage`] to build per-tick [`AgentFs`]
 //! instances.
 
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+use std::env;
 use std::sync::{Arc, OnceLock};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+use jarvis_node::decide_llm::LlmDecide;
 use jarvis_node::decision::Decide;
+#[cfg(feature = "llm-anthropic")]
+use jarvis_node::model_client::anthropic::AnthropicClient;
+#[cfg(feature = "llm-cohere")]
+use jarvis_node::model_client::cohere::CohereClient;
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+use jarvis_node::model_client::CompleteOptions;
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+use jarvis_node::model_client::ModelClient;
 use jarvis_node::storage::AgentStorage;
 use jarvis_node::tools::ToolRegistry;
 use temporalio_client::Client;
 use temporalio_sdk::{Worker, WorkerOptions};
 use temporalio_sdk_core::CoreRuntime;
+
+/// JAR2-62 vendor selector env var. See [`build_decide_from_env`].
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+const VENDOR_ENV: &str = "JARVIS_MODEL_VENDOR";
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+const COHERE_API_KEY_ENV: &str = "COHERE_API_KEY";
 
 use crate::activities::AgentActivities;
 use crate::workflow::AgentWorkflow;
@@ -204,6 +224,111 @@ pub fn build_worker(runtime: &CoreRuntime, client: Client, task_queue: &str) -> 
         .register_activities(AgentActivities)
         .build();
     Worker::new(runtime, client, opts).map_err(|e| anyhow::anyhow!("Worker::new failed: {e}"))
+}
+
+/// JAR2-62 / JAR2-68 — pick the LLM vendor from env and build the
+/// [`Decide`] implementation the `decide_next_action` activity body
+/// will call.
+///
+/// Used by both `bin/worker.rs` (long-running worker daemon) and
+/// `bin/jarvis_run_workflow.rs` (JAR2-68 live-vendor smoke); factored
+/// here so the selection precedence + feature-gating live in one
+/// place. Returns the vendor tag (`"anthropic"` / `"cohere"`)
+/// alongside the trait object so the caller can log it.
+///
+/// **Selection precedence:**
+/// 1. `JARVIS_MODEL_VENDOR` env var, if set to `"anthropic"` or
+///    `"cohere"`. Unknown values bubble as an error.
+/// 2. Otherwise: whichever vendor's API key is set in the environment.
+///    If both are set, prefer `anthropic` (matches `node-run-llm`'s
+///    documented vendor order in `bin/node_run_llm.rs::USAGE`).
+/// 3. If neither key is set, bail. The activity body would panic at
+///    the first `decide_next_action` call anyway; an early-and-loud
+///    failure is friendlier.
+///
+/// **Feature gating.** A vendor selected at runtime must be compiled
+/// in (`--features llm-anthropic` / `--features llm-cohere`); the
+/// not-built variants return an error pointing at the missing
+/// feature. The non-feature-gated body is itself `#[cfg]`-gated on at-
+/// least-one vendor, with a "no vendors built" stub for the zero-
+/// feature build (still compiles, errors at runtime).
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+pub fn build_decide_from_env() -> Result<(&'static str, Arc<dyn Decide>)> {
+    let vendor = resolve_vendor()?;
+    let model_client: Arc<dyn ModelClient> = match vendor {
+        "anthropic" => build_anthropic_client()?,
+        "cohere" => build_cohere_client()?,
+        other => return Err(anyhow!("internal: resolve_vendor returned `{other}`")),
+    };
+    let options = CompleteOptions::default();
+    let decide: Arc<dyn Decide> = Arc::new(LlmDecide::new(model_client, options));
+    Ok((vendor, decide))
+}
+
+/// Zero-vendor stub. Lib still compiles in a feature-less build (the
+/// workspace `cargo build` does this); callers get an early error when
+/// no vendor is compiled in.
+#[cfg(not(any(feature = "llm-anthropic", feature = "llm-cohere")))]
+pub fn build_decide_from_env() -> Result<(&'static str, Arc<dyn Decide>)> {
+    Err(anyhow!(
+        "no LLM vendor compiled in; rebuild with --features llm-anthropic and/or --features llm-cohere"
+    ))
+}
+
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+fn resolve_vendor() -> Result<&'static str> {
+    if let Ok(v) = env::var(VENDOR_ENV) {
+        return match v.as_str() {
+            "anthropic" => Ok("anthropic"),
+            "cohere" => Ok("cohere"),
+            other => Err(anyhow!(
+                "{VENDOR_ENV}=`{other}` is not a known vendor (expected `anthropic` or `cohere`)"
+            )),
+        };
+    }
+    let have_anthropic = env::var(ANTHROPIC_API_KEY_ENV)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let have_cohere = env::var(COHERE_API_KEY_ENV)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    match (have_anthropic, have_cohere) {
+        (true, _) => Ok("anthropic"),
+        (false, true) => Ok("cohere"),
+        (false, false) => Err(anyhow!(
+            "no vendor selected: set {VENDOR_ENV}, {ANTHROPIC_API_KEY_ENV}, or {COHERE_API_KEY_ENV}"
+        )),
+    }
+}
+
+#[cfg(feature = "llm-anthropic")]
+fn build_anthropic_client() -> Result<Arc<dyn ModelClient>> {
+    Ok(Arc::new(AnthropicClient::new()))
+}
+
+#[cfg(all(
+    any(feature = "llm-anthropic", feature = "llm-cohere"),
+    not(feature = "llm-anthropic")
+))]
+fn build_anthropic_client() -> Result<Arc<dyn ModelClient>> {
+    Err(anyhow!(
+        "vendor `anthropic` requested but not compiled in; rebuild with --features llm-anthropic"
+    ))
+}
+
+#[cfg(feature = "llm-cohere")]
+fn build_cohere_client() -> Result<Arc<dyn ModelClient>> {
+    Ok(Arc::new(CohereClient::new()))
+}
+
+#[cfg(all(
+    any(feature = "llm-anthropic", feature = "llm-cohere"),
+    not(feature = "llm-cohere")
+))]
+fn build_cohere_client() -> Result<Arc<dyn ModelClient>> {
+    Err(anyhow!(
+        "vendor `cohere` requested but not compiled in; rebuild with --features llm-cohere"
+    ))
 }
 
 #[cfg(test)]

@@ -56,6 +56,7 @@
 //!   `workflow.rs` tests).
 
 use std::env;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -66,8 +67,12 @@ use temporalio_client::{
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
+use jarvis_node::decision::Decision;
+use jarvis_node::storage::{AgentStorage, MemoryStorage};
+use jarvis_node::tools::{EchoTool, ToolRegistry};
 use jarvis_node::trigger::{HumanOp, MandatePatch, Trigger};
-use jarvis_temporal::worker::build_worker;
+use jarvis_temporal::activities::set_decision_script;
+use jarvis_temporal::worker::{build_worker, install_agent_storage, install_tool_registry};
 use jarvis_temporal::workflow::{agent_workflow_id, AgentInput, AgentSnapshot, AgentWorkflow};
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
@@ -106,7 +111,36 @@ async fn signal_handlers_round_trip_and_inspect_state_returns_snapshot() {
     run_live_test().await.expect("live signal_handlers test");
 }
 
+/// JAR2-68: install a process-wide `AgentStorage` + `ToolRegistry` once
+/// per process. Required because JAR2-66's `persist_retirement` and
+/// JAR2-68's `append_decision_log` activity bodies reach for
+/// `agent_storage()` — even on the retire-signal short-circuit path,
+/// `persist_retirement` runs before the workflow returns. Pre-JAR2-66
+/// the test didn't need this because the activity body was a no-op stub.
+fn ensure_installed_for_signal_handlers_test() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let storage: Arc<dyn AgentStorage> = Arc::new(MemoryStorage::new());
+        install_agent_storage(storage);
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool)).expect("register EchoTool");
+        install_tool_registry(Arc::new(reg));
+    });
+}
+
 async fn run_live_test() -> Result<()> {
+    ensure_installed_for_signal_handlers_test();
+    // JAR2-68: install a long-Idle script so `decide_next_action` returns
+    // without falling through to the (un-installed) live `Decide` impl.
+    // The retire-signal short-circuit fires before `decide_next_action`
+    // most of the time, but `INITIAL_NEXT_WAKE` (1ms) can let one tick
+    // sneak in between worker start and the test's signals; that tick's
+    // `decide_next_action` would otherwise panic on `decide_impl()`.
+    // A single Idle{60s} is enough — the retire-signal fires within
+    // tens of ms in practice and the second tick never runs.
+    set_decision_script(vec![Decision::Idle {
+        next_after: Duration::from_secs(60),
+    }]);
     let suffix = run_suffix();
     let task_queue = format!("jarvis-agents-signal-test-{suffix}");
 
