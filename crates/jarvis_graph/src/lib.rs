@@ -78,6 +78,7 @@
 
 pub mod store;
 pub mod types;
+pub mod yaml;
 pub use store::GraphStore;
 pub use types::{AgentRecord, Edge, Graph, ToolRecord};
 

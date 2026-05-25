@@ -50,6 +50,29 @@ thiserror = "1"
 anyhow = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
+# Stage 4.1 (JAR2-72) deps for `graph.yaml` parsing.
+#
+# All three pinned with `=` so the `examples/graph.schema.json` byte-
+# equality test (and humanized-duration parser surface) cannot silently
+# drift under a `cargo update`. Same convention `sqlx` uses above.
+#
+# `serde_yaml` 0.9.x is marked `+deprecated` upstream but is still the
+# canonical Rust YAML driver — `serde_yml` is a recent fork without a
+# stability story yet. Documented as the v1 choice in
+# `scratch/graph_yaml_schema.md` § 5. Bump only when there's a reason.
+#
+# `humantime` parses `100ms` / `5m` / `1h` per `scratch/graph_yaml_schema.md`
+# § 4.4. Stays a leaf dep — no `humantime-serde` (we deserialize via a
+# custom adapter on `String` to keep the error surface aligned with the
+# rest of `GraphYamlError`).
+#
+# `schemars` 1.x is the current major; `derive` gives us
+# `JsonSchema` derive macros. `examples/graph.schema.json` is generated
+# from these.
+serde_yaml = "=0.9.34"
+humantime = "=2.3.0"
+schemars = { version = "=1.2.1", features = ["derive"] }
+
 # Stage-1 lint posture matches `jarvis_node` — see its `Cargo.toml` for
 # the rationale (clippy 1.88 promoted a handful of style lints; keep the
 # diff small until there's a reason to broadly modernize formatting).
