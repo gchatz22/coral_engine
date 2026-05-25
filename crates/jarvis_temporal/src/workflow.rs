@@ -577,6 +577,32 @@ impl AgentWorkflow {
             // is no manual history-length counter and no once-marker
             // sentinel. Note the early-`return` retirement arms above:
             // CAN is structurally never reached on a retirement tick.
+            //
+            // **SDK + server gotcha** (documented for JAR2-68 + future
+            // maintainers): `continue_as_new_suggested` is server-
+            // driven, surfaced on each `WorkflowActivation`. The
+            // `temporalio-sdk` v0.4.0 `ContinueAsNewOptions` exposes
+            // workflow_type, task_queue, timeouts, memo, headers,
+            // search_attributes, retry_policy, versioning_intent —
+            // and nothing else. There is **no client-side knob** to
+            // lower the suggested-CAN threshold. Empirically, an
+            // `AgentWorkflow` driven through 175 idle ticks against
+            // `temporal server start-dev` produced 3001 history
+            // events without `continue_as_new_suggested` flipping to
+            // true; the dev-server threshold is undocumented and
+            // appears to be substantially larger than the 4096 figure
+            // some SDK docs cite. Forcing a natural CAN under a
+            // unit-test wall-clock budget therefore isn't feasible
+            // here.
+            //
+            // Correctness of *this* call site (encode + `ctx.continue_as_new`)
+            // is covered by the hermetic tests in this file's `tests`
+            // module — they exercise the full wire path
+            // (`encode_carryover` → JSON → deserialize →
+            // `hydrate_from_carryover`) end-to-end without needing a
+            // server. JAR2-68's long-running workflow-driven smoke is
+            // the natural owner of a live CAN observation, since it
+            // has the wall-clock budget.
             if ctx.continue_as_new_suggested() {
                 let carryover = ctx.state(|s| s.encode_carryover());
                 let next = AgentInput {
