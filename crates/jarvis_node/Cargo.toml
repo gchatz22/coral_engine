@@ -59,6 +59,12 @@ thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 tracing = "0.1"
 ulid = { version = "1", features = ["serde"] }
+# JAR2-78 (stage 5.1): `AgentId` is a `Uuid` newtype matching the
+# structural DB's `agents.id` column (`crates/jarvis_graph` schema). The
+# kernel never *generates* one — those come from the 5.3
+# `register_child_in_structural_db` activity — so only `serde` is needed;
+# `v4` is opt-out to keep the bootstrap honest about where ids originate.
+uuid = { version = "1", default-features = false, features = ["serde", "std"] }
 
 [features]
 # Default build is network-free: no `reqwest`, no live model adapters.

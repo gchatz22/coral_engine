@@ -242,6 +242,29 @@ pub async fn dispatch(
             fs.persist_retirement(&reason, Utc::now()).await?;
             Ok(DispatchOutcome::Retired(RetireReason(reason)))
         }
+        // JAR2-78 (stage 5.1): the four parent-child topology variants
+        // are not dispatchable from `Agent::run`. Per Stage 5 Project
+        // decision 11, the in-process loop stays single-agent forever;
+        // the workflow host (5.3 / 5.5 / 5.7) is the only place these
+        // variants execute. Reaching this arm in the in-process loop is
+        // a wiring bug — `unimplemented!` is the boundary signal the
+        // ticket explicitly calls for.
+        Decision::SpawnChild { .. } => unimplemented!(
+            "stage 5: in-process dispatch for parent-child decisions is \
+             intentionally not wired — see Stage 5 Project decision 11"
+        ),
+        Decision::ReconcileChildren { .. } => unimplemented!(
+            "stage 5: in-process dispatch for parent-child decisions is \
+             intentionally not wired — see Stage 5 Project decision 11"
+        ),
+        Decision::RetireChild { .. } => unimplemented!(
+            "stage 5: in-process dispatch for parent-child decisions is \
+             intentionally not wired — see Stage 5 Project decision 11"
+        ),
+        Decision::ReplaceChild { .. } => unimplemented!(
+            "stage 5: in-process dispatch for parent-child decisions is \
+             intentionally not wired — see Stage 5 Project decision 11"
+        ),
     }
 }
 

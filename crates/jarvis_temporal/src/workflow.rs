@@ -627,6 +627,23 @@ impl AgentWorkflow {
                     // line, not a deferred event.
                     return retire(ctx, &input.fs_handle, reason).await;
                 }
+                // JAR2-78 (stage 5.1): the four parent-child topology
+                // variants are reserved here so the exhaustive match
+                // compiles, but their workflow-side dispatch lands in
+                // stage 5.3 (`spawn_child`), 5.5 (`reconcile_children`)
+                // and 5.7 (`retire_child` / `replace_child`). Until
+                // those tickets ship, the parser can produce these
+                // variants but no `MockDecide` or live LLM script in
+                // the existing suite will reach them — and if one did,
+                // `unimplemented!` is the boundary signal Stage 5
+                // Project decision 11 calls for.
+                Decision::SpawnChild { .. }
+                | Decision::ReconcileChildren { .. }
+                | Decision::RetireChild { .. }
+                | Decision::ReplaceChild { .. } => unimplemented!(
+                    "stage 5.3/5.5/5.7: workflow-side dispatch for parent-child decisions \
+                     is not yet wired — see Stage 5 Project decisions 4 and 11"
+                ),
             }
             // Bump the tick after non-retire arms so the *next* iteration's
             // decision lands at `decisions/<tick+1>.jsonl`. The retire arm
@@ -924,6 +941,26 @@ fn decision_summary(decision: &Decision) -> String {
             format!("Idle {{ next_after_ms: {} }}", next_after.as_millis())
         }
         Decision::Retire { reason } => format!("Retire {{ reason: {reason:?} }}"),
+        // JAR2-78 (stage 5.1): stub summaries so the decision log can
+        // record parent-child intents the moment they begin to flow
+        // through workflow code (5.3+). Bodies stay deliberately
+        // compact — the structured payload lives in Temporal history
+        // and (post-5.5) in the parent's `evidence/` directory.
+        Decision::SpawnChild { agent_name, .. } => {
+            format!("SpawnChild {{ agent_name: {agent_name:?} }}")
+        }
+        Decision::ReconcileChildren { sources, conflict } => format!(
+            "ReconcileChildren {{ sources: {}, conflict: {} }}",
+            sources.len(),
+            conflict.is_some(),
+        ),
+        Decision::RetireChild { child_ref, reason } => format!(
+            "RetireChild {{ agent_id: {}, reason: {reason:?} }}",
+            child_ref.agent_id,
+        ),
+        Decision::ReplaceChild { child_ref, .. } => {
+            format!("ReplaceChild {{ agent_id: {} }}", child_ref.agent_id)
+        }
     }
 }
 
