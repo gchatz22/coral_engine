@@ -236,15 +236,14 @@ pub fn build_worker(runtime: &CoreRuntime, client: Client, task_queue: &str) -> 
     Worker::new(runtime, client, opts).map_err(|e| anyhow::anyhow!("Worker::new failed: {e}"))
 }
 
-/// JAR2-62 / JAR2-68 — pick the LLM vendor from env and build the
-/// [`Decide`] implementation the `decide_next_action` activity body
-/// will call.
+/// JAR2-62 — pick the LLM vendor from env and build the [`Decide`]
+/// implementation the `decide_next_action` activity body will call.
 ///
-/// Used by both `bin/worker.rs` (long-running worker daemon) and
-/// `bin/jarvis_run_workflow.rs` (JAR2-68 live-vendor smoke); factored
-/// here so the selection precedence + feature-gating live in one
-/// place. Returns the vendor tag (`"anthropic"` / `"cohere"`)
-/// alongside the trait object so the caller can log it.
+/// Used by `bin/worker.rs` (the long-running worker daemon). Returns
+/// the vendor tag (`"anthropic"` / `"cohere"`) alongside the trait
+/// object so the caller can log it. Pre-JAR2-76 a second caller
+/// (`bin/jarvis_run_workflow.rs`) shared this helper; that binary was
+/// deleted with the thin-client refactor.
 ///
 /// **Selection precedence (JAR2-70):**
 /// 1. `JARVIS_MODEL_VENDOR` env var set + that vendor is compiled in

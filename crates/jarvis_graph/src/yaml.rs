@@ -74,9 +74,7 @@ pub const KIND: &str = "Graph";
 ///
 /// `seed` is optional in the strawman but required at apply time today —
 /// the workflow's first tick would otherwise drain an empty trigger queue
-/// and send the LLM an empty prompt (see
-/// `jarvis_temporal::bin::jarvis_run_workflow::load_triggers`'s "contained
-/// no triggers" guardrail). Validation enforces non-empty
+/// and send the LLM an empty prompt. Validation enforces non-empty
 /// `seed.triggers`.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -658,13 +656,12 @@ fn locate_token_in_line(
 ///   agent" guarantee via `agents[0]` and would panic on an empty agents
 ///   vector otherwise. Treat it as a typed-witness consumer of the
 ///   validator.
-/// - The returned `AgentInput.fs_handle.prefix` is the empty string. The
-///   `jarvis-apply` binary mirrors `jarvis_run_workflow`'s pattern of
-///   rooting [`jarvis_node::storage::LocalStorage`] directly at the
-///   per-invocation FS subdir, so `<prefix>/outputs/...` resolves to
-///   `<fs_root>/outputs/...` on disk. The empty-prefix choice lives in
-///   the binary's storage construction, not here — this conversion
-///   stays a pure value-to-value mapping.
+/// - The returned `AgentInput.fs_handle.prefix` is the empty string.
+///   The worker daemon's [`jarvis_node::storage::LocalStorage`] is rooted
+///   at its configured `AGENT_FS_ROOT`, so `<prefix>/outputs/...`
+///   resolves to `<fs_root>/outputs/...` on disk. The empty-prefix
+///   choice lives in the daemon's storage construction, not here — this
+///   conversion stays a pure value-to-value mapping.
 ///
 /// ## Field mapping
 ///
@@ -1255,8 +1252,9 @@ seed:
             jarvis_node::mandate::ContextPolicy::default(),
         );
 
-        // FS handle prefix is empty: the binary roots LocalStorage at the
-        // per-invocation FS subdir itself, mirroring jarvis_run_workflow.
+        // FS handle prefix is empty: the worker daemon roots
+        // LocalStorage at its configured `AGENT_FS_ROOT`, so paths
+        // resolve against that root without any per-CLI subdir stamping.
         assert!(input.fs_handle.prefix.is_empty());
 
         // Parent + carryover are None on a fresh apply (first run).

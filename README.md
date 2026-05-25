@@ -18,7 +18,7 @@ The day-to-day dev loop runs **backing services in Docker** and the **worker nat
 
 **Operator CLIs dispatch to the daemon.** Per `scratch/temporal_staged_plan.md` § 2.6, operator-facing CLIs (`jarvis apply`, future `jarvis signal` / `inspect` / `retire`) are thin Temporal clients — they connect to Temporal, dispatch onto the canonical task queue `jarvis-agents` (exported as `jarvis_temporal::worker::DEFAULT_TASK_QUEUE`), and exit. The long-lived worker daemon — the binary at `crates/jarvis_temporal/src/bin/worker.rs`, either run natively or as the `worker` compose service — is what executes the workflows.
 
-> Today's `jarvis apply` (JAR2-73) and `jarvis-run-workflow` (JAR2-68) still host *inline* workers on randomized task queues — that's a v1 smoke-shape expedient, not the thin-client convention. JAR2-76 refactors them to dispatch against the running daemon on `jarvis-agents`.
+> JAR2-76 finished the thin-client refactor: `jarvis apply` now dispatches against the running daemon on `jarvis-agents` (overrideable via `TEMPORAL_TASK_QUEUE`), and the legacy `jarvis-run-workflow` smoke binary was deleted along the way. The sibling CLIs (`jarvis signal` / `inspect` / `retire`) ship in Stage 6 proper.
 
 ### Prerequisites
 

@@ -1207,7 +1207,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "ulid",
  "url",
  "uuid",
 ]
@@ -1247,7 +1246,6 @@ dependencies = [
  "jarvis_node",
  "serde",
  "serde_json",
- "tempfile",
  "temporalio-client",
  "temporalio-common",
  "temporalio-macros",
@@ -1256,7 +1254,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "ulid",
  "url",
 ]
 
