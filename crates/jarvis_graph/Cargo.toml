@@ -69,6 +69,12 @@ serde_json = "1"
 thiserror = "1"
 anyhow = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# JAR2-80 — `impl jarvis_temporal::worker::StructuralDbStore for GraphStore`
+# in `src/store.rs` uses `#[async_trait]` because the trait is itself
+# `#[async_trait]`-annotated (Rust trait methods can't be `async` until
+# AFIT lands). Pre-JAR2-80 `async-trait` was a dev-only dep
+# (`jarvis_apply_smoke.rs`'s `EchoLike`); promoted here.
+async-trait = "0.1"
 
 # Stage 4.1 (JAR2-72) deps for `graph.yaml` parsing.
 #
@@ -113,12 +119,6 @@ default = []
 # powers the `load_graph` test cases against a synthesized YAML file.
 tempfile = "3"
 
-# JAR2-74 — the `jarvis_apply_smoke.rs` integration test impls
-# `Tool` for an inline test double (`EchoLike`); `Tool::call` is an
-# async-trait method, so the impl block needs the `#[async_trait]`
-# attribute. Mirrors `jarvis_temporal`'s dev-dep on the same crate
-# for the same reason in `tests/workflow_smoke.rs`.
-async-trait = "0.1"
 # JAR2-74 — the integration test uses `MemoryStorage` as the storage
 # backend, which is gated behind the `memory-storage` feature on
 # `jarvis_node`. Dev-only override turns the feature on for the test

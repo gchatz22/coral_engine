@@ -172,6 +172,18 @@ async fn main() -> Result<()> {
     install_tool_registry(Arc::new(registry));
     info!("installed ToolRegistry with tools: echo");
 
+    // JAR2-80 (stage 5.3) follow-up — the `register_child_in_structural_db`
+    // activity body reaches for `worker::structural_db_store()`. Wiring
+    // a real `GraphStore` (from `jarvis_graph`) here would require a
+    // `jarvis_graph` dep on this binary, which is structurally fine
+    // (binaries are leaves), but `jarvis_graph` -> `jarvis_temporal`
+    // already exists so adding the reverse edge needs the
+    // worker-binary-in-jarvis_graph relocation the staged plan reserves
+    // for the Stage 6 operator-surface cleanup. Until then, daemons
+    // that drive multi-agent workflows (`Decision::SpawnChild`) will
+    // panic on the first spawn; single-agent + signal / retire paths
+    // (everything Stage 3 + 4 ships) are unaffected.
+
     let telemetry_options = TelemetryOptions::builder().build();
     let runtime = CoreRuntime::new_assume_tokio(
         RuntimeOptions::builder()

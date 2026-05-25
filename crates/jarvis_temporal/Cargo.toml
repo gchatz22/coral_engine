@@ -75,6 +75,18 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # as a direct dep so the activity body can construct `Bytes` without
 # pulling it through a re-export.
 bytes = "1"
+# JAR2-80 — `register_child_in_structural_db` activity mints a fresh
+# child `Uuid` via `Uuid::new_v4()` and returns it wrapped in `AgentId`.
+# The activity body lives in `jarvis_temporal`; `jarvis_node`'s `AgentId`
+# is the wire type but the v4 generator lives at the call site. `serde`
+# covers the test-time round-trip; `v4` is the runtime generator.
+uuid = { version = "1", default-features = false, features = ["serde", "std", "v4"] }
+# JAR2-80 — `StructuralDbStore` trait in `worker.rs` is `#[async_trait]`
+# so `jarvis_graph::GraphStore` can impl it from outside this crate (the
+# JAR2-69-style `OnceLock` pattern resolved against a trait keeps
+# `jarvis_temporal` free of a `jarvis_graph` dep, which would otherwise
+# cycle). Pre-JAR2-80 `async-trait` was a dev-only dep; promoted here.
+async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
@@ -95,13 +107,11 @@ llm-anthropic = ["jarvis_node/llm-anthropic"]
 llm-cohere = ["jarvis_node/llm-cohere"]
 
 [dev-dependencies]
-# JAR2-62 — `async-trait` is needed to impl the `jarvis_node::decision::Decide`
-# trait (itself `#[async_trait]`-annotated) on a test-only `ErrDecide`
-# helper in `src/activities.rs`. JAR2-63 also uses it for
-# `AliasEchoTool`/`FailingTool` test impls of `jarvis_node::tools::Tool`
-# (also `#[async_trait]`-annotated). Dev-only because production
-# activity bodies never impl these traits themselves.
-async-trait = "0.1"
+# JAR2-62 — `async-trait` is also exercised by test-only `ErrDecide` /
+# `AliasEchoTool` / `FailingTool` impls (`#[async_trait]`-annotated
+# traits in `jarvis_node`). The crate itself now lists `async-trait` as
+# a runtime dep (JAR2-80 promoted it for `StructuralDbStore`), so this
+# section no longer needs to declare it — it's available transitively.
 # JAR2-69 — the unit test for `install_agent_storage` / `agent_storage`
 # in `src/worker.rs` needs `MemoryStorage`, which is gated behind the
 # `memory-storage` feature on `jarvis_node`. Dev-only dep override

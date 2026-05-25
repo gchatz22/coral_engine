@@ -77,19 +77,23 @@
 
 use std::time::Duration;
 
+use jarvis_node::agent_ref::{AgentId, AgentRef, GraphId};
 use jarvis_node::decision::{ContextBundle, CorrectionContext, Decision, ToolCall};
 use jarvis_node::evidence::EvidenceId;
 use jarvis_node::mandate::{Mandate, OutputId};
 use jarvis_node::trigger::{HumanOp, MandatePatch, Trigger};
 use serde::{Deserialize, Serialize};
+use temporalio_common::protos::temporal::api::enums::v1::ParentClosePolicy;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, ContinueAsNewOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
+    ActivityOptions, ChildWorkflowOptions, ContinueAsNewOptions, SyncWorkflowContext,
+    WorkflowContext, WorkflowResult,
 };
 
 use crate::activities::{
     AgentActivities, AppendDecisionLogInput, ApplyFsOpsInput, AssembleContextInput, DecideInput,
-    ExecuteToolInput, PersistOutputInput, PersistRetirementInput, ToolCallFailure, ToolCallOutcome,
+    ExecuteToolInput, PersistOutputInput, PersistRetirementInput, RegisterChildInStructuralDbInput,
+    ToolCallFailure, ToolCallOutcome,
 };
 
 /// Resolved agent configuration handed to the workflow at start.
@@ -120,14 +124,74 @@ pub struct FsHandle {
     pub prefix: String,
 }
 
+impl FsHandle {
+    /// JAR2-80 (stage 5.3): construct an [`FsHandle`] for a `(graph_id,
+    /// agent_id)` pair using the canonical workflow-id prefix layout
+    /// (`graphs/<graph_id>/agents/<agent_id>` — matches
+    /// [`agent_workflow_id`] and Stage 5 Project decision 6's flat
+    /// workflow-id scheme).
+    ///
+    /// Used by [`build_child_input`] when constructing the child
+    /// workflow's input from the parent's known identity; keeps the
+    /// prefix-derivation rule in one place so a future schema bump
+    /// touches one call site rather than every spawn helper.
+    pub fn for_agent(graph_id: GraphId, agent_id: AgentId) -> Self {
+        Self {
+            prefix: agent_workflow_id(&graph_id.to_string(), &agent_id.to_string()),
+        }
+    }
+}
+
 /// Parent workflow reference for cross-workflow signal routing.
 ///
-/// **Placeholder.** Stage 5 territory (parent → child topology + child →
-/// parent signal path per `scratch/temporal_staged_plan.md` § 5 stage 5).
-/// Field exists on `AgentInput` so the input schema doesn't churn when
-/// stage 5 fills it in.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ParentRef {}
+/// JAR2-80 (stage 5.3) promotes this from an empty stub to its real
+/// shape: the child workflow's [`build_child_input`] populates it so
+/// stage 5.4's child → parent path can call
+/// `WorkflowContext::external_workflow(parent_handle.workflow_id, None)
+/// .signal(parent_handle.signal, ..)`. Today's `Default` is
+/// `signal: "external_signal"` matching the existing
+/// [`AgentWorkflow::external_signal`] handler the JAR2-60 stack routes
+/// `Trigger` payloads through; sibling JAR2-81 (5.4) introduces a
+/// dedicated handler if the trigger taxonomy splits.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentRef {
+    /// Temporal workflow id of the parent — load-bearing for
+    /// `external_workflow(workflow_id, None)` lookups. Per Stage 5
+    /// Project decision 6 this is the flat `graphs/<gid>/agents/<aid>`
+    /// form, not a nested id, so reparenting doesn't rewrite ids.
+    pub workflow_id: String,
+    /// Signal name on the parent the child fires `Trigger`s through.
+    /// Defaults to `"external_signal"` — the JAR2-60 handler name —
+    /// pinned as a constant via [`Self::DEFAULT_SIGNAL`]. Carried as a
+    /// field (rather than a hard-coded constant in the child's spawn
+    /// code) so the future Trigger-taxonomy split (5.4 if needed) only
+    /// touches this one default.
+    pub signal: String,
+}
+
+impl ParentRef {
+    /// The default signal name the JAR2-60 stack routes `Trigger`
+    /// payloads through (`AgentWorkflow::external_signal`).
+    /// [`build_child_input`] uses this when constructing the child's
+    /// `ParentRef` so the constant has one home.
+    pub const DEFAULT_SIGNAL: &'static str = "external_signal";
+}
+
+impl Default for ParentRef {
+    /// Default has an empty `workflow_id` and the JAR2-60 signal name.
+    /// The empty `workflow_id` is *not* a valid signal target — callers
+    /// constructing a `ParentRef` for live use must always populate
+    /// `workflow_id` (the `Default` exists for serde compat with the
+    /// pre-JAR2-80 wire shape and the test surface that constructs
+    /// `AgentInput` with `parent_handle: None`, which is the load-
+    /// bearing "no parent" case).
+    fn default() -> Self {
+        Self {
+            workflow_id: String::new(),
+            signal: Self::DEFAULT_SIGNAL.to_string(),
+        }
+    }
+}
 
 /// Scheduler-state subset of the [`Carryover`].
 ///
@@ -155,18 +219,12 @@ pub struct SchedulerCursor {
     pub next_wake: Option<Duration>,
 }
 
-/// Stage-5 child-workflow handle placeholder.
-///
-/// Empty struct because stage 3 does not have a parent-child topology
-/// (see `scratch/temporal_staged_plan.md` § 5 stage 5). The
-/// `Carryover.child_handles` vector is structurally always empty
-/// today; carrying it across CAN is a no-op until stage 5 fills in
-/// the field. `#[non_exhaustive]` reserves room for future fields
-/// (`workflow_id`, `run_id`, `parent_signal_path`, …) without a wire
-/// break.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct ChildRef {}
+// JAR2-80 (stage 5.3) drops the empty `ChildRef` placeholder — the
+// `Carryover.child_handles` slot now carries the kernel-native
+// [`AgentRef`] from `jarvis_node::agent_ref` (workflow_id + agent_id).
+// `Decision::SpawnChild`'s workflow arm pushes a fresh `AgentRef` onto
+// the parent's `child_handles` workflow-state field, and the carryover
+// round-trip preserves it across continue-as-new.
 
 /// Typed continue-as-new carryover.
 ///
@@ -230,9 +288,17 @@ pub struct Carryover {
     /// than a bare `Option<Duration>` so future scheduler state can
     /// slot in without a wire break (see [`SchedulerCursor`] doc).
     pub scheduler_cursor: SchedulerCursor,
-    /// Stage-5 placeholder — always `Vec::new()` today (see
-    /// [`ChildRef`] doc).
-    pub child_handles: Vec<ChildRef>,
+    /// JAR2-80 (stage 5.3): handles to spawned child agents the parent
+    /// retains across continue-as-new. Each entry is an [`AgentRef`]
+    /// (workflow id + structural `agent_id`) populated by the
+    /// `Decision::SpawnChild` arm of [`AgentWorkflow::run`]. The
+    /// carryover round-trip preserves the vector so a post-CAN run's
+    /// snapshot / reconcile path sees the same child set the pre-CAN
+    /// run did. Pre-JAR2-80 this slot was structurally always empty
+    /// (`Vec<ChildRef>` where `ChildRef` was a placeholder unit
+    /// struct); the change is a wire break per the
+    /// no-back-compat-pre-prod stance.
+    pub child_handles: Vec<AgentRef>,
     /// `EmitOutput`-side last-persisted output id. Today the workflow
     /// body does not consume this (`persist_output` activity writes the
     /// output without echoing the id back into workflow state), but
@@ -291,22 +357,66 @@ pub struct AgentInput {
     /// `jarvis-apply` CLI derives it from the operator-authored
     /// `graph.yaml` via `jarvis_graph::yaml::into_agent_input`.
     pub mandate: Mandate,
+    /// JAR2-80 (Stage 5 Project decision 8): the graph this agent
+    /// belongs to. Carried on `AgentInput` (rather than synthesized from
+    /// the workflow id string at activity-time) so the workflow body
+    /// can pass it through to the `register_child_in_structural_db`
+    /// activity without parsing `ctx.workflow_id()` — the parse would
+    /// tie the workflow body to the id-scheme string format, which is
+    /// brittle.
+    pub graph_id: GraphId,
+    /// JAR2-80: this agent's structural-DB id. Same rationale as
+    /// `graph_id` — the `Decision::SpawnChild` arm needs the parent's
+    /// `AgentId` to write the parent → child edge.
+    pub agent_id: AgentId,
+    /// JAR2-80: the operator-authored agent name (the
+    /// `agents[].id` from the YAML, distinct from the structural
+    /// `agent_id` UUID). Bundled now (rather than added later by
+    /// sibling JAR2-81 separately) so the wire shape of `AgentInput`
+    /// changes atomically with one of the JAR2-80 / JAR2-81 PRs
+    /// merging — the merger sees byte-identical struct definitions.
+    /// JAR2-81's child → parent signal renderer uses this for the
+    /// `ChildOutput { child_name }` field; JAR2-80's spawn arm
+    /// populates it from `Decision::SpawnChild { agent_name }`.
+    pub agent_name: String,
 }
 
-impl Default for AgentInput {
-    /// Manual impl (instead of `derive`) because [`Mandate`] has no
-    /// `Default`. JAR2-68 promoted `mandate` to a load-bearing field;
-    /// the default value mirrors the placeholder the JAR2-58..67 path
-    /// synthesized inline (`Mandate::new("", ZERO, None)`), so every
-    /// `AgentInput::default()` callsite in tests keeps its prior
-    /// observable shape (empty text + zero idle + no cap).
-    fn default() -> Self {
+// JAR2-80 deliberately drops the `Default` impl on `AgentInput`. An
+// agent without `graph_id` / `agent_id` / `agent_name` is meaningless —
+// the new identity fields don't have sensible zero values that wouldn't
+// silently mask a missing-construction bug at the call site (a
+// zero-UUID for `agent_id` would parse as valid but route every spawn
+// to the same edge row). Every test + binary now constructs `AgentInput`
+// explicitly via [`AgentInput::new_for_test`] (test surface) or the YAML
+// adapter (`jarvis_graph::yaml::into_agent_input`).
+
+impl AgentInput {
+    /// JAR2-80 test surface: construct an [`AgentInput`] with the
+    /// JAR2-58..67 first-run defaults for every non-identity field
+    /// (`cfg: Default`, `fs_handle: Default`, `parent_handle: None`,
+    /// `carryover: None`, `mandate: Mandate::new("", ZERO, None)`),
+    /// requiring the caller to supply the identity triple
+    /// (`graph_id`, `agent_id`, `agent_name`) explicitly.
+    ///
+    /// **Test-only.** Production constructors (`into_agent_input` /
+    /// `build_child_input`) carry a real mandate + fs_handle; this
+    /// helper exists so JAR2-58..67's signal / smoke / loop tests can
+    /// keep their "empty `AgentInput`" shape after `Default` was
+    /// removed without each test re-coding the same boilerplate.
+    pub fn new_for_test(
+        graph_id: GraphId,
+        agent_id: AgentId,
+        agent_name: impl Into<String>,
+    ) -> Self {
         Self {
             cfg: AgentConfig::default(),
             fs_handle: FsHandle::default(),
             parent_handle: None,
             carryover: None,
             mandate: Mandate::new("", Duration::ZERO, None),
+            graph_id,
+            agent_id,
+            agent_name: agent_name.into(),
         }
     }
 }
@@ -484,6 +594,15 @@ pub struct AgentWorkflow {
     /// [`Carryover::tick`] on post-CAN runs so the artifact stream
     /// stays monotonic across the boundary.
     tick: u64,
+    /// JAR2-80 (stage 5.3): handles to child agents this workflow has
+    /// spawned via `Decision::SpawnChild`. Each entry is an
+    /// [`AgentRef`] (workflow id + structural `agent_id`). Pushed by
+    /// the `Decision::SpawnChild` arm of [`AgentWorkflow::run`] after
+    /// the `register_child_in_structural_db` activity returns the
+    /// child's id and `ctx.child_workflow(..)` has dispatched the
+    /// child run. Round-trips across continue-as-new via
+    /// [`Carryover::child_handles`].
+    child_handles: Vec<AgentRef>,
 }
 
 #[workflow_methods]
@@ -627,21 +746,39 @@ impl AgentWorkflow {
                     // line, not a deferred event.
                     return retire(ctx, &input.fs_handle, reason).await;
                 }
-                // JAR2-78 (stage 5.1): the four parent-child topology
-                // variants are reserved here so the exhaustive match
-                // compiles, but their workflow-side dispatch lands in
-                // stage 5.3 (`spawn_child`), 5.5 (`reconcile_children`)
-                // and 5.7 (`retire_child` / `replace_child`). Until
-                // those tickets ship, the parser can produce these
-                // variants but no `MockDecide` or live LLM script in
-                // the existing suite will reach them — and if one did,
-                // `unimplemented!` is the boundary signal Stage 5
-                // Project decision 11 calls for.
-                Decision::SpawnChild { .. }
-                | Decision::ReconcileChildren { .. }
+                // JAR2-80 (stage 5.3): spawn_child wired here. Calls
+                // the `register_child_in_structural_db` activity to
+                // mint the child's structural id + write the
+                // parent→child edge, then `ctx.child_workflow(..)` to
+                // start the child workflow under the flat workflow-id
+                // scheme `graphs/<gid>/agents/<child_aid>` with
+                // `ParentClosePolicy::Abandon` (Stage 5 Project
+                // decision 5). The child handle is dropped without
+                // `.result().await` — detached per `agent_runtime.md`
+                // § 7 (children survive parent retirement; only
+                // `Decision::RetireChild` (5.7) terminates them). The
+                // new child's `AgentRef` lands on
+                // `self.child_handles`, which round-trips through
+                // continue-as-new via [`Carryover::child_handles`].
+                //
+                // `ctx.state_mut(|s| s.staged_correction = None)` is
+                // omitted here: a successful SpawnChild does not
+                // satisfy a previously-staged tool-failure correction
+                // (the correction is about the parent's *own* prior
+                // failed tool call, not about spawning a sibling);
+                // clearing it would silently swallow next-tick LLM
+                // context. The correction clears naturally on the
+                // next `EmitOutput` / `RewriteFs` / `Idle` arm.
+                Decision::SpawnChild {
+                    agent_name,
+                    mandate,
+                } => {
+                    spawn_child(ctx, &input, agent_name, mandate).await?;
+                }
+                Decision::ReconcileChildren { .. }
                 | Decision::RetireChild { .. }
                 | Decision::ReplaceChild { .. } => unimplemented!(
-                    "stage 5.3/5.5/5.7: workflow-side dispatch for parent-child decisions \
+                    "stage 5.5/5.7: workflow-side dispatch for reconcile/retire/replace \
                      is not yet wired — see Stage 5 Project decisions 4 and 11"
                 ),
             }
@@ -717,7 +854,13 @@ impl AgentWorkflow {
             scheduler_cursor: SchedulerCursor {
                 next_wake: self.next_wake,
             },
-            child_handles: Vec::new(),
+            // JAR2-80 (stage 5.3): child_handles is now load-bearing.
+            // Pre-JAR2-80 this was always `Vec::new()` because no
+            // workflow code populated it; the `Decision::SpawnChild`
+            // arm now pushes `AgentRef`s onto `self.child_handles`, and
+            // they must survive CAN so the post-CAN run's snapshot /
+            // reconcile path sees the same child set.
+            child_handles: self.child_handles.clone(),
             last_output_id: self.last_output_id.clone(),
             mid_tick_evidence: self.mid_tick_evidence.clone(),
             cumulative_triggers_observed: self.cumulative_triggers_observed,
@@ -750,8 +893,13 @@ impl AgentWorkflow {
         self.cumulative_human_ops_observed = c.cumulative_human_ops_observed;
         self.cumulative_mandate_patches_observed = c.cumulative_mandate_patches_observed;
         self.tick = c.tick;
-        // `child_handles` is structurally empty in stage 3 — ignored.
-        let _ = c.child_handles;
+        // JAR2-80 (stage 5.3): child_handles round-trips on the carryover
+        // — restore the spawned-child handle set so a post-CAN run's
+        // reconcile / retire / replace paths see the same children the
+        // pre-CAN run did. Replaces the `let _ = c.child_handles`
+        // bridge that the JAR2-67 placeholder used while `ChildRef` was
+        // an empty unit struct.
+        self.child_handles = c.child_handles;
     }
 }
 
@@ -1072,6 +1220,151 @@ async fn dispatch_call_tools(
     Ok(())
 }
 
+/// JAR2-80 (stage 5.3): construct the [`AgentInput`] for a freshly-
+/// spawned child workflow. Shared between the `Decision::SpawnChild`
+/// arm of [`AgentWorkflow::run`] and 5.8's `jarvis apply` walker so
+/// the two surfaces cannot drift on `parent_handle` shape, FS
+/// prefix layout, or inherited cfg.
+///
+/// Fields:
+/// - `parent_workflow_id` — `&str` from `ctx.workflow_id()` in the
+///   workflow arm, or the apply walker's freshly-allocated id.
+/// - `parent_agent_id`, `parent_graph_id` — needed for the child's
+///   `parent_handle` and for `FsHandle::for_agent` (which scopes the
+///   child's FS to `graphs/<parent_gid>/agents/<child_aid>`; per Stage 5
+///   Project decision 6 the child shares the parent's graph_id rather
+///   than getting a fresh one — only `agent_id` is fresh per spawn).
+/// - `child_agent_id`, `child_agent_name`, `child_mandate` — the new
+///   child's identity + mandate.
+/// - `inherited_cfg` — the parent's [`AgentConfig`]. v1's `AgentConfig`
+///   is an empty placeholder so inheritance is a clone; later stages
+///   may make this a selective merge.
+///
+/// Returns an `AgentInput` with `carryover: None` (fresh first run) and
+/// `parent_handle: Some(..)` populated to route 5.4's child → parent
+/// signals back to the parent.
+pub fn build_child_input(
+    parent_workflow_id: &str,
+    parent_agent_id: AgentId,
+    parent_graph_id: GraphId,
+    child_agent_id: AgentId,
+    child_agent_name: String,
+    child_mandate: Mandate,
+    inherited_cfg: AgentConfig,
+) -> AgentInput {
+    // `parent_agent_id` is on the signature for symmetry + future use
+    // (e.g. a `parent_handle.agent_id` field if 5.4 needs it for
+    // routing), but today's `ParentRef` shape only carries the
+    // workflow id. Acknowledge the binding so clippy's
+    // unused-variable lint doesn't fire and a future field addition
+    // doesn't need a new positional argument.
+    let _ = parent_agent_id;
+    AgentInput {
+        cfg: inherited_cfg,
+        fs_handle: FsHandle::for_agent(parent_graph_id, child_agent_id),
+        parent_handle: Some(ParentRef {
+            workflow_id: parent_workflow_id.to_string(),
+            signal: ParentRef::DEFAULT_SIGNAL.to_string(),
+        }),
+        carryover: None,
+        mandate: child_mandate,
+        graph_id: parent_graph_id,
+        agent_id: child_agent_id,
+        agent_name: child_agent_name,
+    }
+}
+
+/// JAR2-80 (stage 5.3): the `Decision::SpawnChild` workflow arm body.
+///
+/// Pulled into a free function so the loop body's `match` stays inside
+/// the readability budget. Sequence:
+///
+/// 1. Invoke `register_child_in_structural_db` activity — writes the
+///    child's `agents` row + parent→child `edges` row, returns the
+///    freshly-minted `AgentId`.
+/// 2. Construct child workflow id (`graphs/<gid>/agents/<child_aid>`,
+///    per Stage 5 Project decision 6).
+/// 3. Build the child's `AgentInput` via [`build_child_input`].
+/// 4. `ctx.child_workflow(AgentWorkflow::run, ..)` with
+///    `ParentClosePolicy::Abandon` (Stage 5 Project decision 5). The
+///    `.await` here resolves once the child workflow has *started*,
+///    not when it completes — `ctx.child_workflow` returns a
+///    `Future<Result<StartedChildWorkflow, _>>` and the started handle
+///    has its own `.result()` that completion-waits.
+/// 5. Drop the started child handle without awaiting its result. The
+///    parent does NOT block on the child (`agent_runtime.md` § 7); the
+///    child runs independently and reports back via 5.4's
+///    `signal_external_workflow` path.
+/// 6. Push the child's `AgentRef` onto `self.child_handles` for
+///    later snapshot / reconcile / retire reads + carryover round-trip.
+async fn spawn_child(
+    ctx: &WorkflowContext<AgentWorkflow>,
+    input: &AgentInput,
+    child_agent_name: String,
+    child_mandate: Mandate,
+) -> WorkflowResult<()> {
+    let reg = ctx
+        .start_activity(
+            AgentActivities::register_child_in_structural_db,
+            RegisterChildInStructuralDbInput {
+                parent_graph_id: input.graph_id,
+                parent_agent_id: input.agent_id,
+                child_agent_name: child_agent_name.clone(),
+                // Runtime spawns don't carry a `mandate_ref` (the
+                // child's mandate travels on `AgentInput.mandate`, per
+                // Stage 5 Project decision 9). YAML-driven spawns
+                // (5.8) may pass a real ref here once the resolver
+                // ships.
+                child_mandate_ref: None,
+            },
+            activity_opts(),
+        )
+        .await?;
+    let child_agent_id = reg.child_agent_id;
+
+    let child_workflow_id =
+        agent_workflow_id(&input.graph_id.to_string(), &child_agent_id.to_string());
+    let parent_workflow_id = ctx.workflow_id().to_string();
+    let child_input = build_child_input(
+        &parent_workflow_id,
+        input.agent_id,
+        input.graph_id,
+        child_agent_id,
+        child_agent_name,
+        child_mandate,
+        input.cfg.clone(),
+    );
+
+    // Per Stage 5 Project decision 5: every child is spawned with
+    // `ParentClosePolicy::Abandon` so it survives parent CAN, parent
+    // restart, and even parent retirement. The only kill path is
+    // `Decision::RetireChild` (5.7).
+    //
+    // The SDK's `child_workflow(..)` returns a future that resolves
+    // once the child has *started*; we await that (to surface a start
+    // failure as a workflow error) and then drop the started handle
+    // without awaiting its `.result()` — detached per § 7.
+    let opts = ChildWorkflowOptions {
+        workflow_id: child_workflow_id.clone(),
+        parent_close_policy: ParentClosePolicy::Abandon,
+        ..Default::default()
+    };
+    let started = ctx
+        .child_workflow(AgentWorkflow::run, child_input, opts)
+        .await
+        .map_err(|e| anyhow::anyhow!("child_workflow start failed: {e:?}"))?;
+    // Detached: explicitly drop the started handle. Awaiting
+    // `started.result()` would block the parent for the child's full
+    // lifetime — defeats the whole `Abandon` design.
+    drop(started);
+
+    ctx.state_mut(|s| {
+        s.child_handles
+            .push(AgentRef::new(child_workflow_id, child_agent_id));
+    });
+    Ok(())
+}
+
 /// Render the staged correction text for a tool-batch failure. Mirrors
 /// the *shape* of `agent_core::tool_failure_correction_text` (the
 /// in-process loop's equivalent) but lives here so the workflow can
@@ -1114,14 +1407,21 @@ mod tests {
     }
 
     #[test]
-    fn agent_input_default_has_no_carryover() {
-        // `Default` pinned by JAR2-58 + JAR2-59 tests. JAR2-60 keeps the
-        // shape: `carryover.is_none()` is "first run", but the loop body
-        // no longer branches on it — `ctx.continue_as_new_suggested()`
-        // is the trigger.
-        let input = AgentInput::default();
+    fn agent_input_new_for_test_has_no_carryover_and_no_parent() {
+        // JAR2-80 (stage 5.3): `Default` impl was dropped because the
+        // new identity fields (`graph_id` / `agent_id` / `agent_name`)
+        // don't have sensible zero values. `new_for_test` is the
+        // test surface that preserves the JAR2-58..67 first-run
+        // observable shape (no carryover, no parent) given an
+        // explicit identity triple.
+        let input = AgentInput::new_for_test(
+            GraphId::new(uuid::Uuid::nil()),
+            AgentId::new(uuid::Uuid::nil()),
+            "root",
+        );
         assert!(input.carryover.is_none());
         assert!(input.parent_handle.is_none());
+        assert_eq!(input.agent_name, "root");
     }
 
     #[test]
@@ -1134,6 +1434,9 @@ mod tests {
             parent_handle: None,
             carryover: Some(Carryover::default()),
             mandate: Mandate::new("hello", Duration::from_millis(123), Some(7)),
+            graph_id: GraphId::new(uuid::Uuid::from_u128(0xAB)),
+            agent_id: AgentId::new(uuid::Uuid::from_u128(0xCD)),
+            agent_name: "root".into(),
         };
         let json = serde_json::to_string(&input).expect("serialize AgentInput");
         let back: AgentInput = serde_json::from_str(&json).expect("deserialize AgentInput");
@@ -1355,6 +1658,7 @@ mod tests {
     /// against this fixture so a future field addition automatically
     /// shows up as a test miss if not represented.
     fn fully_populated_carryover() -> Carryover {
+        use uuid::Uuid;
         Carryover {
             pending_triggers: vec![
                 Trigger::ScheduledWake,
@@ -1370,7 +1674,13 @@ mod tests {
             scheduler_cursor: SchedulerCursor {
                 next_wake: Some(Duration::from_millis(250)),
             },
-            child_handles: Vec::new(),
+            // JAR2-80: child_handles is load-bearing — populated with
+            // one entry so the fully-populated round-trip exercises
+            // the AgentRef serde wire shape.
+            child_handles: vec![AgentRef::new(
+                "graphs/g1/agents/c1",
+                AgentId::new(Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap()),
+            )],
             last_output_id: Some(OutputId::from_hex("ab".repeat(32))),
             mid_tick_evidence: vec![EvidenceId::from_hex("0123456789abcdef")],
             cumulative_triggers_observed: 5,
@@ -1418,6 +1728,9 @@ mod tests {
             parent_handle: None,
             carryover: Some(fully_populated_carryover()),
             mandate: Mandate::new("populated-carryover", Duration::from_millis(50), None),
+            graph_id: GraphId::new(uuid::Uuid::from_u128(0xAB)),
+            agent_id: AgentId::new(uuid::Uuid::from_u128(0xCD)),
+            agent_name: "root".into(),
         };
         let json = serde_json::to_string(&input).unwrap();
         let back: AgentInput = serde_json::from_str(&json).unwrap();
@@ -1606,15 +1919,122 @@ mod tests {
         assert!(c.next_wake.is_none());
     }
 
+    // ---- JAR2-80 (stage 5.3) — build_child_input + FsHandle::for_agent + ParentRef ----
+
     #[test]
-    fn child_handles_empty_on_stage_3_carryover() {
-        // Stage 3 has no parent-child topology — every carryover
-        // produced by the workflow body must have an empty
-        // `child_handles`. Stage 5 fills this in.
+    fn parent_ref_default_uses_external_signal_constant() {
+        let p = ParentRef::default();
+        assert!(p.workflow_id.is_empty());
+        assert_eq!(p.signal, ParentRef::DEFAULT_SIGNAL);
+        assert_eq!(p.signal, "external_signal");
+    }
+
+    #[test]
+    fn parent_ref_round_trips_through_json() {
+        let p = ParentRef {
+            workflow_id: "graphs/g1/agents/parent".into(),
+            signal: "custom_signal".into(),
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: ParentRef = serde_json::from_str(&s).unwrap();
+        assert_eq!(p, back);
+        assert!(s.contains("\"workflow_id\":\"graphs/g1/agents/parent\""));
+    }
+
+    #[test]
+    fn fs_handle_for_agent_uses_workflow_id_layout() {
+        use uuid::Uuid;
+        let g = GraphId::new(Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap());
+        let a = AgentId::new(Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap());
+        let h = FsHandle::for_agent(g, a);
+        assert_eq!(
+            h.prefix,
+            "graphs/11111111-2222-3333-4444-555555555555/agents/66666666-7777-8888-9999-aaaaaaaaaaaa",
+        );
+    }
+
+    #[test]
+    fn build_child_input_populates_parent_handle_and_identity() {
+        use uuid::Uuid;
+        let parent_graph_id =
+            GraphId::new(Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap());
+        let parent_agent_id =
+            AgentId::new(Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap());
+        let child_agent_id =
+            AgentId::new(Uuid::parse_str("bbbbbbbb-cccc-dddd-eeee-ffffffffffff").unwrap());
+        let mandate = Mandate::new("child mandate", Duration::from_millis(500), Some(8));
+
+        let input = build_child_input(
+            "graphs/g1/agents/parent",
+            parent_agent_id,
+            parent_graph_id,
+            child_agent_id,
+            "fetcher".into(),
+            mandate.clone(),
+            AgentConfig::default(),
+        );
+
+        // Identity carried from the helper args.
+        assert_eq!(input.graph_id, parent_graph_id);
+        assert_eq!(input.agent_id, child_agent_id);
+        assert_eq!(input.agent_name, "fetcher");
+        assert_eq!(input.mandate, mandate);
+
+        // Carryover is `None` — child is a fresh first run.
+        assert!(input.carryover.is_none());
+
+        // FS prefix scopes under the parent's graph (NOT a fresh
+        // graph_id) — matches Stage 5 Project decision 6's flat
+        // workflow-id scheme.
+        assert_eq!(
+            input.fs_handle.prefix,
+            format!("graphs/{parent_graph_id}/agents/{child_agent_id}"),
+        );
+
+        // parent_handle points back at the parent's workflow id with
+        // the default `external_signal` name.
+        let parent_handle = input
+            .parent_handle
+            .as_ref()
+            .expect("build_child_input must populate parent_handle");
+        assert_eq!(parent_handle.workflow_id, "graphs/g1/agents/parent");
+        assert_eq!(parent_handle.signal, ParentRef::DEFAULT_SIGNAL);
+    }
+
+    #[test]
+    fn child_handles_round_trip_via_carryover() {
+        // JAR2-80 (stage 5.3): `child_handles` is now a load-bearing
+        // slot. Encode a workflow with two spawned children, ensure
+        // the carryover carries both handles, then hydrate into a
+        // fresh workflow and confirm the vec survives round-trip.
+        // Replaces the pre-JAR2-80 "always-empty" assertion (which
+        // bound the stage-3 stub shape).
+        use uuid::Uuid;
+        let h1 = AgentRef::new(
+            "graphs/g1/agents/c1",
+            AgentId::new(Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap()),
+        );
+        let h2 = AgentRef::new(
+            "graphs/g1/agents/c2",
+            AgentId::new(Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap()),
+        );
         let mut wf = AgentWorkflow::default();
-        wf.pending_triggers.push(Trigger::ScheduledWake);
+        wf.child_handles.push(h1.clone());
+        wf.child_handles.push(h2.clone());
+
         let c = wf.encode_carryover();
-        assert!(c.child_handles.is_empty());
+        assert_eq!(c.child_handles, vec![h1.clone(), h2.clone()]);
+
+        // Round-trip through JSON (the wire path Temporal uses).
+        let json = serde_json::to_string(&c).expect("serialize carryover w/ child_handles");
+        let c2: Carryover =
+            serde_json::from_str(&json).expect("deserialize carryover w/ child_handles");
+        assert_eq!(c2.child_handles, vec![h1.clone(), h2.clone()]);
+
+        // Hydrate into a fresh workflow and confirm restoration.
+        let mut wf2 = AgentWorkflow::default();
+        wf2.hydrate_from_carryover(c2);
+        assert_eq!(wf2.child_handles, vec![h1, h2]);
     }
 
     /// JAR2-68: the decision-log summary string is what the TUI phase 1

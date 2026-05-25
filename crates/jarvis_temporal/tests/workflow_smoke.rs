@@ -53,6 +53,7 @@ use temporalio_client::{
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
+use jarvis_node::agent_ref::{AgentId, GraphId};
 use jarvis_node::decision::{ClaimSeed, Decision, ToolCall};
 use jarvis_node::evidence::EvidenceRecord;
 use jarvis_node::fs::AgentFs;
@@ -62,6 +63,7 @@ use jarvis_node::tools::{Tool, ToolRegistry};
 use jarvis_temporal::activities::{set_decision_script, DecisionLogEntry};
 use jarvis_temporal::worker::{build_worker, install_agent_storage, install_tool_registry};
 use jarvis_temporal::workflow::{agent_workflow_id, AgentInput, AgentResult, AgentWorkflow};
+use uuid::Uuid;
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
 const DEFAULT_NAMESPACE: &str = "default";
@@ -265,11 +267,16 @@ async fn drive(
     storage: Arc<MemoryStorage>,
     planted_id: jarvis_node::evidence::EvidenceId,
 ) -> Result<()> {
-    let input = AgentInput {
-        fs_handle: jarvis_temporal::workflow::FsHandle {
-            prefix: agent_prefix.into(),
-        },
-        ..AgentInput::default()
+    // JAR2-80: `Default` was dropped — use `new_for_test` for the
+    // identity defaults, then override `fs_handle` so the per-run
+    // prefix continues to namespace storage writes.
+    let mut input = AgentInput::new_for_test(
+        GraphId::new(Uuid::new_v4()),
+        AgentId::new(Uuid::new_v4()),
+        "workflow-smoke-test",
+    );
+    input.fs_handle = jarvis_temporal::workflow::FsHandle {
+        prefix: agent_prefix.into(),
     };
     let handle = client
         .start_workflow(

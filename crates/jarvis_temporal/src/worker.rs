@@ -28,6 +28,8 @@ use std::env;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use jarvis_node::agent_ref::{AgentId, GraphId};
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 use jarvis_node::decide_llm::LlmDecide;
 use jarvis_node::decision::Decide;
@@ -216,6 +218,87 @@ pub fn tool_registry() -> Arc<ToolRegistry> {
         .get()
         .cloned()
         .expect("tool_registry() accessed before install_tool_registry()")
+}
+
+/// Structural-DB writer surface the `register_child_in_structural_db`
+/// activity (JAR2-80, stage 5.3) reaches for.
+///
+/// **Trait, not concrete type** — `jarvis_graph::GraphStore` already
+/// imports from `jarvis_temporal` (`yaml::into_agent_input` constructs
+/// an `AgentInput`), so depending on `jarvis_graph` from here would
+/// cycle. Defining the contract as a trait in `jarvis_temporal` and
+/// `impl`ing it on `GraphStore` from inside `jarvis_graph` resolves the
+/// dependency direction the same way [`AgentStorage`] does for the per-
+/// agent FS (JAR2-69).
+///
+/// The two methods mirror the `GraphStore` shape the activity's pseudo-
+/// code calls out — `add_agent` returns the freshly-minted `AgentId`,
+/// `add_edge` records the parent → child relationship.
+#[async_trait]
+pub trait StructuralDbStore: Send + Sync {
+    /// Insert an agent row into a graph and return the freshly-allocated
+    /// `AgentId`. `mandate_ref` is the opaque text handle from
+    /// `migrations/0001_initial.sql`; the runtime spawn path passes
+    /// `None` (the child's mandate travels via `AgentInput.mandate`, per
+    /// Stage 5 Project decision 9).
+    async fn add_agent(
+        &self,
+        graph_id: GraphId,
+        name: &str,
+        mandate_ref: Option<&str>,
+    ) -> anyhow::Result<AgentId>;
+
+    /// Insert a parent → child edge. Returns an error on UNIQUE
+    /// violation; the activity surfaces that as `ActivityError` so the
+    /// workflow body's retry / correction path takes over (rather than
+    /// silently swallowing a double-spawn).
+    async fn add_edge(
+        &self,
+        parent_agent_id: AgentId,
+        child_agent_id: AgentId,
+    ) -> anyhow::Result<()>;
+}
+
+/// Process-wide [`StructuralDbStore`] backend the
+/// `register_child_in_structural_db` activity (JAR2-80) reaches for.
+///
+/// Same OnceLock pattern as [`AGENT_STORAGE`] / [`TOOL_REGISTRY`] — the
+/// activity macro takes a value-typed bundle (smoke § 3.4), so shared
+/// state lives behind a `static`. The worker daemon installs a
+/// `GraphStore` (wrapped in `Arc<dyn StructuralDbStore>`) at boot; test
+/// harnesses install an in-memory fake.
+static STRUCTURAL_DB: OnceLock<Arc<dyn StructuralDbStore>> = OnceLock::new();
+
+/// Install the process-wide [`StructuralDbStore`] backend.
+///
+/// Worker binaries call this at boot once they've connected to the
+/// structural DB (`DATABASE_URL`) and built a `GraphStore`. Test
+/// harnesses install a fake implementation.
+///
+/// **Panics** on double install. Same loud-on-misuse rationale as
+/// [`install_agent_storage`].
+pub fn install_structural_db_store(store: Arc<dyn StructuralDbStore>) {
+    STRUCTURAL_DB
+        .set(store)
+        .map_err(|_| ())
+        .expect("install_structural_db_store called twice; one process, one structural DB");
+}
+
+/// Access the installed [`StructuralDbStore`] backend.
+///
+/// Returns a cheap [`Arc`] clone — the activity body holds it only for
+/// the duration of one add_agent + add_edge pair. `Arc<dyn ..>` is the
+/// trait-object form so callers can swap in `MemoryStructuralDbStore`
+/// (tests) or `GraphStore` (production) interchangeably.
+///
+/// **Panics** if [`install_structural_db_store`] hasn't been called.
+/// Activities only run after the worker has booted, so callers from
+/// activity bodies are structurally safe.
+pub fn structural_db_store() -> Arc<dyn StructuralDbStore> {
+    STRUCTURAL_DB
+        .get()
+        .cloned()
+        .expect("structural_db_store() accessed before install_structural_db_store()")
 }
 
 /// Build a worker registering [`AgentWorkflow`] + [`AgentActivities`] on
@@ -454,6 +537,37 @@ mod tests {
     use jarvis_node::tools::{EchoTool, ToolRegistry};
     use std::time::Duration;
 
+    /// JAR2-80 — minimal `StructuralDbStore` impl whose methods panic
+    /// when called. The install/access test only exercises the
+    /// `OnceLock` plumbing; we never `add_agent` / `add_edge` through
+    /// it, so panicking on call is the cheapest way to flag any
+    /// accidental dispatch through this fake.
+    mod structural_db_test_double {
+        use super::*;
+
+        pub struct PanicStructuralDbStore;
+
+        #[async_trait]
+        impl StructuralDbStore for PanicStructuralDbStore {
+            async fn add_agent(
+                &self,
+                _graph_id: GraphId,
+                _name: &str,
+                _mandate_ref: Option<&str>,
+            ) -> anyhow::Result<AgentId> {
+                panic!("PanicStructuralDbStore::add_agent must not be called from this test")
+            }
+
+            async fn add_edge(
+                &self,
+                _parent_agent_id: AgentId,
+                _child_agent_id: AgentId,
+            ) -> anyhow::Result<()> {
+                panic!("PanicStructuralDbStore::add_edge must not be called from this test")
+            }
+        }
+    }
+
     #[test]
     fn install_then_access_then_double_install_panics() {
         // ---- storage half ------------------------------------------------
@@ -514,6 +628,32 @@ mod tests {
             install_tool_registry(Arc::new(ToolRegistry::new()));
         });
         assert!(result.is_err(), "double install_tool_registry should panic");
+    }
+
+    /// JAR2-80 mirror of the JAR2-69/JAR2-63 install/access pattern for
+    /// the [`StructuralDbStore`] OnceLock. Same one-test-per-process
+    /// constraint: the static can only be `set` once, so install +
+    /// access + double-install live in one test. Each install pair runs
+    /// against its own freshly-constructed `OnceLock` (the static here
+    /// is independent of `AGENT_STORAGE` / `DECIDE_IMPL` /
+    /// `TOOL_REGISTRY`), so this test can't conflict with the others.
+    #[test]
+    fn install_structural_db_store_then_access_then_double_install_panics() {
+        let fake: Arc<dyn StructuralDbStore> =
+            Arc::new(structural_db_test_double::PanicStructuralDbStore);
+        install_structural_db_store(fake);
+        let s = structural_db_store();
+        assert!(Arc::strong_count(&s) >= 2);
+
+        let result = std::panic::catch_unwind(|| {
+            install_structural_db_store(Arc::new(
+                structural_db_test_double::PanicStructuralDbStore,
+            ));
+        });
+        assert!(
+            result.is_err(),
+            "double install_structural_db_store should panic"
+        );
     }
 
     /// JAR2-70 — `resolve_vendor_inner` precedence matrix.

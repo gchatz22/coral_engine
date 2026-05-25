@@ -57,6 +57,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use jarvis_node::agent_core;
+use jarvis_node::agent_ref::{AgentId, GraphId};
 use jarvis_node::decision::{ContextBundle, CorrectionContext, Decide, Decision, FsOp, ToolCall};
 use jarvis_node::evidence::EvidenceId;
 use jarvis_node::fs::AgentFs;
@@ -69,7 +70,7 @@ use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use temporalio_sdk::ApplicationFailure;
 
-use crate::worker::agent_storage;
+use crate::worker::{agent_storage, structural_db_store};
 use crate::workflow::{AgentConfig, FsHandle};
 
 // ---------------------------------------------------------------------------
@@ -239,6 +240,35 @@ pub struct AppendDecisionLogInput {
     pub fs_handle: FsHandle,
     pub tick: u64,
     pub decision_summary: String,
+}
+
+/// JAR2-80 (stage 5.3) — input for the `register_child_in_structural_db`
+/// activity body. Carries the parent's `(graph_id, agent_id)` so the
+/// activity can write the child's `agents` row (scoped to the parent's
+/// graph) and the parent → child `edges` row in one transaction's worth
+/// of writes.
+///
+/// `child_mandate_ref` is the opaque text handle from the structural-DB
+/// schema (`migrations/0001_initial.sql`). Runtime spawns
+/// (`Decision::SpawnChild`) pass `None` — the child's mandate travels
+/// via `AgentInput.mandate` per Stage 5 Project decision 9 and the
+/// runtime spawn never produces a stable text handle. YAML-driven
+/// spawns (5.8) may pass a real ref here once the resolver ships.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisterChildInStructuralDbInput {
+    pub parent_graph_id: GraphId,
+    pub parent_agent_id: AgentId,
+    pub child_agent_name: String,
+    pub child_mandate_ref: Option<String>,
+}
+
+/// JAR2-80 (stage 5.3) — output of the `register_child_in_structural_db`
+/// activity. Returns the child's freshly-allocated `AgentId` so the
+/// workflow body can construct the child workflow id
+/// (`graphs/<gid>/agents/<aid>`) and pass it to `ctx.child_workflow(..)`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisterChildInStructuralDbOutput {
+    pub child_agent_id: AgentId,
 }
 
 /// One JSONL entry written by [`AgentActivities::append_decision_log`].
@@ -793,6 +823,75 @@ impl AgentActivities {
         append_decision_log_impl(agent_storage(), &input.fs_handle.prefix, &entry).await?;
         Ok(())
     }
+
+    /// JAR2-80 (stage 5.3) — write the child's `agents` row + the
+    /// parent → child `edges` row into the structural DB, returning
+    /// the freshly-allocated `AgentId`.
+    ///
+    /// Routed through the worker-shared [`crate::worker::StructuralDbStore`]
+    /// trait object (installed at worker boot via
+    /// [`crate::worker::install_structural_db_store`]). The trait
+    /// lives in `jarvis_temporal` rather than `jarvis_node` because
+    /// `jarvis_graph::GraphStore` (the production impl) already
+    /// imports from `jarvis_temporal`'s public API — taking
+    /// `jarvis_graph` as a dep here would cycle. See
+    /// `crate::worker::StructuralDbStore`'s doc for the dependency-
+    /// direction rationale.
+    ///
+    /// The activity does **not** write `mandate.json` to the child's
+    /// FS — that's the child workflow's first-run `assemble_context`
+    /// (JAR2-61) job per Stage 5 Project decision 9. The activity's
+    /// scope is structural state only.
+    ///
+    /// Idempotency: not provided. Both writes are FK-bound — a
+    /// retried activity invocation with a re-allocated child UUID
+    /// would create a duplicate child row + duplicate edge. The
+    /// alternative — content-addressed `(graph_id, child_agent_name,
+    /// parent_agent_id)` keys — would require the DB schema to grow
+    /// a non-null `name`-uniqueness constraint per graph, which v1's
+    /// schema deliberately doesn't enforce (operator may want two
+    /// children with the same name). For now, Temporal's at-most-once
+    /// activity completion semantics keep the duplication
+    /// vanishingly rare; if it surfaces, the right fix is the schema
+    /// migration, not a workaround here.
+    #[activity]
+    pub async fn register_child_in_structural_db(
+        _ctx: ActivityContext,
+        input: RegisterChildInStructuralDbInput,
+    ) -> Result<RegisterChildInStructuralDbOutput, ActivityError> {
+        let store = structural_db_store();
+        let out = register_child_in_structural_db_impl(store, input).await?;
+        Ok(out)
+    }
+}
+
+/// JAR2-80 (stage 5.3) — substantive body of
+/// [`AgentActivities::register_child_in_structural_db`], factored out so
+/// hermetic / DB-backed integration tests can drive it against any
+/// [`crate::worker::StructuralDbStore`] without an `ActivityContext`
+/// (unconstructable outside a Worker per smoke § 3.4) or the
+/// process-wide `OnceLock` install (which would race the worker-test
+/// install). The activity-level wrapper above is a 3-line shim around
+/// this helper.
+///
+/// Mirrors the helper-extraction shape already in use for
+/// `apply_fs_ops_impl`, `persist_output_impl`, `append_decision_log_impl`,
+/// `persist_retirement_inner`.
+pub async fn register_child_in_structural_db_impl(
+    store: std::sync::Arc<dyn crate::worker::StructuralDbStore>,
+    input: RegisterChildInStructuralDbInput,
+) -> anyhow::Result<RegisterChildInStructuralDbOutput> {
+    let child_agent_id = store
+        .add_agent(
+            input.parent_graph_id,
+            &input.child_agent_name,
+            input.child_mandate_ref.as_deref(),
+        )
+        .await?;
+    store
+        .add_edge(input.parent_agent_id, child_agent_id)
+        .await?;
+    Ok(RegisterChildInStructuralDbOutput { child_agent_id })
 }
 
 /// Body of [`AgentActivities::persist_retirement`], factored out so the
@@ -1611,6 +1710,169 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.as_ref(), second.as_ref());
+    }
+
+    // ---- JAR2-80: register_child_in_structural_db_impl hermetic test ----
+
+    /// In-memory `StructuralDbStore` fake. Records every `add_agent` /
+    /// `add_edge` call so the hermetic tests can assert against them
+    /// without spinning up Postgres. Mirrors the role
+    /// `MemoryStorage` plays for the `AgentStorage` test surface.
+    /// One recorded call to [`MemoryStructuralDbStore::add_agent`].
+    /// Extracted to a struct (rather than a 4-tuple field on the fake)
+    /// to keep clippy's `type_complexity` lint happy and to give the
+    /// assertion below readable field names.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct RecordedAgent {
+        graph_id: GraphId,
+        name: String,
+        mandate_ref: Option<String>,
+        allocated_id: AgentId,
+    }
+
+    struct MemoryStructuralDbStore {
+        agents: std::sync::Mutex<Vec<RecordedAgent>>,
+        edges: std::sync::Mutex<Vec<(AgentId, AgentId)>>,
+    }
+
+    impl MemoryStructuralDbStore {
+        fn new() -> Self {
+            Self {
+                agents: std::sync::Mutex::new(Vec::new()),
+                edges: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::worker::StructuralDbStore for MemoryStructuralDbStore {
+        async fn add_agent(
+            &self,
+            graph_id: GraphId,
+            name: &str,
+            mandate_ref: Option<&str>,
+        ) -> anyhow::Result<AgentId> {
+            let id = AgentId::new(uuid::Uuid::new_v4());
+            self.agents.lock().unwrap().push(RecordedAgent {
+                graph_id,
+                name: name.to_string(),
+                mandate_ref: mandate_ref.map(str::to_string),
+                allocated_id: id,
+            });
+            Ok(id)
+        }
+
+        async fn add_edge(
+            &self,
+            parent_agent_id: AgentId,
+            child_agent_id: AgentId,
+        ) -> anyhow::Result<()> {
+            self.edges
+                .lock()
+                .unwrap()
+                .push((parent_agent_id, child_agent_id));
+            Ok(())
+        }
+    }
+
+    /// Activity-body hermetic coverage: the helper writes one agent
+    /// row + one parent → child edge with the right endpoints, and
+    /// the returned child id matches the recorded agent row's id.
+    /// Mirrors the helper-extraction shape of
+    /// `apply_fs_ops_impl_*` tests (drive the substantive logic against
+    /// an in-memory backend, no `ActivityContext`).
+    #[tokio::test]
+    async fn register_child_in_structural_db_impl_records_agent_name_and_edge_endpoints() {
+        let fake = std::sync::Arc::new(MemoryStructuralDbStore::new());
+        let store: std::sync::Arc<dyn crate::worker::StructuralDbStore> = fake.clone();
+
+        let parent_graph_id = GraphId::new(uuid::Uuid::new_v4());
+        let parent_agent_id = AgentId::new(uuid::Uuid::new_v4());
+
+        let out = register_child_in_structural_db_impl(
+            store,
+            RegisterChildInStructuralDbInput {
+                parent_graph_id,
+                parent_agent_id,
+                child_agent_name: "fetcher".into(),
+                child_mandate_ref: Some("v1".into()),
+            },
+        )
+        .await
+        .expect("activity body ok");
+
+        let agents = fake.agents.lock().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].graph_id, parent_graph_id);
+        assert_eq!(agents[0].name, "fetcher");
+        assert_eq!(agents[0].mandate_ref.as_deref(), Some("v1"));
+        assert_eq!(agents[0].allocated_id, out.child_agent_id);
+
+        let edges = fake.edges.lock().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].0, parent_agent_id);
+        assert_eq!(edges[0].1, out.child_agent_id);
+    }
+
+    // ---- JAR2-80: register_child_in_structural_db wire-shape tests ----
+
+    /// Pin the wire shape of the new activity's input/output types so
+    /// a future field addition (e.g. inheritance metadata) shows up as
+    /// a test miss. The activity body itself can't be hermetically
+    /// driven without constructing an `ActivityContext` (unbuildable
+    /// outside a Worker per smoke § 3.4) + installing a process-wide
+    /// `StructuralDbStore` (would race the JAR2-80 worker tests that
+    /// already install one); the live coverage lives in the live
+    /// integration test gated on `TEMPORAL_LIVE_TEST=1` +
+    /// `DATABASE_URL`.
+    #[test]
+    fn register_child_input_round_trips_through_json() {
+        use uuid::Uuid;
+        let i = RegisterChildInStructuralDbInput {
+            parent_graph_id: GraphId::new(
+                Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap(),
+            ),
+            parent_agent_id: AgentId::new(
+                Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap(),
+            ),
+            child_agent_name: "fetcher".into(),
+            child_mandate_ref: Some("v1".into()),
+        };
+        let s = serde_json::to_string(&i).unwrap();
+        let back: RegisterChildInStructuralDbInput = serde_json::from_str(&s).unwrap();
+        assert_eq!(i, back);
+        // The mandate_ref Option is on the wire (no `skip_serializing_if`).
+        assert!(
+            s.contains("\"child_mandate_ref\":\"v1\""),
+            "wire shape: {s}"
+        );
+    }
+
+    #[test]
+    fn register_child_input_round_trips_with_no_mandate_ref() {
+        use uuid::Uuid;
+        let i = RegisterChildInStructuralDbInput {
+            parent_graph_id: GraphId::new(Uuid::nil()),
+            parent_agent_id: AgentId::new(Uuid::nil()),
+            child_agent_name: "x".into(),
+            child_mandate_ref: None,
+        };
+        let s = serde_json::to_string(&i).unwrap();
+        let back: RegisterChildInStructuralDbInput = serde_json::from_str(&s).unwrap();
+        assert_eq!(i, back);
+    }
+
+    #[test]
+    fn register_child_output_round_trips_through_json() {
+        use uuid::Uuid;
+        let o = RegisterChildInStructuralDbOutput {
+            child_agent_id: AgentId::new(
+                Uuid::parse_str("bbbbbbbb-cccc-dddd-eeee-ffffffffffff").unwrap(),
+            ),
+        };
+        let s = serde_json::to_string(&o).unwrap();
+        let back: RegisterChildInStructuralDbOutput = serde_json::from_str(&s).unwrap();
+        assert_eq!(o, back);
     }
 
     /// Wire-shape check for `AppendDecisionLogInput` + `DecisionLogEntry`.

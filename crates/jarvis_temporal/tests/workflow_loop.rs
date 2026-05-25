@@ -60,6 +60,7 @@ use temporalio_common::protos::temporal::api::history::v1::history_event::Attrib
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
+use jarvis_node::agent_ref::{AgentId, GraphId};
 use jarvis_node::decision::{ClaimSeed, Decision, FsOp, ToolCall};
 use jarvis_node::evidence::EvidenceRecord;
 use jarvis_node::fs::AgentFs;
@@ -69,6 +70,7 @@ use jarvis_node::tools::{Tool, ToolRegistry};
 use jarvis_temporal::activities::set_decision_script;
 use jarvis_temporal::worker::{build_worker, install_agent_storage, install_tool_registry};
 use jarvis_temporal::workflow::{agent_workflow_id, AgentInput, AgentResult, AgentWorkflow};
+use uuid::Uuid;
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
 const DEFAULT_NAMESPACE: &str = "default";
@@ -350,11 +352,18 @@ async fn drive(
     // `<prefix>/retirement.json`, JAR2-64's `persist_output` to
     // `<prefix>/outputs/<ulid>.json`, and JAR2-65's `apply_fs_ops` to
     // `<prefix>/notes/loop-test.md`.
-    let input = AgentInput {
-        fs_handle: jarvis_temporal::workflow::FsHandle {
-            prefix: agent_prefix.into(),
-        },
-        ..AgentInput::default()
+    // JAR2-80: `Default` was dropped; build via `new_for_test` (which
+    // supplies the JAR2-58..67 first-run defaults for non-identity
+    // fields) and then override `fs_handle` so the per-test prefix
+    // continues to scope storage writes the same way it did pre-
+    // JAR2-80.
+    let mut input = AgentInput::new_for_test(
+        GraphId::new(Uuid::new_v4()),
+        AgentId::new(Uuid::new_v4()),
+        "workflow-loop-test",
+    );
+    input.fs_handle = jarvis_temporal::workflow::FsHandle {
+        prefix: agent_prefix.into(),
     };
     let handle = client
         .start_workflow(
@@ -725,10 +734,18 @@ async fn run_partial_failure_test() -> Result<()> {
 }
 
 async fn drive_partial(client: Client, task_queue: &str, workflow_id: &str) -> Result<()> {
+    // JAR2-80: `Default` was dropped; partial-failure test uses
+    // synthetic identity (it asserts on tool dispatch history, not on
+    // the identity fields).
+    let input = AgentInput::new_for_test(
+        GraphId::new(Uuid::new_v4()),
+        AgentId::new(Uuid::new_v4()),
+        "workflow-loop-pf-test",
+    );
     let handle = client
         .start_workflow(
             AgentWorkflow::run,
-            AgentInput::default(),
+            input,
             WorkflowStartOptions::new(task_queue, workflow_id).build(),
         )
         .await
