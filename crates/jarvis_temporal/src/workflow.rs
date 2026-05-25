@@ -1305,6 +1305,66 @@ mod tests {
     }
 
     #[test]
+    fn encode_then_serialize_then_deserialize_then_hydrate_round_trips_state() {
+        // The full wire path that a real `continue_as_new` boundary
+        // exercises: workflow state → encode_carryover → JSON (which
+        // is what Temporal's default payload codec produces over the
+        // wire) → JSON parse → hydrate_from_carryover → workflow
+        // state on the new run. Hermetic version of the live CAN
+        // test's load-bearing invariant.
+        let mut pre_can = AgentWorkflow::default();
+        pre_can.pending_triggers.push(Trigger::External {
+            kind: "wire-roundtrip".into(),
+            payload: serde_json::json!({"i": 42}),
+        });
+        pre_can
+            .pending_human_ops
+            .push(HumanOp::new(serde_json::json!({"a": "b"})));
+        pre_can
+            .pending_mandate_patches
+            .push(MandatePatch::new(serde_json::json!({"m": "n"})));
+        pre_can.retirement_request = Some("not yet".into());
+        pre_can.staged_correction = Some(CorrectionContext::new("prior batch failed"));
+        pre_can.next_wake = Some(Duration::from_millis(500));
+        pre_can.cumulative_triggers_observed = 3;
+        pre_can.cumulative_human_ops_observed = 5;
+        pre_can.cumulative_mandate_patches_observed = 7;
+        pre_can.last_output_id = Some(OutputId::new());
+
+        // Encode → JSON → decode → hydrate, exactly as Temporal will
+        // do at CAN time.
+        let carryover_pre = pre_can.encode_carryover();
+        let wire = serde_json::to_string(&carryover_pre).expect("wire-encode Carryover");
+        let carryover_post: Carryover = serde_json::from_str(&wire).expect("wire-decode Carryover");
+        let mut post_can = AgentWorkflow::default();
+        post_can.hydrate_from_carryover(carryover_post);
+
+        // Every observable field survived the boundary.
+        assert_eq!(post_can.pending_triggers, pre_can.pending_triggers);
+        assert_eq!(post_can.pending_human_ops, pre_can.pending_human_ops);
+        assert_eq!(
+            post_can.pending_mandate_patches,
+            pre_can.pending_mandate_patches
+        );
+        assert_eq!(post_can.retirement_request, pre_can.retirement_request);
+        assert_eq!(post_can.staged_correction, pre_can.staged_correction);
+        assert_eq!(post_can.next_wake, pre_can.next_wake);
+        assert_eq!(
+            post_can.cumulative_triggers_observed,
+            pre_can.cumulative_triggers_observed
+        );
+        assert_eq!(
+            post_can.cumulative_human_ops_observed,
+            pre_can.cumulative_human_ops_observed
+        );
+        assert_eq!(
+            post_can.cumulative_mandate_patches_observed,
+            pre_can.cumulative_mandate_patches_observed
+        );
+        assert_eq!(post_can.last_output_id, pre_can.last_output_id);
+    }
+
+    #[test]
     fn hydrate_then_signal_handler_bumps_counter_past_carryover_value() {
         // JAR2-67 § "Hard guardrails" 4 / ticket "Cumulative counter
         // bridging" — the cumulative_*_observed counters must bridge

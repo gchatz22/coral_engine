@@ -69,13 +69,16 @@ const DEFAULT_ADDRESS: &str = "http://localhost:7233";
 const DEFAULT_NAMESPACE: &str = "default";
 
 /// Number of `Decision::Idle` decisions to script before the final
-/// `Decision::Retire`. Each iteration costs ~6-10 history events
-/// (assemble_context start/scheduled/completed + decide_next_action
-/// triple + timer events + maybe-workflow-task events); the server
-/// default suggested-CAN threshold is ~4096 events. 600 ticks puts
-/// us comfortably past the threshold while keeping the test under
-/// 60s on a healthy local Temporal Server.
-const IDLE_TICKS_TO_FORCE_CAN: usize = 600;
+/// `Decision::Retire`. Each iteration generates roughly two-dozen
+/// history events (timer started+fired, two activity round-trips each
+/// with scheduled/started/completed, workflow tasks bracketing each
+/// activation). Empirically (JAR2-60's `workflow_loop` test, ~5
+/// decisions → 120 events ⇒ ~24 events/tick), 250 ticks reaches the
+/// server's default suggested-CAN threshold (~4096 events) with
+/// comfortable headroom. Tunable: a higher count makes the test
+/// flake-proof, a lower count finishes faster. 250 lands the test in
+/// the 90-150s range on a healthy local Temporal Server.
+const IDLE_TICKS_TO_FORCE_CAN: usize = 250;
 
 /// Per-loop idle. 1ms keeps the test from blocking on real wall-clock
 /// time; the workflow's `next_wake` only needs to be non-zero so the
@@ -117,12 +120,30 @@ async fn build_client() -> Result<Client> {
     Ok(client)
 }
 
+/// Gated behind a **secondary** env var (`TEMPORAL_LIVE_CAN_TEST=1`) in
+/// addition to the standard `TEMPORAL_LIVE_TEST=1` gate, because the
+/// natural-CAN trigger requires hundreds of activity round-trips and
+/// runs ~3-6 minutes on `temporal server start-dev`. The hermetic
+/// tests in `workflow.rs::tests` carry the correctness load; this
+/// live test is opt-in confirmation of the wire path.
+///
+/// To run: `TEMPORAL_LIVE_TEST=1 TEMPORAL_LIVE_CAN_TEST=1 cargo test -p jarvis_temporal --test workflow_carryover -- --nocapture`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_continue_as_new_bridges_carryover() {
     if env::var("TEMPORAL_LIVE_TEST").ok().as_deref() != Some("1") {
         eprintln!(
             "skipping workflow_continue_as_new_bridges_carryover; \
              set TEMPORAL_LIVE_TEST=1 with a local Temporal Server to run"
+        );
+        return;
+    }
+    if env::var("TEMPORAL_LIVE_CAN_TEST").ok().as_deref() != Some("1") {
+        eprintln!(
+            "skipping workflow_continue_as_new_bridges_carryover; \
+             additionally set TEMPORAL_LIVE_CAN_TEST=1 — this test \
+             runs ~250 idle ticks (3-6 minutes) to force a natural CAN \
+             boundary, gated separately so the standard TEMPORAL_LIVE_TEST \
+             sweep stays fast"
         );
         return;
     }
@@ -193,12 +214,13 @@ async fn run_live_can_test() -> Result<()> {
         .await
     });
 
-    // Generous timeout — 600 idle ticks at 1ms wake + activity round-
-    // trips runs ~25-40s on a healthy laptop. 120s gives 3x headroom
-    // for CI variability.
-    let worker_result = tokio::time::timeout(Duration::from_secs(120), worker.run())
+    // Generous timeout — 250 idle ticks each costing ~100ms (timer
+    // round-trip + 2 activity round-trips through the dev server)
+    // runs ~30-60s; 240s gives 4-8x headroom for CI variability and
+    // slow laptops.
+    let worker_result = tokio::time::timeout(Duration::from_secs(240), worker.run())
         .await
-        .map_err(|_| anyhow::anyhow!("worker.run() timed out (120s)"))?
+        .map_err(|_| anyhow::anyhow!("worker.run() timed out (240s)"))?
         .map_err(|e| anyhow::anyhow!("worker.run() exited with error: {e}"));
     let driver_result = driver.await.context("driver task panicked")?;
 
