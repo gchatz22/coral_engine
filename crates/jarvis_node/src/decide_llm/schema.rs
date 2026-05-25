@@ -24,8 +24,19 @@ use thiserror::Error;
 
 /// Tool name → matching `Decision` variant tag (`#[serde(tag = "type")]`
 /// value). Listed in the same order as the `Decision` enum so a reviewer
-/// can scan the two side by side.
-const TOOL_NAMES: &[&str] = &["call_tool", "emit_output", "rewrite_fs", "idle", "retire"];
+/// can scan the two side by side. JAR2-78 (stage 5.1) appended the four
+/// parent-child topology tools.
+const TOOL_NAMES: &[&str] = &[
+    "call_tool",
+    "emit_output",
+    "rewrite_fs",
+    "idle",
+    "retire",
+    "spawn_child",
+    "reconcile_children",
+    "retire_child",
+    "replace_child",
+];
 
 /// Build the `ToolSpec` list to publish to the model via
 /// `CompleteRequest::tools`.
@@ -128,6 +139,96 @@ pub fn decision_tools() -> Vec<ToolSpec> {
                     "reason": { "type": "string" }
                 },
                 "required": ["reason"]
+            }),
+        },
+        // JAR2-78 (stage 5.1): parent-child topology decision tools. Each
+        // is a *terminal singleton* (same shape contract as `retire`):
+        // mixing with `call_tool` or another terminal in the same response
+        // fails parsing. The inner shapes (`mandate`, `sources`,
+        // `child_ref`, ...) are described as plain `object` and left to
+        // serde validation, mirroring the `rewrite_fs.ops` precedent —
+        // hand-rolling JSON Schema for `Mandate` / `AgentRef` / friends
+        // would duplicate `decision.rs` + `mandate.rs` + `agent_ref.rs`
+        // and drift on every kernel-shape change.
+        ToolSpec {
+            name: "spawn_child".into(),
+            description: "Express the decision to spawn a child agent. The runtime \
+                 allocates the child's agent_id deterministically and \
+                 instantiates a child workflow under \
+                 graphs/<graph_id>/agents/<new_agent_id>. The variant \
+                 carries only the agent's logical name + mandate."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_name": { "type": "string" },
+                    "mandate": { "type": "object" }
+                },
+                "required": ["agent_name", "mandate"]
+            }),
+        },
+        ToolSpec {
+            name: "reconcile_children".into(),
+            description: "Express the decision to fold N child outputs into the \
+                 parent's context as synthetic evidence; optionally record \
+                 a conflict if the children disagree. Each source becomes \
+                 one synthetic evidence record in the parent's evidence/ \
+                 directory; the parent's next emit_output can cite those \
+                 synthetic ids."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "sources": {
+                        "type": "array",
+                        "items": { "type": "object" },
+                        "description": "Each: {child_ref, output_id}."
+                    },
+                    "conflict": {
+                        "type": "object",
+                        "description": "Optional. Set iff the children disagree. \
+                                        Carries {alternatives: [..], resolution?}."
+                    }
+                },
+                "required": ["sources"]
+            }),
+        },
+        ToolSpec {
+            name: "retire_child".into(),
+            description: "Express the decision to terminate a child agent. The \
+                 workflow host signals the child's existing retire arm via \
+                 signal_external_workflow. No replacement is spawned; use \
+                 replace_child for that."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "child_ref": {
+                        "type": "object",
+                        "description": "Stable handle: {workflow_id, agent_id}."
+                    },
+                    "reason": { "type": "string" }
+                },
+                "required": ["child_ref", "reason"]
+            }),
+        },
+        ToolSpec {
+            name: "replace_child".into(),
+            description: "Express the decision to retire a child and spawn a \
+                 replacement with a new mandate. The replacement gets a \
+                 fresh agent_id + workflow id — not an in-place mandate \
+                 swap on the existing child."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "child_ref": {
+                        "type": "object",
+                        "description": "Stable handle: {workflow_id, agent_id}."
+                    },
+                    "new_mandate": { "type": "object" }
+                },
+                "required": ["child_ref", "new_mandate"]
             }),
         },
     ]
@@ -254,6 +355,14 @@ pub fn parse_decision(calls: &[ToolCall]) -> Result<Decision, DecisionParseError
         "rewrite_fs" => &["ops"],
         "idle" => &["next_after"],
         "retire" => &["reason"],
+        // JAR2-78 (stage 5.1): parent-child topology variants — terminal
+        // singletons (same shape contract as `retire`). Inner-shape
+        // validation (e.g. `mandate` field structure) falls through to
+        // serde via the `tagged.insert("type", ...)` re-tagging below.
+        "spawn_child" => &["agent_name", "mandate"],
+        "reconcile_children" => &["sources"],
+        "retire_child" => &["child_ref", "reason"],
+        "replace_child" => &["child_ref", "new_mandate"],
         _ => unreachable!("guarded by mixed/any_call_tool checks above"),
     };
     for field in required {
@@ -552,8 +661,18 @@ mod tests {
         // Round-trip the metadata: every name `decision_tools()` advertises
         // is one `parse_decision` accepts. Catches drift between the schema
         // list and the parser's allowed-names table. `call_tool` folds into
-        // the `call_tools` variant tag (the parallel-tool shape); the other
-        // four map one-to-one with their own variant tags.
+        // the `call_tools` variant tag (the parallel-tool shape); every
+        // other tool maps one-to-one with its own snake_case variant tag.
+        // JAR2-78: the four parent-child topology tools are appended.
+        let agent_ref_minimal = json!({
+            "workflow_id": "graphs/g1/agents/c1",
+            "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+        });
+        let mandate_minimal = json!({
+            "text": "",
+            "idle_period": 0,
+            "max_ticks": null,
+        });
         for spec in decision_tools() {
             let minimal: Value = match spec.name.as_str() {
                 "call_tool" => json!({
@@ -565,6 +684,23 @@ mod tests {
                 "rewrite_fs" => json!({"ops": []}),
                 "idle" => json!({"next_after": 0}),
                 "retire" => json!({"reason": "ok"}),
+                "spawn_child" => json!({
+                    "agent_name": "child",
+                    "mandate": mandate_minimal,
+                }),
+                "reconcile_children" => json!({
+                    "sources": [
+                        {"child_ref": agent_ref_minimal, "output_id": "ab".repeat(32)},
+                    ],
+                }),
+                "retire_child" => json!({
+                    "child_ref": agent_ref_minimal,
+                    "reason": "no longer needed",
+                }),
+                "replace_child" => json!({
+                    "child_ref": agent_ref_minimal,
+                    "new_mandate": mandate_minimal,
+                }),
                 other => panic!("unhandled tool {other}"),
             };
             let tc = call(&spec.name, minimal);
@@ -582,6 +718,198 @@ mod tests {
                 spec.name,
             );
         }
+    }
+
+    // ---- JAR2-78 (stage 5.1): per-variant parse round-trips --------------
+
+    #[test]
+    fn parse_spawn_child_round_trips() {
+        let mandate = json!({
+            "text": "fetch foo",
+            "idle_period": 500,
+            "max_ticks": 8,
+        });
+        let tc = call(
+            "spawn_child",
+            json!({"agent_name": "fetcher", "mandate": mandate}),
+        );
+        let d = parse_decision(&[tc]).unwrap();
+        match d {
+            Decision::SpawnChild {
+                agent_name,
+                mandate,
+            } => {
+                assert_eq!(agent_name, "fetcher");
+                assert_eq!(mandate.text, "fetch foo");
+                assert_eq!(mandate.idle_period, Duration::from_millis(500));
+                assert_eq!(mandate.max_ticks, Some(8));
+            }
+            other => panic!("expected SpawnChild, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_reconcile_children_round_trips_with_no_conflict() {
+        let agent_ref = json!({
+            "workflow_id": "graphs/g1/agents/c1",
+            "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+        });
+        let oid = "ab".repeat(32);
+        let tc = call(
+            "reconcile_children",
+            json!({"sources": [{"child_ref": agent_ref, "output_id": oid}]}),
+        );
+        let d = parse_decision(&[tc]).unwrap();
+        match d {
+            Decision::ReconcileChildren { sources, conflict } => {
+                assert_eq!(sources.len(), 1);
+                assert!(conflict.is_none());
+                assert_eq!(sources[0].child_ref.workflow_id, "graphs/g1/agents/c1");
+            }
+            other => panic!("expected ReconcileChildren, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_reconcile_children_round_trips_with_conflict_and_resolution() {
+        let agent_ref_a = json!({
+            "workflow_id": "graphs/g1/agents/c1",
+            "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+        });
+        let agent_ref_b = json!({
+            "workflow_id": "graphs/g1/agents/c2",
+            "agent_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        });
+        let oid_a = "ab".repeat(32);
+        let oid_b = "cd".repeat(32);
+        let tc = call(
+            "reconcile_children",
+            json!({
+                "sources": [
+                    {"child_ref": agent_ref_a, "output_id": oid_a},
+                    {"child_ref": agent_ref_b, "output_id": oid_b},
+                ],
+                "conflict": {
+                    "alternatives": [
+                        {
+                            "source_child": agent_ref_a,
+                            "source_output_id": oid_a,
+                            "claim": "value is 42",
+                        },
+                        {
+                            "source_child": agent_ref_b,
+                            "source_output_id": oid_b,
+                            "claim": "value is 43",
+                        },
+                    ],
+                    "resolution": {
+                        "chosen_alternative_idx": 0,
+                        "reasoning": "primary source",
+                    },
+                },
+            }),
+        );
+        let d = parse_decision(&[tc]).unwrap();
+        match d {
+            Decision::ReconcileChildren { sources, conflict } => {
+                assert_eq!(sources.len(), 2);
+                let c = conflict.expect("expected conflict block");
+                assert_eq!(c.alternatives.len(), 2);
+                assert_eq!(c.alternatives[0].claim, "value is 42");
+                let r = c.resolution.expect("expected resolution");
+                assert_eq!(r.chosen_alternative_idx, 0);
+                assert_eq!(r.reasoning, "primary source");
+            }
+            other => panic!("expected ReconcileChildren, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_retire_child_round_trips() {
+        let agent_ref = json!({
+            "workflow_id": "graphs/g1/agents/c1",
+            "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+        });
+        let tc = call(
+            "retire_child",
+            json!({"child_ref": agent_ref, "reason": "stop"}),
+        );
+        let d = parse_decision(&[tc]).unwrap();
+        match d {
+            Decision::RetireChild { child_ref, reason } => {
+                assert_eq!(child_ref.workflow_id, "graphs/g1/agents/c1");
+                assert_eq!(reason, "stop");
+            }
+            other => panic!("expected RetireChild, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_replace_child_round_trips() {
+        let agent_ref = json!({
+            "workflow_id": "graphs/g1/agents/c1",
+            "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+        });
+        let mandate = json!({
+            "text": "v2",
+            "idle_period": 100,
+            "max_ticks": null,
+        });
+        let tc = call(
+            "replace_child",
+            json!({"child_ref": agent_ref, "new_mandate": mandate}),
+        );
+        let d = parse_decision(&[tc]).unwrap();
+        match d {
+            Decision::ReplaceChild {
+                child_ref,
+                new_mandate,
+            } => {
+                assert_eq!(child_ref.workflow_id, "graphs/g1/agents/c1");
+                assert_eq!(new_mandate.text, "v2");
+                assert_eq!(new_mandate.idle_period, Duration::from_millis(100));
+            }
+            other => panic!("expected ReplaceChild, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_spawn_child_missing_mandate_errors_with_structured_missing_field() {
+        let tc = call("spawn_child", json!({"agent_name": "fetcher"}));
+        let err = parse_decision(&[tc]).unwrap_err();
+        assert_eq!(
+            err,
+            DecisionParseError::MissingField {
+                tool: "spawn_child".into(),
+                field: "mandate".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_reconcile_children_mixed_with_terminal_errors() {
+        // `reconcile_children` is a terminal singleton — pairing it with
+        // another terminal in the same response is a mixed-shape error
+        // (same contract as `retire` + `idle`).
+        let agent_ref = json!({
+            "workflow_id": "graphs/g1/agents/c1",
+            "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+        });
+        let err = parse_decision(&[
+            call(
+                "reconcile_children",
+                json!({"sources": [{"child_ref": agent_ref, "output_id": "ab".repeat(32)}]}),
+            ),
+            call("retire", json!({"reason": "stop"})),
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DecisionParseError::DuplicateTerminalTool { count: 2, .. }
+            ),
+            "got {err:?}"
+        );
     }
 
     // ---- vendor-shape fixture (Cohere) ----------------------------------

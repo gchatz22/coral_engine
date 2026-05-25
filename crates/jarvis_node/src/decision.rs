@@ -20,9 +20,10 @@
 //!   packages the bundle. Kept as a free function for the bootstrap; it
 //!   can graduate to its own trait once real LLM activities arrive.
 
+use crate::agent_ref::AgentRef;
 use crate::evidence::{EvidenceId, EvidenceRecord};
 use crate::fs::{AgentFs, Claim, ClaimStatus};
-use crate::mandate::{Mandate, Output};
+use crate::mandate::{Mandate, Output, OutputId};
 use crate::trigger::Trigger;
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,106 @@ pub enum Decision {
     },
     /// Stop running. The reason is persisted so retirement is auditable.
     Retire { reason: String },
+    /// JAR2-78 (stage 5.1): parent spawns a child agent at decision time.
+    /// The runtime activity (5.3 `register_child_in_structural_db`)
+    /// allocates the child's `AgentId` deterministically and instantiates
+    /// an `AgentWorkflow` under `graphs/<gid>/agents/<new_aid>`. This
+    /// variant carries only the agent's logical name + mandate; the
+    /// structural id is host-side state.
+    SpawnChild {
+        agent_name: String,
+        mandate: Mandate,
+    },
+    /// JAR2-78 (stage 5.1): parent folds N child outputs into its own
+    /// context as synthetic evidence; optionally records a conflict if
+    /// the children disagree.
+    ///
+    /// Per Stage 5 Project decision 4: the LLM is the only thing that
+    /// can summarize a child claim, so the variant carries the claim
+    /// summaries inline (via `ConflictAlternative.claim`) rather than
+    /// asking the activity to introspect arbitrary JSON outputs.
+    /// `conflict` is `Some` iff the children disagree; the activity
+    /// writes the conflict record only on `Some`.
+    ReconcileChildren {
+        /// 1+ child outputs to fold in. Each becomes one synthetic
+        /// evidence record in the parent's `evidence/` directory at
+        /// activity-execution time (5.5).
+        sources: Vec<ReconcileSource>,
+        /// `Some` iff the parent observed disagreement among the
+        /// `sources`. `None` reconciliations are concordance fold-ins
+        /// (no conflict record written).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conflict: Option<ConflictRecordIntent>,
+    },
+    /// JAR2-78 (stage 5.1): parent terminates a child. The workflow host
+    /// (5.7) signals the child's existing retire arm via
+    /// `WorkflowContext::signal_external_workflow(..)`. No replacement
+    /// is spawned — for that, use `ReplaceChild`.
+    RetireChild { child_ref: AgentRef, reason: String },
+    /// JAR2-78 (stage 5.1): parent retires a child and spawns a
+    /// replacement with a new mandate. The replacement gets a fresh
+    /// `AgentId` + workflow id — not an in-place mandate swap on the
+    /// existing child. Matches Stage 5 Project decision 6's flat
+    /// workflow-id scheme: ids do not encode topology, so a "replace"
+    /// is structurally a retire + spawn from the kernel's point of view.
+    ReplaceChild {
+        child_ref: AgentRef,
+        new_mandate: Mandate,
+    },
+}
+
+/// JAR2-78 (stage 5.1): one child output the parent wants folded into its
+/// own context. The 5.5 `reconcile_children` activity reads the child's
+/// `outputs/<output_id>.json` and writes one synthetic evidence record
+/// per source into the parent's `evidence/` directory; the parent's
+/// subsequent `EmitOutput { evidence: [..] }` then cites those synthetic
+/// ids, so cross-agent provenance becomes a normal evidence trail.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconcileSource {
+    pub child_ref: AgentRef,
+    pub output_id: OutputId,
+}
+
+/// JAR2-78 (stage 5.1): the parent's account of a disagreement among
+/// the cited child outputs. `alternatives.len() >= 2` is the load-bearing
+/// invariant (a single alternative is not a conflict); the 5.5 activity
+/// is responsible for validating that and writing the resulting
+/// `<agent_root>/conflicts/<id>.json` (5.6 schema).
+///
+/// `resolution` is `None` for "held open" — the parent records the
+/// disagreement but does not pick a winner. `Some` carries the chosen
+/// alternative index + the parent's reasoning.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictRecordIntent {
+    /// At least two alternatives; the type does not enforce the bound,
+    /// the 5.5 activity does (so a malformed `Decision` is a
+    /// `NeedsCorrection` rather than a panic).
+    pub alternatives: Vec<ConflictAlternative>,
+    /// `None` = held open; `Some` = parent picked a winner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<ConflictResolution>,
+}
+
+/// JAR2-78 (stage 5.1): one side of a conflict. The `claim` text is the
+/// parent LLM's summary of what this source asserts — per Stage 5
+/// Project decision 4, this summarization happens at decision time
+/// because only the LLM has the context to do it well; the activity
+/// just persists what's in the decision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictAlternative {
+    pub source_child: AgentRef,
+    pub source_output_id: OutputId,
+    pub claim: String,
+}
+
+/// JAR2-78 (stage 5.1): how the parent resolved a conflict. The chosen
+/// index points into the surrounding `ConflictRecordIntent.alternatives`
+/// vec; bounds-checking is the 5.5 activity's job. `reasoning` becomes
+/// part of the persisted conflict record so the resolution is auditable.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictResolution {
+    pub chosen_alternative_idx: usize,
+    pub reasoning: String,
 }
 
 /// One element of a `Decision::CallTools`. `claim_seed` is an opaque
@@ -458,6 +559,196 @@ mod tests {
         let s = serde_json::to_string(&d).unwrap();
         let back: Decision = serde_json::from_str(&s).unwrap();
         assert_eq!(d, back);
+    }
+
+    // ---- JAR2-78 (stage 5.1): parent-child topology variants -------------
+
+    use crate::agent_ref::{AgentId, AgentRef};
+    use crate::mandate::OutputId;
+    use uuid::Uuid;
+
+    /// Hand-picked, valid UUID v4 reused across the stage 5.1 tests so
+    /// the wire-form assertions are exact.
+    fn fixed_agent_id() -> AgentId {
+        AgentId::new(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap())
+    }
+
+    fn fixed_agent_ref() -> AgentRef {
+        AgentRef::new("graphs/g1/agents/a-child", fixed_agent_id())
+    }
+
+    fn fixed_output_id() -> OutputId {
+        // 64-hex-char placeholder; `OutputId::from_hex` trusts the caller
+        // (mirrors `EvidenceId::from_hex`).
+        OutputId::from_hex("ab".repeat(32))
+    }
+
+    #[test]
+    fn spawn_child_round_trip_carries_mandate_and_agent_name() {
+        let d = Decision::SpawnChild {
+            agent_name: "fetcher".into(),
+            mandate: Mandate::new("fetch foo", Duration::from_millis(500), Some(8)),
+        };
+        let s = serde_json::to_string(&d).unwrap();
+        let back: Decision = serde_json::from_str(&s).unwrap();
+        assert_eq!(d, back);
+        // Wire tag matches `rename_all = "snake_case"`.
+        assert!(s.contains("\"type\":\"spawn_child\""), "wire shape: {s}");
+        assert!(s.contains("\"agent_name\":\"fetcher\""), "wire shape: {s}");
+        // Mandate's `idle_period` round-trips as ms (shared
+        // `duration_ms` helper).
+        assert!(s.contains("\"idle_period\":500"), "wire shape: {s}");
+    }
+
+    #[test]
+    fn reconcile_children_round_trip_with_no_conflict_omits_conflict_field() {
+        let d = Decision::ReconcileChildren {
+            sources: vec![ReconcileSource {
+                child_ref: fixed_agent_ref(),
+                output_id: fixed_output_id(),
+            }],
+            conflict: None,
+        };
+        let s = serde_json::to_string(&d).unwrap();
+        let back: Decision = serde_json::from_str(&s).unwrap();
+        assert_eq!(d, back);
+        assert!(
+            s.contains("\"type\":\"reconcile_children\""),
+            "wire shape: {s}"
+        );
+        // `skip_serializing_if` on `conflict` keeps the wire form lean
+        // for the common concordance-fold case.
+        assert!(!s.contains("conflict"), "wire shape: {s}");
+    }
+
+    #[test]
+    fn reconcile_children_round_trip_with_conflict_and_resolution() {
+        let alt_a = ConflictAlternative {
+            source_child: fixed_agent_ref(),
+            source_output_id: fixed_output_id(),
+            claim: "value is 42".into(),
+        };
+        let alt_b = ConflictAlternative {
+            source_child: AgentRef::new(
+                "graphs/g1/agents/b-child",
+                AgentId::new(Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap()),
+            ),
+            source_output_id: OutputId::from_hex("cd".repeat(32)),
+            claim: "value is 43".into(),
+        };
+        let d = Decision::ReconcileChildren {
+            sources: vec![ReconcileSource {
+                child_ref: fixed_agent_ref(),
+                output_id: fixed_output_id(),
+            }],
+            conflict: Some(ConflictRecordIntent {
+                alternatives: vec![alt_a, alt_b],
+                resolution: Some(ConflictResolution {
+                    chosen_alternative_idx: 0,
+                    reasoning: "primary source has higher confidence".into(),
+                }),
+            }),
+        };
+        let s = serde_json::to_string(&d).unwrap();
+        let back: Decision = serde_json::from_str(&s).unwrap();
+        assert_eq!(d, back);
+        assert!(
+            s.contains("\"chosen_alternative_idx\":0"),
+            "wire shape: {s}"
+        );
+    }
+
+    #[test]
+    fn reconcile_children_round_trip_with_held_open_resolution() {
+        // `resolution: None` is "held open" — explicit recorded
+        // disagreement without a winner. The wire form must omit the
+        // `resolution` field (matching `#[serde(skip_serializing_if)]`).
+        let intent = ConflictRecordIntent {
+            alternatives: vec![
+                ConflictAlternative {
+                    source_child: fixed_agent_ref(),
+                    source_output_id: fixed_output_id(),
+                    claim: "disagree A".into(),
+                },
+                ConflictAlternative {
+                    source_child: fixed_agent_ref(),
+                    source_output_id: OutputId::from_hex("ef".repeat(32)),
+                    claim: "disagree B".into(),
+                },
+            ],
+            resolution: None,
+        };
+        let s = serde_json::to_string(&intent).unwrap();
+        assert!(!s.contains("resolution"), "wire shape: {s}");
+        let back: ConflictRecordIntent = serde_json::from_str(&s).unwrap();
+        assert_eq!(intent, back);
+    }
+
+    #[test]
+    fn retire_child_round_trip_carries_child_ref_and_reason() {
+        let d = Decision::RetireChild {
+            child_ref: fixed_agent_ref(),
+            reason: "no longer needed".into(),
+        };
+        let s = serde_json::to_string(&d).unwrap();
+        let back: Decision = serde_json::from_str(&s).unwrap();
+        assert_eq!(d, back);
+        assert!(s.contains("\"type\":\"retire_child\""), "wire shape: {s}");
+        assert!(
+            s.contains("\"reason\":\"no longer needed\""),
+            "wire shape: {s}"
+        );
+    }
+
+    #[test]
+    fn replace_child_round_trip_carries_new_mandate() {
+        let d = Decision::ReplaceChild {
+            child_ref: fixed_agent_ref(),
+            new_mandate: Mandate::new("retry fetch", Duration::from_millis(250), None),
+        };
+        let s = serde_json::to_string(&d).unwrap();
+        let back: Decision = serde_json::from_str(&s).unwrap();
+        assert_eq!(d, back);
+        assert!(s.contains("\"type\":\"replace_child\""), "wire shape: {s}");
+        assert!(s.contains("\"text\":\"retry fetch\""), "wire shape: {s}");
+    }
+
+    #[test]
+    fn reconcile_source_round_trip_field_names() {
+        let r = ReconcileSource {
+            child_ref: fixed_agent_ref(),
+            output_id: fixed_output_id(),
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("child_ref").is_some());
+        assert!(v.get("output_id").is_some());
+        let back: ReconcileSource = serde_json::from_value(v).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn conflict_alternative_round_trip_carries_claim_text_verbatim() {
+        let a = ConflictAlternative {
+            source_child: fixed_agent_ref(),
+            source_output_id: fixed_output_id(),
+            claim: "this exact text matters".into(),
+        };
+        let s = serde_json::to_string(&a).unwrap();
+        assert!(s.contains("\"claim\":\"this exact text matters\""));
+        let back: ConflictAlternative = serde_json::from_str(&s).unwrap();
+        assert_eq!(a, back);
+    }
+
+    #[test]
+    fn conflict_resolution_round_trip() {
+        let r = ConflictResolution {
+            chosen_alternative_idx: 3,
+            reasoning: "weighted by source reliability".into(),
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: ConflictResolution = serde_json::from_str(&s).unwrap();
+        assert_eq!(r, back);
+        assert!(s.contains("\"chosen_alternative_idx\":3"));
     }
 
     #[test]
