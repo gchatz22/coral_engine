@@ -79,6 +79,58 @@ impl From<Uuid> for AgentId {
     }
 }
 
+/// Newtype over the structural DB's `graphs.id` column (a `Uuid`). Mirrors
+/// [`AgentId`]'s shape — transparent serde, `Display`, `FromStr`, `From<Uuid>` —
+/// so a `Uuid` from anywhere else in the codebase cannot be mistaken for a
+/// graph identifier.
+///
+/// Added in JAR2-80 (stage 5.3): the `register_child_in_structural_db`
+/// activity needs the parent's `graph_id` to construct the child's workflow
+/// id (`graphs/<graph_id>/agents/<agent_id>`, per Stage 5 Project decision 6)
+/// and to call `GraphStore::add_agent` (which keys agents by `graph_id`).
+/// Threading the parent's `graph_id` through `AgentInput` keeps the activity
+/// hermetic — no DB lookup just to discover which graph the parent lives in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GraphId(Uuid);
+
+impl GraphId {
+    /// Wrap a pre-allocated `Uuid`. Mirrors [`AgentId::new`]'s rationale.
+    pub fn new(uuid: Uuid) -> Self {
+        GraphId(uuid)
+    }
+
+    /// Borrow the underlying `Uuid`.
+    pub fn as_uuid(&self) -> &Uuid {
+        &self.0
+    }
+
+    /// Move the underlying `Uuid` out.
+    pub fn into_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
+impl fmt::Display for GraphId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for GraphId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(GraphId)
+    }
+}
+
+impl From<Uuid> for GraphId {
+    fn from(u: Uuid) -> Self {
+        GraphId(u)
+    }
+}
+
 /// Kernel-side handle for an agent, sufficient for the parent-child
 /// topology decisions to name a sibling or child.
 ///
@@ -176,5 +228,45 @@ mod tests {
         let workflow_pos = s.find("workflow_id").unwrap();
         let agent_pos = s.find("agent_id").unwrap();
         assert!(workflow_pos < agent_pos, "wire shape: {s}");
+    }
+
+    // JAR2-80 (stage 5.3): GraphId mirror tests — keep the type-level
+    // shape of `GraphId` honest against `AgentId` so a future divergence
+    // (e.g. a non-transparent serde form on one but not the other) shows
+    // up here.
+
+    #[test]
+    fn graph_id_transparent_serde_round_trip() {
+        let id = GraphId::new(fixed_uuid());
+        let s = serde_json::to_string(&id).unwrap();
+        assert_eq!(s, "\"550e8400-e29b-41d4-a716-446655440000\"");
+        let back: GraphId = serde_json::from_str(&s).unwrap();
+        assert_eq!(id, back);
+    }
+
+    #[test]
+    fn graph_id_display_matches_uuid_hyphenated_form() {
+        let id = GraphId::new(fixed_uuid());
+        assert_eq!(id.to_string(), "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    #[test]
+    fn graph_id_from_str_round_trips_display() {
+        let id = GraphId::new(fixed_uuid());
+        let parsed: GraphId = id.to_string().parse().unwrap();
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn graph_id_from_str_rejects_garbage() {
+        assert!("not-a-uuid".parse::<GraphId>().is_err());
+    }
+
+    #[test]
+    fn graph_id_from_uuid_conversion() {
+        let u = fixed_uuid();
+        let id: GraphId = u.into();
+        assert_eq!(id.as_uuid(), &u);
+        assert_eq!(id.into_uuid(), u);
     }
 }

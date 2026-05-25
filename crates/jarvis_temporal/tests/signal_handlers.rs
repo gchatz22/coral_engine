@@ -5,8 +5,9 @@
 //! When set, the test:
 //!
 //! 1. Starts a Temporal worker registering `AgentWorkflow`.
-//! 2. Starts an `AgentWorkflow` instance with `AgentInput::default()`
-//!    under a unique workflow ID (epoch-ms suffixed).
+//! 2. Starts an `AgentWorkflow` instance with `AgentInput::new_for_test(..)`
+//!    (JAR2-80 dropped `Default`) under a unique workflow ID
+//!    (epoch-ms suffixed).
 //! 3. Sends a `retire` signal. The JAR2-60 loop body wakes on
 //!    `retirement_request.is_some()` (or a per-tick timer) and
 //!    short-circuits to the retirement path before draining any
@@ -67,6 +68,7 @@ use temporalio_client::{
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
+use jarvis_node::agent_ref::{AgentId, GraphId};
 use jarvis_node::decision::Decision;
 use jarvis_node::storage::{AgentStorage, MemoryStorage};
 use jarvis_node::tools::{EchoTool, ToolRegistry};
@@ -74,6 +76,7 @@ use jarvis_node::trigger::{HumanOp, MandatePatch, Trigger};
 use jarvis_temporal::activities::set_decision_script;
 use jarvis_temporal::worker::{build_worker, install_agent_storage, install_tool_registry};
 use jarvis_temporal::workflow::{agent_workflow_id, AgentInput, AgentSnapshot, AgentWorkflow};
+use uuid::Uuid;
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
 const DEFAULT_NAMESPACE: &str = "default";
@@ -181,10 +184,18 @@ async fn run_live_test() -> Result<()> {
 }
 
 async fn drive(client: Client, task_queue: &str, workflow_id: &str) -> Result<()> {
+    // JAR2-80: `AgentInput::Default` was dropped; use the explicit test
+    // constructor. Signal-handler test doesn't read the new identity
+    // fields — it exercises signal landing + retire short-circuit.
+    let input = AgentInput::new_for_test(
+        GraphId::new(Uuid::new_v4()),
+        AgentId::new(Uuid::new_v4()),
+        "signal-handlers-test",
+    );
     let handle = client
         .start_workflow(
             AgentWorkflow::run,
-            AgentInput::default(),
+            input,
             WorkflowStartOptions::new(task_queue, workflow_id).build(),
         )
         .await

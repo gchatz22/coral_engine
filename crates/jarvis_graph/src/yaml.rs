@@ -55,12 +55,14 @@
 //! avoids the round-trip ambiguity ("what does `metadata.name: Foo`
 //! become?") that normalization would introduce.
 
+use jarvis_node::agent_ref::{AgentId, GraphId};
 use jarvis_node::mandate::Mandate as NodeMandate;
 use jarvis_node::trigger::Trigger as NodeTrigger;
 use jarvis_temporal::workflow::{agent_workflow_id, AgentConfig, AgentInput, FsHandle};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::time::Duration;
+use uuid::Uuid;
 
 /// The exact `apiVersion` literal v1 accepts. Bump only when the schema
 /// breaks.
@@ -697,6 +699,20 @@ pub fn into_agent_input(graph: &GraphYaml) -> AgentInput {
         agent.mandate.idle_period,
         agent.mandate.max_ticks,
     );
+    // JAR2-80 (Stage 5 Project decision 8): `AgentInput` now requires
+    // structural identity fields (`graph_id` + `agent_id`). v1's YAML
+    // is single-agent and pre-DB; the structural-DB resolver that
+    // pulls real UUIDs lives on the `jarvis-apply` binary side, not
+    // here. Mint synthetic v4 UUIDs as a stand-in so the workflow
+    // body has something to thread through `Decision::SpawnChild`'s
+    // activity input. Note: these are NOT the same as the
+    // `GraphStore::create_from_yaml` UUIDs (the binary doesn't yet
+    // wire those back into `AgentInput`); a future cleanup ticket
+    // (deferred — see PR coordination note) should align them so
+    // `Decision::SpawnChild` writes edges keyed off the same root
+    // agent the structural-DB row identifies.
+    let graph_id = GraphId::new(Uuid::new_v4());
+    let agent_id = AgentId::new(Uuid::new_v4());
     AgentInput {
         cfg: AgentConfig::default(),
         fs_handle: FsHandle {
@@ -705,6 +721,9 @@ pub fn into_agent_input(graph: &GraphYaml) -> AgentInput {
         parent_handle: None,
         carryover: None,
         mandate,
+        graph_id,
+        agent_id,
+        agent_name: agent.id.clone(),
     }
 }
 

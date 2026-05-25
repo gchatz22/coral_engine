@@ -9,7 +9,8 @@
 //! 2. Starts an in-process worker registering `AgentWorkflow` +
 //!    `AgentActivities` on a unique task queue (suffixed by epoch-ms so
 //!    parallel test runs don't collide).
-//! 3. Starts `AgentWorkflow` with `AgentInput::default()` under the
+//! 3. Starts `AgentWorkflow` with an `AgentInput::new_for_test(..)`
+//!    (JAR2-80 dropped `Default` — see workflow.rs) under the
 //!    URL-shaped workflow ID `graphs/<graph_id>/agents/<agent_id>`.
 //! 4. Sends a `retire` signal after a short delay.
 //! 5. Awaits the workflow result. The new JAR2-60 loop body short-
@@ -51,12 +52,14 @@ use temporalio_client::{
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
+use jarvis_node::agent_ref::{AgentId, GraphId};
 use jarvis_node::decision::Decision;
 use jarvis_node::storage::{AgentStorage, MemoryStorage};
 use jarvis_node::tools::{EchoTool, ToolRegistry};
 use jarvis_temporal::activities::set_decision_script;
 use jarvis_temporal::worker::{build_worker, install_agent_storage, install_tool_registry};
 use jarvis_temporal::workflow::{agent_workflow_id, AgentInput, AgentWorkflow};
+use uuid::Uuid;
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
 const DEFAULT_NAMESPACE: &str = "default";
@@ -170,10 +173,18 @@ async fn run_live_test() -> Result<()> {
 }
 
 async fn drive(client: Client, task_queue: &str, workflow_id: &str) -> Result<()> {
+    // JAR2-80: `AgentInput::Default` was dropped; use the explicit
+    // test constructor with synthetic identity. The skeleton smoke
+    // doesn't read these fields — it just exercises the retire path.
+    let input = AgentInput::new_for_test(
+        GraphId::new(Uuid::new_v4()),
+        AgentId::new(Uuid::new_v4()),
+        "skeleton-test",
+    );
     let handle = client
         .start_workflow(
             AgentWorkflow::run,
-            AgentInput::default(),
+            input,
             WorkflowStartOptions::new(task_queue, workflow_id).build(),
         )
         .await

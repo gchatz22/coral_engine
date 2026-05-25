@@ -18,6 +18,9 @@
 
 use crate::types::{AgentRecord, Edge, Graph, ToolRecord};
 use crate::yaml::{GraphYaml, ToolKind};
+use async_trait::async_trait;
+use jarvis_node::agent_ref::{AgentId, GraphId};
+use jarvis_temporal::worker::StructuralDbStore;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -507,6 +510,46 @@ impl GraphStore {
     }
 }
 
+// JAR2-80 (stage 5.3) — bridge `GraphStore` to the worker-shared
+// `StructuralDbStore` trait `jarvis_temporal::worker` defines. The
+// trait lives in `jarvis_temporal` rather than `jarvis_graph` because
+// the `OnceLock<Arc<dyn ...>>` install is read from inside the
+// `register_child_in_structural_db` activity body (which can't depend
+// on `jarvis_graph` — the existing `jarvis_graph -> jarvis_temporal`
+// edge would cycle).
+//
+// The impl is a thin adapter: `GraphStore::add_agent` already returns
+// the full `AgentRecord` and takes a raw `Uuid`; the trait surface
+// hands back just the freshly-allocated `AgentId` and takes / returns
+// the kernel newtypes. `sqlx::Error` → `anyhow::Error` via `?` so the
+// activity layer can classify uniformly.
+#[async_trait]
+impl StructuralDbStore for GraphStore {
+    async fn add_agent(
+        &self,
+        graph_id: GraphId,
+        name: &str,
+        mandate_ref: Option<&str>,
+    ) -> anyhow::Result<AgentId> {
+        let record = GraphStore::add_agent(self, graph_id.into_uuid(), name, mandate_ref).await?;
+        Ok(AgentId::new(record.id))
+    }
+
+    async fn add_edge(
+        &self,
+        parent_agent_id: AgentId,
+        child_agent_id: AgentId,
+    ) -> anyhow::Result<()> {
+        GraphStore::add_edge(
+            self,
+            parent_agent_id.into_uuid(),
+            child_agent_id.into_uuid(),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Per-method tests against an ephemeral per-test Postgres via
@@ -970,6 +1013,41 @@ seed:
             row.0, tools_before,
             "collision must short-circuit before any tool INSERT",
         );
+        Ok(())
+    }
+
+    // --- JAR2-80 (stage 5.3) — StructuralDbStore bridge --------------
+
+    /// The `StructuralDbStore` impl is a thin shim over `add_agent` +
+    /// `add_edge`; the load-bearing claim is that the freshly-allocated
+    /// child id round-trips through the kernel newtype and the edge
+    /// row reads back via `list_children`. Mirrors the JAR2-49
+    /// `list_children_returns_child_records` shape, but routes through
+    /// the trait method (so a future trait-only refactor of the
+    /// activity body has coverage).
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn structural_db_store_trait_adds_agent_and_edge(pool: PgPool) -> sqlx::Result<()> {
+        let store = GraphStore::new(pool);
+        let graph = seed_graph(&store).await;
+        let parent_record = seed_agent(&store, graph.id, "parent").await;
+        let parent_id = AgentId::new(parent_record.id);
+        let graph_id = GraphId::new(graph.id);
+
+        // Trait dispatch: returns AgentId, not AgentRecord.
+        let child_id: AgentId =
+            <GraphStore as StructuralDbStore>::add_agent(&store, graph_id, "child", None)
+                .await
+                .expect("trait add_agent");
+        <GraphStore as StructuralDbStore>::add_edge(&store, parent_id, child_id)
+            .await
+            .expect("trait add_edge");
+
+        // Read back via the existing query API — the freshly-allocated
+        // child id matches what `list_children` reports for the parent.
+        let children = store.list_children(parent_record.id).await?;
+        assert_eq!(children.len(), 1);
+        assert_eq!(AgentId::new(children[0].id), child_id);
+        assert_eq!(children[0].name, "child");
         Ok(())
     }
 }
