@@ -1,0 +1,237 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GraphYaml",
+  "description": "Top-level document type for `graph.yaml`. Read\n`scratch/graph_yaml_schema.md` § 2 for the strawman this mirrors.\n\n`seed` is optional in the strawman but required at apply time today —\nthe workflow's first tick would otherwise drain an empty trigger queue\nand send the LLM an empty prompt (see\n`jarvis_temporal::bin::jarvis_run_workflow::load_triggers`'s \"contained\nno triggers\" guardrail). Validation enforces non-empty\n`seed.triggers`.",
+  "type": "object",
+  "properties": {
+    "agents": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Agent"
+      }
+    },
+    "apiVersion": {
+      "description": "Must be `\"jarvis.engine/v1alpha1\"`. Validated in [`validate`].",
+      "type": "string"
+    },
+    "kind": {
+      "description": "Must be `\"Graph\"`. Validated in [`validate`].",
+      "type": "string"
+    },
+    "metadata": {
+      "$ref": "#/$defs/Metadata"
+    },
+    "seed": {
+      "$ref": "#/$defs/Seed"
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Tool"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "tools",
+    "agents",
+    "seed"
+  ],
+  "$defs": {
+    "Agent": {
+      "description": "`agents[i]`. v1 requires exactly one entry — enforced in [`validate`].\n\n`children`, `defaults`, and any other multi-agent / inheritance\nconstructs are rejected by `#[serde(deny_unknown_fields)]` with a\n`line:col`-bearing serde error.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "URL-path-safe id (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`); strict-\nvalidated in [`validate`]. Combined with `metadata.name` to form\nthe workflow ID JAR2-73 will pass to the Temporal client:\n`graphs/<metadata.name>/agents/<id>`.",
+          "type": "string"
+        },
+        "mandate": {
+          "$ref": "#/$defs/Mandate"
+        },
+        "tools": {
+          "description": "References by id into the top-level `tools:`. Resolved + checked\nfor misses in [`validate`].",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "mandate",
+        "tools"
+      ]
+    },
+    "ExternalEnvelope": {
+      "description": "Payload of `seed.triggers[].external:`. The runtime translates this\ninto `Trigger::External { kind, payload }` at apply time (JAR2-73).",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "payload": {
+          "description": "Opaque JSON. Mirrors `Trigger::External::payload`'s shape.",
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ]
+    },
+    "Mandate": {
+      "description": "`agents[].mandate:` — the standing instruction. **Not** the same wire\nshape as `jarvis_node::mandate::Mandate` (which is ms-integers +\n`retry_policy` + `context_policy`); kept distinct because the YAML is\nthe authored / human-edited surface and `jarvis_node::Mandate` is the\nruntime/wire shape. Conversion lives in JAR2-73.\n\n`from_file:` (`scratch/graph_yaml_schema.md` § 4.5) is rejected by\n`deny_unknown_fields`; v1 is inline-only.",
+      "type": "object",
+      "properties": {
+        "idle_period": {
+          "description": "Wake cadence when no signal arrives. Accepts the\n[`humantime`](https://docs.rs/humantime) duration grammar:\n`100ms`, `5m`, `1h30m`, `1h 30m`, etc. Parsed via\n`humantime::parse_duration`. Empty / malformed values surface as\n[`GraphYamlError::Parse`] (the adapter raises a serde error\nmid-deserialize so `serde_yaml::Location` pins the `line:col`).",
+          "type": "string"
+        },
+        "max_ticks": {
+          "description": "Optional safety cap on loop iterations. `None` ⇒ run until\n`Retire`. Mirrors `jarvis_node::mandate::Mandate::max_ticks`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "text": {
+          "description": "Free-form mandate text. YAML block scalars (`|`) are fine.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "text",
+        "idle_period"
+      ]
+    },
+    "Metadata": {
+      "description": "`metadata:` block — identity + free-form description.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "description": "Free-form text. Tolerates `|` block scalars per the strawman.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "name": {
+          "description": "URL-path-safe name (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`). Strict-\nvalidated in [`validate`]; not lowercased.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "Seed": {
+      "description": "`seed:` — what kicks the graph off. v1 requires `triggers` to be\nnon-empty (see [`GraphYaml`] doc for the empty-prompt guardrail).",
+      "type": "object",
+      "properties": {
+        "triggers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SeedTrigger"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "triggers"
+      ]
+    },
+    "SeedTrigger": {
+      "description": "One row under `seed.triggers:`. Mirrors the strawman § 2 shape:\naddressed to an agent, fired `at: start`, carrying an `external:`\nenvelope. `scripted_decisions:` is rejected by `deny_unknown_fields`\non [`Seed`] — vanished with real `Decide` per <JAR2-71>.",
+      "type": "object",
+      "properties": {
+        "agent": {
+          "description": "Target agent id. Validated against `agents[].id` in [`validate`].",
+          "type": "string"
+        },
+        "at": {
+          "description": "When to fire. Today only `start` is accepted; future stages may\nadd `every: <duration>`, `at: <iso8601>`, etc. v1 enforces the\nliteral in [`validate`].",
+          "type": "string"
+        },
+        "external": {
+          "description": "External-signal payload. Mirror of `jarvis_node::trigger::Trigger::External`.",
+          "$ref": "#/$defs/ExternalEnvelope"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agent",
+        "at",
+        "external"
+      ]
+    },
+    "Tool": {
+      "description": "A tool registration. `kind` is the discriminant; `Builtin` is the\nonly variant accepted at validate-time today. `Mcp` is parseable so\nwe can reject it with a targeted error message.\n\nIntentionally **no** `#[serde(deny_unknown_fields)]` here — the\n`#[serde(flatten)]` + `deny_unknown_fields` combo on a parent struct\nis incompatible (serde flattens via a `MapAccess` adapter that\n`deny_unknown_fields` cannot see through). The inner `ToolKind`\nenum carries `deny_unknown_fields` per-variant, which is the actual\nguard we want; the outer struct only carries `id`.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "Reference id used by `agents[].tools`. URL-path-safe (same regex\nas `metadata.name` — checked in [`validate`]).",
+          "type": "string"
+        }
+      },
+      "oneOf": [
+        {
+          "description": "Tool registered against the in-process bootstrap `ToolRegistry`\n(today: `EchoTool`). The `builtin` field names which one (e.g.\n`echo`).",
+          "type": "object",
+          "properties": {
+            "builtin": {
+              "description": "Identifier of the in-process tool to register (`\"echo\"` etc).",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "builtin"
+            }
+          },
+          "required": [
+            "kind",
+            "builtin"
+          ]
+        },
+        {
+          "description": "MCP server. Parseable so [`validate`] can emit the targeted\n\"JAR2-63 follow-up\" hint; not allowed in v1.",
+          "type": "object",
+          "properties": {
+            "args": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "string"
+              }
+            },
+            "command": {
+              "description": "Command to spawn for the MCP server (e.g. `\"mcp-web-search\"`).",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "mcp"
+            }
+          },
+          "required": [
+            "kind",
+            "command"
+          ]
+        }
+      ],
+      "required": [
+        "id"
+      ]
+    }
+  }
+}
