@@ -55,6 +55,9 @@
 //! avoids the round-trip ambiguity ("what does `metadata.name: Foo`
 //! become?") that normalization would introduce.
 
+use jarvis_node::mandate::Mandate as NodeMandate;
+use jarvis_node::trigger::Trigger as NodeTrigger;
+use jarvis_temporal::workflow::{AgentConfig, AgentInput, FsHandle};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::time::Duration;
@@ -643,6 +646,91 @@ fn locate_token_in_line(
     None
 }
 
+// --- YAML → workflow input conversion (Stage 4.2, JAR2-73) -------------
+
+/// Build the [`AgentInput`] the `AgentWorkflow` consumes from a validated
+/// [`GraphYaml`]. Hermetic — no DB, no Temporal client, no filesystem.
+///
+/// Caller-side invariants:
+///
+/// - The graph must already have passed [`validate`] (or
+///   [`parse_and_validate`]); this function unwraps the v1 "exactly one
+///   agent" guarantee via `agents[0]` and would panic on an empty agents
+///   vector otherwise. Treat it as a typed-witness consumer of the
+///   validator.
+/// - The returned `AgentInput.fs_handle.prefix` is the empty string. The
+///   `jarvis-apply` binary mirrors `jarvis_run_workflow`'s pattern of
+///   rooting [`jarvis_node::storage::LocalStorage`] directly at the
+///   per-invocation FS subdir, so `<prefix>/outputs/...` resolves to
+///   `<fs_root>/outputs/...` on disk. The empty-prefix choice lives in
+///   the binary's storage construction, not here — this conversion
+///   stays a pure value-to-value mapping.
+///
+/// ## Field mapping
+///
+/// | YAML | `AgentInput` |
+/// |---|---|
+/// | `agents[0].mandate.{text, idle_period, max_ticks}` | `mandate` via [`NodeMandate::new`] |
+/// | `seed.triggers[*].external.{kind, payload}` | **not** in `AgentInput` — the binary signals them post-`start_workflow` via [`yaml_seed_triggers`] |
+/// | `metadata.name`, `agents[0].id` | **not** in `AgentInput` — they form the workflow ID (`agent_workflow_id`), passed separately by the binary |
+///
+/// `cfg` defaults to [`AgentConfig::default`] (the JAR2-58 placeholder),
+/// `parent_handle` defaults to `None` (no parent — single-agent v1),
+/// `carryover` defaults to `None` (a fresh apply is a first run, not a
+/// post-CAN hydrate).
+///
+/// `NodeMandate::new` synthesizes the `retry_policy: None` +
+/// `context_policy: ContextPolicy::default()` defaults; v1 YAML does not
+/// surface either knob (out of scope per parent JAR2-71).
+pub fn into_agent_input(graph: &GraphYaml) -> AgentInput {
+    debug_assert_eq!(
+        graph.agents.len(),
+        1,
+        "into_agent_input requires a validated single-agent graph; \
+         call parse_and_validate or validate before this conversion",
+    );
+    let agent = &graph.agents[0];
+    let mandate = NodeMandate::new(
+        agent.mandate.text.clone(),
+        agent.mandate.idle_period,
+        agent.mandate.max_ticks,
+    );
+    AgentInput {
+        cfg: AgentConfig::default(),
+        fs_handle: FsHandle {
+            prefix: String::new(),
+        },
+        parent_handle: None,
+        carryover: None,
+        mandate,
+    }
+}
+
+/// Translate the YAML's `seed.triggers` into the
+/// [`jarvis_node::trigger::Trigger::External`] values the `jarvis-apply`
+/// binary will `handle.signal(AgentWorkflow::external_signal, ...)` to
+/// the workflow.
+///
+/// In v1 every seed trigger targets `agents[0].id` (the validator
+/// rejects others), so this function does not return the destination
+/// agent — the binary signals against the single workflow handle it
+/// started. Stage 5+ multi-agent will need the destination back; the
+/// shape is reserved by `SeedTrigger.agent` already.
+///
+/// Order is preserved from the YAML — the binary signals them in the
+/// same order the operator wrote them.
+pub fn yaml_seed_triggers(graph: &GraphYaml) -> Vec<NodeTrigger> {
+    graph
+        .seed
+        .triggers
+        .iter()
+        .map(|seed| NodeTrigger::External {
+            kind: seed.external.kind.clone(),
+            payload: seed.external.payload.clone(),
+        })
+        .collect()
+}
+
 // --- tests --------------------------------------------------------------
 
 #[cfg(test)]
@@ -1138,6 +1226,121 @@ seed:
         assert!(!is_url_path_safe_name("foo_bar"));
         assert!(!is_url_path_safe_name("foo/bar"));
         assert!(!is_url_path_safe_name("foo.bar"));
+    }
+
+    // --- YAML → AgentInput conversion (Stage 4.2, JAR2-73) -----------
+
+    #[test]
+    fn into_agent_input_maps_canonical_fixture_to_expected_values() {
+        let g = parse_and_validate(HAPPY_YAML).expect("happy path");
+        let input = super::into_agent_input(&g);
+
+        // `mandate.text`, `idle_period`, `max_ticks` round-trip from the
+        // YAML's inline mandate.
+        assert!(
+            input
+                .mandate
+                .text
+                .contains("call the `echo` tool exactly once"),
+            "mandate text propagated: {}",
+            input.mandate.text,
+        );
+        assert_eq!(input.mandate.idle_period, Duration::from_secs(1));
+        assert_eq!(input.mandate.max_ticks, Some(8));
+
+        // Defaults that v1 YAML does not surface.
+        assert!(input.mandate.retry_policy.is_none());
+        assert_eq!(
+            input.mandate.context_policy,
+            jarvis_node::mandate::ContextPolicy::default(),
+        );
+
+        // FS handle prefix is empty: the binary roots LocalStorage at the
+        // per-invocation FS subdir itself, mirroring jarvis_run_workflow.
+        assert!(input.fs_handle.prefix.is_empty());
+
+        // Parent + carryover are None on a fresh apply (first run).
+        assert!(input.parent_handle.is_none());
+        assert!(input.carryover.is_none());
+    }
+
+    #[test]
+    fn into_agent_input_propagates_humanized_idle_period_units() {
+        // Cover the duration adapter end-to-end through the conversion
+        // — `100ms` survives as `Duration::from_millis(100)`, etc.
+        let yaml = HAPPY_YAML.replace("      idle_period: 1s\n", "      idle_period: 100ms\n");
+        let g = parse_and_validate(&yaml).expect("happy path");
+        let input = super::into_agent_input(&g);
+        assert_eq!(input.mandate.idle_period, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn into_agent_input_propagates_max_ticks_none_when_absent() {
+        // `max_ticks` is optional in the YAML; missing → `None` on the
+        // way through (matches `Mandate::new`'s contract).
+        let yaml = HAPPY_YAML.replace("      max_ticks: 8\n", "");
+        let g = parse_and_validate(&yaml).expect("happy path");
+        let input = super::into_agent_input(&g);
+        assert!(input.mandate.max_ticks.is_none());
+    }
+
+    #[test]
+    fn yaml_seed_triggers_translates_external_envelopes_in_order() {
+        // Two ordered seeds, both targeting the same agent (v1's only
+        // legal shape per the validator). The binary will signal them
+        // in the YAML's declared order; assert the translated vector
+        // preserves that order verbatim.
+        let yaml = HAPPY_YAML.replace(
+            "  triggers:\n    - agent: root\n      at: start\n      external:\n        kind: kickoff\n        payload: {}\n",
+            "  triggers:\n    - agent: root\n      at: start\n      external:\n        kind: kickoff\n        payload: {}\n    - agent: root\n      at: start\n      external:\n        kind: heartbeat\n        payload:\n          beat: 1\n",
+        );
+        let g = parse_and_validate(&yaml).expect("happy path");
+        let triggers = super::yaml_seed_triggers(&g);
+        assert_eq!(triggers.len(), 2);
+        match &triggers[0] {
+            jarvis_node::trigger::Trigger::External { kind, payload } => {
+                assert_eq!(kind, "kickoff");
+                assert_eq!(*payload, serde_json::json!({}));
+            }
+            other => panic!("expected External, got {other:?}"),
+        }
+        match &triggers[1] {
+            jarvis_node::trigger::Trigger::External { kind, payload } => {
+                assert_eq!(kind, "heartbeat");
+                assert_eq!(*payload, serde_json::json!({"beat": 1}));
+            }
+            other => panic!("expected External, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn yaml_seed_triggers_passes_arbitrary_json_payloads_through() {
+        // Payload is `serde_json::Value`; non-trivial shapes (nested
+        // objects, arrays, scalars) must survive the YAML → JSON
+        // translation unmangled.
+        let yaml = HAPPY_YAML.replace(
+            "        payload: {}\n",
+            "        payload:\n          nested:\n            list: [1, 2, 3]\n            flag: true\n            text: hello\n",
+        );
+        let g = parse_and_validate(&yaml).expect("happy path");
+        let triggers = super::yaml_seed_triggers(&g);
+        assert_eq!(triggers.len(), 1);
+        match &triggers[0] {
+            jarvis_node::trigger::Trigger::External { kind, payload } => {
+                assert_eq!(kind, "kickoff");
+                assert_eq!(
+                    *payload,
+                    serde_json::json!({
+                        "nested": {
+                            "list": [1, 2, 3],
+                            "flag": true,
+                            "text": "hello",
+                        }
+                    }),
+                );
+            }
+            other => panic!("expected External, got {other:?}"),
+        }
     }
 
     // --- Schema-drift regression --------------------------------------

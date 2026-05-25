@@ -17,8 +17,38 @@
 //! `list_tools_for_agent` are all in scope.
 
 use crate::types::{AgentRecord, Edge, Graph, ToolRecord};
-use sqlx::PgPool;
+use crate::yaml::{GraphYaml, ToolKind};
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
+
+/// Typed error surface for [`GraphStore::create_from_yaml`].
+///
+/// Stage 4.2 (JAR2-73) introduces a single domain-typed variant —
+/// `GraphAlreadyExists` — so the `jarvis-apply` binary can pattern-match
+/// the `metadata.name` collision and print a clean, operator-targeted
+/// error (rather than letting a generic `sqlx::Error` bubble through).
+/// Other failure paths stay opaque via `Sqlx`; the v1 CREATE-only
+/// semantics don't need finer-grained typing yet (see <JAR2-71> for the
+/// deferred reconciliation work that will).
+#[derive(Debug, thiserror::Error)]
+pub enum GraphStoreError {
+    /// A graph with this `metadata.name` already exists in the structural
+    /// DB. v1 is CREATE-only; reconciliation lives in Stage 5+.
+    /// See <JAR2-71>'s parent-ticket decision matrix.
+    #[error(
+        "graph {name:?} already exists in the structural DB; v1 of `jarvis apply` is CREATE-only \
+         (reconciliation is deferred to Stage 5 — see <JAR2-71>). Drop the existing graph or use \
+         a different `metadata.name`."
+    )]
+    GraphAlreadyExists { name: String },
+
+    /// Any other DB-level failure (FK violation, connection drop, etc.).
+    /// Surfaced verbatim so operators can see the underlying `sqlx`
+    /// error text; the `jarvis-apply` binary chains it into anyhow at
+    /// the call site.
+    #[error("structural DB write failed: {0}")]
+    Sqlx(#[from] sqlx::Error),
+}
 
 /// Thin wrapper over a `PgPool` exposing the structural-DB CRUD surface
 /// stage-4's `jarvis apply` will write into and downstream consumers
@@ -174,6 +204,171 @@ impl GraphStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Stage 4.2 (JAR2-73) transactional wrapper: in one DB transaction,
+    /// CREATE the graph row + the (single, v1) agent row + every tool
+    /// row + every `agent_tools` attachment.
+    ///
+    /// Returns [`GraphStoreError::GraphAlreadyExists`] when a graph with
+    /// the same `metadata.name` already exists. v1 of `jarvis apply` is
+    /// CREATE-only; the reconciliation alternative (compare-and-update,
+    /// or `--prune`) is locked to Stage 5+ per the parent ticket
+    /// (<JAR2-71>). The collision is detected via a
+    /// `SELECT 1 FROM graphs WHERE name = $1` inside the transaction;
+    /// the `graphs.name` column has no `UNIQUE` constraint today, so
+    /// catching SQLSTATE 23505 would not bite. A schema migration to
+    /// add the constraint is a follow-up — see the PR body for the
+    /// noted JAR2-74+ ticket.
+    ///
+    /// Caller invariant: `graph` must already have passed
+    /// [`crate::yaml::validate`] (or [`crate::yaml::parse_and_validate`]),
+    /// since this function takes the v1 "exactly one agent" guarantee as
+    /// a typed witness via `graph.agents[0]`.
+    ///
+    /// Tool-row shape (mirror of the schema's free-form `kind` column):
+    /// `kind = "builtin"`, `command = Some(<builtin name>)`,
+    /// `args = []`, `env_refs = []`. v1's only tool variant is
+    /// `kind: builtin`; the validator rejects `kind: mcp` so an
+    /// `unreachable!()`-style match arm would be the only alternative
+    /// here, which adds nothing.
+    pub async fn create_from_yaml(&self, graph: &GraphYaml) -> Result<Graph, GraphStoreError> {
+        let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
+
+        // Collision check inside the transaction. `FOR UPDATE` would be
+        // the textbook race-free shape, but `graphs.name` has no index
+        // and `jarvis apply` is operator-driven (not concurrent), so a
+        // plain SELECT is sufficient for v1. A two-`jarvis apply`-at-
+        // once race is a vanishingly unlikely scenario, and even when
+        // it does occur both inserts would succeed today (no UNIQUE
+        // constraint) — the right fix is the deferred schema migration,
+        // not adding locking that papers over its absence.
+        let existing: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM graphs WHERE name = $1 LIMIT 1")
+                .bind(&graph.metadata.name)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if existing.is_some() {
+            return Err(GraphStoreError::GraphAlreadyExists {
+                name: graph.metadata.name.clone(),
+            });
+        }
+
+        // --- graph row -------------------------------------------------
+        let graph_id = Uuid::new_v4();
+        let graph_row = sqlx::query_as!(
+            Graph,
+            r#"
+            INSERT INTO graphs (id, name, metadata)
+            VALUES ($1, $2, $3)
+            RETURNING id, name, metadata as "metadata!: serde_json::Value", created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            "#,
+            graph_id,
+            &graph.metadata.name,
+            // `metadata` jsonb is `{}` for v1; the description lives on
+            // the YAML side only (operator authoring surface), not in
+            // the structural DB. Stage 5+ may bubble selected metadata
+            // up if a need surfaces.
+            serde_json::json!({}),
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // --- agent row (v1: exactly one) -------------------------------
+        let agent_yaml = &graph.agents[0];
+        let agent_id = Uuid::new_v4();
+        sqlx::query_as!(
+            AgentRecord,
+            r#"
+            INSERT INTO agents (id, graph_id, name, mandate_ref)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, graph_id, name, mandate_ref, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            "#,
+            agent_id,
+            graph_id,
+            &agent_yaml.id,
+            // `mandate_ref` is the opaque text handle to the authored
+            // mandate. v1's mandate travels via `AgentInput.mandate`
+            // directly (no resolver looks `mandate_ref` up), so leave
+            // it `None` rather than seed a placeholder value the
+            // structural DB would not interpret. See the no-back-compat-
+            // scaffolding memo.
+            None as Option<&str>,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // --- tool rows + agent_tools attachments -----------------------
+        // The validator rejects `kind: mcp`, so every tool entry is a
+        // `ToolKind::Builtin` here. We persist `command = <builtin name>`
+        // so the structural DB row preserves the operator's choice
+        // (e.g. `"echo"`) — the worker side doesn't read this column
+        // back today, but writing it correctly future-proofs Stage 5+
+        // for MCP-tool registration (which would set `command =
+        // Some(<spawn argv[0]>)`). A `HashMap` indexes the freshly
+        // minted UUIDs so the agent-tools attachment loop can resolve
+        // tool ids by name without re-querying.
+        let mut tool_uuid_by_id: std::collections::HashMap<&str, Uuid> =
+            std::collections::HashMap::with_capacity(graph.tools.len());
+        for tool in &graph.tools {
+            let tool_uuid = Uuid::new_v4();
+            let (kind_text, command_text): (&str, Option<&str>) = match &tool.kind {
+                ToolKind::Builtin { builtin } => ("builtin", Some(builtin.as_str())),
+                // v1's validator rejects `kind: mcp` before this code
+                // runs — but the match must be exhaustive. A panic
+                // here would be a validator bug; surface it as such.
+                ToolKind::Mcp { .. } => {
+                    return Err(GraphStoreError::Sqlx(sqlx::Error::Protocol(format!(
+                        "internal: create_from_yaml saw kind: mcp for tool {:?}; \
+                             validator should have rejected it (see <JAR2-71>)",
+                        tool.id,
+                    ))));
+                }
+            };
+            sqlx::query_as!(
+                ToolRecord,
+                r#"
+                INSERT INTO tools (id, kind, command, args, env_refs)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id, kind, command, args as "args!: serde_json::Value", env_refs as "env_refs!: serde_json::Value", created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+                "#,
+                tool_uuid,
+                kind_text,
+                command_text,
+                serde_json::json!([]),
+                serde_json::json!([]),
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            tool_uuid_by_id.insert(tool.id.as_str(), tool_uuid);
+        }
+
+        for tool_id in &agent_yaml.tools {
+            // Validator guarantees every `agent.tools[i]` resolves to a
+            // top-level `tools[].id`; the lookup is therefore
+            // infallible. We propagate a typed error if it isn't
+            // rather than panic, so the validator bug (if any) surfaces
+            // as a clean operator-facing message.
+            let tool_uuid = tool_uuid_by_id
+                .get(tool_id.as_str())
+                .copied()
+                .ok_or_else(|| {
+                    GraphStoreError::Sqlx(sqlx::Error::Protocol(format!(
+                        "internal: create_from_yaml could not resolve tool ref {tool_id:?}; \
+                     validator should have caught this (see <JAR2-71>)"
+                    )))
+                })?;
+            sqlx::query!(
+                "INSERT INTO agent_tools (agent_id, tool_id) VALUES ($1, $2)",
+                agent_id,
+                tool_uuid,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(graph_row)
     }
 
     // --- reads ------------------------------------------------------
@@ -538,6 +733,126 @@ mod tests {
         let agent = seed_agent(&store, graph.id, "a").await;
         let tools = store.list_tools_for_agent(agent.id).await?;
         assert!(tools.is_empty());
+        Ok(())
+    }
+
+    // --- create_from_yaml (Stage 4.2, JAR2-73) -----------------------
+
+    /// Canonical happy-path fixture for `create_from_yaml`. Mirror of
+    /// the validator-tests `HAPPY_YAML` (kept inline to avoid coupling
+    /// the store-test module's pass/fail to the yaml-test module's
+    /// shape).
+    const HAPPY_YAML: &str = r#"
+apiVersion: jarvis.engine/v1alpha1
+kind: Graph
+metadata:
+  name: smoke
+  description: store-test fixture
+tools:
+  - id: echo
+    kind: builtin
+    builtin: echo
+agents:
+  - id: root
+    mandate:
+      text: do the thing
+      idle_period: 1s
+      max_ticks: 4
+    tools: [echo]
+seed:
+  triggers:
+    - agent: root
+      at: start
+      external:
+        kind: kickoff
+        payload: {}
+"#;
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn create_from_yaml_happy_path_writes_graph_agent_tool_rows(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let store = GraphStore::new(pool);
+        let g = crate::yaml::parse_and_validate(HAPPY_YAML).expect("validator green on fixture");
+        let graph_row = store.create_from_yaml(&g).await.expect("create_from_yaml");
+
+        assert_eq!(graph_row.name, "smoke");
+        let agents = store.list_agents_in_graph(graph_row.id).await?;
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "root");
+        assert!(
+            agents[0].mandate_ref.is_none(),
+            "v1 leaves mandate_ref None; got {:?}",
+            agents[0].mandate_ref,
+        );
+
+        let tools = store.list_tools_for_agent(agents[0].id).await?;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].kind, "builtin");
+        assert_eq!(tools[0].command.as_deref(), Some("echo"));
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn create_from_yaml_returns_typed_error_on_metadata_name_collision(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let store = GraphStore::new(pool);
+        let g = crate::yaml::parse_and_validate(HAPPY_YAML).expect("validator green");
+        // First apply lands.
+        store.create_from_yaml(&g).await.expect("first apply");
+
+        // Second apply with the same `metadata.name` must surface the
+        // typed `GraphAlreadyExists` variant — the binary uses this to
+        // print the operator-facing v1-CREATE-only error.
+        let err = store
+            .create_from_yaml(&g)
+            .await
+            .expect_err("second apply must reject");
+        match err {
+            crate::GraphStoreError::GraphAlreadyExists { name } => {
+                assert_eq!(name, "smoke");
+            }
+            other => panic!("expected GraphAlreadyExists, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn create_from_yaml_is_transactional_on_collision_no_partial_writes(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        // The collision check runs inside the transaction before any
+        // INSERT touches `graphs`/`agents`/`tools`. We can't directly
+        // observe a rolled-back partial write (because nothing is
+        // attempted before the SELECT), but we can assert the
+        // post-collision DB state hasn't gained extra rows from the
+        // second apply attempt — proving the transaction's
+        // collision-short-circuit didn't leak.
+        let store = GraphStore::new(pool);
+        let g = crate::yaml::parse_and_validate(HAPPY_YAML).expect("validator green");
+        store.create_from_yaml(&g).await.expect("first apply");
+
+        // Count tools after the first apply.
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tools")
+            .fetch_one(store.pool())
+            .await?;
+        let tools_before = row.0;
+
+        // Second apply errors.
+        let _ = store
+            .create_from_yaml(&g)
+            .await
+            .expect_err("must reject collision");
+
+        // No new tool row was inserted.
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tools")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(
+            row.0, tools_before,
+            "collision must short-circuit before any tool INSERT",
+        );
         Ok(())
     }
 }

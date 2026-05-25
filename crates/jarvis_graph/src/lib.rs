@@ -79,7 +79,7 @@
 pub mod store;
 pub mod types;
 pub mod yaml;
-pub use store::GraphStore;
+pub use store::{GraphStore, GraphStoreError};
 pub use types::{AgentRecord, Edge, Graph, ToolRecord};
 
 /// Embedded migration set under `migrations/`. Apps call

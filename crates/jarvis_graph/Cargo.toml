@@ -11,7 +11,33 @@ publish = false
 name = "jarvis_graph"
 path = "src/lib.rs"
 
+# Stage 4.2 (JAR2-73) — operator-facing apply binary that consumes
+# `graph.yaml`, writes the structural DB, and instantiates the
+# `AgentWorkflow` via the Temporal client. Mirrors the call shape of
+# `jarvis_temporal/src/bin/jarvis_run_workflow.rs` (JAR2-68) — the FS-tree
+# printing + per-invocation `<fs_root>/<timestamp>` stamping are
+# deliberately duplicated for v1; a shared helper crate is a follow-up
+# (filed in the PR body) when a third caller emerges.
+[[bin]]
+name = "jarvis-apply"
+path = "src/bin/jarvis_apply.rs"
+# Like `jarvis-run-workflow`, vendor + features are gated at runtime
+# inside the binary via `build_decide_from_env`. A zero-vendor build
+# still compiles; the binary errors at boot with a "rebuild with
+# --features" hint.
+
 [dependencies]
+# Stage 4.2 (JAR2-73) — `jarvis_graph` now owns the YAML → AgentInput
+# conversion (`yaml::into_agent_input`) and the `jarvis-apply` binary,
+# both of which materialize `jarvis_node` types (`Mandate`, `Trigger`)
+# and a `jarvis_temporal::workflow::AgentInput`. JAR2-72's `yaml.rs`
+# deliberately stayed `jarvis_node`-free; JAR2-73 is the explicit
+# handoff where the structural-DB crate grows the kernel-runtime
+# dependency.
+jarvis_node = { path = "../jarvis_node" }
+jarvis_temporal = { path = "../jarvis_temporal" }
+
+
 # `sqlx` is pinned with `=` to match the convention `jarvis_temporal` set
 # for stage-0 critical-path deps — a future `cargo update` should not
 # silently shift the DB driver under us. Bump deliberately when there's
@@ -72,6 +98,39 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_yaml = "=0.9.34"
 humantime = "=2.3.0"
 schemars = { version = "=1.2.1", features = ["derive"] }
+
+# Stage 4.2 (JAR2-73) — the `jarvis-apply` binary mirrors the Temporal
+# call surface of `jarvis_run_workflow.rs`. Pinned with `=` to match the
+# rest of the Temporal SDK pins in `jarvis_temporal`'s Cargo.toml so a
+# future `cargo update` doesn't drift the binary's wire shape from the
+# worker's.
+temporalio-sdk = "=0.4.0"
+temporalio-client = "=0.4.0"
+temporalio-common = "=0.4.0"
+temporalio-sdk-core = "=0.4.0"
+url = "2"
+ulid = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+
+[features]
+# JAR2-73 — vendor feature passthrough so `cargo build --features
+# llm-anthropic` (or `--features llm-cohere`) on `jarvis_graph` rebuilds
+# `jarvis_temporal` with the matching feature on, which in turn rebuilds
+# `jarvis_node`'s vendor adapter. Without this passthrough the
+# `jarvis-apply` binary would only ever see `build_decide_from_env`'s
+# zero-vendor stub and error out at boot with "no LLM vendor compiled
+# in". Mirrors `jarvis_temporal`'s `[features]` block exactly.
+default = []
+llm-anthropic = ["jarvis_temporal/llm-anthropic"]
+llm-cohere = ["jarvis_temporal/llm-cohere"]
+
+[dev-dependencies]
+# JAR2-73 — hermetic tests for `into_agent_input` need no DB, but the
+# `--help`-smoke + binary unit tests pull in tempfile to exercise
+# `resolve_fs_root`'s "creates missing parent" assertion (mirroring
+# `jarvis_run_workflow`'s test layout).
+tempfile = "3"
 
 # Stage-1 lint posture matches `jarvis_node` — see its `Cargo.toml` for
 # the rationale (clippy 1.88 promoted a handful of style lints; keep the
