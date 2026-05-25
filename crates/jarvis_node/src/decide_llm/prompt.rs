@@ -158,11 +158,19 @@ fn render_correction(c: &CorrectionContext) -> String {
     )
 }
 
-/// Render the trigger window as a bulleted JSON list.
+/// Render the trigger window as a bulleted list.
 ///
-/// Each trigger is serialized via its existing serde shape — the same shape
-/// the kernel uses on the wire — so the prompt cannot drift from the typed
-/// enum without a serde test failure elsewhere.
+/// Most variants are serialized via their existing serde shape — the same
+/// shape the kernel uses on the wire — so the prompt cannot drift from
+/// the typed enum without a serde test failure elsewhere.
+///
+/// Stage 5 (JAR2-79) cross-agent variants (`ChildOutput`, `ChildRetired`)
+/// render as human-readable prose instead: the model needs the child's
+/// name as a first-class signal ("which child should I reconcile?"), and
+/// an opaque `External`-shaped JSON blob buries that name behind a
+/// nested struct. Rendering distinct from `External` is part of the
+/// 5.2 acceptance — pinned by `snapshot_child_output_trigger_is_distinct_from_external`
+/// below.
 fn render_triggers(triggers: &[Trigger]) -> String {
     // Header has no trailing newline; each bullet is `\n\n- BODY`, giving
     // a blank line between header-and-first-bullet and between every pair
@@ -171,7 +179,26 @@ fn render_triggers(triggers: &[Trigger]) -> String {
     let mut s = format!("# Triggers ({})", triggers.len());
     for t in triggers {
         s.push_str("\n\n- ");
-        s.push_str(&serde_json::to_string(t).expect("Trigger serializes"));
+        match t {
+            Trigger::ChildOutput {
+                agent_name,
+                output_id,
+                ..
+            } => {
+                // The agent name is the load-bearing piece; output_id is
+                // the citation handle the model needs if it later emits
+                // a `ReconcileChildren` decision pointing at this output.
+                s.push_str(&format!("Child output: {agent_name} emitted {output_id}"));
+            }
+            Trigger::ChildRetired {
+                agent_name, reason, ..
+            } => {
+                s.push_str(&format!("Child retired: {agent_name} ({reason})"));
+            }
+            _ => {
+                s.push_str(&serde_json::to_string(t).expect("Trigger serializes"));
+            }
+        }
     }
     s
 }
@@ -256,9 +283,10 @@ mod tests {
     use super::*;
     use crate::decision::{ContextBundle, CorrectionContext};
     use crate::evidence::{EvidenceId, EvidenceRecord};
+    use crate::mandate::OutputId;
     use crate::mandate::{Mandate, Output};
     use crate::model_client::{ContentBlock, Role};
-    use crate::trigger::{HumanOp, Trigger};
+    use crate::trigger::{AgentRef, HumanOp, Trigger};
     use chrono::{DateTime, Utc};
     use serde_json::json;
     use std::time::Duration;
@@ -497,6 +525,159 @@ mod tests {
              - {\"type\":\"external\",\"kind\":\"webhook\",\"payload\":{\"x\":1}}\n\
              \n\
              - {\"type\":\"human_override\",\"op\":{\"action\":\"pause\"}}"
+        );
+    }
+
+    // ---- JAR2-79: cross-agent trigger rendering ------------------------
+
+    fn child_ref() -> AgentRef {
+        AgentRef {
+            agent_id: "agent-7".into(),
+            workflow_id: "graphs/g/agents/agent-7".into(),
+        }
+    }
+
+    /// Snapshot: a `ChildOutput` trigger renders as a human-readable
+    /// bullet that names the child and cites the `OutputId`. This is the
+    /// distinct-from-`External` shape the Stage 5.2 ticket pins.
+    #[test]
+    fn snapshot_child_output_trigger() {
+        let output_id = OutputId::from_hex("ab".repeat(32));
+        let bundle = ContextBundle {
+            triggers: vec![Trigger::ChildOutput {
+                child_ref: child_ref(),
+                agent_name: "fda_scraper".into(),
+                output_id: output_id.clone(),
+            }],
+            ..empty_bundle()
+        };
+        let msgs = render(&bundle);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(
+            text(&msgs[1]),
+            format!(
+                "# Triggers (1)\n\
+                 \n\
+                 - Child output: fda_scraper emitted {output_id}"
+            )
+        );
+    }
+
+    /// Snapshot: a `ChildRetired` trigger renders as a human-readable
+    /// bullet that names the child and surfaces the retirement reason.
+    #[test]
+    fn snapshot_child_retired_trigger() {
+        let bundle = ContextBundle {
+            triggers: vec![Trigger::ChildRetired {
+                child_ref: child_ref(),
+                agent_name: "fda_scraper".into(),
+                reason: "mandate satisfied".into(),
+            }],
+            ..empty_bundle()
+        };
+        let msgs = render(&bundle);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(
+            text(&msgs[1]),
+            "# Triggers (1)\n\
+             \n\
+             - Child retired: fda_scraper (mandate satisfied)"
+        );
+    }
+
+    /// The cross-agent variants must render structurally distinct from
+    /// `External` — the model needs the child's name as a first-class
+    /// signal, not buried behind an opaque JSON payload. This test pins
+    /// the distinction by asserting the rendered bullet does NOT look like
+    /// the serde JSON form of either variant.
+    #[test]
+    fn child_output_trigger_is_distinct_from_external() {
+        let output_id = OutputId::from_hex("ab".repeat(32));
+        let child_bundle = ContextBundle {
+            triggers: vec![Trigger::ChildOutput {
+                child_ref: child_ref(),
+                agent_name: "fda_scraper".into(),
+                output_id,
+            }],
+            ..empty_bundle()
+        };
+        let external_bundle = ContextBundle {
+            triggers: vec![Trigger::External {
+                kind: "child_output".into(),
+                payload: serde_json::json!({"agent_name": "fda_scraper"}),
+            }],
+            ..empty_bundle()
+        };
+        let child = text(&render(&child_bundle)[1]).to_string();
+        let external = text(&render(&external_bundle)[1]).to_string();
+
+        // `External` is rendered via the verbatim serde shape — leading
+        // `{"type":"external"`. `ChildOutput` must NOT use that shape.
+        assert!(
+            !child.contains("\"type\":\"child_output\""),
+            "ChildOutput rendered using the opaque serde shape: {child}"
+        );
+        assert!(
+            external.contains("\"type\":\"external\""),
+            "External lost its serde shape: {external}"
+        );
+        // The child name is surfaced in plain prose.
+        assert!(
+            child.contains("Child output: fda_scraper"),
+            "agent_name not surfaced: {child}"
+        );
+        // And the two prompts must not be byte-equal.
+        assert_ne!(child, external);
+    }
+
+    /// Mixed-trigger snapshot covering every variant in priority order
+    /// after Stage 5.2 (human > external > child_output/child_retired >
+    /// scheduled). Locks both the per-variant rendering and the fact that
+    /// the renderer preserves whatever order the bundle hands it (the
+    /// queue is responsible for the priority sort upstream).
+    #[test]
+    fn snapshot_mixed_triggers_with_cross_agent_variants() {
+        let output_id = OutputId::from_hex("cd".repeat(32));
+        let bundle = ContextBundle {
+            triggers: vec![
+                Trigger::HumanOverride {
+                    op: HumanOp::new(json!({"action": "pause"})),
+                },
+                Trigger::External {
+                    kind: "webhook".into(),
+                    payload: json!({"x": 1}),
+                },
+                Trigger::ChildOutput {
+                    child_ref: child_ref(),
+                    agent_name: "fda_scraper".into(),
+                    output_id: output_id.clone(),
+                },
+                Trigger::ChildRetired {
+                    child_ref: child_ref(),
+                    agent_name: "fda_scraper".into(),
+                    reason: "mandate satisfied".into(),
+                },
+                Trigger::ScheduledWake,
+            ],
+            ..empty_bundle()
+        };
+        let msgs = render(&bundle);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(
+            text(&msgs[1]),
+            format!(
+                "# Triggers (5)\n\
+                 \n\
+                 - {{\"type\":\"human_override\",\"op\":{{\"action\":\"pause\"}}}}\n\
+                 \n\
+                 - {{\"type\":\"external\",\"kind\":\"webhook\",\"payload\":{{\"x\":1}}}}\n\
+                 \n\
+                 - Child output: fda_scraper emitted {output_id}\n\
+                 \n\
+                 - Child retired: fda_scraper (mandate satisfied)\n\
+                 \n\
+                 - {{\"type\":\"scheduled_wake\"}}"
+            )
         );
     }
 

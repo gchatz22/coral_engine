@@ -11,8 +11,13 @@
 //! * [`TriggerQueue::drain_ordered`] — synchronous, drains everything
 //!   currently buffered (both the internal staging buffer and any pending
 //!   items in the channel) and returns them sorted by the rule from
-//!   `scratch/minimal_node_backend.md` § 4: **human > external > scheduled,
-//!   FIFO within each class**.
+//!   `scratch/minimal_node_backend.md` § 4, tightened in Stage 5
+//!   (`scratch/temporal_staged_plan.md` § 5 ticket 5.2 / JAR2-79):
+//!   **human > external > child_output > scheduled, FIFO within each
+//!   class**. Operator-driven signals always preempt cross-agent traffic;
+//!   cross-agent traffic preempts idle timers. `ChildRetired` is treated
+//!   as a `ChildOutput`-class signal for ordering purposes — both
+//!   represent a child telling the parent something actionable.
 //!
 //! [`TriggerQueue::push`] is a synchronous self-send used by the scheduler
 //! to inject `ScheduledWake` from inside the loop. It routes through the
@@ -123,7 +128,9 @@ impl TriggerQueue {
     }
 
     /// Drain everything currently buffered and return it sorted by class
-    /// (Human > External > Scheduled), FIFO within each class.
+    /// (Human > External > ChildOutput/ChildRetired > Scheduled), FIFO
+    /// within each class. See the module doc for the rationale on slotting
+    /// cross-agent signals between operator signals and idle timers.
     ///
     /// Synchronous: pulls the staging buffer first, then non-blockingly
     /// drains any items already sitting in the channel. Items that arrive
@@ -148,13 +155,17 @@ impl TriggerQueue {
 }
 
 /// Lower number = higher priority. Stable-sorting by this key yields the
-/// rule from `scratch/minimal_node_backend.md` § 4: human > external >
-/// scheduled, FIFO within each class.
+/// rule from `scratch/minimal_node_backend.md` § 4 tightened by Stage 5
+/// (JAR2-79): human > external > child_output/child_retired > scheduled,
+/// FIFO within each class. `ChildOutput` and `ChildRetired` share a
+/// priority class — both are cross-agent signals from a child, and the
+/// ordering between them is FIFO by arrival.
 fn class_priority(t: &Trigger) -> u8 {
     match t {
         Trigger::HumanOverride { .. } => 0,
         Trigger::External { .. } => 1,
-        Trigger::ScheduledWake => 2,
+        Trigger::ChildOutput { .. } | Trigger::ChildRetired { .. } => 2,
+        Trigger::ScheduledWake => 3,
     }
 }
 
@@ -166,7 +177,8 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::trigger::{HumanOp, Trigger};
+    use crate::mandate::OutputId;
+    use crate::trigger::{AgentRef, HumanOp, Trigger};
 
     fn ext(kind: &str) -> Trigger {
         Trigger::External {
@@ -178,6 +190,29 @@ mod tests {
     fn human(action: &str) -> Trigger {
         Trigger::HumanOverride {
             op: HumanOp::new(json!({ "action": action })),
+        }
+    }
+
+    fn child_ref(name: &str) -> AgentRef {
+        AgentRef {
+            agent_id: name.into(),
+            workflow_id: format!("graphs/g/agents/{name}"),
+        }
+    }
+
+    fn child_output(name: &str) -> Trigger {
+        Trigger::ChildOutput {
+            child_ref: child_ref(name),
+            agent_name: name.into(),
+            output_id: OutputId::from_hex("ab".repeat(32)),
+        }
+    }
+
+    fn child_retired(name: &str) -> Trigger {
+        Trigger::ChildRetired {
+            child_ref: child_ref(name),
+            agent_name: name.into(),
+            reason: "done".into(),
         }
     }
 
@@ -198,6 +233,50 @@ mod tests {
         assert_eq!(drained.len(), 3);
         assert!(matches!(drained[0], Trigger::HumanOverride { .. }));
         assert!(matches!(drained[1], Trigger::External { .. }));
+        assert!(matches!(drained[2], Trigger::ScheduledWake));
+    }
+
+    #[tokio::test]
+    async fn drain_returns_human_external_child_output_then_scheduled() {
+        // JAR2-79: Stage 5 ordering invariant — operator signals preempt
+        // cross-agent traffic preempts idle timers.
+        // `Human > External > ChildOutput > Scheduled`.
+        let (mut q, sink) = TriggerQueue::new();
+        // Push in the worst possible order for a naive FIFO drain — the
+        // newly-added cross-agent class is the load-bearing assertion.
+        sink.send(Trigger::ScheduledWake).unwrap();
+        sink.send(child_output("scraper")).unwrap();
+        sink.send(ext("webhook")).unwrap();
+        sink.send(human("pause")).unwrap();
+
+        q.wait_nonempty().await;
+        let drained = q.drain_ordered();
+
+        assert_eq!(drained.len(), 4);
+        assert!(matches!(drained[0], Trigger::HumanOverride { .. }));
+        assert!(matches!(drained[1], Trigger::External { .. }));
+        assert!(matches!(drained[2], Trigger::ChildOutput { .. }));
+        assert!(matches!(drained[3], Trigger::ScheduledWake));
+    }
+
+    #[tokio::test]
+    async fn child_retired_shares_priority_class_with_child_output_and_preempts_scheduled() {
+        // `ChildRetired` is the same priority class as `ChildOutput`
+        // (both are "a child told us something"); both preempt
+        // `ScheduledWake`. Order between them is FIFO by arrival.
+        let (mut q, sink) = TriggerQueue::new();
+        sink.send(Trigger::ScheduledWake).unwrap();
+        sink.send(child_retired("worker_a")).unwrap();
+        sink.send(child_output("worker_b")).unwrap();
+
+        q.wait_nonempty().await;
+        let drained = q.drain_ordered();
+
+        assert_eq!(drained.len(), 3);
+        // FIFO within the shared cross-agent class: retired-a, then
+        // output-b, then the scheduled wake.
+        assert!(matches!(drained[0], Trigger::ChildRetired { .. }));
+        assert!(matches!(drained[1], Trigger::ChildOutput { .. }));
         assert!(matches!(drained[2], Trigger::ScheduledWake));
     }
 
