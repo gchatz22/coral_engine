@@ -701,7 +701,7 @@ impl AgentWorkflow {
                 next_wake: self.next_wake,
             },
             child_handles: Vec::new(),
-            last_output_id: self.last_output_id,
+            last_output_id: self.last_output_id.clone(),
             mid_tick_evidence: self.mid_tick_evidence.clone(),
             cumulative_triggers_observed: self.cumulative_triggers_observed,
             cumulative_human_ops_observed: self.cumulative_human_ops_observed,
@@ -1334,7 +1334,7 @@ mod tests {
                 next_wake: Some(Duration::from_millis(250)),
             },
             child_handles: Vec::new(),
-            last_output_id: Some(OutputId::new()),
+            last_output_id: Some(OutputId::from_hex("ab".repeat(32))),
             mid_tick_evidence: vec![EvidenceId::from_hex("0123456789abcdef")],
             cumulative_triggers_observed: 5,
             cumulative_human_ops_observed: 7,
@@ -1408,7 +1408,7 @@ mod tests {
         original.cumulative_triggers_observed = 9;
         original.cumulative_human_ops_observed = 13;
         original.cumulative_mandate_patches_observed = 17;
-        original.last_output_id = Some(OutputId::new());
+        original.last_output_id = Some(OutputId::from_hex("cd".repeat(32)));
         original.tick = 23;
 
         let c = original.encode_carryover();
@@ -1468,7 +1468,7 @@ mod tests {
         pre_can.cumulative_triggers_observed = 3;
         pre_can.cumulative_human_ops_observed = 5;
         pre_can.cumulative_mandate_patches_observed = 7;
-        pre_can.last_output_id = Some(OutputId::new());
+        pre_can.last_output_id = Some(OutputId::from_hex("ef".repeat(32)));
         pre_can.tick = 19;
 
         // Encode → JSON → decode → hydrate, exactly as Temporal will

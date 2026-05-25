@@ -4,8 +4,8 @@
 use crate::evidence::EvidenceId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
-use ulid::Ulid;
 
 /// Retry policy for tool calls invoked under this mandate. Bounds attempts
 /// within a single tool call and the fixed delay between them. Lives on
@@ -161,11 +161,19 @@ impl Default for ContextPolicy {
 }
 
 /// A produced artifact. Every output carries the evidence ids that justify
-/// its content; the run loop will later refuse outputs whose evidence does
-/// not resolve on disk. For now this type is pure data.
+/// its content; the run loop refuses outputs whose evidence does not resolve
+/// on disk (see `AgentFs::persist_output`).
 ///
-/// `id` is a ULID so outputs sort lexically by creation time and have a
-/// short, URL-safe textual form.
+/// `id` is **content-addressed** (JAR2-70): `sha256` over the canonical
+/// JSON of `{content, evidence: sorted_ids}`, mirroring `EvidenceId::new`'s
+/// shape. Two ticks that emit byte-identical `(content, evidence)` produce
+/// the same `OutputId`, which makes `persist_output` idempotent for free
+/// under Temporal activity retries.
+///
+/// `created_at` is deliberately **not** part of the hash: the same logical
+/// claim minted twice on different ticks must collapse to one file, not
+/// two. Wall-clock drift is a cosmetic property of the file's on-disk
+/// timestamp, not an identity contract.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Output {
     pub id: OutputId,
@@ -175,42 +183,75 @@ pub struct Output {
 }
 
 impl Output {
-    /// Build an output with a freshly minted id and the supplied timestamp.
+    /// Build an output whose id is derived from `(content, evidence)`.
+    /// Two calls with the same content and evidence (in any input order)
+    /// produce the same `OutputId`.
     pub fn new(
         content: impl Into<String>,
         evidence: Vec<EvidenceId>,
         created_at: DateTime<Utc>,
     ) -> Self {
+        let content = content.into();
+        let id = OutputId::new(&content, &evidence);
         Self {
-            id: OutputId::new(),
-            content: content.into(),
+            id,
+            content,
             evidence,
             created_at,
         }
     }
 }
 
-/// Newtype around a ULID identifying an `Output`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// Hex-encoded sha256 identifying an `Output`. Content-addressed: same
+/// `(content, evidence)` → same id. Wraps the hex digits as a `String`
+/// so the on-disk filename is the id verbatim.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct OutputId(pub Ulid);
+pub struct OutputId(String);
 
 impl OutputId {
-    /// Mint a new id from the ULID monotonic generator.
-    pub fn new() -> Self {
-        OutputId(Ulid::new())
-    }
-}
+    /// Derive an id from `(content, evidence)`. Evidence ids are sorted
+    /// before hashing so caller-side ordering doesn't fragment the id
+    /// space. Mirrors `EvidenceId::new`'s canonical-JSON envelope:
+    /// fixed lexical-order keys, no whitespace, recursive canonical
+    /// sub-encoding.
+    pub fn new(content: &str, evidence: &[EvidenceId]) -> Self {
+        let mut sorted: Vec<&EvidenceId> = evidence.iter().collect();
+        sorted.sort();
 
-impl Default for OutputId {
-    fn default() -> Self {
-        Self::new()
+        // Build the canonical JSON form of {content, evidence: [..]} via
+        // serde_json::Value so we share `EvidenceId`'s rules for sorted
+        // object keys and stringly-quoted scalars. The wrapping object
+        // has exactly two keys (`content`, `evidence`) in lexical order
+        // by construction.
+        let envelope = serde_json::json!({
+            "content": content,
+            "evidence": sorted
+                .iter()
+                .map(|e| serde_json::Value::String(e.as_str().to_string()))
+                .collect::<Vec<_>>(),
+        });
+        let bytes =
+            serde_json::to_vec(&envelope).expect("canonical envelope serialization is infallible");
+        let digest = Sha256::digest(&bytes);
+        OutputId(hex::encode(digest))
+    }
+
+    /// Wrap a pre-computed hex string. Trusts the caller; useful for
+    /// deserialization paths and tests.
+    pub fn from_hex(hex: impl Into<String>) -> Self {
+        OutputId(hex.into())
+    }
+
+    /// Borrow the hex digits.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
 impl std::fmt::Display for OutputId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        f.write_str(&self.0)
     }
 }
 
@@ -403,17 +444,89 @@ mod tests {
     }
 
     #[test]
-    fn output_ids_are_unique() {
-        let a = OutputId::new();
-        let b = OutputId::new();
+    fn output_id_is_deterministic_for_same_content_and_evidence() {
+        let ev1 = EvidenceId::new("echo", &json!({"a": 1}), &json!({"r": 1}));
+        let ev2 = EvidenceId::new("echo", &json!({"a": 2}), &json!({"r": 2}));
+        let a = OutputId::new("hello", &[ev1.clone(), ev2.clone()]);
+        let b = OutputId::new("hello", &[ev1.clone(), ev2.clone()]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn output_id_is_stable_across_evidence_ordering() {
+        // Evidence ids must be sorted before hashing — same set, different
+        // insertion order → same id. This is what makes
+        // `Decision::EmitOutput` idempotent even when the agent shuffles
+        // its evidence vector between retries.
+        let ev1 = EvidenceId::new("echo", &json!({"a": 1}), &json!({"r": 1}));
+        let ev2 = EvidenceId::new("echo", &json!({"a": 2}), &json!({"r": 2}));
+        let a = OutputId::new("hello", &[ev1.clone(), ev2.clone()]);
+        let b = OutputId::new("hello", &[ev2, ev1]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn output_id_differs_for_different_content() {
+        let ev = EvidenceId::new("echo", &json!({"a": 1}), &json!({"r": 1}));
+        let a = OutputId::new("hello", &[ev.clone()]);
+        let b = OutputId::new("world", &[ev]);
         assert_ne!(a, b);
     }
 
     #[test]
+    fn output_id_differs_for_different_evidence() {
+        let ev1 = EvidenceId::new("echo", &json!({"a": 1}), &json!({"r": 1}));
+        let ev2 = EvidenceId::new("echo", &json!({"a": 2}), &json!({"r": 2}));
+        let a = OutputId::new("hello", &[ev1]);
+        let b = OutputId::new("hello", &[ev2]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn output_id_is_independent_of_created_at() {
+        // The hash domain is `(content, evidence)`; timestamps must not
+        // leak in or two ticks emitting the same claim at different
+        // wall-clock times would land in different files, defeating
+        // dedup. `Output::new` derives the id from `(content, evidence)`
+        // alone, so two calls with different `created_at` produce the
+        // same `OutputId`.
+        let ev = EvidenceId::new("echo", &json!({"a": 1}), &json!({"r": 1}));
+        let t1 = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t2 = DateTime::parse_from_rfc3339("2030-12-31T23:59:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let a = Output::new("hello", vec![ev.clone()], t1);
+        let b = Output::new("hello", vec![ev], t2);
+        assert_eq!(a.id, b.id);
+        // ...but the per-call timestamps remain distinct on the record.
+        assert_ne!(a.created_at, b.created_at);
+    }
+
+    #[test]
+    fn output_id_is_64_hex_chars() {
+        let ev = EvidenceId::new("echo", &json!(null), &json!(null));
+        let id = OutputId::new("x", &[ev]);
+        assert_eq!(id.as_str().len(), 64);
+        assert!(id.as_str().chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
     fn output_id_round_trip() {
-        let id = OutputId::new();
+        let ev = EvidenceId::new("echo", &json!({"k": "v"}), &json!(1));
+        let id = OutputId::new("hello", &[ev]);
         let s = serde_json::to_string(&id).unwrap();
+        // `transparent` should serialize as a bare JSON string.
+        assert!(s.starts_with('"') && s.ends_with('"'));
         let back: OutputId = serde_json::from_str(&s).unwrap();
         assert_eq!(id, back);
+    }
+
+    #[test]
+    fn output_id_from_hex_round_trips() {
+        let id = OutputId::from_hex("abc123");
+        assert_eq!(id.as_str(), "abc123");
+        assert_eq!(id.to_string(), "abc123");
     }
 }

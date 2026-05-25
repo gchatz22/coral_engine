@@ -339,8 +339,8 @@ async fn apply_fs_ops_impl(
 
 /// Stage 3.8 helper — open an `AgentFs` over `storage` at `prefix` and
 /// persist `content` as an output whose provenance trail is `evidence`.
-/// Returns the minted `OutputId` (a fresh ULID — see the
-/// `persist_output` doc comment for the idempotency caveat).
+/// Returns the `OutputId`, which post-JAR2-70 is `sha256(content, evidence)`
+/// — see the `persist_output` doc comment for the idempotency contract.
 ///
 /// `AgentFs::persist_output` rejects:
 /// - Empty `evidence` (`FsError::EmptyEvidence`).
@@ -664,14 +664,13 @@ impl AgentActivities {
     /// to the real `Mandate` shape; until that lands, this body matches
     /// the same placeholder `assemble_context` uses today.
     ///
-    /// **Idempotency caveat.** Per the JAR2-64 ticket the activity is
-    /// "idempotent for free" because `OutputId` was assumed to be
-    /// content-addressed — but `OutputId::new()` in `jarvis_node::mandate`
-    /// is a random ULID, so a Temporal retry of a successful FS write +
-    /// failed activity ack will mint a fresh id and write a second
-    /// file. Out of scope for JAR2-64 (smallest correct diff: swap the
-    /// body, not redesign `OutputId`); flagged as a follow-up in the PR
-    /// summary.
+    /// **Idempotency (JAR2-70).** `OutputId::new(content, evidence)` is
+    /// content-addressed, and `AgentFs::persist_output` uses
+    /// `put_if_absent`, so a Temporal retry of a successful FS write +
+    /// failed activity ack returns the same `OutputId` and does not
+    /// land a second file or shuffle the tail-index entry. Two ticks
+    /// that emit byte-identical `(content, evidence)` also collapse to
+    /// one file.
     #[activity]
     pub async fn persist_output(
         _ctx: ActivityContext,

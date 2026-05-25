@@ -236,22 +236,33 @@ pub fn build_worker(runtime: &CoreRuntime, client: Client, task_queue: &str) -> 
 /// place. Returns the vendor tag (`"anthropic"` / `"cohere"`)
 /// alongside the trait object so the caller can log it.
 ///
-/// **Selection precedence:**
-/// 1. `JARVIS_MODEL_VENDOR` env var, if set to `"anthropic"` or
-///    `"cohere"`. Unknown values bubble as an error.
-/// 2. Otherwise: whichever vendor's API key is set in the environment.
-///    If both are set, prefer `anthropic` (matches `node-run-llm`'s
-///    documented vendor order in `bin/node_run_llm.rs::USAGE`).
-/// 3. If neither key is set, bail. The activity body would panic at
-///    the first `decide_next_action` call anyway; an early-and-loud
-///    failure is friendlier.
+/// **Selection precedence (JAR2-70):**
+/// 1. `JARVIS_MODEL_VENDOR` env var set + that vendor is compiled in
+///    → use it.
+/// 2. `JARVIS_MODEL_VENDOR` env var set + that vendor is NOT compiled
+///    in → error pointing at the missing feature.
+/// 3. `JARVIS_MODEL_VENDOR` unset → walk the vendor preference order
+///    (`anthropic`, then `cohere` — matches `node-run-llm`'s documented
+///    order in `bin/node_run_llm.rs::USAGE`) and pick the **first
+///    compiled-in vendor whose API key is set**. A vendor that isn't
+///    compiled in is skipped even if its key is present; a compiled-
+///    in vendor with no key is skipped too.
+/// 4. None of the compiled-in vendors have keys → error with a
+///    "rebuild with --features" hint pointing at the union of the
+///    compiled-in vendors' key env vars.
 ///
-/// **Feature gating.** A vendor selected at runtime must be compiled
-/// in (`--features llm-anthropic` / `--features llm-cohere`); the
-/// not-built variants return an error pointing at the missing
-/// feature. The non-feature-gated body is itself `#[cfg]`-gated on at-
-/// least-one vendor, with a "no vendors built" stub for the zero-
-/// feature build (still compiles, errors at runtime).
+/// Pre-JAR2-70 the env-key fallback (case 3) returned whichever
+/// vendor's key was set without checking compilation, so a binary
+/// built with `--features llm-cohere` and `ANTHROPIC_API_KEY` set in
+/// the env would resolve to `"anthropic"` and then fail at
+/// `build_anthropic_client` with the "not compiled in" error. Now
+/// `JARVIS_MODEL_VENDOR=anthropic` is the only path that surfaces
+/// that error; the auto-fallback transparently picks the compiled-in
+/// alternative.
+///
+/// **Feature gating.** The non-feature-gated body is itself `#[cfg]`-
+/// gated on at-least-one vendor, with a "no vendors built" stub for
+/// the zero-feature build (still compiles, errors at runtime).
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 pub fn build_decide_from_env() -> Result<(&'static str, Arc<dyn Decide>)> {
     let vendor = resolve_vendor()?;
@@ -277,28 +288,103 @@ pub fn build_decide_from_env() -> Result<(&'static str, Arc<dyn Decide>)> {
 
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 fn resolve_vendor() -> Result<&'static str> {
-    if let Ok(v) = env::var(VENDOR_ENV) {
-        return match v.as_str() {
-            "anthropic" => Ok("anthropic"),
-            "cohere" => Ok("cohere"),
+    resolve_vendor_inner(
+        env::var(VENDOR_ENV).ok().as_deref(),
+        |k| env::var(k).map(|v| !v.is_empty()).unwrap_or(false),
+        compiled_vendors(),
+    )
+}
+
+/// Vendor + its required-key env var. The fallback walk in case 3
+/// iterates this list in preference order.
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+const VENDOR_KEY_ENVS: &[(&str, &str)] = &[
+    ("anthropic", ANTHROPIC_API_KEY_ENV),
+    ("cohere", COHERE_API_KEY_ENV),
+];
+
+/// Compile-time list of vendors built into this binary, in the
+/// preference order `VENDOR_KEY_ENVS` defines. Empty in the zero-
+/// vendor build (the outer `#[cfg]` guard means this function only
+/// exists when at least one vendor is compiled in, but the slice may
+/// still be inspected from the table-driven test below).
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+fn compiled_vendors() -> &'static [&'static str] {
+    #[cfg(all(feature = "llm-anthropic", feature = "llm-cohere"))]
+    {
+        &["anthropic", "cohere"]
+    }
+    #[cfg(all(feature = "llm-anthropic", not(feature = "llm-cohere")))]
+    {
+        &["anthropic"]
+    }
+    #[cfg(all(not(feature = "llm-anthropic"), feature = "llm-cohere"))]
+    {
+        &["cohere"]
+    }
+}
+
+/// Pure, env-injected core of `resolve_vendor` — broken out so the
+/// table-driven test below can exercise the full matrix of
+/// (compiled-in vendors) × (which keys are set) × (`JARVIS_MODEL_VENDOR`
+/// set / unset) without mutating process env.
+///
+/// `compiled` is the list of vendors built into this binary, in
+/// preference order (`compiled_vendors()` at runtime; a test fixture
+/// in tests).
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+fn resolve_vendor_inner(
+    vendor_env: Option<&str>,
+    key_set: impl Fn(&str) -> bool,
+    compiled: &[&'static str],
+) -> Result<&'static str> {
+    // Case 1 + 2: explicit env vendor.
+    if let Some(v) = vendor_env {
+        return match v {
+            "anthropic" => {
+                if compiled.contains(&"anthropic") {
+                    Ok("anthropic")
+                } else {
+                    Err(anyhow!(
+                        "vendor `anthropic` requested but not compiled in; rebuild with --features llm-anthropic"
+                    ))
+                }
+            }
+            "cohere" => {
+                if compiled.contains(&"cohere") {
+                    Ok("cohere")
+                } else {
+                    Err(anyhow!(
+                        "vendor `cohere` requested but not compiled in; rebuild with --features llm-cohere"
+                    ))
+                }
+            }
             other => Err(anyhow!(
                 "{VENDOR_ENV}=`{other}` is not a known vendor (expected `anthropic` or `cohere`)"
             )),
         };
     }
-    let have_anthropic = env::var(ANTHROPIC_API_KEY_ENV)
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    let have_cohere = env::var(COHERE_API_KEY_ENV)
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    match (have_anthropic, have_cohere) {
-        (true, _) => Ok("anthropic"),
-        (false, true) => Ok("cohere"),
-        (false, false) => Err(anyhow!(
-            "no vendor selected: set {VENDOR_ENV}, {ANTHROPIC_API_KEY_ENV}, or {COHERE_API_KEY_ENV}"
-        )),
+    // Case 3: walk vendor preference order, pick first compiled-in
+    // vendor with key. Pre-JAR2-70 bug was returning a non-compiled
+    // vendor's name based on key presence alone, which then errored
+    // downstream at `build_*_client`.
+    for (vendor, key_env) in VENDOR_KEY_ENVS {
+        if compiled.contains(vendor) && key_set(key_env) {
+            return Ok(*vendor);
+        }
     }
+    // Case 4: nothing usable. The error message names only the
+    // compiled-in vendors' key env vars (no point telling the user to
+    // set `ANTHROPIC_API_KEY` on a cohere-only build).
+    let usable_keys: Vec<&str> = VENDOR_KEY_ENVS
+        .iter()
+        .filter(|(v, _)| compiled.contains(v))
+        .map(|(_, k)| *k)
+        .collect();
+    Err(anyhow!(
+        "no vendor selected: set {VENDOR_ENV}, or one of [{keys}]",
+        keys = usable_keys.join(", ")
+    ))
 }
 
 #[cfg(feature = "llm-anthropic")]
@@ -419,5 +505,122 @@ mod tests {
             install_tool_registry(Arc::new(ToolRegistry::new()));
         });
         assert!(result.is_err(), "double install_tool_registry should panic");
+    }
+
+    /// JAR2-70 — `resolve_vendor_inner` precedence matrix.
+    ///
+    /// Hermetic: env is injected via the function's `key_set` callback
+    /// and the explicit `vendor_env` argument, so no real env-var
+    /// mutation happens and no `serial_test` is needed. Covers the
+    /// full cross product:
+    ///   - `compiled`: anthropic-only, cohere-only, both.
+    ///   - `keys`: none, anthropic, cohere, both.
+    ///   - `vendor_env`: unset, anthropic, cohere, unknown.
+    ///
+    /// The matrix asserts the JAR2-70 precedence rule: `JARVIS_MODEL_VENDOR`
+    /// is honored only if compiled in (else feature-rebuild error);
+    /// otherwise pick the first compiled-in vendor whose key is set.
+    #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+    #[test]
+    fn resolve_vendor_inner_precedence_matrix() {
+        use std::collections::HashSet;
+
+        const ANTHROPIC: &[&str] = &["anthropic"];
+        const COHERE: &[&str] = &["cohere"];
+        const BOTH: &[&str] = &["anthropic", "cohere"];
+
+        // (compiled, vendor_env, keys_set, expected)
+        //   expected = Ok("anthropic"/"cohere") | Err(substring)
+        type Expected = Result<&'static str, &'static str>;
+        type Case = (
+            &'static [&'static str],
+            Option<&'static str>,
+            &'static [&'static str],
+            Expected,
+        );
+        let cases: &[Case] = &[
+            // ---- explicit JARVIS_MODEL_VENDOR honored when compiled in ----
+            (BOTH, Some("anthropic"), &[], Ok("anthropic")),
+            (BOTH, Some("cohere"), &[], Ok("cohere")),
+            (ANTHROPIC, Some("anthropic"), &[], Ok("anthropic")),
+            (COHERE, Some("cohere"), &[], Ok("cohere")),
+            // ---- explicit but not compiled in -> error ----
+            (
+                ANTHROPIC,
+                Some("cohere"),
+                &["COHERE_API_KEY"],
+                Err("cohere"),
+            ),
+            (
+                COHERE,
+                Some("anthropic"),
+                &["ANTHROPIC_API_KEY"],
+                Err("anthropic"),
+            ),
+            // ---- unknown vendor name -> error ----
+            (BOTH, Some("openai"), &["ANTHROPIC_API_KEY"], Err("openai")),
+            // ---- env unset, fallback by key + compiled-in ----
+            // both compiled, anthropic key only -> anthropic.
+            (BOTH, None, &["ANTHROPIC_API_KEY"], Ok("anthropic")),
+            // both compiled, cohere key only -> cohere.
+            (BOTH, None, &["COHERE_API_KEY"], Ok("cohere")),
+            // both compiled, both keys -> anthropic (preference order).
+            (
+                BOTH,
+                None,
+                &["ANTHROPIC_API_KEY", "COHERE_API_KEY"],
+                Ok("anthropic"),
+            ),
+            // anthropic-only build, only ANTHROPIC_API_KEY -> anthropic.
+            (ANTHROPIC, None, &["ANTHROPIC_API_KEY"], Ok("anthropic")),
+            // anthropic-only build, only COHERE_API_KEY -> error (bug
+            // before JAR2-70 returned Ok("anthropic") then died at
+            // build_anthropic_client; OR Ok("cohere") then died at
+            // build_cohere_client. Post-JAR2-70 it's a clean "no
+            // vendor selected").
+            (ANTHROPIC, None, &["COHERE_API_KEY"], Err("no vendor")),
+            // cohere-only build, only COHERE_API_KEY -> cohere (this
+            // is the bug case from the ticket: pre-JAR2-70 the
+            // env-key walk preferred anthropic even when not compiled
+            // in, so a cohere-only build with only the cohere key set
+            // and ANTHROPIC_API_KEY unset already worked; the actual
+            // breakage was when ANTHROPIC_API_KEY *was* also set,
+            // captured in the next case).
+            (COHERE, None, &["COHERE_API_KEY"], Ok("cohere")),
+            // cohere-only build, both keys set -> cohere (the
+            // headline JAR2-70 fix: pre-fix returned anthropic and
+            // died downstream).
+            (
+                COHERE,
+                None,
+                &["ANTHROPIC_API_KEY", "COHERE_API_KEY"],
+                Ok("cohere"),
+            ),
+            // No keys, no env -> error.
+            (BOTH, None, &[], Err("no vendor")),
+            (ANTHROPIC, None, &[], Err("no vendor")),
+            (COHERE, None, &[], Err("no vendor")),
+        ];
+
+        for (i, (compiled, vendor_env, keys, expected)) in cases.iter().enumerate() {
+            let set: HashSet<&str> = keys.iter().copied().collect();
+            let got = resolve_vendor_inner(*vendor_env, |k| set.contains(k), compiled);
+            match (got, expected) {
+                (Ok(g), Ok(e)) => assert_eq!(
+                    g, *e,
+                    "case {i} (compiled={compiled:?}, vendor_env={vendor_env:?}, keys={keys:?}): expected Ok({e}), got Ok({g})"
+                ),
+                (Err(e), Err(needle)) => {
+                    let msg = format!("{e}");
+                    assert!(
+                        msg.contains(needle),
+                        "case {i} (compiled={compiled:?}, vendor_env={vendor_env:?}, keys={keys:?}): expected error containing {needle:?}, got `{msg}`"
+                    );
+                }
+                (g, e) => panic!(
+                    "case {i} (compiled={compiled:?}, vendor_env={vendor_env:?}, keys={keys:?}): expected {e:?}, got {g:?}"
+                ),
+            }
+        }
     }
 }
