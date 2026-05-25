@@ -106,6 +106,26 @@ This principle shapes how `AgentWorkflow` is structured — it matches on `Decis
 
 ---
 
+## 2.6 Operator CLI surfaces — thin Temporal clients (the second load-bearing principle)
+
+A second principle, lateral to § 2.5. Stated at the top because it dictates the deployment topology every stage from 4 onward inherits.
+
+**The principle.** Every operator-facing CLI — `jarvis apply`, `jarvis signal`, `jarvis inspect`, `jarvis retire`, and any future sibling — is a **thin Temporal client**. It connects to Temporal, calls `start_workflow` / `signal_workflow` / `query_workflow` / `describe_workflow`, and exits. It does **not** host its own Temporal worker. Workflows run on a **separately-deployed long-lived worker daemon** (the binary at `crates/jarvis_temporal/src/bin/worker.rs`, deployed as the worker container introduced in stage 0.3).
+
+**Why.** Same shape as `kubectl apply`, `helm install`, `temporal workflow start`, for the same reasons: the CLI is fast and local; the long-lived work runs centrally; the CLI's lifetime is decoupled from the workflow's. An operator launching a graph should not have to keep their terminal open while the agent retires hours or days later. Operators on multiple machines all dispatch to the same worker fleet. Restarting the CLI's host does not restart the workflows.
+
+**Concrete implications for stages 4 and 6.**
+
+- **`jarvis apply graph.yaml`** (stage 4): writes the structural DB → `start_workflow` → signals seed triggers → **exits**. Does **not** call `get_result`. Does **not** boot a worker. Assumes a worker daemon is already consuming from the right task queue.
+- **`jarvis signal / inspect / retire <agent_id>`** (stage 6): same thin-client shape. Each is one Temporal client call + exit.
+- Integration tests in this lineage (stage 4.3 onward) start a worker as test fixture (or rely on the dev-stack worker daemon). They are **not** a license to put the worker inline inside the operator CLI.
+
+**Prerequisite: worker daemon deployment.** The thin-client CLI shape is only viable when there is a worker daemon to dispatch to. Stage 0.3 built the worker container scaffold; stage 3 filled it with the real workflow + activity code. **What's still missing** as of this writing: actually running that worker as a long-lived daemon in dev (uncomment the `worker` service in `docker-compose.yml`, point it at the right task queue, document the dev loop). Surface as a stage-0 follow-up; the new ticket should bundle: (a) wire the dev-stack worker daemon, (b) document the task-queue convention CLIs and the daemon both target, (c) refactor the existing `jarvis_run_workflow` and `jarvis_apply` binaries off their inline-worker shape.
+
+**v1 expedient (JAR2-73, Stage 4.2).** What shipped in JAR2-73 is the smoke-shape inline-worker binary — boots its own worker, starts the workflow, signals seed triggers, blocks on `get_result`, prints FS-tree artifacts, exits. **This deviates from the principle above.** It was chosen pragmatically: (1) no worker daemon was deployed yet, (2) JAR2-68's smoke binary was the only working call-shape reference, (3) JAR2-74's regression test wants a synchronous byte-comparable end-state. The cleanup — refactor `jarvis apply` to the thin-client shape — is **bundled into the Stage-6 CLI work** (§ 5 Stage 6 sub-ticket 6.3) so that `jarvis_{apply,signal,inspect,retire}` ship as a single consistent set of thin-client CLIs once the worker daemon is deployed.
+
+---
+
 ## 3. Workspace shape
 
 Single crate today (`jarvis_node`); this plan grows the surface enough that splitting into a workspace becomes worth the cost. Proposed:
@@ -283,7 +303,7 @@ This is the load-bearing Project. Filing as a **Linear Project** (per CLAUDE.md 
 
 ### Stage 4 — Graph YAML consumption (single-agent first)
 
-**Goal.** Operator authors `graph.yaml`; runtime brings the graph into existence: parses YAML → validates → writes to structural DB → instantiates `AgentWorkflow` per agent.
+**Goal.** Operator authors `graph.yaml`; runtime brings the graph into existence: parses YAML → validates → writes to structural DB → **instantiates `AgentWorkflow` per agent via the Temporal client (thin-client CLI per § 2.6 — worker runs separately as a daemon, the CLI exits immediately after `start_workflow` + seed-signal).**
 
 Stage 4 ships **single-agent only** because parent–child topology (stage 5) hasn't landed yet. The strawman in `scratch/graph_yaml_schema.md` § 2 is the target shape for stage 4; § 3 (multi-agent) waits for stage 5.
 
@@ -291,7 +311,7 @@ Stage 4 ships **single-agent only** because parent–child topology (stage 5) ha
 
 - **4.1 — `schemars`-derived schema + parser.** `serde_yaml` parses into the Rust types from `jarvis_node` + `jarvis_graph`. JSON Schema is generated from `schemars` derive (per the graph-yaml-schema doc § 4.8). Ship `graph.schema.json` for editor autocomplete.
 - **4.2 — Validation pass.** Refs resolve (`tools: [echo]` refers to an existing tool id). Times parse (`100ms`). Required fields present. Validation errors carry source location (line:col) per `serde_yaml` capabilities.
-- **4.3 — `jarvis apply` binary.** `jarvis apply graph.yaml` writes the parsed structure to the structural DB. For single-agent graphs in stage 4: also starts the `AgentWorkflow` via Temporal client. (Multi-agent topology lands in stage 5; this binary's behavior extends then, not now.)
+- **4.3 — `jarvis apply` binary.** `jarvis apply graph.yaml` writes the parsed structure to the structural DB. For single-agent graphs in stage 4: also starts the `AgentWorkflow` via Temporal client, **signals seed triggers, and exits (thin-client shape per § 2.6 — does NOT host an inline worker and does NOT block on `get_result`).** (Multi-agent topology lands in stage 5; this binary's behavior extends then, not now.) **Note on what shipped (JAR2-73):** the binary was first delivered in smoke-style (inline worker + `get_result` block) as a pragmatic v1 expedient; the cleanup to thin-client shape is bundled into stage 6 sub-ticket 6.3.
 - **4.4 — Integration test.** Round-trip: apply a YAML fixture, assert the structural DB has the expected rows, assert the workflow is running, assert an output lands.
 
 **Out of scope.** Multi-agent topology (stage 5). The "missing from YAML → ?" reconciliation question from § 4.6 of the schema doc — lean "warn-and-leave" for v1, defer the `--prune` flag. Dynamic spawn / sidecar (§ 4.7) — defer to stage 5.
@@ -327,13 +347,13 @@ Filing as a **Linear Project** (Project size, multi-month, multi-cross-crate).
 
 ### Stage 6 — Human-in-kernel surfaces
 
-**Goal.** Wire `HumanOverride { op }` (and friends — mandate-update, dispute-output, inspect-state, retire) from outside the workflow. Today `HumanOverride` exists as a trigger variant with no caller.
+**Goal.** Wire `HumanOverride { op }` (and friends — mandate-update, dispute-output, inspect-state, retire) from outside the workflow. Today `HumanOverride` exists as a trigger variant with no caller. **All CLIs landed in this stage follow the thin-client shape from § 2.6 — Temporal client only, no inline worker. Stage 6 also bundles the cleanup of `jarvis apply` (refactor from its smoke-style v1 expedient to the same shape) so the operator CLI surface ships as a single consistent set.**
 
 **Sub-tickets.**
 
 - **6.1 — External signal API design.** Short scratch sub-doc: HTTP/gRPC choice? Auth surface? Per-workflow addressability? Out of scope for the first cut: cross-tenant isolation, RBAC. Decide before code.
 - **6.2 — Signal/update wiring in `AgentWorkflow`.** Already partially in place from stage 3.3; complete the routing.
-- **6.3 — CLI commands.** `jarvis signal <agent_id> --human-override '<json>'`, `jarvis inspect <agent_id>`, `jarvis retire <agent_id> --reason '...'`. Use Temporal client directly.
+- **6.3 — CLI commands.** `jarvis signal <agent_id> --human-override '<json>'`, `jarvis inspect <agent_id>`, `jarvis retire <agent_id> --reason '...'`. Use Temporal client directly (thin-client per § 2.6 — no inline worker). **Bundled with this sub-ticket:** refactor `jarvis apply` from the JAR2-73 smoke-style inline-worker shape to the same thin-client shape, so `jarvis_{apply,signal,inspect,retire}` all behave identically vis-à-vis the worker daemon. Prerequisite: the stage-0 follow-up that actually deploys the worker as a long-lived daemon (see § 2.6).
 - **6.4 — Dispute path.** `dispute_output(output_id, reason)` as a Temporal update (sync ack). Parent's workflow records dispute in conflict log; trigger queue gets a `Disputed` entry the next loop iteration reconciles.
 - **6.5 — Inspect-state read API.** `inspect_state()` returns a typed snapshot (mandate, last_decision, health, recent_output_ids, child_handles). The TUI's `KernelGraphSource` (stage 7 phase 3) will call this.
 
