@@ -228,20 +228,16 @@ async fn run_smoke() -> Result<()> {
     // ---- Per-test setup ---------------------------------------------------
     let suffix = run_suffix();
     let task_queue = format!("jarvis-apply-smoke-{suffix}");
-    // The JAR2-73 binary roots `LocalStorage` at the per-invocation FS
-    // subdir and passes `fs_handle.prefix = ""` to the workflow (this
-    // is exactly what `into_agent_input` returns). With `MemoryStorage`
-    // the equivalent move is to namespace artifacts via a per-test
-    // prefix so concurrent test runs don't collide on the shared
-    // storage; we override `agent_input.fs_handle.prefix` accordingly.
-    // This *adds* prefix vs. the binary's empty-prefix shape — but the
-    // workflow body resolves writes via `<prefix>/outputs/...` either
-    // way, and the artifact *contents* (not paths) are what the parent
-    // ticket's byte-identical bar judges.
-    let agent_prefix = format!(
-        "graphs/{}/agents/{}-{suffix}",
-        graph.metadata.name, graph.agents[0].id,
-    );
+    // Post-JAR2-76: `into_agent_input` returns the production-shape
+    // prefix `graphs/<metadata.name>/agents/<agents[0].id>` so the
+    // daemon's shared `LocalStorage` namespaces artifacts per agent.
+    // `MemoryStorage` here is process-wide via `OnceLock`, so any second
+    // test in this binary would still collide on that one prefix — we
+    // append a timestamp suffix to keep the per-test namespace hermetic.
+    // The suffix sits on top of the prod-shape prefix rather than
+    // replacing it, so this test exercises the same prefix derivation
+    // production uses (only with the extra suffix layer for isolation).
+    let agent_prefix = format!("{}-{suffix}", agent_input.fs_handle.prefix);
     let storage = ensure_installed();
 
     // Plant one `EchoLike`-shaped evidence record under the workflow's
