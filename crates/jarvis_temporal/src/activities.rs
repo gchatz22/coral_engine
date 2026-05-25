@@ -221,6 +221,57 @@ pub struct PersistRetirementInput {
     pub reason: String,
 }
 
+/// Input to [`AgentActivities::append_decision_log`].
+///
+/// JAR2-68 / plan § 8 decision 6 — one entry per tick, written to
+/// `<prefix>/decisions/<tick>.jsonl`. The workflow body calls the
+/// activity after [`decide`](crate::workflow) returns a `Decision`, so
+/// the entry is observable end-to-end (output decisions, retirements,
+/// idle ticks all land in the same artifact stream).
+///
+/// `decision_summary` is the human-readable rendering of the
+/// `Decision` enum variant. The full structured decision payload is
+/// already captured by Temporal workflow history; the on-disk log is a
+/// host-agnostic, FS-readable, replay-stable summary the TUI phase 1
+/// (stage 7.6) consumes without talking to Temporal.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppendDecisionLogInput {
+    pub fs_handle: FsHandle,
+    pub tick: u64,
+    pub decision_summary: String,
+}
+
+/// One JSONL entry written by [`AgentActivities::append_decision_log`].
+///
+/// Wire format (one per line, no trailing newline on the last):
+///
+/// ```json
+/// {"tick": 0, "decision_summary": "Idle { 50ms }", "ts": "2026-05-25T12:00:00Z"}
+/// ```
+///
+/// Pinned as a typed struct (not free-form JSON) so the TUI phase 1
+/// reader has a stable shape. `#[non_exhaustive]` reserves room for
+/// per-tick health / cost meters (stage 7.6's "calibration" surface)
+/// without a wire break.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DecisionLogEntry {
+    pub tick: u64,
+    pub decision_summary: String,
+    pub ts: DateTime<Utc>,
+}
+
+impl DecisionLogEntry {
+    /// Convenience constructor for the workflow body call site.
+    pub fn new(tick: u64, decision_summary: String, ts: DateTime<Utc>) -> Self {
+        Self {
+            tick,
+            decision_summary,
+            ts,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test-injectable decision script
 //
@@ -301,6 +352,38 @@ async fn apply_fs_ops_impl(
 /// correction-context staging (JAR2-60 `dispatch_call_tools`) is the
 /// agent-loop's mechanism for surfacing these failures to the LLM; the
 /// activity itself just reports.
+/// JAR2-68 helper — append a single [`DecisionLogEntry`] to the per-tick
+/// JSONL file at `<prefix>/decisions/<tick>.jsonl`. Stage 3.12 / plan
+/// § 8 decision 6.
+///
+/// Each tick gets its own file with exactly one line (one decision).
+/// This keeps Temporal-retry idempotency trivial: a retry of this
+/// activity with the same `(tick, decision_summary, ts)` triple PUTs
+/// byte-identical bytes via [`AgentStorage::put`]. The `ts` arrives
+/// from the workflow's `ctx.info().scheduled_time` for the same
+/// deterministic-across-retries property `persist_retirement` enforces.
+///
+/// The single-line-per-file shape is deliberate: a per-prefix append-
+/// log against a KV backend that has no native append would require a
+/// read-modify-write loop with optimistic concurrency, which is more
+/// machinery than this artifact justifies. The TUI phase 1 reader
+/// concatenates the files in tick order.
+pub(crate) async fn append_decision_log_impl(
+    storage: Arc<dyn AgentStorage>,
+    prefix: &str,
+    entry: &DecisionLogEntry,
+) -> anyhow::Result<()> {
+    let fs = AgentFs::attach(storage, prefix);
+    let prefix = fs.prefix(); // canonicalized with trailing '/'
+    let key = format!("{prefix}decisions/{tick}.jsonl", tick = entry.tick);
+    let line = serde_json::to_string(entry)?;
+    // No trailing newline — one line per file, the TUI reader concatenates.
+    fs.storage()
+        .put(&key, bytes::Bytes::from(line.into_bytes()))
+        .await?;
+    Ok(())
+}
+
 pub(crate) async fn persist_output_impl(
     storage: Arc<dyn AgentStorage>,
     prefix: &str,
@@ -678,6 +761,37 @@ impl AgentActivities {
         input: PersistRetirementInput,
     ) -> Result<(), ActivityError> {
         persist_retirement_inner(&input, ctx.info().scheduled_time).await?;
+        Ok(())
+    }
+
+    /// Stage 3.12 (JAR2-68) — append a one-line JSONL entry describing
+    /// the decision the workflow just took to
+    /// `<prefix>/decisions/<tick>.jsonl`. Plan § 8 decision 6.
+    ///
+    /// One activity invocation per tick, called from the workflow body
+    /// after `decide_next_action` returns (before the match-on-`Decision`
+    /// arms run). Idempotency is trivial: `<tick>.jsonl` is a per-tick
+    /// file containing exactly one line, and the timestamp is sourced
+    /// from `ctx.info().scheduled_time` so retries PUT byte-identical
+    /// bytes (same property `persist_retirement` enforces).
+    ///
+    /// **Fallback path** (mirror of `persist_retirement`): if
+    /// `scheduled_time` is `None` — test harnesses that bypass the
+    /// worker's activity-info plumbing — we synthesize `Utc::now()`.
+    /// Costs the replay-determinism property in that edge case; live
+    /// production workers always have `scheduled_time` filled in.
+    #[activity]
+    pub async fn append_decision_log(
+        ctx: ActivityContext,
+        input: AppendDecisionLogInput,
+    ) -> Result<(), ActivityError> {
+        let ts: DateTime<Utc> = ctx
+            .info()
+            .scheduled_time
+            .map(DateTime::<Utc>::from)
+            .unwrap_or_else(Utc::now);
+        let entry = DecisionLogEntry::new(input.tick, input.decision_summary, ts);
+        append_decision_log_impl(agent_storage(), &input.fs_handle.prefix, &entry).await?;
         Ok(())
     }
 }
@@ -1430,5 +1544,99 @@ mod tests {
             .unwrap();
         assert_eq!(a.as_ref(), b"v1");
         assert_eq!(b.as_ref(), b"v1");
+    }
+
+    // ---- JAR2-68: append_decision_log hermetic coverage ----------------
+
+    /// `append_decision_log_impl` writes exactly `<prefix>decisions/<tick>.jsonl`
+    /// containing one JSON line that deserializes back to the same entry.
+    /// Mirror shape of `persist_retirement_inner` coverage — same
+    /// `MemoryStorage`-backed roundtrip, no `ActivityContext` plumbing.
+    #[tokio::test]
+    async fn append_decision_log_impl_writes_per_tick_jsonl() {
+        let storage: Arc<dyn jarvis_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
+        let prefix = "graphs/g/agents/a";
+        let ts = DateTime::parse_from_rfc3339("2026-05-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let entry = DecisionLogEntry::new(7, "Idle { 50ms }".into(), ts);
+        append_decision_log_impl(storage.clone(), prefix, &entry)
+            .await
+            .expect("append_decision_log_impl ok");
+
+        // File lands at `<prefix>/decisions/<tick>.jsonl` with the
+        // single JSON line we wrote.
+        let key = "graphs/g/agents/a/decisions/7.jsonl";
+        let bytes = storage
+            .get(key)
+            .await
+            .expect("storage.get ok")
+            .unwrap_or_else(|| panic!("expected key {key}"));
+        let line = std::str::from_utf8(bytes.as_ref()).unwrap();
+        // No trailing newline; one JSONL line.
+        assert!(
+            !line.ends_with('\n'),
+            "no trailing newline in single-line file, got: {line:?}"
+        );
+        let parsed: DecisionLogEntry = serde_json::from_str(line).unwrap();
+        assert_eq!(parsed, entry);
+    }
+
+    /// Temporal-retry idempotency proxy: re-running the helper with the
+    /// same `(tick, decision_summary, ts)` triple writes byte-identical
+    /// bytes. This is the load-bearing property `append_decision_log`'s
+    /// real activity body inherits by sourcing `ts` from
+    /// `ctx.info().scheduled_time` (stable across retries).
+    #[tokio::test]
+    async fn append_decision_log_impl_is_idempotent_on_replay() {
+        let storage: Arc<dyn jarvis_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
+        let prefix = "graphs/g/agents/replay";
+        let ts = DateTime::parse_from_rfc3339("2026-05-25T13:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let entry = DecisionLogEntry::new(0, "Retire { 'done' }".into(), ts);
+        append_decision_log_impl(storage.clone(), prefix, &entry)
+            .await
+            .unwrap();
+        let first = storage
+            .get("graphs/g/agents/replay/decisions/0.jsonl")
+            .await
+            .unwrap()
+            .unwrap();
+        append_decision_log_impl(storage.clone(), prefix, &entry)
+            .await
+            .unwrap();
+        let second = storage
+            .get("graphs/g/agents/replay/decisions/0.jsonl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.as_ref(), second.as_ref());
+    }
+
+    /// Wire-shape check for `AppendDecisionLogInput` + `DecisionLogEntry`.
+    /// Both cross the workflow ↔ activity boundary via Temporal's payload
+    /// codec (serde-backed), so a round-trip through `serde_json` is a
+    /// cheap proxy.
+    #[test]
+    fn decision_log_types_round_trip_through_json() {
+        let i = AppendDecisionLogInput {
+            fs_handle: FsHandle {
+                prefix: "g/a".into(),
+            },
+            tick: 42,
+            decision_summary: "CallTools { 3 calls }".into(),
+        };
+        let s = serde_json::to_string(&i).unwrap();
+        let back: AppendDecisionLogInput = serde_json::from_str(&s).unwrap();
+        assert_eq!(i, back);
+
+        let ts = DateTime::parse_from_rfc3339("2026-05-25T14:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let e = DecisionLogEntry::new(42, "EmitOutput { evidence: 1 }".into(), ts);
+        let s2 = serde_json::to_string(&e).unwrap();
+        let back2: DecisionLogEntry = serde_json::from_str(&s2).unwrap();
+        assert_eq!(e, back2);
     }
 }

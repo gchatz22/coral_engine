@@ -88,8 +88,8 @@ use temporalio_sdk::{
 };
 
 use crate::activities::{
-    AgentActivities, ApplyFsOpsInput, AssembleContextInput, DecideInput, ExecuteToolInput,
-    PersistOutputInput, PersistRetirementInput, ToolCallFailure, ToolCallOutcome,
+    AgentActivities, AppendDecisionLogInput, ApplyFsOpsInput, AssembleContextInput, DecideInput,
+    ExecuteToolInput, PersistOutputInput, PersistRetirementInput, ToolCallFailure, ToolCallOutcome,
 };
 
 /// Resolved agent configuration handed to the workflow at start.
@@ -254,6 +254,12 @@ pub struct Carryover {
     pub cumulative_triggers_observed: u64,
     pub cumulative_human_ops_observed: u64,
     pub cumulative_mandate_patches_observed: u64,
+    /// JAR2-68: monotonically increasing tick counter the workflow body
+    /// stamps onto every `<prefix>/decisions/<tick>.jsonl` artifact.
+    /// Survives CAN so the post-CAN run continues numbering from where
+    /// the pre-CAN run left off — without this, two `decisions/0.jsonl`
+    /// would land (one per run) and clobber each other.
+    pub tick: u64,
 }
 
 /// Input handed to `AgentWorkflow::run` at start (and at every
@@ -267,12 +273,42 @@ pub struct Carryover {
 /// observability counters all survive a CAN boundary. `None` means
 /// "first run of this workflow" — the workflow starts from `Default`
 /// state, identical to JAR2-58's first-run shape.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInput {
     pub cfg: AgentConfig,
     pub fs_handle: FsHandle,
     pub parent_handle: Option<ParentRef>,
     pub carryover: Option<Carryover>,
+    /// JAR2-68: the resolved [`Mandate`] for this agent. The workflow
+    /// body passes it into every `assemble_context` activity invocation
+    /// so the LLM (and the per-tick `ContextBundle`) sees the real
+    /// mandate text + idle period + max-ticks cap, rather than the
+    /// pre-JAR2-68 placeholder `Mandate::new("", ZERO, None)` the
+    /// workflow body used to synthesize inline.
+    ///
+    /// The stage-4 structural-DB → mandate resolver (plan § 8 decision
+    /// 4) will populate this from operator authoring; until then the
+    /// `bin/jarvis_run_workflow` binary reads it from
+    /// `examples/smoke_llm_temporal/config.json`.
+    pub mandate: Mandate,
+}
+
+impl Default for AgentInput {
+    /// Manual impl (instead of `derive`) because [`Mandate`] has no
+    /// `Default`. JAR2-68 promoted `mandate` to a load-bearing field;
+    /// the default value mirrors the placeholder the JAR2-58..67 path
+    /// synthesized inline (`Mandate::new("", ZERO, None)`), so every
+    /// `AgentInput::default()` callsite in tests keeps its prior
+    /// observable shape (empty text + zero idle + no cap).
+    fn default() -> Self {
+        Self {
+            cfg: AgentConfig::default(),
+            fs_handle: FsHandle::default(),
+            parent_handle: None,
+            carryover: None,
+            mandate: Mandate::new("", Duration::ZERO, None),
+        }
+    }
 }
 
 /// Result returned by `AgentWorkflow::run` when the workflow exits cleanly.
@@ -442,6 +478,12 @@ pub struct AgentWorkflow {
     /// activity has returned — but reserved for stage 4+'s mid-tick
     /// checkpointing.
     mid_tick_evidence: Vec<EvidenceId>,
+    /// JAR2-68: per-tick counter bumped at the bottom of each loop
+    /// iteration. Stamped onto each `<prefix>/decisions/<tick>.jsonl`
+    /// artifact via the `append_decision_log` activity. Hydrated from
+    /// [`Carryover::tick`] on post-CAN runs so the artifact stream
+    /// stays monotonic across the boundary.
+    tick: u64,
 }
 
 #[workflow_methods]
@@ -550,9 +592,18 @@ impl AgentWorkflow {
                 return retire(ctx, &input.fs_handle, reason).await;
             }
 
-            // assemble → decide → dispatch.
+            // assemble → decide → log → dispatch.
             let bundle = assemble(ctx, &input, drained).await?;
             let decision = decide(ctx, bundle).await?;
+            // JAR2-68: append a one-line `<prefix>/decisions/<tick>.jsonl`
+            // entry summarizing the decision BEFORE the dispatch arm
+            // runs, so the artifact lands even if a downstream activity
+            // (persist_output, execute_tool) errors out and short-
+            // circuits the workflow. The activity sources its timestamp
+            // from `ctx.info().scheduled_time` so Temporal retries write
+            // byte-identical bytes. See plan § 8 decision 6.
+            let tick = ctx.state(|s| s.tick);
+            log_decision(ctx, &input.fs_handle, tick, &decision).await?;
             match decision {
                 Decision::CallTools { calls } => dispatch_call_tools(ctx, &input, calls).await?,
                 Decision::EmitOutput { content, evidence } => {
@@ -568,9 +619,20 @@ impl AgentWorkflow {
                     s.staged_correction = None;
                 }),
                 Decision::Retire { reason } => {
+                    // The Retire arm short-circuits before the
+                    // tick-bump below, so the decision-log entry just
+                    // written above is the last artifact this run
+                    // produces. That matches the in-process loop's
+                    // behavior — Retire is observable as a final log
+                    // line, not a deferred event.
                     return retire(ctx, &input.fs_handle, reason).await;
                 }
             }
+            // Bump the tick after non-retire arms so the *next* iteration's
+            // decision lands at `decisions/<tick+1>.jsonl`. The retire arm
+            // above intentionally bypasses this — the retirement-tick log
+            // is the final entry for the workflow.
+            ctx.state_mut(|s| s.tick = s.tick.saturating_add(1));
 
             // JAR2-67: continue-as-new when the SDK suggests it
             // (history pressure). This is the *only* trigger — there
@@ -644,6 +706,7 @@ impl AgentWorkflow {
             cumulative_triggers_observed: self.cumulative_triggers_observed,
             cumulative_human_ops_observed: self.cumulative_human_ops_observed,
             cumulative_mandate_patches_observed: self.cumulative_mandate_patches_observed,
+            tick: self.tick,
         }
     }
 
@@ -669,6 +732,7 @@ impl AgentWorkflow {
         self.cumulative_triggers_observed = c.cumulative_triggers_observed;
         self.cumulative_human_ops_observed = c.cumulative_human_ops_observed;
         self.cumulative_mandate_patches_observed = c.cumulative_mandate_patches_observed;
+        self.tick = c.tick;
         // `child_handles` is structurally empty in stage 3 — ignored.
         let _ = c.child_handles;
     }
@@ -724,7 +788,15 @@ async fn assemble(
         .start_activity(
             AgentActivities::assemble_context,
             AssembleContextInput {
-                mandate: placeholder_mandate(&input.cfg),
+                // JAR2-68: the workflow body now sources the mandate
+                // from `AgentInput.mandate` rather than the prior
+                // `placeholder_mandate(&input.cfg)` synthesized inline.
+                // `AgentFs::new_with_storage` only writes
+                // `mandate.json` when absent, so passing the same
+                // mandate every tick is idempotent — and an empty
+                // `Mandate` (the `AgentInput::default()` shape) keeps
+                // the JAR2-58..67 test surface byte-identical.
+                mandate: input.mandate.clone(),
                 fs_handle: input.fs_handle.clone(),
                 triggers: drained.triggers,
                 human_ops: drained.human_ops,
@@ -735,21 +807,6 @@ async fn assemble(
         )
         .await?;
     Ok(out.bundle)
-}
-
-/// Build a placeholder [`Mandate`] from the workflow's [`AgentConfig`].
-///
-/// Today `AgentConfig` is an empty placeholder struct (stage 3 hasn't
-/// resolved the three-layer mandate routing yet — see
-/// `scratch/temporal_staged_plan.md` § 8 decision 4). When JAR2-67 ships
-/// real continue-as-new carryover or stage 6 wires the structural DB →
-/// mandate resolver, this helper goes away in favor of an
-/// `input.mandate: Mandate` field on `AgentInput`. Until then the
-/// `assemble_context` activity needs *some* `Mandate` to seed
-/// `ContextBundle.mandate` + `AgentFs::new_with_storage`, so we
-/// synthesize a minimal one here.
-fn placeholder_mandate(_cfg: &AgentConfig) -> jarvis_node::mandate::Mandate {
-    jarvis_node::mandate::Mandate::new("", Duration::ZERO, None)
 }
 
 /// Invoke the `decide_next_action` activity. Stub consults the
@@ -820,6 +877,54 @@ async fn rewrite_fs(
     )
     .await?;
     Ok(())
+}
+
+/// JAR2-68: invoke the `append_decision_log` activity for the current
+/// tick's decision. Called by the loop body right after `decide(...)`
+/// returns and before the dispatch arm — see the call site for the
+/// "artifact even on dispatch error" rationale.
+///
+/// Pulled into a helper so the workflow body's `run` stays inside the
+/// readability budget the JAR2-60 ticket pinned.
+async fn log_decision(
+    ctx: &WorkflowContext<AgentWorkflow>,
+    fs_handle: &FsHandle,
+    tick: u64,
+    decision: &Decision,
+) -> WorkflowResult<()> {
+    ctx.start_activity(
+        AgentActivities::append_decision_log,
+        AppendDecisionLogInput {
+            fs_handle: fs_handle.clone(),
+            tick,
+            decision_summary: decision_summary(decision),
+        },
+        activity_opts(),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Render a one-line, human-readable summary of a [`Decision`] for the
+/// decision log artifact. Deliberately compact — the structured payload
+/// is captured by Temporal workflow history; this is the TUI-readable
+/// surface (`scratch/temporal_staged_plan.md` § 5 stage 7.6).
+///
+/// Free function so unit tests can exercise the formatter without
+/// involving the SDK. Format is not part of any wire contract — the
+/// TUI parses the JSONL line's `decision_summary` string verbatim.
+fn decision_summary(decision: &Decision) -> String {
+    match decision {
+        Decision::CallTools { calls } => format!("CallTools {{ count: {} }}", calls.len()),
+        Decision::EmitOutput { evidence, .. } => {
+            format!("EmitOutput {{ evidence: {} }}", evidence.len())
+        }
+        Decision::RewriteFs { ops } => format!("RewriteFs {{ ops: {} }}", ops.len()),
+        Decision::Idle { next_after } => {
+            format!("Idle {{ next_after_ms: {} }}", next_after.as_millis())
+        }
+        Decision::Retire { reason } => format!("Retire {{ reason: {reason:?} }}"),
+    }
 }
 
 /// Invoke the `persist_retirement` activity and return the workflow
@@ -991,6 +1096,7 @@ mod tests {
             },
             parent_handle: None,
             carryover: Some(Carryover::default()),
+            mandate: Mandate::new("hello", Duration::from_millis(123), Some(7)),
         };
         let json = serde_json::to_string(&input).expect("serialize AgentInput");
         let back: AgentInput = serde_json::from_str(&json).expect("deserialize AgentInput");
@@ -1233,6 +1339,7 @@ mod tests {
             cumulative_triggers_observed: 5,
             cumulative_human_ops_observed: 7,
             cumulative_mandate_patches_observed: 11,
+            tick: 13,
         }
     }
 
@@ -1273,6 +1380,7 @@ mod tests {
             },
             parent_handle: None,
             carryover: Some(fully_populated_carryover()),
+            mandate: Mandate::new("populated-carryover", Duration::from_millis(50), None),
         };
         let json = serde_json::to_string(&input).unwrap();
         let back: AgentInput = serde_json::from_str(&json).unwrap();
@@ -1301,6 +1409,7 @@ mod tests {
         original.cumulative_human_ops_observed = 13;
         original.cumulative_mandate_patches_observed = 17;
         original.last_output_id = Some(OutputId::new());
+        original.tick = 23;
 
         let c = original.encode_carryover();
         let mut hydrated = AgentWorkflow::default();
@@ -1328,6 +1437,10 @@ mod tests {
             original.cumulative_mandate_patches_observed
         );
         assert_eq!(hydrated.last_output_id, original.last_output_id);
+        // JAR2-68: tick survives the CAN boundary so the post-CAN run
+        // continues stamping `decisions/<tick>.jsonl` files monotonically
+        // rather than restarting at 0 and clobbering the pre-CAN files.
+        assert_eq!(hydrated.tick, original.tick);
     }
 
     #[test]
@@ -1356,6 +1469,7 @@ mod tests {
         pre_can.cumulative_human_ops_observed = 5;
         pre_can.cumulative_mandate_patches_observed = 7;
         pre_can.last_output_id = Some(OutputId::new());
+        pre_can.tick = 19;
 
         // Encode → JSON → decode → hydrate, exactly as Temporal will
         // do at CAN time.
@@ -1388,6 +1502,7 @@ mod tests {
             pre_can.cumulative_mandate_patches_observed
         );
         assert_eq!(post_can.last_output_id, pre_can.last_output_id);
+        assert_eq!(post_can.tick, pre_can.tick);
     }
 
     #[test]
@@ -1463,6 +1578,59 @@ mod tests {
         wf.pending_triggers.push(Trigger::ScheduledWake);
         let c = wf.encode_carryover();
         assert!(c.child_handles.is_empty());
+    }
+
+    /// JAR2-68: the decision-log summary string is what the TUI phase 1
+    /// reader displays per tick. Pin the shape of each `Decision` arm so
+    /// a future refactor of the formatter can't silently drop one.
+    #[test]
+    fn decision_summary_covers_every_decision_arm() {
+        use jarvis_node::decision::{ClaimSeed, FsOp};
+
+        let s = decision_summary(&Decision::Idle {
+            next_after: Duration::from_millis(250),
+        });
+        assert!(s.starts_with("Idle"), "got: {s}");
+        assert!(s.contains("250"), "got: {s}");
+
+        let s = decision_summary(&Decision::Retire {
+            reason: "max_ticks".into(),
+        });
+        assert!(s.starts_with("Retire"), "got: {s}");
+        assert!(s.contains("max_ticks"), "got: {s}");
+
+        let s = decision_summary(&Decision::CallTools {
+            calls: vec![
+                jarvis_node::decision::ToolCall::new(
+                    "echo",
+                    serde_json::json!({}),
+                    ClaimSeed::new("a"),
+                ),
+                jarvis_node::decision::ToolCall::new(
+                    "echo",
+                    serde_json::json!({}),
+                    ClaimSeed::new("b"),
+                ),
+            ],
+        });
+        assert!(s.contains("CallTools"), "got: {s}");
+        assert!(s.contains("count: 2"), "got: {s}");
+
+        let s = decision_summary(&Decision::EmitOutput {
+            content: "claim".into(),
+            evidence: vec![EvidenceId::from_hex("0123456789abcdef")],
+        });
+        assert!(s.contains("EmitOutput"), "got: {s}");
+        assert!(s.contains("evidence: 1"), "got: {s}");
+
+        let s = decision_summary(&Decision::RewriteFs {
+            ops: vec![FsOp::WriteFile {
+                path: "notes/x.md".into(),
+                content: "hi".into(),
+            }],
+        });
+        assert!(s.contains("RewriteFs"), "got: {s}");
+        assert!(s.contains("ops: 1"), "got: {s}");
     }
 
     #[test]
