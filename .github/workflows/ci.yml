@@ -328,6 +328,14 @@ jobs:
       - name: Run jarvis-apply smoke
         env:
           TEMPORAL_LIVE_TEST: "1"
+          # `jarvis_graph`'s lib carries compile-time-checked `sqlx::query!`
+          # macros (via `GraphStore`). Compiling the test binary brings the
+          # lib along, so we need either a live DB or the committed `.sqlx/`
+          # cache. The `temporal-workflow-smoke` job intentionally has no
+          # Postgres service container (the runtime path skips
+          # `create_from_yaml`), so route the build through the offline
+          # cache — same shape `lint-and-test` uses at job scope.
+          SQLX_OFFLINE: "true"
         run: |
           set -o pipefail
           cargo test --locked -p jarvis_graph --test jarvis_apply_smoke -- --nocapture \
