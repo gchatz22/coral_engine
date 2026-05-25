@@ -16,6 +16,10 @@ The Jarvis Engine is an OS for autonomous research: a runtime for graphs of long
 
 The day-to-day dev loop runs **backing services in Docker** and the **worker natively** via `cargo run`. Native worker = fast incremental builds, native debugger, no Docker rebuild between iterations. The container-shape worker exists in `docker-compose.yml` (profile `container-worker`) so the production path stays exercised — but it's not the default.
 
+**Operator CLIs dispatch to the daemon.** Per `scratch/temporal_staged_plan.md` § 2.6, operator-facing CLIs (`jarvis apply`, future `jarvis signal` / `inspect` / `retire`) are thin Temporal clients — they connect to Temporal, dispatch onto the canonical task queue `jarvis-agents` (exported as `jarvis_temporal::worker::DEFAULT_TASK_QUEUE`), and exit. The long-lived worker daemon — the binary at `crates/jarvis_temporal/src/bin/worker.rs`, either run natively or as the `worker` compose service — is what executes the workflows.
+
+> Today's `jarvis apply` (JAR2-73) and `jarvis-run-workflow` (JAR2-68) still host *inline* workers on randomized task queues — that's a v1 smoke-shape expedient, not the thin-client convention. JAR2-76 refactors them to dispatch against the running daemon on `jarvis-agents`.
+
 ### Prerequisites
 
 - Docker + Docker Compose v2 (`docker compose ...`, not `docker-compose ...`).
@@ -46,7 +50,21 @@ What this starts:
 cargo run -p jarvis_temporal --bin worker
 ```
 
-Today this is a stub that prints and exits — stage 3 (per `scratch/temporal_staged_plan.md` § 5) lands the real Temporal worker that connects to the Temporal frontend at `TEMPORAL_HOST` and registers workflows + activities.
+The worker connects to the Temporal frontend at `TEMPORAL_ADDRESS`, registers `AgentWorkflow` + the activity bundle, and listens on the canonical task queue **`jarvis-agents`** (overrideable via `TEMPORAL_TASK_QUEUE` — see `.env.example`). Once the log line `jarvis worker starting; registered: AgentWorkflow + AgentActivities` shows up with `task_queue="jarvis-agents"`, operator CLIs (and `temporal workflow start --task-queue jarvis-agents ...`) can dispatch to it.
+
+### Dispatch a workflow against the running daemon
+
+```sh
+# In a separate terminal, with the dev stack + native worker both up:
+temporal workflow start \
+    --address localhost:7233 --namespace default \
+    --task-queue jarvis-agents \
+    --type AgentWorkflow \
+    --workflow-id 'graphs/<graph_id>/agents/<agent_id>' \
+    --input '{ ... AgentInput JSON ... }'
+```
+
+The Temporal Web UI at <http://localhost:8233> shows the queued + running workflows.
 
 ### Run the worker as a container (production-shape)
 
@@ -55,7 +73,7 @@ make worker-build                # build only
 make worker                      # build + run, attached
 ```
 
-Or directly: `docker compose --profile container-worker up worker`. Worker reads service-name endpoints (`postgres:5432`, `temporal:7233`) inside the compose network — no `.env` changes needed.
+Or directly: `docker compose --profile container-worker up worker`. The container listens on the same `jarvis-agents` queue, so operator CLIs don't care which path is running.  Worker reads service-name endpoints (`postgres:5432`, `temporal:7233`) inside the compose network — no `.env` changes needed.
 
 ### Inspect state
 

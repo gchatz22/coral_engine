@@ -56,7 +56,17 @@ const COHERE_API_KEY_ENV: &str = "COHERE_API_KEY";
 use crate::activities::AgentActivities;
 use crate::workflow::AgentWorkflow;
 
-/// Default task queue. Live tests override via `TEMPORAL_TASK_QUEUE`.
+/// Canonical task queue the worker daemon listens on and operator CLIs
+/// dispatch to. Public so future thin-client CLIs (`jarvis apply`,
+/// `jarvis signal`, etc. — JAR2-76 and onward) import the same constant
+/// the daemon registers under, avoiding the "CLI and daemon target
+/// different queues" failure mode flagged in
+/// `scratch/temporal_staged_plan.md` § 2.6.
+///
+/// Both the `worker` binary and live integration tests under `tests/`
+/// override via `TEMPORAL_TASK_QUEUE` — the binary for fleet-shard /
+/// personal-queue isolation, the tests for per-run uniqueness so
+/// repeated runs don't share state.
 pub const DEFAULT_TASK_QUEUE: &str = "jarvis-agents";
 
 /// Process-wide [`AgentStorage`] backend. Installed once at worker boot

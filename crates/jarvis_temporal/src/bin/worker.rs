@@ -1,12 +1,37 @@
 //! Stage 3.2 (JAR2-58) — Jarvis Temporal worker binary.
 //! Stage 3.6 (JAR2-62) — env-driven [`LlmDecide`] vendor selection
 //! installed on the worker-shared `decide_impl` `OnceLock`.
+//! Stage 0 follow-up (JAR2-75) — header expanded to frame this binary as
+//! the canonical long-lived daemon that operator CLIs dispatch to.
 //!
 //! Connects to a Temporal Server, builds a worker via
 //! [`jarvis_temporal::worker::build_worker`] (registers
 //! [`jarvis_temporal::workflow::AgentWorkflow`] +
 //! [`jarvis_temporal::activities::AgentActivities`]), and runs until
 //! SIGINT (Ctrl-C).
+//!
+//! ## Role: canonical dev-loop daemon
+//!
+//! This is the **long-lived worker daemon** that operator CLIs target
+//! per `scratch/temporal_staged_plan.md` § 2.6. The canonical task queue
+//! is [`jarvis_temporal::worker::DEFAULT_TASK_QUEUE`] (`jarvis-agents`),
+//! exported from the library module so future thin-client CLIs
+//! (`jarvis apply`, `jarvis signal`, `jarvis inspect`, `jarvis retire`)
+//! import it from one place. Operators dispatch workflows via the
+//! Temporal CLI (`temporal workflow start --task-queue jarvis-agents
+//! ...`) or those thin-client CLIs; the daemon picks them up.
+//!
+//! The recommended dev loop is:
+//!
+//! ```text
+//! docker compose up -d                              # backing services
+//! cargo run -p jarvis_temporal --bin worker          # this binary
+//! ```
+//!
+//! Today's `jarvis apply` (JAR2-73) and `jarvis-run-workflow` (JAR2-68)
+//! still host inline workers on randomized task queues — the v1
+//! smoke-shape expedient. The thin-client refactor lives in JAR2-76 and
+//! will switch those binaries to dispatch against this daemon's queue.
 //!
 //! ## SDK constraints (per `scratch/temporal_rust_sdk_smoke.md`)
 //!
