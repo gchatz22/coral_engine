@@ -10,6 +10,7 @@
 //! path — keeps the prompt renderer from needing a `GraphStore` lookup
 //! in `assemble_context`.
 
+use crate::agent_ref::AgentRef;
 use crate::mandate::OutputId;
 use serde::{Deserialize, Serialize};
 
@@ -47,23 +48,6 @@ pub enum Trigger {
         agent_name: String,
         reason: String,
     },
-}
-
-/// Structural pointer to another agent (a child, for the two `Trigger`
-/// variants above). The sibling Stage 5.1 ticket (JAR2-78) owns the
-/// canonical definition of this type in `decision.rs`; the placeholder
-/// here lets this PR compile in isolation. When 5.1 lands, this stub is
-/// deleted and the import switches to `crate::decision::AgentRef`.
-///
-/// Fields are the minimum the Stage 5 Project description (decisions
-/// 6 and 8) names: a stable `agent_id` (the structural-DB identity) and
-/// the `workflow_id` the Temporal layer routes signals to. Both are
-/// strings today — `jarvis_node` does not depend on `uuid` and pulling
-/// it in just for the placeholder would be wasted churn.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentRef {
-    pub agent_id: String,
-    pub workflow_id: String,
 }
 
 /// Opaque newtype around the JSON payload describing a human override op.
@@ -166,11 +150,15 @@ mod tests {
 
     // ---- JAR2-79: Stage 5.2 cross-agent variants -----------------------
 
+    use crate::agent_ref::AgentId;
+    use uuid::Uuid;
+
+    fn child_agent_id() -> AgentId {
+        AgentId::new(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap())
+    }
+
     fn child_ref() -> AgentRef {
-        AgentRef {
-            agent_id: "agent-7".into(),
-            workflow_id: "graphs/g-1/agents/agent-7".into(),
-        }
+        AgentRef::new("graphs/g-1/agents/agent-7", child_agent_id())
     }
 
     #[test]
@@ -233,16 +221,5 @@ mod tests {
             s.contains("\"reason\":\"mandate satisfied\""),
             "wire shape: {s}"
         );
-    }
-
-    #[test]
-    fn agent_ref_round_trip() {
-        let r = AgentRef {
-            agent_id: "agent-7".into(),
-            workflow_id: "graphs/g-1/agents/agent-7".into(),
-        };
-        let s = serde_json::to_string(&r).unwrap();
-        let back: AgentRef = serde_json::from_str(&s).unwrap();
-        assert_eq!(r, back);
     }
 }
