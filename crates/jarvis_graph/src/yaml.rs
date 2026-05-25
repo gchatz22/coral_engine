@@ -57,7 +57,7 @@
 
 use jarvis_node::mandate::Mandate as NodeMandate;
 use jarvis_node::trigger::Trigger as NodeTrigger;
-use jarvis_temporal::workflow::{AgentConfig, AgentInput, FsHandle};
+use jarvis_temporal::workflow::{agent_workflow_id, AgentConfig, AgentInput, FsHandle};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::time::Duration;
@@ -74,9 +74,7 @@ pub const KIND: &str = "Graph";
 ///
 /// `seed` is optional in the strawman but required at apply time today —
 /// the workflow's first tick would otherwise drain an empty trigger queue
-/// and send the LLM an empty prompt (see
-/// `jarvis_temporal::bin::jarvis_run_workflow::load_triggers`'s "contained
-/// no triggers" guardrail). Validation enforces non-empty
+/// and send the LLM an empty prompt. Validation enforces non-empty
 /// `seed.triggers`.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -658,13 +656,17 @@ fn locate_token_in_line(
 ///   agent" guarantee via `agents[0]` and would panic on an empty agents
 ///   vector otherwise. Treat it as a typed-witness consumer of the
 ///   validator.
-/// - The returned `AgentInput.fs_handle.prefix` is the empty string. The
-///   `jarvis-apply` binary mirrors `jarvis_run_workflow`'s pattern of
-///   rooting [`jarvis_node::storage::LocalStorage`] directly at the
-///   per-invocation FS subdir, so `<prefix>/outputs/...` resolves to
-///   `<fs_root>/outputs/...` on disk. The empty-prefix choice lives in
-///   the binary's storage construction, not here — this conversion
-///   stays a pure value-to-value mapping.
+/// - The returned `AgentInput.fs_handle.prefix` is
+///   [`agent_workflow_id`]`(metadata.name, agents[0].id)` —
+///   `graphs/<metadata.name>/agents/<agents[0].id>`. The worker daemon's
+///   [`jarvis_node::storage::LocalStorage`] is rooted at its configured
+///   `AGENT_FS_ROOT` and is shared process-wide across every workflow
+///   the daemon hosts, so per-workflow namespacing has to come from the
+///   prefix; otherwise tick-keyed artifacts (`decisions/<tick>.jsonl`)
+///   and single-file ones (`mandate.json`, `retirement.json`) collide
+///   across distinct graphs landing on the same daemon. The chosen
+///   prefix mirrors the workflow ID so operators inspecting on-disk
+///   artifacts can map back to `temporal workflow describe …` by eye.
 ///
 /// ## Field mapping
 ///
@@ -698,7 +700,7 @@ pub fn into_agent_input(graph: &GraphYaml) -> AgentInput {
     AgentInput {
         cfg: AgentConfig::default(),
         fs_handle: FsHandle {
-            prefix: String::new(),
+            prefix: agent_workflow_id(&graph.metadata.name, &agent.id),
         },
         parent_handle: None,
         carryover: None,
@@ -1255,9 +1257,11 @@ seed:
             jarvis_node::mandate::ContextPolicy::default(),
         );
 
-        // FS handle prefix is empty: the binary roots LocalStorage at the
-        // per-invocation FS subdir itself, mirroring jarvis_run_workflow.
-        assert!(input.fs_handle.prefix.is_empty());
+        // FS handle prefix mirrors the workflow ID so the daemon's
+        // shared `LocalStorage` namespaces artifacts per agent (otherwise
+        // tick-keyed files like `decisions/<tick>.jsonl` would collide
+        // across distinct graphs on the same daemon).
+        assert_eq!(input.fs_handle.prefix, "graphs/smoke/agents/root");
 
         // Parent + carryover are None on a fresh apply (first run).
         assert!(input.parent_handle.is_none());

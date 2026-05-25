@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "GraphYaml",
-  "description": "Top-level document type for `graph.yaml`. Read\n`scratch/graph_yaml_schema.md` § 2 for the strawman this mirrors.\n\n`seed` is optional in the strawman but required at apply time today —\nthe workflow's first tick would otherwise drain an empty trigger queue\nand send the LLM an empty prompt (see\n`jarvis_temporal::bin::jarvis_run_workflow::load_triggers`'s \"contained\nno triggers\" guardrail). Validation enforces non-empty\n`seed.triggers`.",
+  "description": "Top-level document type for `graph.yaml`. Read\n`scratch/graph_yaml_schema.md` § 2 for the strawman this mirrors.\n\n`seed` is optional in the strawman but required at apply time today —\nthe workflow's first tick would otherwise drain an empty trigger queue\nand send the LLM an empty prompt. Validation enforces non-empty\n`seed.triggers`.",
   "type": "object",
   "properties": {
     "agents": {

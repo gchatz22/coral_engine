@@ -28,10 +28,10 @@
 //! cargo run -p jarvis_temporal --bin worker          # this binary
 //! ```
 //!
-//! Today's `jarvis apply` (JAR2-73) and `jarvis-run-workflow` (JAR2-68)
-//! still host inline workers on randomized task queues — the v1
-//! smoke-shape expedient. The thin-client refactor lives in JAR2-76 and
-//! will switch those binaries to dispatch against this daemon's queue.
+//! JAR2-76 finished the thin-client refactor: `jarvis apply` dispatches
+//! against this daemon's queue (the legacy `jarvis-run-workflow` smoke
+//! binary was deleted in the same ticket — its sole consumer
+//! `jarvis_apply_smoke.rs` now spins a worker fixture inline).
 //!
 //! ## SDK constraints (per `scratch/temporal_rust_sdk_smoke.md`)
 //!
@@ -153,14 +153,11 @@ async fn main() -> Result<()> {
     install_agent_storage(storage);
     info!(fs_root = fs_root.as_str(), "installed AgentStorage backend");
 
-    // JAR2-62 / JAR2-68: install the process-wide `Decide` impl from
-    // env-driven vendor selection before the worker starts polling, so
-    // the first `decide_next_action` activity has something to call.
-    // Panics at boot if neither vendor's API key is set (see
-    // `jarvis_temporal::worker::build_decide_from_env`). The helper
-    // lives in the library so the JAR2-68 live-vendor binary
-    // (`jarvis_run_workflow`) can share the same vendor-selection
-    // precedence + feature gating without duplicating it.
+    // JAR2-62 — install the process-wide `Decide` impl from env-driven
+    // vendor selection before the worker starts polling, so the first
+    // `decide_next_action` activity has something to call. Panics at
+    // boot if neither vendor's API key is set (see
+    // `jarvis_temporal::worker::build_decide_from_env`).
     let (vendor_tag, decide) = build_decide_from_env()?;
     install_decide(decide);
     info!(vendor = vendor_tag, "installed Decide backend");

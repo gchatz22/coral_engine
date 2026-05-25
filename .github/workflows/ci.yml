@@ -260,7 +260,9 @@ jobs:
     # asserts the same three durable artifacts `node-run-llm` produces
     # in-process (outputs, retirement, decisions). Scripted-Decide
     # (hermetic) — no LLM keys required. Live-vendor verification stays
-    # manual via the `jarvis-run-workflow` binary.
+    # manual via `jarvis apply` against a worker daemon with vendor
+    # credentials configured (JAR2-76 deleted the standalone
+    # `jarvis-run-workflow` live-vendor smoke binary).
     name: temporal workflow smoke (live)
     runs-on: ubuntu-latest
     timeout-minutes: 15

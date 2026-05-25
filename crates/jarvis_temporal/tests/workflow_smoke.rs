@@ -23,10 +23,13 @@
 //! as an `ActivityError` (unlike the in-process `agent_core::dispatch`,
 //! which maps it to `NeedsCorrection`) — so an LLM-fixture-driven
 //! EmitOutput would fail the workflow instead of producing an output.
-//! Real-LLM coverage lives in the `jarvis-run-workflow` live-vendor
-//! binary; this hermetic test uses the same scripted-decision pattern
-//! `workflow_loop.rs` does, with EmitOutput citing a *planted* evidence
-//! id that is, by construction, on disk.
+//! Real-LLM coverage is manual via `jarvis-apply` against a worker
+//! daemon configured with vendor credentials (the `jarvis-run-workflow`
+//! live-vendor smoke binary was deleted in JAR2-76's thin-client
+//! cleanup; this hermetic harness is what CI runs). The pattern is the
+//! same scripted-decision shape `workflow_loop.rs` uses, with
+//! EmitOutput citing a *planted* evidence id that is, by construction,
+//! on disk.
 //!
 //! ## What this test proves over `workflow_loop.rs`
 //!

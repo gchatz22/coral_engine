@@ -1,24 +1,36 @@
-//! Stage 4.3 (JAR2-74) — graph.yaml-driven smoke. Replaces the JAR2-68
-//! fixture pair (`config.json` + `triggers.jsonl`) with a single
-//! `graph.yaml` and asserts the same three durable artifacts land on
-//! disk: an output, a retirement marker, and per-tick decision-log
-//! entries.
+//! Stage 4.3 (JAR2-74) — graph.yaml-driven smoke, refreshed in JAR2-76
+//! after the `jarvis-apply` thin-client refactor.
+//!
+//! Drives an `AgentWorkflow` through the library surface the thin-client
+//! `jarvis-apply` CLI dispatches into (`parse_and_validate` →
+//! `into_agent_input` + `yaml_seed_triggers` → `start_workflow` +
+//! `external_signal`), with the worker hosted **inline as a test
+//! fixture** rather than out-of-process on the daemon. Asserts the
+//! three durable artifacts the workflow body produces land on disk:
+//! an output, a retirement marker, and per-tick decision-log entries.
 //!
 //! ## What this test proves
 //!
-//! The parent ticket (JAR2-71) acceptance bar: `jarvis apply graph.yaml`
-//! produces byte-identical end-state to today's
-//! `jarvis-run-workflow <config.json> <fs_root> <triggers.jsonl>`
-//! invocation. We exercise the *library* surface
-//! (`parse_and_validate` then `into_agent_input` plus
-//! `yaml_seed_triggers` against the same Temporal-client / scripted-
-//! Decide composition `workflow_smoke.rs` uses) instead of shelling
-//! out to `cargo run --bin jarvis-apply`. The library-call path is
-//! what JAR2-73's binary itself does internally; shelling out would
-//! gain real-binary coverage at the cost of being unable to inject a
-//! scripted `Decide` (the binary calls `build_decide_from_env` which
-//! requires real LLM credentials). See the PR body for the
-//! option-A-vs-option-B writeup.
+//! `jarvis apply graph.yaml` produces the expected workflow end-state
+//! (output + retirement + decision log) when dispatched onto a worker
+//! that's listening for the same task queue. The production CLI is the
+//! thin-client refactored in JAR2-76 — this test exercises the same
+//! library surface (`yaml::{parse_and_validate, into_agent_input,
+//! yaml_seed_triggers}` then `client.start_workflow` then
+//! `handle.signal(AgentWorkflow::external_signal, ...)`) with a worker
+//! spun up inline via `build_worker` for the lifetime of the test.
+//!
+//! ## Test-fixture shape (JAR2-76)
+//!
+//! Pre-JAR2-76 the binary itself hosted the worker on a randomized task
+//! queue and blocked on `get_result`; after JAR2-76 the binary returns
+//! once seed signals are sent and execution runs on the worker daemon.
+//! For hermeticity the test cannot rely on a daemon being up, so it
+//! builds a worker inline (`build_worker(...)` + `tokio::spawn`) on a
+//! per-run randomized task queue and calls `get_result` directly to
+//! synchronize the FS-end-state assertions. Inline rather than a
+//! helper module — single test today; promoting is a follow-up when a
+//! second caller appears.
 //!
 //! ## What this test deliberately does NOT exercise
 //!
@@ -28,10 +40,9 @@
 //!   `temporal-workflow-smoke` job to spin up Postgres for end-state
 //!   value already covered upstream. The parent's acceptance bar is
 //!   workflow end-state, not DB rows.
-//! - **The binary's stdout contract.** "First line is
-//!   `jarvis-apply: fs_root=<abs>`" is unit-tested in
-//!   `jarvis_apply.rs::tests`; this test goes through the same call
-//!   sites a level deeper.
+//! - **The binary's stdout contract.** "Prints `workflow_id=...`" is
+//!   unit-tested in `jarvis_apply.rs::tests`; this test goes through
+//!   the same call sites a level deeper.
 //! - **Real LLM Decide.** Hermetic — the `decide_next_action` activity
 //!   body checks the scripted `DECISION_SCRIPT` *before* reaching for
 //!   the installed `Decide` (`activities.rs::decide_next_action`).
@@ -47,8 +58,8 @@
 //!
 //! ## Env-gated
 //!
-//! `TEMPORAL_LIVE_TEST=1` opts in — same env var the JAR2-68 smoke uses
-//! so a single CI gate covers both. Without it the test prints a
+//! `TEMPORAL_LIVE_TEST=1` opts in — same env var `workflow_smoke.rs`
+//! uses, so a single CI gate covers both. Without it the test prints a
 //! one-line skip and returns Ok.
 
 use std::env;
@@ -200,50 +211,33 @@ async fn run_smoke() -> Result<()> {
     assert_eq!(graph.seed.triggers.len(), 1);
     assert_eq!(graph.seed.triggers[0].external.kind, "kickoff");
 
-    // Verify byte-equality of the mandate text against the legacy
-    // config.json `text` field. This is the bridge between the JAR2-68
-    // fixture pair and the JAR2-74 single-file replacement: if a future
-    // edit drifts one without touching the other, this assertion bites
-    // before the workflow starts.
-    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let legacy_config_path = manifest_dir.join("../../examples/smoke_llm_temporal/config.json");
-    let legacy_config_text = std::fs::read_to_string(&legacy_config_path).with_context(|| {
-        format!(
-            "reading legacy config.json at {}",
-            legacy_config_path.display()
-        )
-    })?;
-    let legacy_config: serde_json::Value =
-        serde_json::from_str(&legacy_config_text).context("parsing legacy config.json")?;
-    let legacy_text = legacy_config
-        .get("text")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("legacy config.json missing string `text` field"))?;
+    // Pin the mandate-derivation invariants in code now that the legacy
+    // `config.json` / `triggers.jsonl` fixtures (the JAR2-68 reference
+    // shapes) were deleted in JAR2-76 along with `jarvis_run_workflow`.
+    // The YAML is the canonical fixture going forward; these assertions
+    // bite if a future YAML edit drifts the mandate translation.
     let agent_input = into_agent_input(&graph);
-    assert_eq!(
-        agent_input.mandate.text, legacy_text,
-        "graph.yaml mandate.text must byte-match legacy config.json[\"text\"]",
-    );
     assert_eq!(agent_input.mandate.idle_period, Duration::from_secs(1));
     assert_eq!(agent_input.mandate.max_ticks, Some(8));
+    assert!(
+        agent_input.mandate.text.contains("call the `echo` tool"),
+        "mandate.text drifted from the smoke fixture's intent: {:?}",
+        agent_input.mandate.text
+    );
 
     // ---- Per-test setup ---------------------------------------------------
     let suffix = run_suffix();
     let task_queue = format!("jarvis-apply-smoke-{suffix}");
-    // The JAR2-73 binary roots `LocalStorage` at the per-invocation FS
-    // subdir and passes `fs_handle.prefix = ""` to the workflow (this
-    // is exactly what `into_agent_input` returns). With `MemoryStorage`
-    // the equivalent move is to namespace artifacts via a per-test
-    // prefix so concurrent test runs don't collide on the shared
-    // storage; we override `agent_input.fs_handle.prefix` accordingly.
-    // This *adds* prefix vs. the binary's empty-prefix shape — but the
-    // workflow body resolves writes via `<prefix>/outputs/...` either
-    // way, and the artifact *contents* (not paths) are what the parent
-    // ticket's byte-identical bar judges.
-    let agent_prefix = format!(
-        "graphs/{}/agents/{}-{suffix}",
-        graph.metadata.name, graph.agents[0].id,
-    );
+    // Post-JAR2-76: `into_agent_input` returns the production-shape
+    // prefix `graphs/<metadata.name>/agents/<agents[0].id>` so the
+    // daemon's shared `LocalStorage` namespaces artifacts per agent.
+    // `MemoryStorage` here is process-wide via `OnceLock`, so any second
+    // test in this binary would still collide on that one prefix — we
+    // append a timestamp suffix to keep the per-test namespace hermetic.
+    // The suffix sits on top of the prod-shape prefix rather than
+    // replacing it, so this test exercises the same prefix derivation
+    // production uses (only with the extra suffix layer for isolation).
+    let agent_prefix = format!("{}-{suffix}", agent_input.fs_handle.prefix);
     let storage = ensure_installed();
 
     // Plant one `EchoLike`-shaped evidence record under the workflow's

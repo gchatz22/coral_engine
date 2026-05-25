@@ -287,9 +287,9 @@ pub struct AgentInput {
     /// workflow body used to synthesize inline.
     ///
     /// The stage-4 structural-DB → mandate resolver (plan § 8 decision
-    /// 4) will populate this from operator authoring; until then the
-    /// `bin/jarvis_run_workflow` binary reads it from
-    /// `examples/smoke_llm_temporal/config.json`.
+    /// 4) will populate this from operator authoring; today the
+    /// `jarvis-apply` CLI derives it from the operator-authored
+    /// `graph.yaml` via `jarvis_graph::yaml::into_agent_input`.
     pub mandate: Mandate,
 }
 
