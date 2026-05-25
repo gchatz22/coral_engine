@@ -11,6 +11,11 @@ pub mod agent;
 // `dispatch` + `DispatchOutcome`. Hosted by today's `Agent::run` and (in
 // stage 3.4+) by `AgentWorkflow`. See `agent_core.rs` module doc.
 pub mod agent_core;
+// JAR2-78 (stage 5.1): `AgentId` + `AgentRef`. Kernel-side stable handles
+// for naming other agents; referenced by `Decision`'s parent-child topology
+// variants and (in JAR2-79) by `Trigger::ChildOutput` / `ChildRetired`. See
+// `agent_ref.rs` module doc for the placement rationale.
+pub mod agent_ref;
 pub mod decide_llm;
 pub mod decision;
 pub mod evidence;
