@@ -165,7 +165,8 @@
 //!   2.5.3 per the "smallest correct diff" rule.
 
 use crate::agent_ref::{AgentId, GraphId};
-use crate::decision::FsOp;
+use crate::conflict::ConflictRecord;
+use crate::decision::{ConflictId, FsOp};
 use crate::evidence::{EvidenceId, EvidenceRecord};
 use crate::mandate::{Mandate, Output, OutputId};
 use crate::storage::{AgentStorage, LocalStorage, PutOutcome};
@@ -245,6 +246,17 @@ pub enum FsError {
     /// `EvidenceNotFound` propagates through `persist_output`).
     #[error("output {0} not found on disk")]
     OutputNotFound(OutputId),
+    /// JAR2-83 (stage 5.6): [`AgentFs::write_conflict`] was called with
+    /// fewer than two alternatives. A single-alternative "conflict" is
+    /// meaningless — there's nothing to disagree with — so the writer
+    /// rejects it as a structural error. The activity boundary maps this
+    /// to `ReconciliationError::ConflictAlternativesTooFew` and surfaces
+    /// it to the workflow body as a non-retryable
+    /// `CorrectionContext`-bearing failure (the LLM produced a bad
+    /// `Decision::ReconcileChildren`; re-running the activity won't fix
+    /// the shape).
+    #[error("conflict rejected: only {count} alternatives (need >= 2)")]
+    ConflictAlternativesTooFew { count: usize },
     /// An `FsOp` path contained `..`, an absolute root, or a Windows
     /// prefix — anything that could escape the agent's root.
     #[error("path traversal rejected: {0}")]
@@ -941,6 +953,81 @@ impl AgentFs {
         self.read_recent_json::<Claim>(&prefix, usize::MAX).await
     }
 
+    /// JAR2-83 (stage 5.6): persist a [`ConflictRecord`] under
+    /// `<prefix>conflicts/<id>.json` and return its content-addressed
+    /// [`ConflictId`].
+    ///
+    /// Validates `record.alternatives.len() >= 2` and returns
+    /// [`FsError::ConflictAlternativesTooFew`] otherwise — a single-
+    /// alternative "conflict" carries no information and is treated as a
+    /// malformed `Decision::ReconcileChildren` from the LLM.
+    ///
+    /// **Idempotent under retries.** `ConflictId` is content-addressed
+    /// over `(alternatives, resolution)`, so a retried `reconcile_children`
+    /// activity that re-PUTs the same record targets the same key. We
+    /// use [`AgentStorage::put_if_absent`] which makes the dedup atomic
+    /// — same shape as `record_evidence` / `persist_output`. `timestamp`
+    /// is not in the hash; the bytes written on the first call (carrying
+    /// the first attempt's `timestamp`) are the bytes that stay on disk,
+    /// matching `Output::created_at`'s contract.
+    ///
+    /// **No tail-index update.** `conflicts/` is bounded — dozens per
+    /// agent over its lifetime per Stage 5 Project decision 14 — so the
+    /// 2.5.4 tail-index pattern is unjustified overhead here. The
+    /// directory-scan path ([`AgentFs::list_conflicts`]) is the only
+    /// reader and it's O(M) over a small M.
+    pub async fn write_conflict(&self, record: &ConflictRecord) -> anyhow::Result<ConflictId> {
+        if record.alternatives.len() < 2 {
+            return Err(FsError::ConflictAlternativesTooFew {
+                count: record.alternatives.len(),
+            }
+            .into());
+        }
+        let id = record.id.clone();
+        let key = self.conflict_key(&id);
+        let bytes = serde_json::to_vec_pretty(record)?;
+        // `put_if_absent` returns Created on first write, Existed on
+        // duplicate attempts — both paths are success for the
+        // content-addressed dedup contract.
+        self.storage
+            .put_if_absent(&key, Bytes::from(bytes))
+            .await
+            .map_err(|e| FsError::storage(&key, e))?;
+        Ok(id)
+    }
+
+    /// JAR2-83 (stage 5.6): point lookup of one persisted
+    /// [`ConflictRecord`] by its content-addressed [`ConflictId`].
+    ///
+    /// Returns `Ok(None)` when the file is absent — the typed-error
+    /// shape (`OutputNotFound`/`EvidenceNotFound`) is reserved for read
+    /// paths where the caller needs to distinguish "the id doesn't
+    /// resolve" from "I/O failed". Conflict-record reads are audit /
+    /// inspection only and a missing id is not a contract violation, so
+    /// the simpler `Option`-returning shape mirrors `read_claim`.
+    pub async fn read_conflict(&self, id: &ConflictId) -> anyhow::Result<Option<ConflictRecord>> {
+        let key = self.conflict_key(id);
+        let got = self
+            .storage
+            .get(&key)
+            .await
+            .map_err(|e| FsError::storage(&key, e))?;
+        match got {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// JAR2-83 (stage 5.6): return every conflict record under
+    /// `<prefix>conflicts/` in ascending filename (== ascending hex-id)
+    /// order. Bounded by the projected count cited above; the LIST +
+    /// `get_many` shape is the same as [`AgentFs::list_claims`].
+    pub async fn list_conflicts(&self) -> anyhow::Result<Vec<ConflictRecord>> {
+        let prefix = self.key("conflicts/");
+        self.read_recent_json::<ConflictRecord>(&prefix, usize::MAX)
+            .await
+    }
+
     // ---- key construction ----------------------------------------------
 
     fn key(&self, tail: &str) -> String {
@@ -957,6 +1044,10 @@ impl AgentFs {
 
     fn evidence_key(&self, id: &EvidenceId) -> String {
         self.key(&format!("evidence/{}.json", id))
+    }
+
+    fn conflict_key(&self, id: &ConflictId) -> String {
+        self.key(&format!("conflicts/{}.json", id))
     }
 
     /// Prepend `filename` to the tail object at `<prefix><tail_suffix>`
@@ -2555,6 +2646,192 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "list_recent_outputs(8) over 10k outputs took {elapsed:?}; bound exceeded"
+        );
+    }
+
+    // ---- JAR2-83 (stage 5.6): conflict-log FS writer ------------------
+
+    use crate::agent_ref::AgentRef;
+    use crate::conflict::{ConflictKind, ConflictRecord};
+    use crate::decision::{ConflictAlternative, ConflictResolution};
+    use uuid::Uuid;
+
+    fn alt(child_slug: &str, claim: &str, output_hex: &str) -> ConflictAlternative {
+        ConflictAlternative {
+            source_child: AgentRef::new(
+                format!("graphs/g1/agents/{child_slug}"),
+                AgentId::new(Uuid::new_v4()),
+            ),
+            source_output_id: OutputId::from_hex(output_hex.repeat(32)),
+            claim: claim.to_string(),
+        }
+    }
+
+    fn ts_fixed() -> chrono::DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-05-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[tokio::test]
+    async fn write_conflict_persists_held_open_record_under_content_addressed_path() {
+        let (tmp, fs, _m) = fresh_fs().await;
+        let record = ConflictRecord::new(
+            ts_fixed(),
+            vec![
+                alt("child-a", "value is 42", "aa"),
+                alt("child-b", "value is 43", "bb"),
+            ],
+            None,
+        );
+        let expected_id = record.id.clone();
+
+        let id = fs.write_conflict(&record).await.unwrap();
+        assert_eq!(id, expected_id, "write_conflict returns the record's id");
+
+        // File exists at the expected path.
+        let path = tmp.path().join("conflicts").join(format!("{}.json", id));
+        assert!(
+            path.is_file(),
+            "conflict file missing at {}",
+            path.display()
+        );
+
+        // Round-trips through read_conflict.
+        let back = fs.read_conflict(&id).await.unwrap().expect("present");
+        assert_eq!(back, record);
+        assert_eq!(back.kind, ConflictKind::HeldOpen);
+    }
+
+    #[tokio::test]
+    async fn write_conflict_persists_resolved_record_with_resolution_intact() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        let resolution = ConflictResolution {
+            chosen_alternative_idx: 1,
+            reasoning: "newer evidence".into(),
+        };
+        let record = ConflictRecord::new(
+            ts_fixed(),
+            vec![
+                alt("child-a", "claim a", "aa"),
+                alt("child-b", "claim b", "bb"),
+            ],
+            Some(resolution.clone()),
+        );
+
+        let id = fs.write_conflict(&record).await.unwrap();
+        let back = fs.read_conflict(&id).await.unwrap().expect("present");
+        assert_eq!(back.kind, ConflictKind::Resolved);
+        assert_eq!(back.resolution.as_ref().unwrap(), &resolution);
+    }
+
+    #[tokio::test]
+    async fn write_conflict_rejects_fewer_than_two_alternatives() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        // Bypass `ConflictRecord::new`'s validation-free constructor —
+        // we want to confirm the writer is the second line of defence.
+        let bad = ConflictRecord {
+            id: ConflictId::from_hex("00".repeat(32)),
+            timestamp: ts_fixed(),
+            kind: ConflictKind::HeldOpen,
+            alternatives: vec![alt("only-child", "lonely claim", "cc")],
+            resolution: None,
+        };
+        let err = fs.write_conflict(&bad).await.unwrap_err();
+        match err.downcast_ref::<FsError>() {
+            Some(FsError::ConflictAlternativesTooFew { count }) => assert_eq!(*count, 1),
+            other => panic!("expected ConflictAlternativesTooFew, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_conflict_is_idempotent_under_retries() {
+        let (tmp, fs, _m) = fresh_fs().await;
+        let alts = vec![
+            alt("child-a", "claim a", "aa"),
+            alt("child-b", "claim b", "bb"),
+        ];
+        // First write at t0, second write at a later wall-clock t1 —
+        // both should land on the same content-addressed file because
+        // timestamp is NOT in the id.
+        let r1 = ConflictRecord::new(ts_fixed(), alts.clone(), None);
+        let id1 = fs.write_conflict(&r1).await.unwrap();
+
+        let later = ts_fixed() + chrono::Duration::seconds(60);
+        let r2 = ConflictRecord::new(later, alts, None);
+        let id2 = fs.write_conflict(&r2).await.unwrap();
+        assert_eq!(id1, id2, "retry must produce the same id");
+
+        // Directory still holds exactly one file.
+        let files: Vec<_> = std::fs::read_dir(tmp.path().join("conflicts"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(files.len(), 1, "expected one file, got {files:?}");
+    }
+
+    #[tokio::test]
+    async fn read_conflict_returns_none_for_missing_id() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        let bogus = ConflictId::from_hex("ee".repeat(32));
+        let got = fs.read_conflict(&bogus).await.unwrap();
+        assert!(got.is_none(), "expected None for missing conflict id");
+    }
+
+    #[tokio::test]
+    async fn list_conflicts_returns_all_written_records() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        let r1 = ConflictRecord::new(
+            ts_fixed(),
+            vec![alt("a", "claim a", "aa"), alt("b", "claim b", "bb")],
+            None,
+        );
+        let r2 = ConflictRecord::new(
+            ts_fixed(),
+            vec![alt("c", "claim c", "cc"), alt("d", "claim d", "dd")],
+            Some(ConflictResolution {
+                chosen_alternative_idx: 0,
+                reasoning: "first".into(),
+            }),
+        );
+        fs.write_conflict(&r1).await.unwrap();
+        fs.write_conflict(&r2).await.unwrap();
+
+        let listed = fs.list_conflicts().await.unwrap();
+        assert_eq!(listed.len(), 2);
+        let ids: std::collections::HashSet<_> =
+            listed.iter().map(|c| c.id.as_str().to_string()).collect();
+        assert!(ids.contains(r1.id.as_str()));
+        assert!(ids.contains(r2.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn conflicts_land_under_agent_prefix_on_memory_storage() {
+        // Same coverage as `open_for_agent_scopes_storage_to_workflow_id_prefix`
+        // but for the conflicts/ prefix — confirms the path scheme survives
+        // a non-empty agent prefix without colliding across agents.
+        let storage = Arc::new(MemoryStorage::new());
+        let dyn_storage: Arc<dyn AgentStorage> = storage.clone();
+        let graph_id = GraphId::new(Uuid::new_v4());
+        let agent_id = AgentId::new(Uuid::new_v4());
+        let fs = AgentFs::open_for_agent(dyn_storage, graph_id, agent_id);
+
+        let record = ConflictRecord::new(
+            ts_fixed(),
+            vec![
+                alt("child-a", "claim a", "aa"),
+                alt("child-b", "claim b", "bb"),
+            ],
+            None,
+        );
+        let id = fs.write_conflict(&record).await.unwrap();
+
+        // The on-disk key carries the agent prefix.
+        let expected_key = format!("graphs/{graph_id}/agents/{agent_id}/conflicts/{id}.json");
+        let bytes = storage.get(&expected_key).await.unwrap();
+        assert!(
+            bytes.is_some(),
+            "conflict not at expected key {expected_key}"
         );
     }
 }
