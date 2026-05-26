@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "GraphYaml",
-  "description": "Top-level document type for `graph.yaml`. Read\n`scratch/graph_yaml_schema.md` § 2 for the strawman this mirrors.\n\n`seed` is optional in the strawman but required at apply time today —\nthe workflow's first tick would otherwise drain an empty trigger queue\nand send the LLM an empty prompt. Validation enforces non-empty\n`seed.triggers`.",
+  "description": "Top-level document type for `graph.yaml`. Read\n`scratch/graph_yaml_schema.md` § 2 (single-agent) and § 3 (multi-\nagent hierarchical) for the strawman this mirrors.\n\n`seed` is optional in the strawman but required at apply time today —\nthe workflow's first tick would otherwise drain an empty trigger queue\nand send the LLM an empty prompt. Validation enforces non-empty\n`seed.triggers`.\n\nJAR2-85: `defaults:` and `policy:` are top-level optional blocks.\n`agents:` is a forest (top-level `Vec<Agent>`); each `Agent` may\nnest `children:`.",
   "type": "object",
   "properties": {
     "agents": {
@@ -14,12 +14,34 @@
       "description": "Must be `\"jarvis.engine/v1alpha1\"`. Validated in [`validate`].",
       "type": "string"
     },
+    "defaults": {
+      "description": "JAR2-85: top-level defaults applied to every agent unless\noverridden inline. Today only `idle_period` and `max_ticks` are\ndeclarable here, matching the two `Mandate`-derived knobs the\ninline mandate currently surfaces.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AgentDefaults"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "kind": {
       "description": "Must be `\"Graph\"`. Validated in [`validate`].",
       "type": "string"
     },
     "metadata": {
       "$ref": "#/$defs/Metadata"
+    },
+    "policy": {
+      "description": "JAR2-85: operator-level policy block. **Pass-through only** in v1\n— stored verbatim into `graphs.metadata` jsonb (under a `\"policy\"`\nkey). The runtime does not enforce these knobs today; cost-budget\nand conflict-resolution enforcement is post-Stage-8. Schema kept\n`serde_json::Value`-opaque so future extensions don't force a\nwire bump here every time a knob lands.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PolicyYaml"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "seed": {
       "$ref": "#/$defs/Seed"
@@ -42,11 +64,18 @@
   ],
   "$defs": {
     "Agent": {
-      "description": "`agents[i]`. v1 requires exactly one entry — enforced in [`validate`].\n\n`children`, `defaults`, and any other multi-agent / inheritance\nconstructs are rejected by `#[serde(deny_unknown_fields)]` with a\n`line:col`-bearing serde error.",
+      "description": "`agents[i]`. JAR2-85: any node in the agent forest. `children:` makes\nthe YAML schema recursive — DFS the tree to discover every agent.\n\n`mandate.idle_period` is `Option<Duration>` here because the top-level\n`defaults:` block may provide it; the validator (`resolve_mandate`)\nreports a typed error if neither inline nor default supplies a value.",
       "type": "object",
       "properties": {
+        "children": {
+          "description": "JAR2-85: nested child agents. Empty for leaves. The validator\nenforces unique `id`s across the whole tree and defensive\nno-cycles. Hierarchical-only at v1 (Project decision 12); flat\n`parent:`-ref form deferred.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Agent"
+          }
+        },
         "id": {
-          "description": "URL-path-safe id (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`); strict-\nvalidated in [`validate`]. Combined with `metadata.name` to form\nthe workflow ID JAR2-73 will pass to the Temporal client:\n`graphs/<metadata.name>/agents/<id>`.",
+          "description": "URL-path-safe id (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`); strict-\nvalidated in [`validate`]. **Operator-authored**, distinct from\nthe structural-DB UUID `GraphStore::add_agent` allocates. The\napply walker maps this id to the allocated `AgentId` via\n[`AppliedGraph::id_map`].",
           "type": "string"
         },
         "mandate": {
@@ -55,6 +84,7 @@
         "tools": {
           "description": "References by id into the top-level `tools:`. Resolved + checked\nfor misses in [`validate`].",
           "type": "array",
+          "default": [],
           "items": {
             "type": "string"
           }
@@ -63,9 +93,33 @@
       "additionalProperties": false,
       "required": [
         "id",
-        "mandate",
-        "tools"
+        "mandate"
       ]
+    },
+    "AgentDefaults": {
+      "description": "JAR2-85: top-level `defaults:` block — knobs applied to every agent\nunless overridden inline. Today this only carries the two\n`Mandate`-derived knobs (`idle_period`, `max_ticks`) — the surface\nmatches what the inline `Mandate` declares and grows together.\n\n**Why a separate type from `Mandate`:** `mandate.text` is per-agent\n(each child has its own narrow mandate); a default text wouldn't be\nmeaningful. Splitting the type makes that explicit.",
+      "type": "object",
+      "properties": {
+        "idle_period": {
+          "description": "Default `idle_period` — used when an agent's inline\n`mandate.idle_period` is absent. Same `humantime` grammar as\nthe inline field.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "max_ticks": {
+          "description": "Default `max_ticks` — used when an agent's inline\n`mandate.max_ticks` is absent. `None` ⇒ no cap by default.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
     },
     "ExternalEnvelope": {
       "description": "Payload of `seed.triggers[].external:`. The runtime translates this\ninto `Trigger::External { kind, payload }` at apply time (JAR2-73).",
@@ -85,15 +139,19 @@
       ]
     },
     "Mandate": {
-      "description": "`agents[].mandate:` — the standing instruction. **Not** the same wire\nshape as `jarvis_node::mandate::Mandate` (which is ms-integers +\n`retry_policy` + `context_policy`); kept distinct because the YAML is\nthe authored / human-edited surface and `jarvis_node::Mandate` is the\nruntime/wire shape. Conversion lives in JAR2-73.\n\n`from_file:` (`scratch/graph_yaml_schema.md` § 4.5) is rejected by\n`deny_unknown_fields`; v1 is inline-only.",
+      "description": "`agents[].mandate:` — the standing instruction. **Not** the same wire\nshape as `jarvis_node::mandate::Mandate` (which is ms-integers +\n`retry_policy` + `context_policy`); kept distinct because the YAML is\nthe authored / human-edited surface and `jarvis_node::Mandate` is the\nruntime/wire shape. Conversion lives in [`into_agent_input`] /\n[`apply_to_workflow_starts`].\n\n`from_file:` (`scratch/graph_yaml_schema.md` § 4.5) is rejected by\n`deny_unknown_fields`; v1 is inline-only.\n\nJAR2-85: `idle_period` and `max_ticks` are `Option` here because the\ntop-level [`AgentDefaults`] block may supply them. `resolve_mandate`\nmerges inline → defaults → error.",
       "type": "object",
       "properties": {
         "idle_period": {
-          "description": "Wake cadence when no signal arrives. Accepts the\n[`humantime`](https://docs.rs/humantime) duration grammar:\n`100ms`, `5m`, `1h30m`, `1h 30m`, etc. Parsed via\n`humantime::parse_duration`. Empty / malformed values surface as\n[`GraphYamlError::Parse`] (the adapter raises a serde error\nmid-deserialize so `serde_yaml::Location` pins the `line:col`).",
-          "type": "string"
+          "description": "Wake cadence when no signal arrives. Accepts the\n[`humantime`](https://docs.rs/humantime) duration grammar:\n`100ms`, `5m`, `1h30m`, `1h 30m`, etc. Parsed via\n`humantime::parse_duration`. Empty / malformed values surface as\n[`GraphYamlError::Parse`] (the adapter raises a serde error\nmid-deserialize so `serde_yaml::Location` pins the `line:col`).\n\nJAR2-85: optional inline so [`AgentDefaults::idle_period`] can\nsupply the value. Validator emits\n[`GraphYamlError::MissingMandateIdlePeriod`] if neither inline\nnor default supplies a value for a given agent.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
         "max_ticks": {
-          "description": "Optional safety cap on loop iterations. `None` ⇒ run until\n`Retire`. Mirrors `jarvis_node::mandate::Mandate::max_ticks`.",
+          "description": "Optional safety cap on loop iterations. `None` ⇒ run until\n`Retire`. Mirrors `jarvis_node::mandate::Mandate::max_ticks`.\nMay be supplied via [`AgentDefaults::max_ticks`].",
           "type": [
             "integer",
             "null"
@@ -109,8 +167,7 @@
       },
       "additionalProperties": false,
       "required": [
-        "text",
-        "idle_period"
+        "text"
       ]
     },
     "Metadata": {
@@ -134,6 +191,9 @@
       "required": [
         "name"
       ]
+    },
+    "PolicyYaml": {
+      "description": "JAR2-85: `policy:` block — operator-level constraints. **Pass-through\nin v1**: the parser stores it verbatim into `graphs.metadata` jsonb\nunder a `\"policy\"` key. No knob is enforced today; cost-budget /\nconflict-resolution enforcement is post-Stage-8 (Project decision per\nthe parent ticket).\n\nModeled as `serde_json::Value`-flavored opaque so the schema doesn't\npin field names that will reshape when enforcement lands. The shape\n`scratch/graph_yaml_schema.md` § 3 sketches (`cost_budget:`,\n`on_budget_exhausted:`, `conflict_resolution:`) survives this lossy\npass-through — it's preserved on disk for operators to read back."
     },
     "Seed": {
       "description": "`seed:` — what kicks the graph off. v1 requires `triggers` to be\nnon-empty (see [`GraphYaml`] doc for the empty-prompt guardrail).",

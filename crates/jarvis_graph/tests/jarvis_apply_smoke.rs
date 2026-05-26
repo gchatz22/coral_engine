@@ -76,7 +76,11 @@ use temporalio_client::{
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
-use jarvis_graph::yaml::{into_agent_input, parse_and_validate, yaml_seed_triggers};
+use jarvis_graph::yaml::{
+    into_agent_input, parse_and_validate, yaml_seed_triggers, AppliedGraph, ResolvedAgent,
+    ResolvedAgentWorkflow,
+};
+use jarvis_node::agent_ref::{AgentId, GraphId};
 use jarvis_node::decision::{ClaimSeed, Decision, ToolCall};
 use jarvis_node::evidence::EvidenceRecord;
 use jarvis_node::fs::AgentFs;
@@ -206,7 +210,10 @@ async fn run_smoke() -> Result<()> {
     assert_eq!(graph.agents.len(), 1);
     assert_eq!(graph.agents[0].id, "root");
     assert_eq!(graph.agents[0].tools, vec!["echo".to_string()]);
-    assert_eq!(graph.agents[0].mandate.idle_period, Duration::from_secs(1));
+    assert_eq!(
+        graph.agents[0].mandate.idle_period,
+        Some(Duration::from_secs(1))
+    );
     assert_eq!(graph.agents[0].mandate.max_ticks, Some(8));
     assert_eq!(graph.seed.triggers.len(), 1);
     assert_eq!(graph.seed.triggers[0].external.kind, "kickoff");
@@ -216,7 +223,18 @@ async fn run_smoke() -> Result<()> {
     // shapes) were deleted in JAR2-76 along with `jarvis_run_workflow`.
     // The YAML is the canonical fixture going forward; these assertions
     // bite if a future YAML edit drifts the mandate translation.
-    let agent_input = into_agent_input(&graph);
+    //
+    // JAR2-85 + JAR2-89: `into_agent_input` now requires the
+    // `(graph_id, agent_id)` allocated by `GraphStore::create_from_yaml`.
+    // The hermetic smoke fixture doesn't run against Postgres (the
+    // structural-DB write is exercised by JAR2-73's unit tests instead
+    // — see the module-doc note "What this test deliberately does NOT
+    // exercise"); we synthesize fresh UUIDs here so the workflow body
+    // still gets a real identity triple. Production `jarvis apply`
+    // gets these from the DB.
+    let synth_graph_id = GraphId::new(uuid::Uuid::new_v4());
+    let synth_agent_id = AgentId::new(uuid::Uuid::new_v4());
+    let agent_input = into_agent_input(&graph, synth_graph_id, synth_agent_id);
     assert_eq!(agent_input.mandate.idle_period, Duration::from_secs(1));
     assert_eq!(agent_input.mandate.max_ticks, Some(8));
     assert!(
@@ -303,7 +321,40 @@ async fn run_smoke() -> Result<()> {
     input.fs_handle = jarvis_temporal::workflow::FsHandle {
         prefix: agent_prefix.clone(),
     };
-    let triggers = yaml_seed_triggers(&graph);
+    // JAR2-85: `yaml_seed_triggers` now takes an `AppliedGraph` so it
+    // can resolve each `seed.triggers[].agent` to a concrete
+    // workflow_id (multi-agent supports seeds targeting any node in
+    // the tree, not just the root). Synthesize a minimal AppliedGraph
+    // matching the synthetic UUIDs above; the test only uses the
+    // resolved `trigger` field (not `workflow_id`), so the synthesis
+    // is a thin shell.
+    let mut synth_id_map = std::collections::HashMap::new();
+    synth_id_map.insert(
+        graph.agents[0].id.clone(),
+        ResolvedAgentWorkflow {
+            db_agent_id: synth_agent_id,
+            workflow_id: format!(
+                "graphs/{}/agents/{}",
+                synth_graph_id.into_uuid(),
+                synth_agent_id.into_uuid(),
+            ),
+        },
+    );
+    let synth_applied = AppliedGraph {
+        graph_id: synth_graph_id,
+        graph_name: graph.metadata.name.clone(),
+        agents: vec![ResolvedAgent {
+            operator_id: graph.agents[0].id.clone(),
+            db_agent_id: synth_agent_id,
+            parent_db_agent_id: None,
+        }],
+        id_map: synth_id_map,
+    };
+    let triggers: Vec<jarvis_node::trigger::Trigger> = yaml_seed_triggers(&graph, &synth_applied)
+        .expect("seed triggers resolve")
+        .into_iter()
+        .map(|r| r.trigger)
+        .collect();
 
     let driver_task_queue = task_queue.clone();
     let driver_prefix = agent_prefix.clone();
