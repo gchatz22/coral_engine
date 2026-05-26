@@ -1252,6 +1252,7 @@ dependencies = [
  "temporalio-macros",
  "temporalio-sdk",
  "temporalio-sdk-core",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -58,9 +58,12 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use jarvis_node::agent_core;
 use jarvis_node::agent_ref::{AgentId, GraphId};
-use jarvis_node::decision::{ContextBundle, CorrectionContext, Decide, Decision, FsOp, ToolCall};
-use jarvis_node::evidence::EvidenceId;
-use jarvis_node::fs::AgentFs;
+use jarvis_node::decision::{
+    ConflictId, ConflictRecordIntent, ContextBundle, CorrectionContext, Decide, Decision, FsOp,
+    ReconcileSource, ToolCall,
+};
+use jarvis_node::evidence::{EvidenceId, EvidenceRecord};
+use jarvis_node::fs::{AgentFs, FsError};
 use jarvis_node::mandate::{Mandate, OutputId};
 use jarvis_node::model_client::ModelError;
 use jarvis_node::storage::AgentStorage;
@@ -269,6 +272,68 @@ pub struct RegisterChildInStructuralDbInput {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegisterChildInStructuralDbOutput {
     pub child_agent_id: AgentId,
+}
+
+/// JAR2-82 (stage 5.5) — input to the `reconcile_children` activity.
+///
+/// Carries the parent's identity (so the activity can open the
+/// parent's FS and write the synthetic evidence) plus the cited
+/// child outputs and the optional conflict-record intent. Both
+/// `parent_graph_id` and every `sources[i].child_ref` must live in
+/// the same graph — cross-graph reads are explicitly out of scope per
+/// the Stage 5 Project description.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReconcileChildrenInput {
+    pub parent_graph_id: GraphId,
+    pub parent_agent_id: AgentId,
+    pub sources: Vec<ReconcileSource>,
+    /// `Some` iff the parent observed disagreement among the cited
+    /// outputs. JAR2-82 leaves the conflict-log writer stubbed
+    /// (the writer + canonical-form bytes land in JAR2-83 / 5.6);
+    /// when `Some`, the activity emits a `tracing::warn!` and returns
+    /// `conflict_id: None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<ConflictRecordIntent>,
+}
+
+/// JAR2-82 (stage 5.5) — output of the `reconcile_children` activity.
+///
+/// `synthetic_evidence[i]` is the freshly-minted `EvidenceId` for the
+/// `sources[i]` cross-agent fold (written into the parent's
+/// `evidence/<id>.json`). The parent's next-tick `assemble_context`
+/// picks these up via the existing `list_recent_evidence` window with
+/// no workflow-state slot involved (Stage 5 Project decision 3 +
+/// JAR2-82 advisor item 4).
+///
+/// `conflict_id` is always `None` in JAR2-82 — the writer ships in
+/// JAR2-83. The field exists on the wire today so 5.6's call-site
+/// upgrade is a value change, not a struct rev.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReconcileChildrenOutput {
+    pub synthetic_evidence: Vec<EvidenceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_id: Option<ConflictId>,
+}
+
+/// JAR2-82 (stage 5.5) — typed reconciliation errors.
+///
+/// The reconcile_children activity wraps these as
+/// `ApplicationFailure::non_retryable` so Temporal's outer retry loop
+/// doesn't churn through them; the workflow body catches the
+/// activity failure and stages a `CorrectionContext` for the next
+/// tick (mirroring the existing `Decision::CallTools` tool-failure
+/// flow).
+#[derive(Debug, thiserror::Error)]
+pub enum ReconciliationError {
+    /// A `sources[i].output_id` did not resolve in the named child's
+    /// `outputs/<id>.json`. Carries the child agent id + the output
+    /// id so the workflow body's correction text is precise enough
+    /// for the LLM to fix on the next tick.
+    #[error("reconcile: child output {output_id} not found for agent {agent_id}")]
+    ChildOutputNotFound {
+        agent_id: AgentId,
+        output_id: OutputId,
+    },
 }
 
 /// One JSONL entry written by [`AgentActivities::append_decision_log`].
@@ -863,6 +928,70 @@ impl AgentActivities {
         let out = register_child_in_structural_db_impl(store, input).await?;
         Ok(out)
     }
+
+    /// JAR2-82 (stage 5.5) — fold N cited child outputs into the
+    /// parent's `evidence/` directory as synthetic evidence records
+    /// (Stage 5 Project decision 3). One activity invocation per
+    /// `Decision::ReconcileChildren`; the workflow body does NOT
+    /// push the resulting evidence into any workflow-state slot —
+    /// the parent's next-tick `assemble_context` picks the synthetic
+    /// records up via the existing `list_recent_evidence` window.
+    ///
+    /// Conflict-record writing stays in JAR2-83 (5.6). This activity
+    /// leaves a `tracing::warn!` at the call site when
+    /// `input.conflict.is_some()` and always returns `conflict_id:
+    /// None` — see [`reconcile_children_impl`] for the rationale.
+    ///
+    /// Error mapping: only typed [`ReconciliationError`]s surface as
+    /// `ActivityError::Application(non_retryable)` — the workflow
+    /// body catches the failure and stages a `CorrectionContext` for
+    /// the next tick (mirroring the existing tool-failure correction-
+    /// context flow). `non_retryable` because `ChildOutputNotFound` is
+    /// structural — re-running the activity with the same id won't
+    /// make it resolve; the LLM must emit a satisfiable decision on
+    /// the next tick.
+    ///
+    /// Every other error (storage backend errors, serde failures from
+    /// the cross-agent read, `record_evidence` write failures) is
+    /// surfaced as a *retryable* `ApplicationFailure` so Temporal's
+    /// default retry policy gets a chance — a transient infra blip
+    /// shouldn't be misreported to the LLM as a provenance miss.
+    ///
+    /// `now` is sourced from `ctx.info().scheduled_time` so a retry
+    /// of this activity (transient worker failure between record-
+    /// evidence completion and ack) PUTs byte-identical bytes under
+    /// the same content-addressed `EvidenceId` — see the activity
+    /// helper doc for the determinism argument.
+    #[activity]
+    pub async fn reconcile_children(
+        ctx: ActivityContext,
+        input: ReconcileChildrenInput,
+    ) -> Result<ReconcileChildrenOutput, ActivityError> {
+        let now: DateTime<Utc> = ctx
+            .info()
+            .scheduled_time
+            .map(DateTime::<Utc>::from)
+            .unwrap_or_else(Utc::now);
+        let storage = agent_storage();
+        match reconcile_children_impl(storage, input, now).await {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                let failure = if e.downcast_ref::<ReconciliationError>().is_some() {
+                    ApplicationFailure::non_retryable(e)
+                } else {
+                    // Transient storage / serde / record_evidence
+                    // error — retryable so Temporal can re-run the
+                    // activity (idempotency: synthetic evidence is
+                    // content-addressed via `record_evidence`'s
+                    // `put_if_absent`, so a retry that completes
+                    // after a previous partial isn't duplicating
+                    // records).
+                    ApplicationFailure::new(e)
+                };
+                Err(ActivityError::application(failure))
+            }
+        }
+    }
 }
 
 /// JAR2-80 (stage 5.3) — substantive body of
@@ -892,6 +1021,157 @@ pub async fn register_child_in_structural_db_impl(
         .add_edge(input.parent_agent_id, child_agent_id)
         .await?;
     Ok(RegisterChildInStructuralDbOutput { child_agent_id })
+}
+
+/// JAR2-82 (stage 5.5) — substantive body of
+/// [`AgentActivities::reconcile_children`], factored out so hermetic
+/// unit tests can drive it against a `MemoryStorage` backend without
+/// constructing an `ActivityContext` or racing the worker's
+/// process-wide storage install.
+///
+/// Per-source loop:
+///
+/// 1. Open the child's FS read-only via
+///    [`AgentFs::open_for_agent`] (Stage 5 Project decision 6's
+///    flat workflow-id prefix — same shape `FsHandle::for_agent`
+///    minted at spawn time). No `mandate.json` read, no tail-index
+///    work — point lookup only.
+/// 2. Read the cited [`Output`](jarvis_node::mandate::Output) via
+///    [`AgentFs::read_output`]. On miss, return
+///    [`ReconciliationError::ChildOutputNotFound`] so the workflow
+///    body's correction path takes over.
+/// 3. Build a synthetic [`EvidenceRecord`] with
+///    `tool = "reconcile"`, the `(child_agent_id, child_workflow_id,
+///    source_output_id)` triple as `args`, and the serialized child
+///    `Output` as `result`. `EvidenceId` is content-addressed over
+///    `(tool, args, result)` — same convention as every other
+///    evidence record on disk, so the parent's existing provenance
+///    contract (`persist_output` rejects unresolvable evidence ids)
+///    keeps working with zero extensions.
+/// 4. Write the synthetic record to the **parent's** `evidence/`
+///    directory via [`AgentFs::record_evidence`]. Returns the
+///    `EvidenceId`, which the activity collects into the output's
+///    `synthetic_evidence` vector.
+///
+/// Conflict-record write: if `input.conflict.is_some()`, emit a
+/// `tracing::warn!` and return `conflict_id: None`. JAR2-83 (5.6)
+/// fills in the actual writer; this ticket leaves the call site as a
+/// TODO so 5.6 has one obvious place to land.
+///
+/// **Error discipline.** Only a genuine `FsError::OutputNotFound`
+/// (the cited child output doesn't resolve on the child's FS) is
+/// wrapped as the typed [`ReconciliationError::ChildOutputNotFound`]
+/// — that signals an LLM-level mistake the workflow body folds into
+/// a `CorrectionContext` and Temporal does NOT retry. Every other
+/// failure (storage backend errors from the cross-agent read,
+/// `serde_json` failures, `record_evidence` write errors) propagates
+/// as a plain `anyhow::Error`, which the activity wrapper surfaces
+/// as a *retryable* `ApplicationFailure`. Conflating the two would
+/// mean a transient storage blip lies to the next-tick LLM about
+/// provenance AND skips Temporal's retry — both wrong.
+///
+/// **Pre-validation pass.** Every source is read before any
+/// `record_evidence` write so a single bad source doesn't leave a
+/// partial trail of synthetic evidence on the parent's FS. Cost: one
+/// extra in-memory traversal per source over `sources.len()`;
+/// negligible at the typical fan-in of a few children. The
+/// alternative (write-as-you-go) would land good records before the
+/// activity errored and the parent's next tick would see partial
+/// provenance for a reconciliation it never completed — confusing
+/// for both the LLM and human reviewers.
+///
+/// `now` is supplied by the caller so the activity body sources it
+/// from `ctx.info().scheduled_time` (deterministic across Temporal
+/// retries — load-bearing because the synthetic record's
+/// `created_at` is part of the on-disk bytes and a retried activity
+/// must PUT byte-identical content under the same content-addressed
+/// id). The hermetic test passes a fixed timestamp.
+pub async fn reconcile_children_impl(
+    storage: std::sync::Arc<dyn jarvis_node::storage::AgentStorage>,
+    input: ReconcileChildrenInput,
+    now: DateTime<Utc>,
+) -> anyhow::Result<ReconcileChildrenOutput> {
+    // Parent FS — write target. `open_for_agent` uses `attach`
+    // semantics (no mandate read, no tail reconcile) because the
+    // parent's `assemble_context` activity has already written
+    // `mandate.json` on its first tick. `record_evidence` itself
+    // doesn't depend on the mandate file existing.
+    let parent_fs = AgentFs::open_for_agent(
+        storage.clone(),
+        input.parent_graph_id,
+        input.parent_agent_id,
+    );
+
+    // Phase 1: read every child output up-front. Only
+    // `FsError::OutputNotFound` becomes the typed reconcile error;
+    // storage / serde failures bubble as anyhow and stay retryable
+    // at the activity layer.
+    let mut child_outputs = Vec::with_capacity(input.sources.len());
+    for source in &input.sources {
+        // Cross-agent read: open the child's FS root over the shared
+        // storage backend at the child's `(graph_id, agent_id)`
+        // prefix. Both agents share `parent_graph_id` per Stage 5
+        // Project decision 6's flat scheme (cross-graph reads are
+        // out-of-scope project-wide).
+        let child_fs = AgentFs::open_for_agent(
+            storage.clone(),
+            input.parent_graph_id,
+            source.child_ref.agent_id,
+        );
+        let child_output = child_fs.read_output(&source.output_id).await.map_err(|e| {
+            if matches!(
+                e.downcast_ref::<FsError>(),
+                Some(FsError::OutputNotFound(_))
+            ) {
+                anyhow::Error::new(ReconciliationError::ChildOutputNotFound {
+                    agent_id: source.child_ref.agent_id,
+                    output_id: source.output_id.clone(),
+                })
+            } else {
+                // Storage-level failure or other infra error —
+                // bubble verbatim so the activity wrapper marks it
+                // retryable and Temporal can re-run the activity.
+                e
+            }
+        })?;
+        child_outputs.push(child_output);
+    }
+
+    // Phase 2: write one synthetic evidence record per source.
+    // `serde_json::to_value` / `record_evidence` failures here
+    // propagate as anyhow → retryable at the activity layer.
+    let mut synthetic_evidence = Vec::with_capacity(input.sources.len());
+    for (source, child_output) in input.sources.iter().zip(child_outputs.iter()) {
+        // Synthetic evidence record. `tool = "reconcile"` is the
+        // wire-locked discriminator (Stage 5 Project decision 3 +
+        // JAR2-82 ticket "Decisions baked in"); do NOT introduce a
+        // new EvidenceKind / sub-tool taxonomy.
+        let args = serde_json::json!({
+            "child_agent_id": source.child_ref.agent_id,
+            "child_workflow_id": source.child_ref.workflow_id,
+            "source_output_id": source.output_id,
+        });
+        let result = serde_json::to_value(child_output)?;
+        let record = EvidenceRecord::new("reconcile", args, result, now);
+        let ev_id = parent_fs.record_evidence(record).await?;
+        synthetic_evidence.push(ev_id);
+    }
+
+    // Conflict-record stub. JAR2-83 (5.6) ships the writer; until
+    // then we surface a tracing line so an operator can see the
+    // intent landed at the boundary and was deliberately not
+    // persisted. Never returns a synthetic `ConflictId` — that would
+    // dangle a reference to a file that never gets written.
+    if input.conflict.is_some() {
+        tracing::warn!(
+            "JAR2-82: conflict intent received but conflict-log writer not yet implemented (JAR2-83 / 5.6)"
+        );
+    }
+
+    Ok(ReconcileChildrenOutput {
+        synthetic_evidence,
+        conflict_id: None,
+    })
 }
 
 /// Body of [`AgentActivities::persist_retirement`], factored out so the
@@ -1899,5 +2179,340 @@ mod tests {
         let s2 = serde_json::to_string(&e).unwrap();
         let back2: DecisionLogEntry = serde_json::from_str(&s2).unwrap();
         assert_eq!(e, back2);
+    }
+
+    // ---- JAR2-82 (stage 5.5): reconcile_children_impl hermetic coverage ----
+
+    /// Deterministic timestamp for the synthetic-evidence records the
+    /// reconcile activity writes — chosen so the resulting `EvidenceId`
+    /// hashes (content-addressed over `(tool, args, result)`, NOT
+    /// `created_at`) and the on-disk JSON bytes are byte-stable across
+    /// test runs.
+    fn fixed_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-05-25T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// Plant a child agent's FS root with one persisted output (citing
+    /// one planted evidence record) and return the (`child_agent_id`,
+    /// child workflow id string, child `OutputId`, planted evidence
+    /// id) tuple. Shared between the happy + failure-mode tests.
+    async fn plant_child_output(
+        storage: Arc<dyn jarvis_node::storage::AgentStorage>,
+        graph_id: GraphId,
+        child_agent_id: AgentId,
+        content: &str,
+    ) -> (String, OutputId, EvidenceId) {
+        let child_prefix = format!("graphs/{graph_id}/agents/{child_agent_id}/");
+        let mandate = Mandate::new("child", Duration::from_millis(0), None);
+        let fs = AgentFs::new_with_storage(storage.clone(), &child_prefix, &mandate)
+            .await
+            .expect("open child FS");
+        let ev = fs
+            .record_evidence(EvidenceRecord::new(
+                "echo",
+                json!({"q": content}),
+                json!({"r": "child result"}),
+                fixed_now(),
+            ))
+            .await
+            .expect("plant child evidence");
+        let out = fs
+            .persist_output(content, &[ev.clone()])
+            .await
+            .expect("plant child output");
+        // Workflow id matches the canonical scheme that
+        // `FsHandle::for_agent` mints.
+        let child_workflow_id = format!("graphs/{graph_id}/agents/{child_agent_id}");
+        (child_workflow_id, out.id, ev)
+    }
+
+    #[tokio::test]
+    async fn reconcile_children_impl_writes_one_synthetic_evidence_per_source() {
+        use jarvis_node::agent_ref::AgentRef;
+        use uuid::Uuid;
+
+        let storage: Arc<dyn jarvis_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
+        let graph_id = GraphId::new(Uuid::new_v4());
+        let parent_agent_id = AgentId::new(Uuid::new_v4());
+        let child_a_id = AgentId::new(Uuid::new_v4());
+        let child_b_id = AgentId::new(Uuid::new_v4());
+
+        // Two distinct child outputs the parent will fold in.
+        let (child_a_wf, child_a_out, _ev_a) =
+            plant_child_output(storage.clone(), graph_id, child_a_id, "claim from A").await;
+        let (child_b_wf, child_b_out, _ev_b) =
+            plant_child_output(storage.clone(), graph_id, child_b_id, "claim from B").await;
+
+        let input = ReconcileChildrenInput {
+            parent_graph_id: graph_id,
+            parent_agent_id,
+            sources: vec![
+                ReconcileSource {
+                    child_ref: AgentRef::new(child_a_wf.clone(), child_a_id),
+                    output_id: child_a_out.clone(),
+                },
+                ReconcileSource {
+                    child_ref: AgentRef::new(child_b_wf.clone(), child_b_id),
+                    output_id: child_b_out.clone(),
+                },
+            ],
+            conflict: None,
+        };
+
+        let out = reconcile_children_impl(storage.clone(), input, fixed_now())
+            .await
+            .expect("reconcile_children_impl ok");
+
+        assert_eq!(out.synthetic_evidence.len(), 2);
+        assert!(
+            out.conflict_id.is_none(),
+            "JAR2-82 always returns conflict_id: None",
+        );
+
+        // Open the parent's FS and verify both synthetic evidence
+        // records landed under the parent's prefix with the right
+        // `tool` + `args` shape.
+        let parent_view = AgentFs::open_for_agent(storage, graph_id, parent_agent_id);
+        let evs = parent_view
+            .list_recent_evidence(8)
+            .await
+            .expect("list parent evidence");
+        assert_eq!(
+            evs.len(),
+            2,
+            "expected exactly two synthetic evidence records under parent's prefix"
+        );
+        for ev in &evs {
+            assert_eq!(
+                ev.tool, "reconcile",
+                "synthetic record's tool must lock to \"reconcile\""
+            );
+            // `args` carries the (child_agent_id, child_workflow_id,
+            // source_output_id) triple. The serde wire form is a JSON
+            // object; pull the fields out for spot-checks rather than
+            // pinning a full string match (canonicalization sorts keys).
+            let args = ev.args.as_object().expect("args is a JSON object");
+            assert!(args.contains_key("child_agent_id"));
+            assert!(args.contains_key("child_workflow_id"));
+            assert!(args.contains_key("source_output_id"));
+        }
+        // Each returned EvidenceId resolves on disk under parent's prefix.
+        for id in &out.synthetic_evidence {
+            parent_view
+                .evidence_must_exist(id)
+                .await
+                .unwrap_or_else(|e| panic!("synthetic evidence {id} not on disk: {e:#}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_children_impl_returns_typed_error_for_missing_child_output() {
+        use jarvis_node::agent_ref::AgentRef;
+        use uuid::Uuid;
+
+        let storage: Arc<dyn jarvis_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
+        let graph_id = GraphId::new(Uuid::new_v4());
+        let parent_agent_id = AgentId::new(Uuid::new_v4());
+        let child_agent_id = AgentId::new(Uuid::new_v4());
+
+        // No child output planted. Synthesize an `OutputId` for content
+        // we never persisted — the cross-agent read will miss.
+        let bogus = OutputId::new(
+            "never-written",
+            &[EvidenceId::new("t", &json!({}), &json!({}))],
+        );
+        let child_workflow_id = format!("graphs/{graph_id}/agents/{child_agent_id}");
+        let input = ReconcileChildrenInput {
+            parent_graph_id: graph_id,
+            parent_agent_id,
+            sources: vec![ReconcileSource {
+                child_ref: AgentRef::new(child_workflow_id, child_agent_id),
+                output_id: bogus.clone(),
+            }],
+            conflict: None,
+        };
+
+        let err = reconcile_children_impl(storage.clone(), input, fixed_now())
+            .await
+            .expect_err("missing child output must surface typed error");
+        // The helper returns `anyhow::Result`; downcast to the typed
+        // `ReconciliationError` variant the activity wrapper uses for
+        // the non-retryable classification.
+        let typed = err
+            .downcast_ref::<ReconciliationError>()
+            .expect("typed ReconciliationError");
+        match typed {
+            ReconciliationError::ChildOutputNotFound {
+                agent_id,
+                output_id,
+            } => {
+                assert_eq!(*agent_id, child_agent_id);
+                assert_eq!(*output_id, bogus);
+            }
+        }
+
+        // No synthetic evidence landed on the parent's FS — the
+        // helper's two-phase pre-validation pass reads every cited
+        // child output before any record_evidence write fires, so a
+        // single bad source short-circuits the activity without
+        // leaving a partial provenance trail.
+        let parent_view = AgentFs::open_for_agent(storage, graph_id, parent_agent_id);
+        let evs = parent_view
+            .list_recent_evidence(8)
+            .await
+            .expect("list parent evidence after failure");
+        assert!(
+            evs.is_empty(),
+            "pre-validation pass: no synthetic evidence should have landed on parent after typed failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_children_impl_atomicity_no_partial_writes_with_good_and_bad_sources() {
+        use jarvis_node::agent_ref::AgentRef;
+        use uuid::Uuid;
+
+        let storage: Arc<dyn jarvis_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
+        let graph_id = GraphId::new(Uuid::new_v4());
+        let parent_agent_id = AgentId::new(Uuid::new_v4());
+        let good_child_id = AgentId::new(Uuid::new_v4());
+        let bad_child_id = AgentId::new(Uuid::new_v4());
+        let (good_wf, good_out, _ev) =
+            plant_child_output(storage.clone(), graph_id, good_child_id, "good claim").await;
+        let bad_output_id = OutputId::from_hex("de".repeat(32));
+        let bad_wf = format!("graphs/{graph_id}/agents/{bad_child_id}");
+
+        let input = ReconcileChildrenInput {
+            parent_graph_id: graph_id,
+            parent_agent_id,
+            sources: vec![
+                ReconcileSource {
+                    child_ref: AgentRef::new(good_wf, good_child_id),
+                    output_id: good_out,
+                },
+                ReconcileSource {
+                    child_ref: AgentRef::new(bad_wf, bad_child_id),
+                    output_id: bad_output_id.clone(),
+                },
+            ],
+            conflict: None,
+        };
+
+        let err = reconcile_children_impl(storage.clone(), input, fixed_now())
+            .await
+            .expect_err("a single bad source must fail the whole activity");
+        let typed = err
+            .downcast_ref::<ReconciliationError>()
+            .expect("typed ReconciliationError");
+        assert!(
+            matches!(
+                typed,
+                ReconciliationError::ChildOutputNotFound { agent_id, .. } if *agent_id == bad_child_id
+            ),
+            "typed error must point at the bad child"
+        );
+
+        // Atomicity property: the good source's synthetic evidence
+        // record did NOT land on the parent (phase-1 pre-validation
+        // saw the bad source's miss before any phase-2 write fired).
+        let parent_view = AgentFs::open_for_agent(storage, graph_id, parent_agent_id);
+        let evs = parent_view
+            .list_recent_evidence(8)
+            .await
+            .expect("list parent evidence after partial-failure attempt");
+        assert!(
+            evs.is_empty(),
+            "atomicity: good_source must not have left a record after bad_source missed"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_children_impl_with_conflict_intent_returns_no_conflict_id_yet() {
+        // JAR2-82 stubs the conflict-record writer with a TODO + warn;
+        // JAR2-83 (5.6) fills it. Confirm the activity returns
+        // `conflict_id: None` even when `input.conflict.is_some()`.
+        use jarvis_node::agent_ref::AgentRef;
+        use jarvis_node::decision::{ConflictAlternative, ConflictRecordIntent};
+        use uuid::Uuid;
+
+        let storage: Arc<dyn jarvis_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
+        let graph_id = GraphId::new(Uuid::new_v4());
+        let parent_agent_id = AgentId::new(Uuid::new_v4());
+        let child_agent_id = AgentId::new(Uuid::new_v4());
+        let (child_wf, child_out, _ev) =
+            plant_child_output(storage.clone(), graph_id, child_agent_id, "single claim").await;
+
+        let conflict = ConflictRecordIntent {
+            alternatives: vec![
+                ConflictAlternative {
+                    source_child: AgentRef::new(child_wf.clone(), child_agent_id),
+                    source_output_id: child_out.clone(),
+                    claim: "value is X".into(),
+                },
+                ConflictAlternative {
+                    source_child: AgentRef::new(child_wf.clone(), child_agent_id),
+                    source_output_id: child_out.clone(),
+                    claim: "value is Y".into(),
+                },
+            ],
+            resolution: None,
+        };
+        let input = ReconcileChildrenInput {
+            parent_graph_id: graph_id,
+            parent_agent_id,
+            sources: vec![ReconcileSource {
+                child_ref: AgentRef::new(child_wf, child_agent_id),
+                output_id: child_out,
+            }],
+            conflict: Some(conflict),
+        };
+        let out = reconcile_children_impl(storage, input, fixed_now())
+            .await
+            .expect("reconcile with conflict intent ok");
+        assert_eq!(out.synthetic_evidence.len(), 1);
+        assert!(
+            out.conflict_id.is_none(),
+            "JAR2-82 returns conflict_id: None even when input.conflict is Some (JAR2-83 fills in writer)"
+        );
+    }
+
+    // ---- JAR2-82: ReconcileChildrenInput / Output wire-shape ----
+
+    #[test]
+    fn reconcile_children_input_round_trips_through_json_with_no_conflict() {
+        use jarvis_node::agent_ref::AgentRef;
+        use uuid::Uuid;
+        let i = ReconcileChildrenInput {
+            parent_graph_id: GraphId::new(Uuid::nil()),
+            parent_agent_id: AgentId::new(Uuid::nil()),
+            sources: vec![ReconcileSource {
+                child_ref: AgentRef::new("graphs/g/agents/c", AgentId::new(Uuid::nil())),
+                output_id: OutputId::from_hex("ab".repeat(32)),
+            }],
+            conflict: None,
+        };
+        let s = serde_json::to_string(&i).unwrap();
+        let back: ReconcileChildrenInput = serde_json::from_str(&s).unwrap();
+        assert_eq!(i, back);
+        // `skip_serializing_if` keeps the wire lean when conflict is None.
+        assert!(!s.contains("conflict"), "wire shape: {s}");
+    }
+
+    #[test]
+    fn reconcile_children_output_round_trips_through_json() {
+        let o = ReconcileChildrenOutput {
+            synthetic_evidence: vec![EvidenceId::new(
+                "reconcile",
+                &json!({"k": "v"}),
+                &json!({"r": 1}),
+            )],
+            conflict_id: None,
+        };
+        let s = serde_json::to_string(&o).unwrap();
+        let back: ReconcileChildrenOutput = serde_json::from_str(&s).unwrap();
+        assert_eq!(o, back);
+        assert!(!s.contains("conflict_id"), "wire shape: {s}");
     }
 }

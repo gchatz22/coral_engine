@@ -92,9 +92,10 @@ use temporalio_sdk::{
 
 use crate::activities::{
     AgentActivities, AppendDecisionLogInput, ApplyFsOpsInput, AssembleContextInput, DecideInput,
-    ExecuteToolInput, PersistOutputInput, PersistRetirementInput, RegisterChildInStructuralDbInput,
-    ToolCallFailure, ToolCallOutcome,
+    ExecuteToolInput, PersistOutputInput, PersistRetirementInput, ReconcileChildrenInput,
+    RegisterChildInStructuralDbInput, ToolCallFailure, ToolCallOutcome,
 };
+use jarvis_node::decision::{ConflictRecordIntent, ReconcileSource};
 
 /// Resolved agent configuration handed to the workflow at start.
 ///
@@ -775,10 +776,28 @@ impl AgentWorkflow {
                 } => {
                     spawn_child(ctx, &input, agent_name, mandate).await?;
                 }
-                Decision::ReconcileChildren { .. }
-                | Decision::RetireChild { .. }
-                | Decision::ReplaceChild { .. } => unimplemented!(
-                    "stage 5.5/5.7: workflow-side dispatch for reconcile/retire/replace \
+                // JAR2-82 (stage 5.5): reconcile_children wired here.
+                // The activity reads each cited child output and
+                // writes one synthetic evidence record per source
+                // into the parent's `evidence/` directory. The
+                // parent's next-tick `assemble_context` picks the
+                // synthetic records up via the existing
+                // `list_recent_evidence` window (Stage 5 Project
+                // decision 3 + JAR2-82 advisor item 4 — no
+                // workflow-state slot).
+                //
+                // On the typed not-found failure mode, the activity
+                // returns a non-retryable `ApplicationFailure` and
+                // we stage a `CorrectionContext` so the next tick's
+                // LLM sees the failure (mirrors the existing
+                // tool-failure correction-context path in
+                // `dispatch_call_tools`). `staged_correction` clears
+                // on the next non-failing tick.
+                Decision::ReconcileChildren { sources, conflict } => {
+                    reconcile_children(ctx, &input, sources, conflict).await;
+                }
+                Decision::RetireChild { .. } | Decision::ReplaceChild { .. } => unimplemented!(
+                    "stage 5.7: workflow-side dispatch for retire/replace \
                      is not yet wired — see Stage 5 Project decisions 4 and 11"
                 ),
             }
@@ -1406,6 +1425,79 @@ async fn spawn_child(
             .push(AgentRef::new(child_workflow_id, child_agent_id));
     });
     Ok(())
+}
+
+/// JAR2-82 (stage 5.5): the `Decision::ReconcileChildren` workflow arm
+/// body.
+///
+/// Calls the `reconcile_children` activity (which opens the parent's
+/// FS + each child's FS read-only, writes one synthetic evidence
+/// record per source into the parent's `evidence/`, and returns the
+/// freshly-minted `EvidenceId`s). The synthetic records flow into
+/// the parent's next-tick `assemble_context` bundle via the existing
+/// `list_recent_evidence` window — no workflow-state slot is needed
+/// (Stage 5 Project decision 3 + JAR2-82 advisor item 4).
+///
+/// Errors do NOT propagate via `?` — that would fail the whole
+/// workflow on a single bad source. Instead the typed activity
+/// failure is folded into a `CorrectionContext` staged for the next
+/// tick, mirroring the existing `Decision::CallTools` tool-failure
+/// flow in `dispatch_call_tools`. Success clears any previously-
+/// staged correction (a successful reconcile is itself a satisfiable
+/// decision).
+///
+/// Returns `()`: there is no value for the workflow body to consume.
+async fn reconcile_children(
+    ctx: &WorkflowContext<AgentWorkflow>,
+    input: &AgentInput,
+    sources: Vec<ReconcileSource>,
+    conflict: Option<ConflictRecordIntent>,
+) {
+    let activity_input = ReconcileChildrenInput {
+        parent_graph_id: input.graph_id,
+        parent_agent_id: input.agent_id,
+        sources,
+        conflict,
+    };
+    match ctx
+        .start_activity(
+            AgentActivities::reconcile_children,
+            activity_input,
+            activity_opts(),
+        )
+        .await
+    {
+        Ok(_out) => {
+            // No workflow-state mutation: the synthetic evidence
+            // records land on the parent's FS and surface naturally
+            // on the next tick via `list_recent_evidence`. Clear any
+            // previously-staged correction so a successful reconcile
+            // doesn't carry a stale tool-failure description
+            // forward.
+            ctx.state_mut(clear_correction);
+        }
+        Err(failure) => {
+            // The activity returned an `ApplicationFailure`
+            // carrying either a typed `ReconciliationError` (non-
+            // retryable, structural — e.g. the cited child output
+            // doesn't resolve) or a wrapped transient error
+            // (retryable, e.g. a storage blip Temporal already
+            // exhausted retries for). Either way we stage a
+            // `CorrectionContext` so the next tick's LLM sees the
+            // failure and emits a satisfiable replacement decision
+            // (drop the bad source, retry with a different one).
+            //
+            // We render a short prefix + the SDK Failure's debug
+            // form. Reaching into the proto for the application-
+            // failure `message` field would give a cleaner string,
+            // but the typed error message is preserved in the debug
+            // form too and the LLM can parse either — keep the
+            // workflow body small.
+            let correction =
+                CorrectionContext::new(format!("reconcile: activity failed: {failure:?}"));
+            ctx.state_mut(|s| s.staged_correction = Some(correction));
+        }
+    }
 }
 
 /// Render the staged correction text for a tool-batch failure. Mirrors

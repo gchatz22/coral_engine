@@ -87,6 +87,11 @@ uuid = { version = "1", default-features = false, features = ["serde", "std", "v
 # `jarvis_temporal` free of a `jarvis_graph` dep, which would otherwise
 # cycle). Pre-JAR2-80 `async-trait` was a dev-only dep; promoted here.
 async-trait = "0.1"
+# JAR2-82 — `ReconciliationError` in `activities.rs` is `thiserror`-
+# derived so the typed errors hit `ApplicationFailure::non_retryable`
+# via `anyhow::Error::new` (which requires `StdError + Send + Sync`).
+# Mirrors `jarvis_node`'s `FsError` shape — same crate, same usage.
+thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
