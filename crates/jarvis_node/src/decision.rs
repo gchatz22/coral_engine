@@ -28,6 +28,7 @@ use crate::trigger::Trigger;
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::fmt;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -164,6 +165,45 @@ pub struct ConflictAlternative {
 pub struct ConflictResolution {
     pub chosen_alternative_idx: usize,
     pub reasoning: String,
+}
+
+/// JAR2-82 (stage 5.5): content-addressed id of a persisted conflict
+/// record (`<agent_root>/conflicts/<id>.json`, schema lands in 5.6).
+///
+/// Carried on [`ReconcileChildrenOutput`](crate::decision) so the
+/// `reconcile_children` activity can return the id of the conflict
+/// record it just wrote. **This ticket (5.5) always returns `None`** —
+/// the actual writer + the canonical-form bytes the id hashes over land
+/// in JAR2-83 (5.6). The type is defined here today so 5.6 doesn't
+/// have to rev the activity's output shape on its way in.
+///
+/// Mirrors the [`OutputId`] / [`EvidenceId`] precedent: transparent
+/// serde so the on-disk filename and wire form are the underlying hex
+/// digits, `Display` for log/trace formatting, `from_hex` for
+/// deserialization-path construction.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ConflictId(String);
+
+impl ConflictId {
+    /// Wrap a pre-computed hex string. Trusts the caller; the actual
+    /// canonicalization-and-hash constructor (`ConflictId::new` over
+    /// the persisted conflict record) lands in JAR2-83 alongside the
+    /// writer.
+    pub fn from_hex(hex: impl Into<String>) -> Self {
+        ConflictId(hex.into())
+    }
+
+    /// Borrow the hex digits.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ConflictId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// One element of a `Decision::CallTools`. `claim_seed` is an opaque
@@ -749,6 +789,21 @@ mod tests {
         let back: ConflictResolution = serde_json::from_str(&s).unwrap();
         assert_eq!(r, back);
         assert!(s.contains("\"chosen_alternative_idx\":3"));
+    }
+
+    // ---- JAR2-82 (stage 5.5): ConflictId surface ----
+
+    #[test]
+    fn conflict_id_is_transparent_serde() {
+        let id = ConflictId::from_hex("ab".repeat(32));
+        let s = serde_json::to_string(&id).unwrap();
+        // Transparent: serializes as the bare hex string with quotes.
+        assert!(s.starts_with('"') && s.ends_with('"'));
+        let back: ConflictId = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, id);
+        // Display + as_str round-trip the hex digits verbatim.
+        assert_eq!(id.to_string(), "ab".repeat(32));
+        assert_eq!(id.as_str(), "ab".repeat(32));
     }
 
     #[test]

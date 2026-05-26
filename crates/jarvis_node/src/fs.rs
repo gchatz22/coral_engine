@@ -164,9 +164,10 @@
 //!   over to `AgentStorage` is a follow-up — out of scope for stage
 //!   2.5.3 per the "smallest correct diff" rule.
 
+use crate::agent_ref::{AgentId, GraphId};
 use crate::decision::FsOp;
 use crate::evidence::{EvidenceId, EvidenceRecord};
-use crate::mandate::{Mandate, Output};
+use crate::mandate::{Mandate, Output, OutputId};
 use crate::storage::{AgentStorage, LocalStorage, PutOutcome};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -235,6 +236,15 @@ pub enum FsError {
     /// `persist_output` referenced an evidence id with no record on disk.
     #[error("output rejected: evidence {0} not found on disk")]
     EvidenceNotFound(EvidenceId),
+    /// [`AgentFs::read_output`] could not resolve the requested
+    /// `OutputId` on disk. Surfaced as a typed error so the JAR2-82
+    /// `reconcile_children` activity can wrap it as
+    /// `ReconciliationError::ChildOutputNotFound` and the parent
+    /// workflow body's correction-context path can stage a satisfiable
+    /// failure description for the next tick (mirroring how
+    /// `EvidenceNotFound` propagates through `persist_output`).
+    #[error("output {0} not found on disk")]
+    OutputNotFound(OutputId),
     /// An `FsOp` path contained `..`, an absolute root, or a Windows
     /// prefix — anything that could escape the agent's root.
     #[error("path traversal rejected: {0}")]
@@ -495,6 +505,33 @@ impl AgentFs {
             prefix.push('/');
         }
         Self { storage, prefix }
+    }
+
+    /// JAR2-82 (stage 5.5): build an `AgentFs` scoped to an arbitrary
+    /// agent's `graphs/<graph_id>/agents/<agent_id>/` prefix on the
+    /// supplied storage backend. Cross-agent reads (the parent's
+    /// `reconcile_children` activity reading a child's
+    /// `outputs/<id>.json`) flow through this constructor.
+    ///
+    /// **Strictly an `attach` wrapper** — no `mandate.json` read, no
+    /// tail-index reconcile. Both load-bearing for the cross-agent
+    /// case: the caller doesn't have the *other* agent's `Mandate` in
+    /// scope (it lives only on that agent's workflow input), and the
+    /// reconcile-target reads are point lookups (`storage.get` against
+    /// a known `OutputId`), not list/window reads that would care about
+    /// the tail's freshness.
+    ///
+    /// Mirrors `crate::workflow::FsHandle::for_agent`'s prefix scheme
+    /// (Stage 5 Project decision 6 — flat `graphs/<gid>/agents/<aid>`
+    /// id form) so a future schema bump touches one call site rather
+    /// than every spawn / reconcile / retire helper.
+    pub fn open_for_agent(
+        storage: Arc<dyn AgentStorage>,
+        graph_id: GraphId,
+        agent_id: AgentId,
+    ) -> Self {
+        let prefix = format!("graphs/{}/agents/{}/", graph_id, agent_id);
+        Self::attach(storage, prefix)
     }
 
     /// Reconcile a tail object against the on-disk reality under its
@@ -781,6 +818,35 @@ impl AgentFs {
         let prefix = self.key("outputs/");
         self.read_recent_window_with_tail::<Output>(&prefix, OUTPUTS_TAIL_SUFFIX, n, false)
             .await
+    }
+
+    /// JAR2-82 (stage 5.5): point lookup of one persisted [`Output`] by
+    /// its content-addressed [`OutputId`].
+    ///
+    /// Returns `Err(FsError::OutputNotFound(id))` when the file is
+    /// absent — the typed-error variant lets the
+    /// `reconcile_children` activity wrap the miss as
+    /// `ReconciliationError::ChildOutputNotFound` (which the parent
+    /// workflow body folds into a `CorrectionContext` for the next
+    /// tick) without losing the original id.
+    ///
+    /// Read-only by construction: a `storage.get` against
+    /// `<prefix>outputs/<id>.json` plus a serde decode. No tail-index
+    /// update, no mandate write. Composes safely with
+    /// [`AgentFs::open_for_agent`] for the cross-agent reconcile path
+    /// where the caller never opens the *other* agent's FS via
+    /// `new_with_storage`.
+    pub async fn read_output(&self, id: &OutputId) -> anyhow::Result<Output> {
+        let key = self.key(&format!("outputs/{}.json", id));
+        let got = self
+            .storage
+            .get(&key)
+            .await
+            .map_err(|e| FsError::storage(&key, e))?;
+        match got {
+            Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            None => Err(FsError::OutputNotFound(id.clone()).into()),
+        }
     }
 
     /// Return the most recent (up to) `n` `EvidenceRecord`s on disk.
@@ -1341,6 +1407,105 @@ mod tests {
         let back: Output = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, out);
         assert!(back.evidence.contains(&id));
+    }
+
+    // ---- JAR2-82 (stage 5.5): read_output + open_for_agent ----
+
+    #[tokio::test]
+    async fn read_output_returns_persisted_output_by_id() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        let rec = record("echo", json!({"q": "k"}), json!({"r": "v"}));
+        let ev = fs.record_evidence(rec).await.unwrap();
+        let out = fs.persist_output("the claim", &[ev.clone()]).await.unwrap();
+
+        let back = fs.read_output(&out.id).await.unwrap();
+        assert_eq!(back, out, "read_output must return the persisted Output");
+        assert_eq!(back.evidence, vec![ev]);
+    }
+
+    #[tokio::test]
+    async fn read_output_returns_typed_error_for_missing_id() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        let ev = EvidenceId::from_hex("0".repeat(64));
+        // Manufacture an OutputId for content we never persisted.
+        let bogus = OutputId::new("never-written", &[ev]);
+        let err = fs
+            .read_output(&bogus)
+            .await
+            .expect_err("missing output must error");
+        let typed = err.downcast_ref::<FsError>().expect("typed FsError");
+        match typed {
+            FsError::OutputNotFound(id) => assert_eq!(id, &bogus),
+            other => panic!("expected OutputNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn open_for_agent_scopes_storage_to_workflow_id_prefix() {
+        use crate::agent_ref::{AgentId, GraphId};
+        use crate::storage::MemoryStorage;
+        use uuid::Uuid;
+
+        let storage: Arc<dyn AgentStorage> = Arc::new(MemoryStorage::new());
+        let graph_id =
+            GraphId::new(Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap());
+        let agent_id =
+            AgentId::new(Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap());
+        let fs = AgentFs::open_for_agent(storage.clone(), graph_id, agent_id);
+        assert_eq!(
+            fs.prefix(),
+            "graphs/11111111-2222-3333-4444-555555555555/agents/66666666-7777-8888-9999-aaaaaaaaaaaa/",
+            "prefix must match the flat workflow-id scheme",
+        );
+
+        // Sanity: writing evidence under this prefix and reading it
+        // back works (cross-agent reads in 5.5 use exactly this shape).
+        let rec = record("echo", json!({"x": 1}), json!({"y": 2}));
+        let id = fs.record_evidence(rec.clone()).await.unwrap();
+        let key = format!(
+            "graphs/{}/agents/{}/evidence/{}.json",
+            graph_id, agent_id, id,
+        );
+        assert!(
+            storage.get(&key).await.unwrap().is_some(),
+            "evidence must land at the prefixed key",
+        );
+    }
+
+    #[tokio::test]
+    async fn open_for_agent_supports_cross_agent_output_read() {
+        // Models the JAR2-82 reconcile path: a parent's FS scoped to
+        // its own prefix opens a child's FS over the *same* storage
+        // backend (different prefix) and reads the child's output.
+        use crate::agent_ref::{AgentId, GraphId};
+        use crate::storage::MemoryStorage;
+        use uuid::Uuid;
+
+        let storage: Arc<dyn AgentStorage> = Arc::new(MemoryStorage::new());
+        let graph_id = GraphId::new(Uuid::new_v4());
+        let child_agent_id = AgentId::new(Uuid::new_v4());
+
+        // Child writes an output via its own FS (mandate present).
+        let child_mandate = Mandate::new("child", Duration::from_millis(100), None);
+        let child_prefix = format!("graphs/{}/agents/{}/", graph_id, child_agent_id);
+        let child_fs = AgentFs::new_with_storage(storage.clone(), &child_prefix, &child_mandate)
+            .await
+            .unwrap();
+        let ev = child_fs
+            .record_evidence(record("echo", json!({"q": "child"}), json!({"r": 1})))
+            .await
+            .unwrap();
+        let child_out = child_fs
+            .persist_output("child's claim", &[ev])
+            .await
+            .unwrap();
+
+        // Parent uses `open_for_agent` (no mandate) to read the
+        // child's output by id — exactly the surface the 5.5 activity
+        // exercises.
+        let parent_view = AgentFs::open_for_agent(storage, graph_id, child_agent_id);
+        let read_back = parent_view.read_output(&child_out.id).await.unwrap();
+        assert_eq!(read_back, child_out);
     }
 
     #[tokio::test]
