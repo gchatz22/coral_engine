@@ -177,8 +177,10 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+    use crate::agent_ref::{AgentId, AgentRef};
     use crate::mandate::OutputId;
-    use crate::trigger::{AgentRef, HumanOp, Trigger};
+    use crate::trigger::{HumanOp, Trigger};
+    use uuid::Uuid;
 
     fn ext(kind: &str) -> Trigger {
         Trigger::External {
@@ -194,10 +196,14 @@ mod tests {
     }
 
     fn child_ref(name: &str) -> AgentRef {
-        AgentRef {
-            agent_id: name.into(),
-            workflow_id: format!("graphs/g/agents/{name}"),
-        }
+        // Deterministic UUID derived from the name's first byte so the
+        // test fixture is stable across runs without pulling in
+        // `uuid/v5`. The two existing call sites pass distinct names
+        // ("alpha", "beta"), so distinct UUIDs land.
+        let mut bytes = [0u8; 16];
+        bytes[0] = name.as_bytes().first().copied().unwrap_or(0);
+        let uuid = Uuid::from_bytes(bytes);
+        AgentRef::new(format!("graphs/g/agents/{name}"), AgentId::new(uuid))
     }
 
     fn child_output(name: &str) -> Trigger {

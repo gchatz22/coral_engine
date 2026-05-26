@@ -46,7 +46,7 @@ Each row maps to a primitive `scratch/agent_runtime.md` § 4 lists. "Worked" mea
 | `start_child_workflow` with `parent_close_policy=Abandon` | **WORKED** | `ChildWorkflowOptions { parent_close_policy: ParentClosePolicy::Abandon, .. }` lines 214–219; `ctx.child_workflow(...)` line 222 | Path lives at `temporalio_common::protos::temporal::api::enums::v1::ParentClosePolicy::Abandon` — a deep proto-derived path that's awkward to type but it's the real one (verified by reading `crates/sdk/src/workflow_context/options.rs` v0.4.0 line 21). The smoke deliberately does NOT `.result().await` the child, letting the parent return while the child keeps running — that's the whole point of `Abandon`. Stage 5's parent–child topology can use this directly. |
 | `continue_as_new` (`ctx.continue_as_new(&carryover, opts)`) | **WORKED** | `ContinueAsNewSmokeWorkflow` line 291; `ctx.continue_as_new(&(current + 1, max), ContinueAsNewOptions::default())` line 302 | API returns `Err(WorkflowTermination::continue_as_new(...))` — calling it terminates the current run, the SDK schedules a fresh run with the new carryover. The smoke iterates current→max with `max=3` and verifies the final return value. **For stage 3.11**: the trigger should be `ctx.continue_as_new_suggested()` (or `ctx.history_length()`), which the SDK exposes — not a turn-count heuristic. Both are visible on `WorkflowContext` per `workflow_context.rs` lines 618 and 650. |
 | Dynamic activity registration (one activity routing arbitrary tool names) | **MISSING** | `tool_echo` + `tool_reverse` lines 98–117 as the static workaround | **No `#[activity(dynamic = true)]`, no `register_activity_by_name`, no `unknown_activity_handler` on `WorkerOptions`.** Verified by reading `crates/sdk/src/activities.rs` v0.4.0 lines 353–420 — only `ActivityImplementer` (compile-time) and `register_activity[ies]` are exposed. The Go/Python SDKs have dynamic dispatch; Rust does not. **Stage 3.7's `execute_tool` design depends on this.** Workarounds, in order of preference: (a) register every known tool by name at build time — works for a closed set of MCP tools, doesn't work for dynamically-loaded tools; (b) one `execute_tool` activity that takes `(tool_name: String, args: serde_json::Value)` and does its own dispatch inside the activity body — loses Temporal's per-activity-type retry config but keeps stage 3.7's shape; (c) upstream contribution to add dynamic registration. Option (b) is the realistic stage 3.7 path until (c) lands; the smoke doc records this as a **blocker on the original stage 3.7 design**, not on Temporal itself. |
-| `signal_external_workflow` (parent ← child output signaling, stage 5.4) | **NOT EXERCISED** | — | The SDK exposes `ExternalWorkflowHandle` and `WorkflowContext::external_workflow(...)` (verified by reading `workflow_context.rs` lines 799–813). The primitive exists; the smoke didn't exercise it because stage 5 is far enough out that "the API surface is there" is a sufficient finding. Stage 5.4 should re-verify with an integration test. |
+| `signal_external_workflow` (parent ← child output signaling, stage 5.4) | **WORKED-WITH-CAVEATS** | `crates/jarvis_temporal/src/workflow.rs::signal_parent_child_output` — child's `Decision::EmitOutput` arm fires through this | **Stage 5.4 / JAR2-81 exercised this end-to-end against `temporal server start-dev`** via `crates/jarvis_temporal/tests/child_parent_signal.rs` (happy path + parent-unreachable failure path). The API surface differs from what the JAR2-41 row above assumed: there is **no single `ctx.signal_external_workflow(workflow_id, signal_name, payload)` method**. The real shape is the two-step typed chain documented in row 8 of § 3 below. The signal-name string therefore can't be threaded through dynamically — it's bound at compile time via the `SignalDefinition` marker the `#[signal]` macro generates. |
 
 ---
 
@@ -98,6 +98,26 @@ The SDK pins `tokio = "1.47"`. Our `jarvis_node` uses tokio with semver-compatib
 
 The SDK is `edition = "2024"`. Our workspace pins Rust 1.88 (per `rust-toolchain.toml`), which supports edition 2024 (stabilized in 1.85), so this is a non-issue today. Calling it out so future-us doesn't trip on it if anyone tries to lower the MSRV.
 
+### 3.10 `signal_external_workflow` is a two-step typed chain (JAR2-81 finding)
+
+The JAR2-41 smoke verified `ExternalWorkflowHandle` and `WorkflowContext::external_workflow(...)` exist (row 8 of § 2). Stage 5.4 / JAR2-81 was the first live exercise — that work surfaced a real API divergence from what § 5 stage 5.4 of `scratch/temporal_staged_plan.md` and the JAR2-81 ticket pseudocode assumed.
+
+**There is no `ctx.signal_external_workflow(workflow_id, signal_name, payload).await` method.** The actual call shape, verified by reading `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/temporalio-sdk-0.4.0/src/workflow_context.rs:799-810` (the `external_workflow` constructor) and `.../src/workflow_context.rs:2007-2030` (`ExternalWorkflowHandle::signal`), is:
+
+```rust
+ctx.external_workflow(workflow_id, run_id)            // -> ExternalWorkflowHandle
+   .signal(MyWorkflow::external_signal, payload)      // SignalDef: SignalDefinition
+   .await                                              // -> Result<SignalExternalOk, Failure>
+```
+
+Two consequences:
+
+1. **The signal name is bound at compile time** via the `SignalDefinition` marker the `#[signal]` macro generates (e.g. `AgentWorkflow::external_signal` is the const auto-generated from the `#[signal] fn external_signal(...)` method). There is no `handle.signal_by_name(&str, payload)` path; the macro-emitted const is the only way to address the signal. **Implication for `ParentRef.signal: String`** (`crates/jarvis_temporal/src/workflow.rs`): it's informational in v1 — the workflow body ignores it because the dispatch target is the compile-time `AgentWorkflow::external_signal` marker regardless. The field stays on the wire for future non-`AgentWorkflow` targets that would use a different `SignalDefinition`.
+
+2. **The result is `Result<SignalExternalOk, Failure>`** (`SignalExternalWfResult` in `temporalio-sdk-0.4.0/src/lib.rs:1049`). A failed signal-to-nonexistent-workflow surfaces as `Err(Failure)` after server acknowledgment — JAR2-81's failure-mode live test (`crates/jarvis_temporal/tests/child_parent_signal.rs::child_continues_normally_when_parent_signal_fails`) confirms this: the child's `signal(...)` call returns `Err`, the `signal_parent_child_output` helper in `workflow.rs` logs + continues per Stage 5 Project decision 10, and the child completes normally.
+
+**No upstream issue filed** — the divergence is doc-only (the SDK works as designed; the assumed name was speculative in the smoke + ticket text). If a future ticket needs name-keyed dispatch against a workflow type that isn't statically importable from inside the worker crate, that's the upstream filing trigger; today every signal target is `AgentWorkflow`, which is in scope.
+
 ---
 
 ## 4. What the smoke does NOT cover
@@ -105,7 +125,7 @@ The SDK is `edition = "2024"`. Our workspace pins Rust 1.88 (per `rust-toolchain
 Out-of-scope on purpose; recording so stage 3+ knows what to add to its own integration tests.
 
 - **Authentication / TLS** — local plaintext only. Production deployments will need `temporalio_client::ConnectionOptions::tls(...)`.
-- **`signal_external_workflow`** — exists in the API, not exercised by this smoke (stage 5 territory).
+- **`signal_external_workflow`** — exists in the API and was first exercised end-to-end by Stage 5.4 (JAR2-81); see § 2 row 8 and § 3.10 above.
 - **Update handlers** (`#[update]` + `WorkflowExecuteUpdateOptions`) — exists, used by the upstream `message_passing` example, not in scope for the agent-runtime primitive list.
 - **Query handlers** (`#[query]`) — exists, not in scope for stage 0.
 - **Local activities** (`start_local_activity`) — exists, may be useful for stage 3.5/3.6 (cheap activities that don't need a full activity worker round-trip), out of scope here.

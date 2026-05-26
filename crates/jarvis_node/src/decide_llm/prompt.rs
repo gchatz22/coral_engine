@@ -281,15 +281,17 @@ mod tests {
     //!   `crate::evidence`); identical inputs always produce identical ids.
 
     use super::*;
+    use crate::agent_ref::{AgentId, AgentRef};
     use crate::decision::{ContextBundle, CorrectionContext};
     use crate::evidence::{EvidenceId, EvidenceRecord};
     use crate::mandate::OutputId;
     use crate::mandate::{Mandate, Output};
     use crate::model_client::{ContentBlock, Role};
-    use crate::trigger::{AgentRef, HumanOp, Trigger};
+    use crate::trigger::{HumanOp, Trigger};
     use chrono::{DateTime, Utc};
     use serde_json::json;
     use std::time::Duration;
+    use uuid::Uuid;
 
     fn ts() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-05-06T12:00:00Z")
@@ -531,10 +533,10 @@ mod tests {
     // ---- JAR2-79: cross-agent trigger rendering ------------------------
 
     fn child_ref() -> AgentRef {
-        AgentRef {
-            agent_id: "agent-7".into(),
-            workflow_id: "graphs/g/agents/agent-7".into(),
-        }
+        AgentRef::new(
+            "graphs/g/agents/agent-7",
+            AgentId::new(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()),
+        )
     }
 
     /// Snapshot: a `ChildOutput` trigger renders as a human-readable

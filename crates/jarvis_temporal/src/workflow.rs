@@ -997,18 +997,61 @@ async fn emit_output(
     content: String,
     evidence: Vec<jarvis_node::evidence::EvidenceId>,
 ) -> WorkflowResult<()> {
-    ctx.start_activity(
-        AgentActivities::persist_output,
-        PersistOutputInput {
-            cfg: input.cfg.clone(),
-            fs_handle: input.fs_handle.clone(),
-            content,
-            evidence,
-        },
-        activity_opts(),
-    )
-    .await?;
+    let output_id = ctx
+        .start_activity(
+            AgentActivities::persist_output,
+            PersistOutputInput {
+                cfg: input.cfg.clone(),
+                fs_handle: input.fs_handle.clone(),
+                content,
+                evidence,
+            },
+            activity_opts(),
+        )
+        .await?;
+    if let Some(parent) = &input.parent_handle {
+        signal_parent_child_output(ctx, input, parent, output_id).await;
+    }
     Ok(())
+}
+
+/// Build a `Trigger::ChildOutput` payload and fire it at the parent
+/// workflow via the SDK's `ExternalWorkflowHandle::signal`. Errors are
+/// logged + swallowed per Stage 5 Project decision 10.
+///
+/// Free function so the `emit_output` happy path stays compact and
+/// the err arm is the only place `tracing::warn!` is emitted on this
+/// edge.
+async fn signal_parent_child_output(
+    ctx: &WorkflowContext<AgentWorkflow>,
+    input: &AgentInput,
+    parent: &ParentRef,
+    output_id: OutputId,
+) {
+    let trigger = Trigger::ChildOutput {
+        child_ref: AgentRef::new(ctx.workflow_id().to_string(), input.agent_id),
+        agent_name: input.agent_name.clone(),
+        output_id,
+    };
+    // SDK two-step: handle = external_workflow(workflow_id, run_id),
+    // then handle.signal(SignalDef, payload). `run_id = None` targets
+    // the latest run (the parent's currently-active execution).
+    let result = ctx
+        .external_workflow(parent.workflow_id.clone(), None)
+        .signal(AgentWorkflow::external_signal, trigger)
+        .await;
+    if let Err(failure) = result {
+        // `failure` is `temporalio_common::protos::temporal::api::failure::v1::Failure`;
+        // its `Display` impl is `Debug`-shaped via `derive_more::Debug`,
+        // sufficient for the warn surface. Stage 6 observability will
+        // route this to a typed signal-failure log; v1 leaves the
+        // tracing line as the operator-visible surface.
+        tracing::warn!(
+            parent_workflow_id = %parent.workflow_id,
+            error = ?failure,
+            "signal_external_workflow to parent failed; child continuing per Stage 5 decision 10"
+        );
+    }
 }
 
 /// Invoke the `apply_fs_ops` activity for a `Decision::RewriteFs`.
