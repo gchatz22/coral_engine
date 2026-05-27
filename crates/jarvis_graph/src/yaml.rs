@@ -1,31 +1,34 @@
-//! `graph.yaml` schema types + parser + validator (Stage 4.1, JAR2-72).
+//! `graph.yaml` schema types + parser + validator (Stage 4.1, JAR2-72;
+//! Stage 5.8 multi-agent extension, JAR2-85).
 //!
 //! Operator-facing surface for "the graph is the program" (VISION.md § 4).
-//! Source of truth for the v1 strawman: `scratch/graph_yaml_schema.md` § 2.
-//! Scope narrowings for v1 are locked in <JAR2-71>; this module enforces
-//! them at parse + validate time so the downstream `jarvis apply` binary
-//! (JAR2-73) can rely on the typed value being well-formed.
+//! Source of truth: `scratch/graph_yaml_schema.md` § 2 (single-agent
+//! shape) and § 3 (multi-agent hierarchical strawman). JAR2-85 extends
+//! the JAR2-72 parser with the hierarchical `children:` form, top-level
+//! `defaults:` inheritance, `policy:` pass-through, and seed targeting
+//! by any agent in the tree.
 //!
 //! ## Public surface
 //!
 //! - [`parse_graph_yaml`] — `&str` → [`GraphYaml`], with source-located
 //!   errors (`line:col`) via `serde_yaml::Error::location()`.
-//! - [`validate`] — enforces the v1 narrowings the type system cannot
-//!   reject on its own (single agent, `kind: builtin` only,
-//!   `apiVersion` + `kind` exact-match, URL-path-safe names, tool-ref
-//!   resolution).
-//! - [`GraphYamlError`] — the unified error surface. JAR2-73 reads from
-//!   this; today's `Display` impl is also CLI-suitable.
+//! - [`validate`] — enforces invariants the type system cannot reject
+//!   on its own (`apiVersion` + `kind` exact-match, URL-path-safe names,
+//!   tool-ref resolution, agent-id uniqueness across the tree,
+//!   seed.triggers[].agent resolves to some agent in the tree).
+//! - [`GraphYamlError`] — the unified error surface.
+//! - [`is_multi_agent`] — apply-binary helper to dispatch between the
+//!   single-agent and multi-agent walkers (today both walkers are the
+//!   same code; the helper exists so the operator-visible single-agent
+//!   path can stay byte-identically named).
 //!
 //! ## What this module deliberately does NOT do
 //!
-//! - DB writes / Temporal workflow instantiation — JAR2-73's binary.
-//! - Conversion into `jarvis_node::Mandate` / structural-DB rows —
-//!   JAR2-73; intentionally not coupled to `jarvis_node` here (the
-//!   workspace dep graph stays clean).
-//! - Multi-agent topology, `defaults:`, `policy:`, `scripted_decisions:`,
-//!   `mandate.from_file:`, `kind: mcp` — all explicitly rejected in
-//!   [`validate`]; deferred to later stages per <JAR2-71>.
+//! - DB writes / Temporal workflow instantiation — `jarvis-apply` binary.
+//! - `policy:` enforcement — pass-through only; stored as
+//!   `graphs.metadata` jsonb. Post-Stage-8.
+//! - Flat `parent:`-ref YAML form — Project decision 12; hierarchical
+//!   only at v1.
 //!
 //! ## `kind: mcp` rejection — explicit parse + validator branch
 //!
@@ -33,36 +36,35 @@
 //! both `Builtin` and `Mcp` variants present even though `Mcp` is rejected
 //! at validation. This lets us emit the targeted error message
 //! ("MCP-in-worker is JAR2-63's flagged follow-up") instead of serde's
-//! generic "unknown variant `mcp`" — the ticket's parent makes that hint
-//! a requirement, not a nice-to-have.
-//!
-//! ## Unknown fields = hard error
-//!
-//! Every struct uses `#[serde(deny_unknown_fields)]`. This is the
-//! lowest-cost way to reject `children:`, `defaults:`, `policy:`,
-//! `scripted_decisions:`, `mandate.from_file:` with serde_yaml-supplied
-//! `line:col` and a "unknown field … expected one of …" message —
-//! without polluting the structs with placeholder fields just to flag
-//! them.
+//! generic "unknown variant `mcp`".
 //!
 //! ## Names: strict validate, do not normalize
 //!
-//! `metadata.name` and `agents[0].id` must already match
-//! `^[a-z0-9][a-z0-9-]*[a-z0-9]$` (or be a single `[a-z0-9]` char). We
-//! reject uppercase rather than lowercasing on read — gives JAR2-73 a
-//! single canonical representation to derive the workflow ID
-//! (`graphs/<metadata.name>/agents/<agents[0].id>`) from verbatim, and
-//! avoids the round-trip ambiguity ("what does `metadata.name: Foo`
-//! become?") that normalization would introduce.
+//! `metadata.name` and every `agents[].id` (at any nesting level) must
+//! match `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`. We reject uppercase rather
+//! than lowercasing on read, so the structural-DB row stores exactly
+//! what the operator wrote and the workflow-id derivation has one
+//! canonical input.
+//!
+//! ## JAR2-89 (subsumed by JAR2-85): UUIDs from `GraphStore`, not
+//!   synthetic
+//!
+//! `into_agent_input` no longer mints synthetic UUIDs. The apply binary
+//! calls `GraphStore::create_from_yaml` first, which returns an
+//! [`AppliedGraph`] carrying the freshly-allocated `(graph_id, agent_id)`
+//! pairs in parents-first DFS order. The walker then builds each
+//! `AgentInput` against the real UUIDs so `AgentInput.agent_id` matches
+//! `agents.id` — required by Stage 5.5's cross-agent FS reads, which
+//! look agents up by UUID.
 
 use jarvis_node::agent_ref::{AgentId, GraphId};
 use jarvis_node::mandate::Mandate as NodeMandate;
 use jarvis_node::trigger::Trigger as NodeTrigger;
-use jarvis_temporal::workflow::{agent_workflow_id, AgentConfig, AgentInput, FsHandle};
+use jarvis_temporal::workflow::{build_child_input, build_root_input, AgentConfig, AgentInput};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::time::Duration;
-use uuid::Uuid;
 
 /// The exact `apiVersion` literal v1 accepts. Bump only when the schema
 /// breaks.
@@ -72,12 +74,17 @@ pub const API_VERSION: &str = "jarvis.engine/v1alpha1";
 pub const KIND: &str = "Graph";
 
 /// Top-level document type for `graph.yaml`. Read
-/// `scratch/graph_yaml_schema.md` § 2 for the strawman this mirrors.
+/// `scratch/graph_yaml_schema.md` § 2 (single-agent) and § 3 (multi-
+/// agent hierarchical) for the strawman this mirrors.
 ///
 /// `seed` is optional in the strawman but required at apply time today —
 /// the workflow's first tick would otherwise drain an empty trigger queue
 /// and send the LLM an empty prompt. Validation enforces non-empty
 /// `seed.triggers`.
+///
+/// JAR2-85: `defaults:` and `policy:` are top-level optional blocks.
+/// `agents:` is a forest (top-level `Vec<Agent>`); each `Agent` may
+/// nest `children:`.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GraphYaml {
@@ -87,9 +94,23 @@ pub struct GraphYaml {
     /// Must be `"Graph"`. Validated in [`validate`].
     pub kind: String,
     pub metadata: Metadata,
+    /// JAR2-85: top-level defaults applied to every agent unless
+    /// overridden inline. Today only `idle_period` and `max_ticks` are
+    /// declarable here, matching the two `Mandate`-derived knobs the
+    /// inline mandate currently surfaces.
+    #[serde(default)]
+    pub defaults: Option<AgentDefaults>,
     pub tools: Vec<Tool>,
     pub agents: Vec<Agent>,
     pub seed: Seed,
+    /// JAR2-85: operator-level policy block. **Pass-through only** in v1
+    /// — stored verbatim into `graphs.metadata` jsonb (under a `"policy"`
+    /// key). The runtime does not enforce these knobs today; cost-budget
+    /// and conflict-resolution enforcement is post-Stage-8. Schema kept
+    /// `serde_json::Value`-opaque so future extensions don't force a
+    /// wire bump here every time a knob lands.
+    #[serde(default)]
+    pub policy: Option<PolicyYaml>,
 }
 
 /// `metadata:` block — identity + free-form description.
@@ -145,33 +166,47 @@ pub enum ToolKind {
     },
 }
 
-/// `agents[i]`. v1 requires exactly one entry — enforced in [`validate`].
+/// `agents[i]`. JAR2-85: any node in the agent forest. `children:` makes
+/// the YAML schema recursive — DFS the tree to discover every agent.
 ///
-/// `children`, `defaults`, and any other multi-agent / inheritance
-/// constructs are rejected by `#[serde(deny_unknown_fields)]` with a
-/// `line:col`-bearing serde error.
+/// `mandate.idle_period` is `Option<Duration>` here because the top-level
+/// `defaults:` block may provide it; the validator (`resolve_mandate`)
+/// reports a typed error if neither inline nor default supplies a value.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Agent {
     /// URL-path-safe id (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`); strict-
-    /// validated in [`validate`]. Combined with `metadata.name` to form
-    /// the workflow ID JAR2-73 will pass to the Temporal client:
-    /// `graphs/<metadata.name>/agents/<id>`.
+    /// validated in [`validate`]. **Operator-authored**, distinct from
+    /// the structural-DB UUID `GraphStore::add_agent` allocates. The
+    /// apply walker maps this id to the allocated `AgentId` via
+    /// [`AppliedGraph::id_map`].
     pub id: String,
     pub mandate: Mandate,
     /// References by id into the top-level `tools:`. Resolved + checked
     /// for misses in [`validate`].
+    #[serde(default)]
     pub tools: Vec<String>,
+    /// JAR2-85: nested child agents. Empty for leaves. The validator
+    /// enforces unique `id`s across the whole tree and defensive
+    /// no-cycles. Hierarchical-only at v1 (Project decision 12); flat
+    /// `parent:`-ref form deferred.
+    #[serde(default)]
+    pub children: Vec<Agent>,
 }
 
 /// `agents[].mandate:` — the standing instruction. **Not** the same wire
 /// shape as `jarvis_node::mandate::Mandate` (which is ms-integers +
 /// `retry_policy` + `context_policy`); kept distinct because the YAML is
 /// the authored / human-edited surface and `jarvis_node::Mandate` is the
-/// runtime/wire shape. Conversion lives in JAR2-73.
+/// runtime/wire shape. Conversion lives in [`into_agent_input`] /
+/// [`apply_to_workflow_starts`].
 ///
 /// `from_file:` (`scratch/graph_yaml_schema.md` § 4.5) is rejected by
 /// `deny_unknown_fields`; v1 is inline-only.
+///
+/// JAR2-85: `idle_period` and `max_ticks` are `Option` here because the
+/// top-level [`AgentDefaults`] block may supply them. `resolve_mandate`
+/// merges inline → defaults → error.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Mandate {
@@ -183,14 +218,58 @@ pub struct Mandate {
     /// `humantime::parse_duration`. Empty / malformed values surface as
     /// [`GraphYamlError::Parse`] (the adapter raises a serde error
     /// mid-deserialize so `serde_yaml::Location` pins the `line:col`).
-    #[serde(deserialize_with = "deserialize_duration")]
-    #[schemars(with = "String")]
-    pub idle_period: Duration,
+    ///
+    /// JAR2-85: optional inline so [`AgentDefaults::idle_period`] can
+    /// supply the value. Validator emits
+    /// [`GraphYamlError::MissingMandateIdlePeriod`] if neither inline
+    /// nor default supplies a value for a given agent.
+    #[serde(default, deserialize_with = "deserialize_duration_opt")]
+    #[schemars(with = "Option<String>")]
+    pub idle_period: Option<Duration>,
     /// Optional safety cap on loop iterations. `None` ⇒ run until
     /// `Retire`. Mirrors `jarvis_node::mandate::Mandate::max_ticks`.
+    /// May be supplied via [`AgentDefaults::max_ticks`].
     #[serde(default)]
     pub max_ticks: Option<u64>,
 }
+
+/// JAR2-85: top-level `defaults:` block — knobs applied to every agent
+/// unless overridden inline. Today this only carries the two
+/// `Mandate`-derived knobs (`idle_period`, `max_ticks`) — the surface
+/// matches what the inline `Mandate` declares and grows together.
+///
+/// **Why a separate type from `Mandate`:** `mandate.text` is per-agent
+/// (each child has its own narrow mandate); a default text wouldn't be
+/// meaningful. Splitting the type makes that explicit.
+#[derive(Clone, Debug, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDefaults {
+    /// Default `idle_period` — used when an agent's inline
+    /// `mandate.idle_period` is absent. Same `humantime` grammar as
+    /// the inline field.
+    #[serde(default, deserialize_with = "deserialize_duration_opt")]
+    #[schemars(with = "Option<String>")]
+    pub idle_period: Option<Duration>,
+    /// Default `max_ticks` — used when an agent's inline
+    /// `mandate.max_ticks` is absent. `None` ⇒ no cap by default.
+    #[serde(default)]
+    pub max_ticks: Option<u64>,
+}
+
+/// JAR2-85: `policy:` block — operator-level constraints. **Pass-through
+/// in v1**: the parser stores it verbatim into `graphs.metadata` jsonb
+/// under a `"policy"` key. No knob is enforced today; cost-budget /
+/// conflict-resolution enforcement is post-Stage-8 (Project decision per
+/// the parent ticket).
+///
+/// Modeled as `serde_json::Value`-flavored opaque so the schema doesn't
+/// pin field names that will reshape when enforcement lands. The shape
+/// `scratch/graph_yaml_schema.md` § 3 sketches (`cost_budget:`,
+/// `on_budget_exhausted:`, `conflict_resolution:`) survives this lossy
+/// pass-through — it's preserved on disk for operators to read back.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct PolicyYaml(#[schemars(with = "serde_json::Value")] pub serde_json::Value);
 
 /// `seed:` — what kicks the graph off. v1 requires `triggers` to be
 /// non-empty (see [`GraphYaml`] doc for the empty-prompt guardrail).
@@ -231,17 +310,20 @@ pub struct ExternalEnvelope {
 
 // --- duration deserializer -----------------------------------------------
 
-/// Serde adapter that defers to `humantime::parse_duration` and surfaces
-/// the source string in the error. The struct-level `serde` error this
-/// produces still carries a `serde_yaml::Location` so [`parse_graph_yaml`]
-/// can pin it to `line:col`.
-fn deserialize_duration<'de, D>(de: D) -> Result<Duration, D::Error>
+/// JAR2-85: serde adapter for `Option<Duration>`. Calls
+/// `humantime::parse_duration` when the field is present; returns
+/// `Ok(None)` when absent (the `#[serde(default)]` path).
+fn deserialize_duration_opt<'de, D>(de: D) -> Result<Option<Duration>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let s = String::deserialize(de)?;
-    humantime::parse_duration(&s)
-        .map_err(|e| serde::de::Error::custom(format!("invalid duration {s:?}: {e}")))
+    let opt = Option::<String>::deserialize(de)?;
+    match opt {
+        Some(s) => humantime::parse_duration(&s)
+            .map(Some)
+            .map_err(|e| serde::de::Error::custom(format!("invalid duration {s:?}: {e}"))),
+        None => Ok(None),
+    }
 }
 
 // --- error type ---------------------------------------------------------
@@ -299,12 +381,37 @@ pub enum GraphYamlError {
     )]
     UnsupportedKind { actual: String },
 
-    /// `agents:` did not contain exactly one entry. v1 is single-agent
-    /// only (multi-agent topology is Stage 5).
+    /// `agents:` was empty. JAR2-85: multi-agent supports any forest
+    /// shape, but the empty forest is nonsense — there'd be nothing to
+    /// kick off.
+    #[error("`agents:` is empty; at least one root agent is required")]
+    NoAgents,
+
+    /// JAR2-85: two agents in the tree share the same operator-authored
+    /// `id`. The id is the lookup key for `seed.triggers[].agent` and
+    /// for the apply walker's `id_map` — duplicates would silently fire
+    /// triggers at the wrong workflow.
     #[error(
-        "expected exactly 1 entry under `agents:`, got {actual} (multi-agent topology is Stage 5; this is JAR2-71's v1 narrowing)"
+        "duplicate agent id {agent_id:?} in the agent tree (every `agents[].id`, including nested `children:` ids, must be unique)"
     )]
-    WrongAgentCount { actual: usize },
+    DuplicateAgentId { agent_id: String },
+
+    /// JAR2-85: a defensive guard against cyclic `children:` references.
+    /// The YAML shape (recursive `Vec<Agent>`) cannot structurally
+    /// express a cycle today; this variant exists so the validator's
+    /// promise ("the tree is a tree") survives a future schema change
+    /// that might add a `parent:` ref form.
+    #[error("cyclic `children:` detected via agent {agent_id:?}")]
+    CyclicChildren { agent_id: String },
+
+    /// JAR2-85: an agent's mandate has no `idle_period` and no
+    /// `defaults.idle_period` is provided. The runtime requires a
+    /// concrete wake cadence; surface a typed error rather than
+    /// defaulting silently to zero.
+    #[error(
+        "agent {agent_id:?} has no `mandate.idle_period` and `defaults.idle_period` is not set (declare one or the other)"
+    )]
+    MissingMandateIdlePeriod { agent_id: String },
 
     /// A `tools[]` entry was `kind: mcp`. v1 builds register only
     /// `EchoTool`; MCP-in-worker is queued.
@@ -408,14 +515,15 @@ fn is_url_path_safe_name(s: &str) -> bool {
     bytes.iter().all(|&b| is_alnum(b) || b == b'-')
 }
 
-/// Enforce the v1 narrowings the type system cannot. Run **after**
+/// Enforce invariants the type system cannot. Run **after**
 /// [`parse_graph_yaml`] and before handing the value to anything that
 /// expects valid invariants (DB writes, workflow start).
 ///
 /// Order of checks is chosen so the most operator-actionable errors
 /// surface first: apiVersion / kind mismatch (the document is the wrong
-/// kind entirely) → single-agent → name shape → tool registry shape →
-/// references.
+/// kind entirely) → non-empty agents → name shape → tool registry shape
+/// → tree-walk invariants (tool refs, agent-id uniqueness, mandate
+/// defaults resolution) → seeds.
 pub fn validate(g: &GraphYaml) -> Result<(), GraphYamlError> {
     if g.api_version != API_VERSION {
         return Err(GraphYamlError::UnsupportedApiVersion {
@@ -435,17 +543,8 @@ pub fn validate(g: &GraphYaml) -> Result<(), GraphYamlError> {
         });
     }
 
-    if g.agents.len() != 1 {
-        return Err(GraphYamlError::WrongAgentCount {
-            actual: g.agents.len(),
-        });
-    }
-    let agent = &g.agents[0];
-    if !is_url_path_safe_name(&agent.id) {
-        return Err(GraphYamlError::InvalidName {
-            field: "agents[0].id",
-            value: agent.id.clone(),
-        });
+    if g.agents.is_empty() {
+        return Err(GraphYamlError::NoAgents);
     }
 
     // Tool-list shape: reject MCP, dedupe ids, sanity-check builtin id.
@@ -466,28 +565,25 @@ pub fn validate(g: &GraphYaml) -> Result<(), GraphYamlError> {
         }
     }
 
-    // Tool-reference resolution: every id under `agents[0].tools` must
-    // exist in top-level `tools[]`.
     let registered: std::collections::HashSet<&str> =
         g.tools.iter().map(|t| t.id.as_str()).collect();
-    for tool_id in &agent.tools {
-        if !registered.contains(tool_id.as_str()) {
-            return Err(GraphYamlError::UnknownToolReference {
-                agent_id: agent.id.clone(),
-                tool_id: tool_id.clone(),
-                location: None,
-            });
-        }
+
+    // Tree walk: per-agent invariants + duplicate-id guard + tool-ref
+    // resolution + mandate-defaults resolution. Defensive cycle check
+    // via a `visiting` set on the DFS frame (the YAML shape can't
+    // structurally express cycles but the validator's promise needs to
+    // survive a future schema change).
+    let mut seen_agent_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for root in &g.agents {
+        validate_agent_tree(root, &registered, &g.defaults, &mut seen_agent_ids)?;
     }
 
-    // Seeds: non-empty, target the declared agent, `at: start` only.
+    // Seeds: non-empty, target some agent in the tree, `at: start` only.
     if g.seed.triggers.is_empty() {
         return Err(GraphYamlError::EmptySeedTriggers);
     }
-    let declared_agents: std::collections::HashSet<&str> =
-        g.agents.iter().map(|a| a.id.as_str()).collect();
     for trigger in &g.seed.triggers {
-        if !declared_agents.contains(trigger.agent.as_str()) {
+        if !seen_agent_ids.contains(trigger.agent.as_str()) {
             return Err(GraphYamlError::UnknownTriggerAgent {
                 agent_id: trigger.agent.clone(),
             });
@@ -500,6 +596,93 @@ pub fn validate(g: &GraphYaml) -> Result<(), GraphYamlError> {
     }
 
     Ok(())
+}
+
+/// Recursive helper for [`validate`]. DFS the agent subtree rooted at
+/// `agent`, enforcing per-node invariants (id shape, tool refs, mandate
+/// resolves with defaults) and accumulating ids into `seen_agent_ids`
+/// (raising [`GraphYamlError::DuplicateAgentId`] on collision —
+/// duplicates across nesting levels are not allowed).
+fn validate_agent_tree(
+    agent: &Agent,
+    registered_tools: &std::collections::HashSet<&str>,
+    defaults: &Option<AgentDefaults>,
+    seen_agent_ids: &mut std::collections::HashSet<String>,
+) -> Result<(), GraphYamlError> {
+    if !is_url_path_safe_name(&agent.id) {
+        return Err(GraphYamlError::InvalidName {
+            field: "agents[].id",
+            value: agent.id.clone(),
+        });
+    }
+    if !seen_agent_ids.insert(agent.id.clone()) {
+        return Err(GraphYamlError::DuplicateAgentId {
+            agent_id: agent.id.clone(),
+        });
+    }
+    // Mandate must resolve to a concrete `idle_period` once defaults are
+    // applied. `max_ticks` is `None` by design (run-until-Retire); only
+    // `idle_period` is required.
+    if agent.mandate.idle_period.is_none()
+        && defaults.as_ref().and_then(|d| d.idle_period).is_none()
+    {
+        return Err(GraphYamlError::MissingMandateIdlePeriod {
+            agent_id: agent.id.clone(),
+        });
+    }
+    // Tool-reference resolution: every id under this agent's `tools:`
+    // must exist in top-level `tools[]`.
+    for tool_id in &agent.tools {
+        if !registered_tools.contains(tool_id.as_str()) {
+            return Err(GraphYamlError::UnknownToolReference {
+                agent_id: agent.id.clone(),
+                tool_id: tool_id.clone(),
+                location: None,
+            });
+        }
+    }
+    for child in &agent.children {
+        // Defensive: the YAML can't express a cycle, but if a child's
+        // id == parent's id we'd hit the duplicate-id check above.
+        // Surface that as `CyclicChildren` when the duplicate is
+        // structurally a parent's own id — preserves operator
+        // expressiveness of the error message.
+        if child.id == agent.id {
+            return Err(GraphYamlError::CyclicChildren {
+                agent_id: child.id.clone(),
+            });
+        }
+        validate_agent_tree(child, registered_tools, defaults, seen_agent_ids)?;
+    }
+    Ok(())
+}
+
+/// JAR2-85: `true` if this YAML uses any multi-agent feature (more than
+/// one root agent, OR any agent has nested `children:`). Single-agent
+/// YAML (one root, no children) is the degenerate case that the
+/// multi-agent walker handles identically; the helper exists so the
+/// apply binary can keep its current operator-facing output for
+/// single-agent applies (workflow id format etc.) without surprising
+/// JAR2-71/72/73/74/76 reviewers.
+pub fn is_multi_agent(g: &GraphYaml) -> bool {
+    g.agents.len() > 1 || g.agents.iter().any(|a| !a.children.is_empty())
+}
+
+/// JAR2-85: resolve an agent's mandate against the top-level defaults.
+/// Returns the concrete [`NodeMandate`] the runtime consumes. Caller
+/// must have already run [`validate`] — this function panics on a
+/// missing `idle_period` (validator should have caught it).
+pub(crate) fn resolve_mandate(agent: &Agent, defaults: &Option<AgentDefaults>) -> NodeMandate {
+    let idle_period = agent
+        .mandate
+        .idle_period
+        .or_else(|| defaults.as_ref().and_then(|d| d.idle_period))
+        .expect("validate() should have rejected agents without idle_period");
+    let max_ticks = agent
+        .mandate
+        .max_ticks
+        .or_else(|| defaults.as_ref().and_then(|d| d.max_ticks));
+    NodeMandate::new(agent.mandate.text.clone(), idle_period, max_ticks)
 }
 
 /// Parse + validate in one shot, with `line:col` enrichment for the
@@ -646,110 +829,258 @@ fn locate_token_in_line(
     None
 }
 
-// --- YAML → workflow input conversion (Stage 4.2, JAR2-73) -------------
+// --- YAML → workflow input conversion (Stage 4.2 + 5.8) ----------------
 
-/// Build the [`AgentInput`] the `AgentWorkflow` consumes from a validated
-/// [`GraphYaml`]. Hermetic — no DB, no Temporal client, no filesystem.
+/// JAR2-85 + JAR2-89 (subsumed): one resolved agent in the apply walk —
+/// the operator-authored id paired with the structural-DB UUIDs
+/// `GraphStore::create_from_yaml` allocated.
 ///
-/// Caller-side invariants:
+/// The walker phase returns these in DFS parents-first order so the
+/// downstream workflow-start phase can build each child's
+/// `parent_handle` against an already-allocated parent workflow id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedAgent {
+    /// Operator-authored `agents[].id` from the YAML (the lookup key for
+    /// `seed.triggers[].agent` and for `id_map`).
+    pub operator_id: String,
+    /// Freshly-allocated structural-DB UUID from `GraphStore::add_agent`.
+    pub db_agent_id: AgentId,
+    /// The parent's `db_agent_id`, when this is a non-root node. `None`
+    /// for the top-level forest entries (true roots; each gets a
+    /// `parent_handle: None`).
+    pub parent_db_agent_id: Option<AgentId>,
+}
+
+/// JAR2-85 + JAR2-89: the apply binary's primary handoff from the
+/// structural-DB phase to the workflow-start phase. Carries the freshly-
+/// allocated `graph_id`, the resolved agent list (parents-first DFS
+/// order), and the lookup map from operator-authored agent id to
+/// allocated UUID + workflow id.
+#[derive(Clone, Debug)]
+pub struct AppliedGraph {
+    /// The graph's structural-DB UUID. Same value that
+    /// `GraphStore::create_from_yaml` returned via the `graphs.id` row.
+    pub graph_id: GraphId,
+    /// Operator-authored graph name. Identity for operator-facing
+    /// output (CLI stdout, log lines). Not used in workflow-id
+    /// derivation (we use UUIDs there for cross-agent FS lookup
+    /// consistency — see JAR2-89).
+    pub graph_name: String,
+    /// Every agent the YAML declared, in DFS parents-first order. Each
+    /// entry pairs the operator-authored id with the structural-DB
+    /// UUIDs.
+    pub agents: Vec<ResolvedAgent>,
+    /// Map from operator-authored agent id → `(db_agent_id,
+    /// workflow_id)`. The workflow id is the canonical UUID-shaped form
+    /// `graphs/<graph_uuid>/agents/<agent_uuid>` (Project decision 6 +
+    /// JAR2-89's cross-agent FS alignment).
+    pub id_map: HashMap<String, ResolvedAgentWorkflow>,
+}
+
+/// JAR2-85 + JAR2-89: bundled `(db_agent_id, workflow_id)` value for
+/// [`AppliedGraph::id_map`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedAgentWorkflow {
+    /// Structural-DB UUID, matching `agents.id`.
+    pub db_agent_id: AgentId,
+    /// Temporal workflow id used at `start_workflow` time.
+    pub workflow_id: String,
+}
+
+/// JAR2-85 + JAR2-89: one workflow to start, with its `AgentInput`. The
+/// apply binary iterates this vector in DFS parents-first order so each
+/// child's `parent_handle.workflow_id` references a workflow id that
+/// has already been issued (`start_workflow` succeeds even before the
+/// parent has produced its first activation, so we don't need to wait
+/// on the parent's actual start; we only need the parent's id).
+#[derive(Clone, Debug)]
+pub struct WorkflowStart {
+    /// `graphs/<graph_uuid>/agents/<agent_uuid>` — UUID-shaped.
+    pub workflow_id: String,
+    /// Resolved `AgentInput` for `client.start_workflow(...)`. Builds
+    /// via [`build_root_input`] for roots and [`build_child_input`] for
+    /// children, in both cases with the real allocated UUIDs (the
+    /// JAR2-89 fix).
+    pub input: AgentInput,
+}
+
+/// JAR2-85: one seed trigger paired with its resolved target workflow
+/// id. The apply binary signals each `(workflow_id, trigger)` pair via
+/// `client.signal_workflow(workflow_id, "external_signal", trigger)`
+/// (or, with a `handle`, `handle.signal(...)`).
+#[derive(Clone, Debug)]
+pub struct ResolvedSeedTrigger {
+    /// The resolved `workflow_id` from [`AppliedGraph::id_map`].
+    pub workflow_id: String,
+    /// The translated [`NodeTrigger::External`].
+    pub trigger: NodeTrigger,
+}
+
+/// JAR2-85 + JAR2-89: build the list of [`WorkflowStart`]s the apply
+/// binary feeds to the Temporal client, against the
+/// `GraphStore`-allocated UUIDs in [`AppliedGraph`]. Hermetic — no DB,
+/// no Temporal client, no filesystem.
 ///
-/// - The graph must already have passed [`validate`] (or
-///   [`parse_and_validate`]); this function unwraps the v1 "exactly one
-///   agent" guarantee via `agents[0]` and would panic on an empty agents
-///   vector otherwise. Treat it as a typed-witness consumer of the
-///   validator.
-/// - The returned `AgentInput.fs_handle.prefix` is
-///   [`agent_workflow_id`]`(metadata.name, agents[0].id)` —
-///   `graphs/<metadata.name>/agents/<agents[0].id>`. The worker daemon's
-///   [`jarvis_node::storage::LocalStorage`] is rooted at its configured
-///   `AGENT_FS_ROOT` and is shared process-wide across every workflow
-///   the daemon hosts, so per-workflow namespacing has to come from the
-///   prefix; otherwise tick-keyed artifacts (`decisions/<tick>.jsonl`)
-///   and single-file ones (`mandate.json`, `retirement.json`) collide
-///   across distinct graphs landing on the same daemon. The chosen
-///   prefix mirrors the workflow ID so operators inspecting on-disk
-///   artifacts can map back to `temporal workflow describe …` by eye.
+/// The single-agent path (`agents.len() == 1`, no children) is the
+/// degenerate one-element case. The output preserves DFS parents-first
+/// order so children's `parent_handle.workflow_id` references workflows
+/// already in the list (the binary starts them in this order).
 ///
-/// ## Field mapping
+/// Caller invariants:
 ///
-/// | YAML | `AgentInput` |
-/// |---|---|
-/// | `agents[0].mandate.{text, idle_period, max_ticks}` | `mandate` via [`NodeMandate::new`] |
-/// | `seed.triggers[*].external.{kind, payload}` | **not** in `AgentInput` — the binary signals them post-`start_workflow` via [`yaml_seed_triggers`] |
-/// | `metadata.name`, `agents[0].id` | **not** in `AgentInput` — they form the workflow ID (`agent_workflow_id`), passed separately by the binary |
-///
-/// `cfg` defaults to [`AgentConfig::default`] (the JAR2-58 placeholder),
-/// `parent_handle` defaults to `None` (no parent — single-agent v1),
-/// `carryover` defaults to `None` (a fresh apply is a first run, not a
-/// post-CAN hydrate).
-///
-/// `NodeMandate::new` synthesizes the `retry_policy: None` +
-/// `context_policy: ContextPolicy::default()` defaults; v1 YAML does not
-/// surface either knob (out of scope per parent JAR2-71).
-pub fn into_agent_input(graph: &GraphYaml) -> AgentInput {
-    debug_assert_eq!(
-        graph.agents.len(),
-        1,
-        "into_agent_input requires a validated single-agent graph; \
-         call parse_and_validate or validate before this conversion",
-    );
-    let agent = &graph.agents[0];
-    let mandate = NodeMandate::new(
-        agent.mandate.text.clone(),
-        agent.mandate.idle_period,
-        agent.mandate.max_ticks,
-    );
-    // JAR2-80 (Stage 5 Project decision 8): `AgentInput` now requires
-    // structural identity fields (`graph_id` + `agent_id`). v1's YAML
-    // is single-agent and pre-DB; the structural-DB resolver that
-    // pulls real UUIDs lives on the `jarvis-apply` binary side, not
-    // here. Mint synthetic v4 UUIDs as a stand-in so the workflow
-    // body has something to thread through `Decision::SpawnChild`'s
-    // activity input. Note: these are NOT the same as the
-    // `GraphStore::create_from_yaml` UUIDs (the binary doesn't yet
-    // wire those back into `AgentInput`); a future cleanup ticket
-    // (deferred — see PR coordination note) should align them so
-    // `Decision::SpawnChild` writes edges keyed off the same root
-    // agent the structural-DB row identifies.
-    let graph_id = GraphId::new(Uuid::new_v4());
-    let agent_id = AgentId::new(Uuid::new_v4());
-    AgentInput {
-        cfg: AgentConfig::default(),
-        fs_handle: FsHandle {
-            prefix: agent_workflow_id(&graph.metadata.name, &agent.id),
-        },
-        parent_handle: None,
-        carryover: None,
-        mandate,
-        graph_id,
-        agent_id,
-        agent_name: agent.id.clone(),
+/// - `graph` must have passed [`validate`] (every node has a resolvable
+///   mandate, ids are unique, tool refs resolve).
+/// - `applied.agents` must be in DFS parents-first order, matching the
+///   order [`GraphStore::create_from_yaml`] allocates UUIDs. The
+///   `id_map` must contain every entry's `operator_id`.
+pub fn build_workflow_starts(graph: &GraphYaml, applied: &AppliedGraph) -> Vec<WorkflowStart> {
+    // Build the agent-yaml lookup by walking the tree in DFS order so
+    // we can pair each `ResolvedAgent` with its mandate / tools by
+    // operator id. Operator ids are unique tree-wide (validator
+    // enforces) — a flat HashMap suffices.
+    let mut yaml_by_id: HashMap<&str, &Agent> = HashMap::new();
+    for root in &graph.agents {
+        index_agents(root, &mut yaml_by_id);
+    }
+
+    let mut starts = Vec::with_capacity(applied.agents.len());
+    for resolved in &applied.agents {
+        let yaml_agent = yaml_by_id
+            .get(resolved.operator_id.as_str())
+            .copied()
+            .expect("AppliedGraph operator_id must reference a YAML agent");
+        let mandate = resolve_mandate(yaml_agent, &graph.defaults);
+        let workflow_id = applied
+            .id_map
+            .get(&resolved.operator_id)
+            .expect("AppliedGraph id_map missing entry")
+            .workflow_id
+            .clone();
+        let input = match resolved.parent_db_agent_id {
+            None => build_root_input(
+                applied.graph_id,
+                resolved.db_agent_id,
+                resolved.operator_id.clone(),
+                mandate,
+                AgentConfig::default(),
+            ),
+            Some(parent_db_id) => {
+                // Look the parent's workflow id up through the id_map.
+                // The lookup is keyed by operator id, which we recover
+                // by scanning `applied.agents` (parents-first order
+                // guarantees the parent is before us in the list).
+                let parent_operator_id = applied
+                    .agents
+                    .iter()
+                    .find(|a| a.db_agent_id == parent_db_id)
+                    .map(|a| a.operator_id.as_str())
+                    .expect("parent_db_agent_id must reference some agent in AppliedGraph");
+                let parent_workflow_id = applied
+                    .id_map
+                    .get(parent_operator_id)
+                    .expect("id_map missing parent operator id")
+                    .workflow_id
+                    .clone();
+                build_child_input(
+                    &parent_workflow_id,
+                    parent_db_id,
+                    applied.graph_id,
+                    resolved.db_agent_id,
+                    resolved.operator_id.clone(),
+                    mandate,
+                    AgentConfig::default(),
+                )
+            }
+        };
+        starts.push(WorkflowStart { workflow_id, input });
+    }
+    starts
+}
+
+/// JAR2-85: index the agent tree under `root` into `out`, keyed by
+/// operator id. Validator pre-condition: ids are unique tree-wide.
+fn index_agents<'a>(root: &'a Agent, out: &mut HashMap<&'a str, &'a Agent>) {
+    out.insert(root.id.as_str(), root);
+    for child in &root.children {
+        index_agents(child, out);
     }
 }
 
-/// Translate the YAML's `seed.triggers` into the
-/// [`jarvis_node::trigger::Trigger::External`] values the `jarvis-apply`
-/// binary will `handle.signal(AgentWorkflow::external_signal, ...)` to
-/// the workflow.
+/// JAR2-85 + JAR2-89 (back-compat shim): build a single-agent
+/// `AgentInput` from a validated single-agent YAML, using
+/// [`GraphStore`]-allocated UUIDs.
 ///
-/// In v1 every seed trigger targets `agents[0].id` (the validator
-/// rejects others), so this function does not return the destination
-/// agent — the binary signals against the single workflow handle it
-/// started. Stage 5+ multi-agent will need the destination back; the
-/// shape is reserved by `SeedTrigger.agent` already.
+/// **JAR2-89 fix**: this no longer mints synthetic UUIDs. The caller
+/// (the `jarvis-apply` binary) calls
+/// [`crate::store::GraphStore::create_from_yaml`] first, threads the
+/// allocated `(graph_id, agent_id)` through, and gets back an
+/// `AgentInput` whose identity matches the structural-DB rows. Stage
+/// 5.5's cross-agent FS reads (which look agents up by `agent_id`) now
+/// resolve.
 ///
-/// Order is preserved from the YAML — the binary signals them in the
-/// same order the operator wrote them.
-pub fn yaml_seed_triggers(graph: &GraphYaml) -> Vec<NodeTrigger> {
-    graph
-        .seed
-        .triggers
-        .iter()
-        .map(|seed| NodeTrigger::External {
-            kind: seed.external.kind.clone(),
-            payload: seed.external.payload.clone(),
-        })
-        .collect()
+/// Caller invariants:
+///
+/// - The YAML must have passed [`validate`].
+/// - `graph` must be single-agent (`agents.len() == 1`, no nested
+///   children). Use [`build_workflow_starts`] for the general
+///   multi-agent case; this is the single-agent ergonomic shim
+///   preserved for the JAR2-74 smoke test surface.
+///
+/// `cfg`, `parent_handle`, `carryover` defaults are unchanged from the
+/// pre-JAR2-89 shape — only the UUID source changes.
+pub fn into_agent_input(graph: &GraphYaml, graph_id: GraphId, agent_id: AgentId) -> AgentInput {
+    debug_assert_eq!(
+        graph.agents.len(),
+        1,
+        "into_agent_input requires a single-agent graph; use \
+         build_workflow_starts for multi-agent",
+    );
+    debug_assert!(
+        graph.agents[0].children.is_empty(),
+        "into_agent_input requires a flat single-agent graph; use \
+         build_workflow_starts for hierarchical",
+    );
+    let agent = &graph.agents[0];
+    let mandate = resolve_mandate(agent, &graph.defaults);
+    build_root_input(
+        graph_id,
+        agent_id,
+        agent.id.clone(),
+        mandate,
+        AgentConfig::default(),
+    )
+}
+
+/// JAR2-85: translate the YAML's `seed.triggers` into resolved
+/// `(workflow_id, Trigger::External)` pairs the binary signals against.
+/// Order is preserved.
+///
+/// Returns [`GraphYamlError::UnknownTriggerAgent`] if a trigger target
+/// isn't in `applied.id_map` — but [`validate`] should have caught this
+/// upstream; the runtime error is a belt-and-braces guard.
+pub fn yaml_seed_triggers(
+    graph: &GraphYaml,
+    applied: &AppliedGraph,
+) -> Result<Vec<ResolvedSeedTrigger>, GraphYamlError> {
+    let mut out = Vec::with_capacity(graph.seed.triggers.len());
+    for seed in &graph.seed.triggers {
+        let workflow_id = applied
+            .id_map
+            .get(&seed.agent)
+            .ok_or_else(|| GraphYamlError::UnknownTriggerAgent {
+                agent_id: seed.agent.clone(),
+            })?
+            .workflow_id
+            .clone();
+        out.push(ResolvedSeedTrigger {
+            workflow_id,
+            trigger: NodeTrigger::External {
+                kind: seed.external.kind.clone(),
+                payload: seed.external.payload.clone(),
+            },
+        });
+    }
+    Ok(out)
 }
 
 // --- tests --------------------------------------------------------------
@@ -819,7 +1150,7 @@ seed:
         let agent = &g.agents[0];
         assert_eq!(agent.id, "root");
         assert_eq!(agent.tools, vec!["echo".to_string()]);
-        assert_eq!(agent.mandate.idle_period, Duration::from_secs(1));
+        assert_eq!(agent.mandate.idle_period, Some(Duration::from_secs(1)));
         assert_eq!(agent.mandate.max_ticks, Some(8));
         assert_eq!(g.seed.triggers.len(), 1);
         let trigger = &g.seed.triggers[0];
@@ -831,39 +1162,12 @@ seed:
 
     // --- `deny_unknown_fields` rejections (parse-time) -----------------
 
-    #[test]
-    fn rejects_children_field_on_agent() {
-        // `children:` is the multi-agent topology field; v1 is single-
-        // agent only. `deny_unknown_fields` on Agent surfaces it.
-        let yaml = HAPPY_YAML.replace(
-            "    tools: [echo]\n",
-            "    tools: [echo]\n    children:\n      - id: child\n",
-        );
-        let err = parse_err(&yaml);
-        let msg = format!("{err}");
-        assert!(msg.contains("unknown field `children`"), "{msg}");
-        // Should carry a line:col prefix.
-        assert!(msg.contains(":"), "expected line:col prefix, got {msg}");
-    }
-
-    #[test]
-    fn rejects_top_level_defaults_block() {
-        let yaml = HAPPY_YAML.replace(
-            "tools:\n  - id: echo\n",
-            "defaults:\n  idle_period: 1h\ntools:\n  - id: echo\n",
-        );
-        let err = parse_err(&yaml);
-        let msg = format!("{err}");
-        assert!(msg.contains("unknown field `defaults`"), "{msg}");
-    }
-
-    #[test]
-    fn rejects_top_level_policy_block() {
-        let yaml = HAPPY_YAML.to_string() + "\npolicy:\n  cost_budget:\n    daily_usd: 50\n";
-        let err = parse_err(&yaml);
-        let msg = format!("{err}");
-        assert!(msg.contains("unknown field `policy`"), "{msg}");
-    }
+    // JAR2-85: `children:`, `defaults:`, `policy:` are now legal fields.
+    // The previously-rejected `rejects_children_field_on_agent`,
+    // `rejects_top_level_defaults_block`, and `rejects_top_level_policy_block`
+    // tests have been replaced with positive-acceptance assertions
+    // (`children:` round-trips; `defaults:` round-trips; `policy:`
+    // round-trips) under the "JAR2-85 multi-agent" section below.
 
     #[test]
     fn rejects_scripted_decisions_under_seed() {
@@ -910,28 +1214,29 @@ seed:
 
     #[test]
     fn rejects_zero_agents() {
+        // JAR2-85: replaced `WrongAgentCount { actual: 0 }` with
+        // `NoAgents`. The forest must contain at least one root.
         let yaml = HAPPY_YAML.replace(
             "agents:\n  - id: root\n    mandate:\n      text: |\n        Your task: call the `echo` tool exactly once with arguments {\"msg\": \"hello from temporal\"},\n        then on the next tick emit an Output via the `emit_output` decision whose `content` is a short\n        summary citing the resulting evidence id, then retire. Do not call any other tool; do not loop;\n        do not idle except as a last resort.\n      idle_period: 1s\n      max_ticks: 8\n    tools: [echo]\n",
             "agents: []\n",
         );
         let err = validate_err(&yaml);
-        assert!(
-            matches!(err, GraphYamlError::WrongAgentCount { actual: 0 }),
-            "got {err:?}",
-        );
+        assert!(matches!(err, GraphYamlError::NoAgents), "got {err:?}",);
     }
 
     #[test]
-    fn rejects_more_than_one_agent() {
+    fn accepts_multiple_top_level_agents_jar2_85() {
+        // JAR2-85: multiple top-level agents is no longer an error. The
+        // validator only enforces unique ids tree-wide + every other
+        // invariant (tool refs resolve, idle_period resolves, etc.).
         let yaml = HAPPY_YAML.to_string().replace(
             "    tools: [echo]\n",
             "    tools: [echo]\n  - id: second\n    mandate:\n      text: x\n      idle_period: 1s\n    tools: []\n",
         );
-        let err = validate_err(&yaml);
-        assert!(
-            matches!(err, GraphYamlError::WrongAgentCount { actual: 2 }),
-            "got {err:?}",
-        );
+        let g = parse_and_validate(&yaml).expect("multi-agent v1 happy path");
+        assert_eq!(g.agents.len(), 2);
+        assert_eq!(g.agents[0].id, "root");
+        assert_eq!(g.agents[1].id, "second");
     }
 
     #[test]
@@ -961,7 +1266,7 @@ seed:
             matches!(
                 err,
                 GraphYamlError::InvalidName {
-                    field: "agents[0].id",
+                    field: "agents[].id",
                     ref value,
                 } if value == "Root!",
             ),
@@ -1167,21 +1472,30 @@ seed:
     fn duration_accepts_100ms() {
         let yaml = HAPPY_YAML.replace("      idle_period: 1s\n", "      idle_period: 100ms\n");
         let g = parse_graph_yaml(&yaml).unwrap();
-        assert_eq!(g.agents[0].mandate.idle_period, Duration::from_millis(100));
+        assert_eq!(
+            g.agents[0].mandate.idle_period,
+            Some(Duration::from_millis(100))
+        );
     }
 
     #[test]
     fn duration_accepts_5m() {
         let yaml = HAPPY_YAML.replace("      idle_period: 1s\n", "      idle_period: 5m\n");
         let g = parse_graph_yaml(&yaml).unwrap();
-        assert_eq!(g.agents[0].mandate.idle_period, Duration::from_secs(5 * 60));
+        assert_eq!(
+            g.agents[0].mandate.idle_period,
+            Some(Duration::from_secs(5 * 60))
+        );
     }
 
     #[test]
     fn duration_accepts_1h() {
         let yaml = HAPPY_YAML.replace("      idle_period: 1s\n", "      idle_period: 1h\n");
         let g = parse_graph_yaml(&yaml).unwrap();
-        assert_eq!(g.agents[0].mandate.idle_period, Duration::from_secs(3600));
+        assert_eq!(
+            g.agents[0].mandate.idle_period,
+            Some(Duration::from_secs(3600))
+        );
     }
 
     #[test]
@@ -1249,12 +1563,46 @@ seed:
         assert!(!is_url_path_safe_name("foo.bar"));
     }
 
-    // --- YAML → AgentInput conversion (Stage 4.2, JAR2-73) -----------
+    // --- YAML → AgentInput conversion (Stage 4.2 + JAR2-89 fix) -----
+
+    /// Build a small synthetic [`AppliedGraph`] for the single-agent
+    /// fixture so the seed-trigger tests don't need a live DB. Uses
+    /// deterministic UUIDs derived from a counter so assertions can
+    /// pin specific prefix strings without flake.
+    fn synthetic_applied(graph: &GraphYaml, root_id: &str) -> super::AppliedGraph {
+        let graph_uuid = uuid::Uuid::new_v4();
+        let agent_uuid = uuid::Uuid::new_v4();
+        let graph_id = jarvis_node::agent_ref::GraphId::new(graph_uuid);
+        let agent_id = jarvis_node::agent_ref::AgentId::new(agent_uuid);
+        let workflow_id = format!("graphs/{graph_uuid}/agents/{agent_uuid}");
+        let mut id_map = std::collections::HashMap::new();
+        id_map.insert(
+            root_id.to_string(),
+            super::ResolvedAgentWorkflow {
+                db_agent_id: agent_id,
+                workflow_id,
+            },
+        );
+        super::AppliedGraph {
+            graph_id,
+            graph_name: graph.metadata.name.clone(),
+            agents: vec![super::ResolvedAgent {
+                operator_id: root_id.to_string(),
+                db_agent_id: agent_id,
+                parent_db_agent_id: None,
+            }],
+            id_map,
+        }
+    }
 
     #[test]
     fn into_agent_input_maps_canonical_fixture_to_expected_values() {
         let g = parse_and_validate(HAPPY_YAML).expect("happy path");
-        let input = super::into_agent_input(&g);
+        let graph_uuid = uuid::Uuid::new_v4();
+        let agent_uuid = uuid::Uuid::new_v4();
+        let graph_id = jarvis_node::agent_ref::GraphId::new(graph_uuid);
+        let agent_id = jarvis_node::agent_ref::AgentId::new(agent_uuid);
+        let input = super::into_agent_input(&g, graph_id, agent_id);
 
         // `mandate.text`, `idle_period`, `max_ticks` round-trip from the
         // YAML's inline mandate.
@@ -1276,11 +1624,17 @@ seed:
             jarvis_node::mandate::ContextPolicy::default(),
         );
 
-        // FS handle prefix mirrors the workflow ID so the daemon's
-        // shared `LocalStorage` namespaces artifacts per agent (otherwise
-        // tick-keyed files like `decisions/<tick>.jsonl` would collide
-        // across distinct graphs on the same daemon).
-        assert_eq!(input.fs_handle.prefix, "graphs/smoke/agents/root");
+        // JAR2-89: FS handle prefix is derived from the GraphStore-
+        // allocated UUIDs (NOT the operator-authored name) so cross-
+        // agent FS reads keyed off `agent_id` resolve correctly.
+        assert_eq!(
+            input.fs_handle.prefix,
+            format!("graphs/{graph_uuid}/agents/{agent_uuid}"),
+        );
+        // Identity triple round-trips through the helper.
+        assert_eq!(input.graph_id, graph_id);
+        assert_eq!(input.agent_id, agent_id);
+        assert_eq!(input.agent_name, "root");
 
         // Parent + carryover are None on a fresh apply (first run).
         assert!(input.parent_handle.is_none());
@@ -1293,7 +1647,9 @@ seed:
         // — `100ms` survives as `Duration::from_millis(100)`, etc.
         let yaml = HAPPY_YAML.replace("      idle_period: 1s\n", "      idle_period: 100ms\n");
         let g = parse_and_validate(&yaml).expect("happy path");
-        let input = super::into_agent_input(&g);
+        let graph_id = jarvis_node::agent_ref::GraphId::new(uuid::Uuid::new_v4());
+        let agent_id = jarvis_node::agent_ref::AgentId::new(uuid::Uuid::new_v4());
+        let input = super::into_agent_input(&g, graph_id, agent_id);
         assert_eq!(input.mandate.idle_period, Duration::from_millis(100));
     }
 
@@ -1303,31 +1659,37 @@ seed:
         // way through (matches `Mandate::new`'s contract).
         let yaml = HAPPY_YAML.replace("      max_ticks: 8\n", "");
         let g = parse_and_validate(&yaml).expect("happy path");
-        let input = super::into_agent_input(&g);
+        let graph_id = jarvis_node::agent_ref::GraphId::new(uuid::Uuid::new_v4());
+        let agent_id = jarvis_node::agent_ref::AgentId::new(uuid::Uuid::new_v4());
+        let input = super::into_agent_input(&g, graph_id, agent_id);
         assert!(input.mandate.max_ticks.is_none());
     }
 
     #[test]
     fn yaml_seed_triggers_translates_external_envelopes_in_order() {
-        // Two ordered seeds, both targeting the same agent (v1's only
-        // legal shape per the validator). The binary will signal them
-        // in the YAML's declared order; assert the translated vector
-        // preserves that order verbatim.
+        // Two ordered seeds, both targeting the same agent. The binary
+        // will signal them in the YAML's declared order; assert the
+        // translated vector preserves that order verbatim and resolves
+        // each to the correct workflow id via the id_map.
         let yaml = HAPPY_YAML.replace(
             "  triggers:\n    - agent: root\n      at: start\n      external:\n        kind: kickoff\n        payload: {}\n",
             "  triggers:\n    - agent: root\n      at: start\n      external:\n        kind: kickoff\n        payload: {}\n    - agent: root\n      at: start\n      external:\n        kind: heartbeat\n        payload:\n          beat: 1\n",
         );
         let g = parse_and_validate(&yaml).expect("happy path");
-        let triggers = super::yaml_seed_triggers(&g);
+        let applied = synthetic_applied(&g, "root");
+        let triggers = super::yaml_seed_triggers(&g, &applied).expect("seed triggers resolve");
         assert_eq!(triggers.len(), 2);
-        match &triggers[0] {
+        let expected_workflow_id = applied.id_map.get("root").unwrap().workflow_id.clone();
+        assert_eq!(triggers[0].workflow_id, expected_workflow_id);
+        match &triggers[0].trigger {
             jarvis_node::trigger::Trigger::External { kind, payload } => {
                 assert_eq!(kind, "kickoff");
                 assert_eq!(*payload, serde_json::json!({}));
             }
             other => panic!("expected External, got {other:?}"),
         }
-        match &triggers[1] {
+        assert_eq!(triggers[1].workflow_id, expected_workflow_id);
+        match &triggers[1].trigger {
             jarvis_node::trigger::Trigger::External { kind, payload } => {
                 assert_eq!(kind, "heartbeat");
                 assert_eq!(*payload, serde_json::json!({"beat": 1}));
@@ -1346,9 +1708,10 @@ seed:
             "        payload:\n          nested:\n            list: [1, 2, 3]\n            flag: true\n            text: hello\n",
         );
         let g = parse_and_validate(&yaml).expect("happy path");
-        let triggers = super::yaml_seed_triggers(&g);
+        let applied = synthetic_applied(&g, "root");
+        let triggers = super::yaml_seed_triggers(&g, &applied).expect("seed triggers resolve");
         assert_eq!(triggers.len(), 1);
-        match &triggers[0] {
+        match &triggers[0].trigger {
             jarvis_node::trigger::Trigger::External { kind, payload } => {
                 assert_eq!(kind, "kickoff");
                 assert_eq!(
@@ -1364,6 +1727,382 @@ seed:
             }
             other => panic!("expected External, got {other:?}"),
         }
+    }
+
+    // --- JAR2-85 multi-agent tests -------------------------------------
+
+    /// Strawman from `scratch/graph_yaml_schema.md` § 3, condensed to
+    /// the parse-only surface (no MCP tools — those are still rejected
+    /// per JAR2-71). Demonstrates the hierarchical `children:` form, the
+    /// top-level `defaults:` block, the pass-through `policy:` block,
+    /// and a `seed.triggers[].agent` targeting a non-root agent.
+    const HIERARCHICAL_YAML: &str = r#"
+apiVersion: jarvis.engine/v1alpha1
+kind: Graph
+metadata:
+  name: fda-monitor
+  description: "Continuous watch on FDA decisions for biotech X"
+defaults:
+  idle_period: 1h
+tools:
+  - id: web-search
+    kind: builtin
+    builtin: echo
+  - id: fda-feed
+    kind: builtin
+    builtin: echo
+agents:
+  - id: root
+    mandate:
+      text: "Monitor the FDA"
+      idle_period: 4h
+    tools: [web-search]
+    children:
+      - id: drug-alpha
+        mandate:
+          text: "Watch Drug Alpha"
+        tools: [fda-feed, web-search]
+      - id: drug-beta
+        mandate:
+          text: "Watch Drug Beta"
+        tools: [fda-feed, web-search]
+      - id: competitive-landscape
+        mandate:
+          text: "Track competitors"
+          idle_period: 12h
+        tools: [web-search]
+        children:
+          - id: competitor-a
+            mandate:
+              text: "Watch Competitor A"
+            tools: [fda-feed]
+          - id: competitor-b
+            mandate:
+              text: "Watch Competitor B"
+            tools: [fda-feed]
+seed:
+  triggers:
+    - agent: root
+      at: start
+      external:
+        kind: kickoff
+        payload: {}
+policy:
+  cost_budget:
+    daily_usd: 50
+  on_budget_exhausted: pause
+"#;
+
+    #[test]
+    fn parses_and_validates_hierarchical_fixture() {
+        let g = parse_and_validate(HIERARCHICAL_YAML).expect("hierarchical happy path");
+        assert_eq!(g.metadata.name, "fda-monitor");
+        assert_eq!(g.agents.len(), 1, "single root forest");
+        let root = &g.agents[0];
+        assert_eq!(root.id, "root");
+        assert_eq!(root.children.len(), 3);
+        // `competitive-landscape` has its own children.
+        let comp = root
+            .children
+            .iter()
+            .find(|a| a.id == "competitive-landscape")
+            .unwrap();
+        assert_eq!(comp.children.len(), 2);
+        // Defaults inheritance: root has inline 4h, drug-alpha uses
+        // defaults.idle_period (1h).
+        assert!(g.defaults.is_some());
+        assert_eq!(
+            g.defaults.as_ref().unwrap().idle_period,
+            Some(Duration::from_secs(3600))
+        );
+        // Drug-alpha has no inline idle_period — the validator allowed
+        // that because defaults provides one.
+        let alpha = root.children.iter().find(|a| a.id == "drug-alpha").unwrap();
+        assert!(alpha.mandate.idle_period.is_none());
+        // Policy round-trips as opaque JSON.
+        assert!(g.policy.is_some());
+    }
+
+    #[test]
+    fn is_multi_agent_detects_hierarchical_and_forest_shapes() {
+        let g = parse_and_validate(HIERARCHICAL_YAML).expect("happy");
+        assert!(
+            super::is_multi_agent(&g),
+            "nested children: triggers multi-agent"
+        );
+
+        let single = parse_and_validate(HAPPY_YAML).expect("single-agent happy");
+        assert!(!super::is_multi_agent(&single));
+
+        // Two roots, no children: still multi-agent.
+        let two_roots_yaml = HAPPY_YAML.to_string().replace(
+            "    tools: [echo]\n",
+            "    tools: [echo]\n  - id: second\n    mandate:\n      text: x\n      idle_period: 1s\n    tools: []\n",
+        );
+        let two_roots = parse_and_validate(&two_roots_yaml).expect("two-roots happy");
+        assert!(super::is_multi_agent(&two_roots));
+    }
+
+    #[test]
+    fn resolve_mandate_uses_defaults_when_inline_idle_period_absent() {
+        let g = parse_and_validate(HIERARCHICAL_YAML).expect("happy");
+        let root = &g.agents[0];
+        let alpha = root.children.iter().find(|a| a.id == "drug-alpha").unwrap();
+        let mandate = super::resolve_mandate(alpha, &g.defaults);
+        // Defaults.idle_period (1h) wins because alpha has no inline.
+        assert_eq!(mandate.idle_period, Duration::from_secs(3600));
+        assert_eq!(mandate.text, "Watch Drug Alpha");
+    }
+
+    #[test]
+    fn resolve_mandate_inline_overrides_defaults() {
+        let g = parse_and_validate(HIERARCHICAL_YAML).expect("happy");
+        let root = &g.agents[0];
+        let mandate = super::resolve_mandate(root, &g.defaults);
+        // Root's inline idle_period (4h) wins over defaults (1h).
+        assert_eq!(mandate.idle_period, Duration::from_secs(4 * 3600));
+    }
+
+    #[test]
+    fn rejects_duplicate_agent_id_across_tree() {
+        // Two agents with `id: dupe` at different nesting levels — the
+        // validator's tree walk must catch this.
+        let yaml = r#"
+apiVersion: jarvis.engine/v1alpha1
+kind: Graph
+metadata:
+  name: dup
+tools:
+  - id: echo
+    kind: builtin
+    builtin: echo
+agents:
+  - id: root
+    mandate:
+      text: r
+      idle_period: 1s
+    tools: []
+    children:
+      - id: dupe
+        mandate:
+          text: a
+          idle_period: 1s
+        tools: []
+      - id: dupe
+        mandate:
+          text: b
+          idle_period: 1s
+        tools: []
+seed:
+  triggers:
+    - agent: root
+      at: start
+      external:
+        kind: k
+        payload: {}
+"#;
+        let err = validate_err(yaml);
+        assert!(
+            matches!(err, GraphYamlError::DuplicateAgentId { ref agent_id } if agent_id == "dupe"),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn rejects_cyclic_children_via_direct_self_reference() {
+        // Defensive: a child whose `id` matches its parent's id (in
+        // the same `children:` list) is reported as `CyclicChildren`
+        // rather than `DuplicateAgentId` — more operator-actionable.
+        let yaml = r#"
+apiVersion: jarvis.engine/v1alpha1
+kind: Graph
+metadata:
+  name: cyc
+tools:
+  - id: echo
+    kind: builtin
+    builtin: echo
+agents:
+  - id: same
+    mandate:
+      text: parent
+      idle_period: 1s
+    tools: []
+    children:
+      - id: same
+        mandate:
+          text: child
+          idle_period: 1s
+        tools: []
+seed:
+  triggers:
+    - agent: same
+      at: start
+      external:
+        kind: k
+        payload: {}
+"#;
+        let err = validate_err(yaml);
+        assert!(
+            matches!(err, GraphYamlError::CyclicChildren { ref agent_id } if agent_id == "same"),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn rejects_unresolved_seed_trigger_target_across_tree() {
+        // Targets `ghost` which is nowhere in the tree.
+        let yaml = HIERARCHICAL_YAML.replace("- agent: root", "- agent: ghost");
+        let err = validate_err(&yaml);
+        assert!(
+            matches!(err, GraphYamlError::UnknownTriggerAgent { ref agent_id } if agent_id == "ghost"),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn rejects_missing_mandate_idle_period_when_no_defaults() {
+        // Agent has no inline `idle_period`; no top-level `defaults`.
+        // Validator must reject with the typed error.
+        let yaml = r#"
+apiVersion: jarvis.engine/v1alpha1
+kind: Graph
+metadata:
+  name: no-idle
+tools:
+  - id: echo
+    kind: builtin
+    builtin: echo
+agents:
+  - id: root
+    mandate:
+      text: x
+    tools: []
+seed:
+  triggers:
+    - agent: root
+      at: start
+      external:
+        kind: k
+        payload: {}
+"#;
+        let err = validate_err(yaml);
+        assert!(
+            matches!(err, GraphYamlError::MissingMandateIdlePeriod { ref agent_id } if agent_id == "root"),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn seed_trigger_can_target_a_leaf_agent() {
+        let yaml = HIERARCHICAL_YAML.replace("- agent: root", "- agent: competitor-a");
+        let g = parse_and_validate(&yaml).expect("leaf-targeted seed happy");
+        assert_eq!(g.seed.triggers[0].agent, "competitor-a");
+    }
+
+    #[test]
+    fn unresolved_tool_reference_in_deep_child_is_caught() {
+        // The validator's tree walk must enforce tool-ref resolution
+        // at every nesting level, not just the root.
+        let yaml = HIERARCHICAL_YAML.replace("tools: [fda-feed]\n", "tools: [fda-feed, missing]\n");
+        let err = validate_err(&yaml);
+        assert!(
+            matches!(
+                err,
+                GraphYamlError::UnknownToolReference {
+                    ref tool_id,
+                    ..
+                } if tool_id == "missing",
+            ),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn build_workflow_starts_produces_dfs_parents_first_with_real_uuids() {
+        // Hermetic — uses a synthetic AppliedGraph that mirrors what
+        // GraphStore::create_from_yaml would return. Asserts root +
+        // children + grandchildren land in parents-first DFS order,
+        // each with `parent_handle.workflow_id` pointing at the parent
+        // already in the list.
+        let g = parse_and_validate(HIERARCHICAL_YAML).expect("happy");
+        let graph_uuid = uuid::Uuid::new_v4();
+        let graph_id = jarvis_node::agent_ref::GraphId::new(graph_uuid);
+        // Walk the YAML to mint UUIDs in DFS parents-first order
+        // (matches the GraphStore walker's allocation order).
+        let mut resolved = Vec::new();
+        let mut id_map = std::collections::HashMap::new();
+        fn walk(
+            agent: &super::Agent,
+            parent: Option<jarvis_node::agent_ref::AgentId>,
+            graph_uuid: uuid::Uuid,
+            resolved: &mut Vec<super::ResolvedAgent>,
+            id_map: &mut std::collections::HashMap<String, super::ResolvedAgentWorkflow>,
+        ) {
+            let agent_uuid = uuid::Uuid::new_v4();
+            let agent_id = jarvis_node::agent_ref::AgentId::new(agent_uuid);
+            id_map.insert(
+                agent.id.clone(),
+                super::ResolvedAgentWorkflow {
+                    db_agent_id: agent_id,
+                    workflow_id: format!("graphs/{graph_uuid}/agents/{agent_uuid}"),
+                },
+            );
+            resolved.push(super::ResolvedAgent {
+                operator_id: agent.id.clone(),
+                db_agent_id: agent_id,
+                parent_db_agent_id: parent,
+            });
+            for child in &agent.children {
+                walk(child, Some(agent_id), graph_uuid, resolved, id_map);
+            }
+        }
+        for root in &g.agents {
+            walk(root, None, graph_uuid, &mut resolved, &mut id_map);
+        }
+        let applied = super::AppliedGraph {
+            graph_id,
+            graph_name: g.metadata.name.clone(),
+            agents: resolved,
+            id_map,
+        };
+        let starts = super::build_workflow_starts(&g, &applied);
+        // 6 agents: root + 3 children + 2 grandchildren.
+        assert_eq!(starts.len(), 6);
+        // Root first.
+        assert!(
+            starts[0].input.parent_handle.is_none(),
+            "root has no parent_handle"
+        );
+        assert_eq!(starts[0].input.agent_name, "root");
+        // Every non-root has a parent_handle pointing at a workflow id
+        // that appears earlier in the list.
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for start in &starts {
+            if let Some(parent) = &start.input.parent_handle {
+                assert!(
+                    seen_ids.contains(&parent.workflow_id),
+                    "child's parent_handle.workflow_id {} not in earlier entries: {:?}",
+                    parent.workflow_id,
+                    seen_ids
+                );
+            }
+            seen_ids.insert(start.workflow_id.clone());
+        }
+        // FsHandle prefix matches the workflow id (UUID-shaped).
+        for start in &starts {
+            assert_eq!(start.input.fs_handle.prefix, start.workflow_id);
+        }
+        // Defaults propagation: drug-alpha's mandate.idle_period
+        // came from `defaults.idle_period`.
+        let alpha_start = starts
+            .iter()
+            .find(|s| s.input.agent_name == "drug-alpha")
+            .unwrap();
+        assert_eq!(
+            alpha_start.input.mandate.idle_period,
+            Duration::from_secs(3600)
+        );
     }
 
     // --- Schema-drift regression --------------------------------------

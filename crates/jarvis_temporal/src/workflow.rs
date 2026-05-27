@@ -1412,6 +1412,38 @@ pub fn build_child_input(
     }
 }
 
+/// JAR2-85 (stage 5.8): construct the [`AgentInput`] for a freshly-
+/// applied **root** agent (no parent). Counterpart to
+/// [`build_child_input`]; the only difference is `parent_handle: None`.
+///
+/// Used by the multi-agent apply walker for the top-level forest entries
+/// and by the single-agent ergonomic shim
+/// (`jarvis_graph::yaml::into_agent_input`). Sharing the helper between
+/// the two surfaces means `FsHandle` derivation and the identity-triple
+/// (graph_id, agent_id, agent_name) handling lives in one place.
+///
+/// `cfg` matches `build_child_input`'s `inherited_cfg` — for roots
+/// there's nothing to inherit from, so the caller passes
+/// `AgentConfig::default()`.
+pub fn build_root_input(
+    graph_id: GraphId,
+    agent_id: AgentId,
+    agent_name: String,
+    mandate: Mandate,
+    cfg: AgentConfig,
+) -> AgentInput {
+    AgentInput {
+        cfg,
+        fs_handle: FsHandle::for_agent(graph_id, agent_id),
+        parent_handle: None,
+        carryover: None,
+        mandate,
+        graph_id,
+        agent_id,
+        agent_name,
+    }
+}
+
 /// JAR2-80 (stage 5.3): the `Decision::SpawnChild` workflow arm body.
 ///
 /// Pulled into a free function so the loop body's `match` stays inside

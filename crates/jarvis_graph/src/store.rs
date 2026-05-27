@@ -17,11 +17,13 @@
 //! `list_tools_for_agent` are all in scope.
 
 use crate::types::{AgentRecord, Edge, Graph, ToolRecord};
-use crate::yaml::{GraphYaml, ToolKind};
+use crate::yaml::{AppliedGraph, GraphYaml, ResolvedAgent, ResolvedAgentWorkflow, ToolKind};
 use async_trait::async_trait;
 use jarvis_node::agent_ref::{AgentId, GraphId};
 use jarvis_temporal::worker::StructuralDbStore;
+use jarvis_temporal::workflow::agent_workflow_id;
 use sqlx::{PgPool, Postgres, Transaction};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Typed error surface for [`GraphStore::create_from_yaml`].
@@ -209,9 +211,19 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Stage 4.2 (JAR2-73) transactional wrapper: in one DB transaction,
-    /// CREATE the graph row + the (single, v1) agent row + every tool
-    /// row + every `agent_tools` attachment.
+    /// Stage 4.2 (JAR2-73) + 5.8 (JAR2-85 / JAR2-89) transactional
+    /// wrapper: in one DB transaction, CREATE the graph row, every
+    /// agent row (DFS parents-first across the whole forest), every
+    /// parent→child `edges` row, every tool row, and every
+    /// `agent_tools` attachment.
+    ///
+    /// Returns [`AppliedGraph`] carrying the freshly-allocated
+    /// `graph_id`, a parents-first list of [`ResolvedAgent`]s, and the
+    /// `operator_id → (db_agent_id, workflow_id)` map the apply
+    /// binary's workflow-start phase consumes. **Single-agent YAML
+    /// (one root, no children) is the degenerate one-element case;
+    /// the JAR2-74 smoke test continues to work without changes on
+    /// the structural-DB side.**
     ///
     /// Returns [`GraphStoreError::GraphAlreadyExists`] when a graph with
     /// the same `metadata.name` already exists. v1 of `jarvis apply` is
@@ -227,28 +239,28 @@ impl GraphStore {
     /// concurrent-applies race the SELECT-then-INSERT alone cannot
     /// rule out.
     ///
+    /// JAR2-85: `graph.policy` is preserved verbatim into the `graphs.metadata`
+    /// jsonb under a `"policy"` key (pass-through; not enforced).
+    /// `graphs.metadata` is `{}` when no policy is declared, matching
+    /// the pre-JAR2-85 shape.
+    ///
     /// Caller invariant: `graph` must already have passed
-    /// [`crate::yaml::validate`] (or [`crate::yaml::parse_and_validate`]),
-    /// since this function takes the v1 "exactly one agent" guarantee as
-    /// a typed witness via `graph.agents[0]`.
+    /// [`crate::yaml::validate`] (or [`crate::yaml::parse_and_validate`]).
     ///
     /// Tool-row shape (mirror of the schema's free-form `kind` column):
     /// `kind = "builtin"`, `command = Some(<builtin name>)`,
-    /// `args = []`, `env_refs = []`. v1's only tool variant is
-    /// `kind: builtin`; the validator rejects `kind: mcp` so an
-    /// `unreachable!()`-style match arm would be the only alternative
-    /// here, which adds nothing.
-    pub async fn create_from_yaml(&self, graph: &GraphYaml) -> Result<Graph, GraphStoreError> {
+    /// `args = []`, `env_refs = []`.
+    pub async fn create_from_yaml(
+        &self,
+        graph: &GraphYaml,
+    ) -> Result<AppliedGraph, GraphStoreError> {
         let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
 
         // Collision check inside the transaction. `FOR UPDATE` would be
         // the textbook race-free shape, but `graphs.name` has no index
         // and `jarvis apply` is operator-driven (not concurrent), so a
-        // plain SELECT is sufficient for v1. A two-`jarvis apply`-at-
-        // once race is a vanishingly unlikely scenario, and even when
-        // it does occur both inserts would succeed today (no UNIQUE
-        // constraint) — the right fix is the deferred schema migration,
-        // not adding locking that papers over its absence.
+        // plain SELECT is sufficient for v1 (with the SQLSTATE 23505
+        // catch on the INSERT below as the structural-race backstop).
         let existing: Option<(Uuid,)> =
             sqlx::query_as("SELECT id FROM graphs WHERE name = $1 LIMIT 1")
                 .bind(&graph.metadata.name)
@@ -261,6 +273,13 @@ impl GraphStore {
         }
 
         // --- graph row -------------------------------------------------
+        // JAR2-85: `policy:` is pass-through. When declared, it lands
+        // verbatim under the `policy` key in `graphs.metadata`. When
+        // absent, metadata stays `{}` (pre-JAR2-85 shape).
+        let graph_metadata: serde_json::Value = match &graph.policy {
+            Some(p) => serde_json::json!({ "policy": p.0 }),
+            None => serde_json::json!({}),
+        };
         let graph_id = Uuid::new_v4();
         let graph_row = match sqlx::query_as!(
             Graph,
@@ -271,32 +290,12 @@ impl GraphStore {
             "#,
             graph_id,
             &graph.metadata.name,
-            // `metadata` jsonb is `{}` for v1; the description lives on
-            // the YAML side only (operator authoring surface), not in
-            // the structural DB. Stage 5+ may bubble selected metadata
-            // up if a need surfaces.
-            serde_json::json!({}),
+            graph_metadata,
         )
         .fetch_one(&mut *tx)
         .await
         {
             Ok(row) => row,
-            // JAR2-77 — the SELECT above is the fast path for the
-            // common, operator-driven case. The `graphs_name_unique`
-            // constraint (migration `0002_graphs_name_unique.sql`) is
-            // the DB-level backstop for the two-concurrent-applies
-            // race: two SELECTs can both miss, but only one INSERT
-            // wins; the loser's `fetch_one` resolves to
-            // `sqlx::Error::Database` with SQLSTATE 23505 (Postgres
-            // unique-violation). Surface it as the same typed
-            // `GraphAlreadyExists` variant the fast path uses so the
-            // caller (the `jarvis-apply` binary) renders one clean
-            // error message regardless of which check fired.
-            //
-            // The transaction is dropped on the `return` below, which
-            // Postgres rolls back implicitly — no agent / tool rows
-            // can leak from this branch because the only writes so
-            // far are the failed INSERT itself.
             Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {
                 return Err(GraphStoreError::GraphAlreadyExists {
                     name: graph.metadata.name.clone(),
@@ -305,49 +304,14 @@ impl GraphStore {
             Err(e) => return Err(e.into()),
         };
 
-        // --- agent row (v1: exactly one) -------------------------------
-        let agent_yaml = &graph.agents[0];
-        let agent_id = Uuid::new_v4();
-        sqlx::query_as!(
-            AgentRecord,
-            r#"
-            INSERT INTO agents (id, graph_id, name, mandate_ref)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id, graph_id, name, mandate_ref, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
-            "#,
-            agent_id,
-            graph_id,
-            &agent_yaml.id,
-            // `mandate_ref` is the opaque text handle to the authored
-            // mandate. v1's mandate travels via `AgentInput.mandate`
-            // directly (no resolver looks `mandate_ref` up), so leave
-            // it `None` rather than seed a placeholder value the
-            // structural DB would not interpret. See the no-back-compat-
-            // scaffolding memo.
-            None as Option<&str>,
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-
-        // --- tool rows + agent_tools attachments -----------------------
-        // The validator rejects `kind: mcp`, so every tool entry is a
-        // `ToolKind::Builtin` here. We persist `command = <builtin name>`
-        // so the structural DB row preserves the operator's choice
-        // (e.g. `"echo"`) — the worker side doesn't read this column
-        // back today, but writing it correctly future-proofs Stage 5+
-        // for MCP-tool registration (which would set `command =
-        // Some(<spawn argv[0]>)`). A `HashMap` indexes the freshly
-        // minted UUIDs so the agent-tools attachment loop can resolve
-        // tool ids by name without re-querying.
-        let mut tool_uuid_by_id: std::collections::HashMap<&str, Uuid> =
-            std::collections::HashMap::with_capacity(graph.tools.len());
+        // --- tool rows -------------------------------------------------
+        // Tools are graph-scoped (per JAR2-71). Index by operator id
+        // so each agent's `tools[]` reference can resolve to a UUID.
+        let mut tool_uuid_by_id: HashMap<&str, Uuid> = HashMap::with_capacity(graph.tools.len());
         for tool in &graph.tools {
             let tool_uuid = Uuid::new_v4();
             let (kind_text, command_text): (&str, Option<&str>) = match &tool.kind {
                 ToolKind::Builtin { builtin } => ("builtin", Some(builtin.as_str())),
-                // v1's validator rejects `kind: mcp` before this code
-                // runs — but the match must be exhaustive. A panic
-                // here would be a validator bug; surface it as such.
                 ToolKind::Mcp { .. } => {
                     return Err(GraphStoreError::Sqlx(sqlx::Error::Protocol(format!(
                         "internal: create_from_yaml saw kind: mcp for tool {:?}; \
@@ -374,36 +338,151 @@ impl GraphStore {
             tool_uuid_by_id.insert(tool.id.as_str(), tool_uuid);
         }
 
-        for tool_id in &agent_yaml.tools {
-            // Validator guarantees every `agent.tools[i]` resolves to a
-            // top-level `tools[].id`; the lookup is therefore
-            // infallible. We propagate a typed error if it isn't
-            // rather than panic, so the validator bug (if any) surfaces
-            // as a clean operator-facing message.
+        // --- agent rows + edges + agent_tools (DFS parents-first) ------
+        // The walker emits one row per agent (parents before children),
+        // one `edges` row per parent→child pair, and one `agent_tools`
+        // attachment per tool reference. The accumulator
+        // (`resolved_agents`) carries the (operator_id, db_agent_id,
+        // parent_db_id) triples downstream into [`AppliedGraph`].
+        let mut resolved_agents: Vec<ResolvedAgent> = Vec::new();
+        let mut id_map: HashMap<String, ResolvedAgentWorkflow> = HashMap::new();
+        for root_yaml in &graph.agents {
+            walk_agent_tree(
+                &mut tx,
+                graph_id,
+                root_yaml,
+                None,
+                &tool_uuid_by_id,
+                &mut resolved_agents,
+                &mut id_map,
+            )
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(AppliedGraph {
+            graph_id: GraphId::new(graph_row.id),
+            graph_name: graph_row.name,
+            agents: resolved_agents,
+            id_map,
+        })
+    }
+
+    // --- reads ------------------------------------------------------
+    // (walk_agent_tree is a free function below — recursive async fns
+    // need explicit boxing on the recursive call site.)
+}
+
+/// JAR2-85: recursive DFS walker for `create_from_yaml`. Writes one
+/// `agents` row, optionally one `edges` row (when `parent_db_id` is
+/// `Some`), every `agent_tools` join, then recurses into children.
+///
+/// Recursive `async fn` requires boxing on the recursive call (the
+/// future's size would otherwise be unbounded); the function returns a
+/// boxed future via `Box::pin` for the recursion.
+fn walk_agent_tree<'a>(
+    tx: &'a mut Transaction<'_, Postgres>,
+    graph_id: Uuid,
+    yaml_agent: &'a crate::yaml::Agent,
+    parent_db_id: Option<AgentId>,
+    tool_uuid_by_id: &'a HashMap<&'a str, Uuid>,
+    resolved_agents: &'a mut Vec<ResolvedAgent>,
+    id_map: &'a mut HashMap<String, ResolvedAgentWorkflow>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), GraphStoreError>> + Send + 'a>> {
+    Box::pin(async move {
+        // Allocate this agent's UUID + insert its row.
+        let agent_uuid = Uuid::new_v4();
+        sqlx::query_as!(
+            AgentRecord,
+            r#"
+            INSERT INTO agents (id, graph_id, name, mandate_ref)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, graph_id, name, mandate_ref, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            "#,
+            agent_uuid,
+            graph_id,
+            &yaml_agent.id,
+            // `mandate_ref` is the opaque text handle to the authored
+            // mandate. v1's mandate travels via `AgentInput.mandate`
+            // directly, so leave it `None`.
+            None as Option<&str>,
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+
+        let db_agent_id = AgentId::new(agent_uuid);
+
+        // Edge row: parent → this agent.
+        if let Some(parent) = parent_db_id {
+            sqlx::query!(
+                "INSERT INTO edges (id, parent_agent_id, child_agent_id) VALUES ($1, $2, $3)",
+                Uuid::new_v4(),
+                parent.into_uuid(),
+                agent_uuid,
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
+
+        // Agent-tool attachments.
+        for tool_ref in &yaml_agent.tools {
             let tool_uuid = tool_uuid_by_id
-                .get(tool_id.as_str())
+                .get(tool_ref.as_str())
                 .copied()
                 .ok_or_else(|| {
                     GraphStoreError::Sqlx(sqlx::Error::Protocol(format!(
-                        "internal: create_from_yaml could not resolve tool ref {tool_id:?}; \
+                        "internal: create_from_yaml could not resolve tool ref {tool_ref:?}; \
                      validator should have caught this (see <JAR2-71>)"
                     )))
                 })?;
             sqlx::query!(
                 "INSERT INTO agent_tools (agent_id, tool_id) VALUES ($1, $2)",
-                agent_id,
+                agent_uuid,
                 tool_uuid,
             )
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
 
-        tx.commit().await?;
-        Ok(graph_row)
-    }
+        // Record this agent's id_map entry. The workflow id is the
+        // UUID-shaped flat form (per Stage 5 Project decision 6 + JAR2-89:
+        // cross-agent FS reads look agents up by UUID, so the
+        // FsHandle::for_agent prefix must match the workflow id format).
+        let workflow_id = agent_workflow_id(&graph_id.to_string(), &agent_uuid.to_string());
+        id_map.insert(
+            yaml_agent.id.clone(),
+            ResolvedAgentWorkflow {
+                db_agent_id,
+                workflow_id,
+            },
+        );
+        resolved_agents.push(ResolvedAgent {
+            operator_id: yaml_agent.id.clone(),
+            db_agent_id,
+            parent_db_agent_id: parent_db_id,
+        });
 
-    // --- reads ------------------------------------------------------
+        // Recurse into children (parents-first DFS order: this agent's
+        // row + edge + tool rows are already written before any child
+        // row).
+        for child in &yaml_agent.children {
+            walk_agent_tree(
+                tx,
+                graph_id,
+                child,
+                Some(db_agent_id),
+                tool_uuid_by_id,
+                resolved_agents,
+                id_map,
+            )
+            .await?;
+        }
 
+        Ok(())
+    })
+}
+
+impl GraphStore {
     /// Fetch a single agent by id. Returns `Ok(None)` if no row matches —
     /// the call shape stage-3 startup code expects (lookup that may
     /// legitimately miss).
@@ -845,12 +924,22 @@ seed:
     ) -> sqlx::Result<()> {
         let store = GraphStore::new(pool);
         let g = crate::yaml::parse_and_validate(HAPPY_YAML).expect("validator green on fixture");
-        let graph_row = store.create_from_yaml(&g).await.expect("create_from_yaml");
+        let applied = store.create_from_yaml(&g).await.expect("create_from_yaml");
 
-        assert_eq!(graph_row.name, "smoke");
-        let agents = store.list_agents_in_graph(graph_row.id).await?;
+        assert_eq!(applied.graph_name, "smoke");
+        assert_eq!(applied.agents.len(), 1);
+        assert_eq!(applied.agents[0].operator_id, "root");
+        assert!(applied.agents[0].parent_db_agent_id.is_none());
+        // id_map round-trips the operator id to the allocated UUIDs.
+        let resolved = applied.id_map.get("root").expect("root id in id_map");
+        assert_eq!(resolved.db_agent_id, applied.agents[0].db_agent_id);
+
+        let agents = store
+            .list_agents_in_graph(applied.graph_id.into_uuid())
+            .await?;
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name, "root");
+        assert_eq!(AgentId::new(agents[0].id), applied.agents[0].db_agent_id);
         assert!(
             agents[0].mandate_ref.is_none(),
             "v1 leaves mandate_ref None; got {:?}",
@@ -861,6 +950,163 @@ seed:
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].kind, "builtin");
         assert_eq!(tools[0].command.as_deref(), Some("echo"));
+        Ok(())
+    }
+
+    /// JAR2-85 multi-agent hermetic test — parent + 2 children fixture
+    /// against ephemeral Postgres. Verifies:
+    ///   1. `agents` has 3 rows in the same graph
+    ///   2. `edges` has 2 parent→child rows
+    ///   3. `agent_tools` joins each agent to its declared tools
+    ///   4. `AppliedGraph.id_map` contains all 3 operator ids mapped to
+    ///      matching UUIDs (the JAR2-89 fix in action — operator-authored
+    ///      ids resolve to the same UUIDs `agents.id` holds)
+    ///   5. `AppliedGraph.agents` is in DFS parents-first order
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn create_from_yaml_multi_agent_writes_tree_and_id_map_matches_agents_table(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        const MULTI: &str = r#"
+apiVersion: jarvis.engine/v1alpha1
+kind: Graph
+metadata:
+  name: multi-smoke
+tools:
+  - id: echo
+    kind: builtin
+    builtin: echo
+agents:
+  - id: parent
+    mandate:
+      text: parent
+      idle_period: 1s
+    tools: [echo]
+    children:
+      - id: child-a
+        mandate:
+          text: a
+          idle_period: 1s
+        tools: [echo]
+      - id: child-b
+        mandate:
+          text: b
+          idle_period: 1s
+        tools: []
+seed:
+  triggers:
+    - agent: parent
+      at: start
+      external:
+        kind: kickoff
+        payload: {}
+"#;
+        let store = GraphStore::new(pool);
+        let g = crate::yaml::parse_and_validate(MULTI).expect("validator green");
+        let applied = store.create_from_yaml(&g).await.expect("create_from_yaml");
+
+        // 3 agents, all in the same graph, parents-first DFS.
+        let agents = store
+            .list_agents_in_graph(applied.graph_id.into_uuid())
+            .await?;
+        assert_eq!(agents.len(), 3);
+        assert_eq!(applied.agents.len(), 3);
+        assert_eq!(applied.agents[0].operator_id, "parent");
+        assert!(applied.agents[0].parent_db_agent_id.is_none());
+        // Child entries reference the parent's db UUID.
+        let parent_db_id = applied.agents[0].db_agent_id;
+        for child in &applied.agents[1..] {
+            assert_eq!(child.parent_db_agent_id, Some(parent_db_id));
+        }
+
+        // 2 edges (parent → child-a, parent → child-b).
+        let edges = store
+            .list_edges_in_graph(applied.graph_id.into_uuid())
+            .await?;
+        assert_eq!(edges.len(), 2);
+        assert!(edges
+            .iter()
+            .all(|e| AgentId::new(e.parent_agent_id) == parent_db_id));
+
+        // agent_tools joins: parent + child-a each have echo; child-b has none.
+        let parent_resolved = applied.id_map.get("parent").unwrap();
+        let parent_tools = store
+            .list_tools_for_agent(parent_resolved.db_agent_id.into_uuid())
+            .await?;
+        assert_eq!(parent_tools.len(), 1);
+        let child_a_resolved = applied.id_map.get("child-a").unwrap();
+        let child_a_tools = store
+            .list_tools_for_agent(child_a_resolved.db_agent_id.into_uuid())
+            .await?;
+        assert_eq!(child_a_tools.len(), 1);
+        let child_b_resolved = applied.id_map.get("child-b").unwrap();
+        let child_b_tools = store
+            .list_tools_for_agent(child_b_resolved.db_agent_id.into_uuid())
+            .await?;
+        assert_eq!(child_b_tools.len(), 0);
+
+        // JAR2-89 fix: id_map UUIDs match agents.id UUIDs verbatim.
+        for resolved in &applied.agents {
+            let row = agents
+                .iter()
+                .find(|a| AgentId::new(a.id) == resolved.db_agent_id)
+                .unwrap_or_else(|| panic!("agent row for {:?} not found", resolved.operator_id));
+            assert_eq!(row.name, resolved.operator_id);
+        }
+        Ok(())
+    }
+
+    /// JAR2-85: `policy:` round-trips into `graphs.metadata` jsonb.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn create_from_yaml_persists_policy_into_graph_metadata(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        const WITH_POLICY: &str = r#"
+apiVersion: jarvis.engine/v1alpha1
+kind: Graph
+metadata:
+  name: with-policy
+tools:
+  - id: echo
+    kind: builtin
+    builtin: echo
+agents:
+  - id: root
+    mandate:
+      text: x
+      idle_period: 1s
+    tools: [echo]
+seed:
+  triggers:
+    - agent: root
+      at: start
+      external:
+        kind: k
+        payload: {}
+policy:
+  cost_budget:
+    daily_usd: 50
+  on_budget_exhausted: pause
+"#;
+        let store = GraphStore::new(pool);
+        let g = crate::yaml::parse_and_validate(WITH_POLICY).expect("validator green");
+        let applied = store.create_from_yaml(&g).await.expect("create_from_yaml");
+        // Re-fetch the graph row to verify metadata.
+        let row: (serde_json::Value,) = sqlx::query_as("SELECT metadata FROM graphs WHERE id = $1")
+            .bind(applied.graph_id.into_uuid())
+            .fetch_one(store.pool())
+            .await?;
+        let policy = row.0.get("policy").expect("policy key persists");
+        assert_eq!(
+            policy.get("on_budget_exhausted").and_then(|v| v.as_str()),
+            Some("pause")
+        );
+        assert_eq!(
+            policy
+                .get("cost_budget")
+                .and_then(|v| v.get("daily_usd"))
+                .and_then(|v| v.as_i64()),
+            Some(50),
+        );
         Ok(())
     }
 
@@ -927,8 +1173,9 @@ seed:
         // state beyond the pool. `JoinSet` is the dep-free
         // alternative to `futures::join_all` (no `futures` in the
         // crate's `[dependencies]`).
-        let mut joinset: tokio::task::JoinSet<Result<Graph, crate::GraphStoreError>> =
-            tokio::task::JoinSet::new();
+        let mut joinset: tokio::task::JoinSet<
+            Result<crate::yaml::AppliedGraph, crate::GraphStoreError>,
+        > = tokio::task::JoinSet::new();
         for _ in 0..N {
             let store = store.clone();
             let graph = graph.clone();
@@ -940,8 +1187,8 @@ seed:
         while let Some(joined) = joinset.join_next().await {
             let res = joined.expect("spawned task did not panic");
             match res {
-                Ok(g) => {
-                    assert_eq!(g.name, expected_name);
+                Ok(a) => {
+                    assert_eq!(a.graph_name, expected_name);
                     ok_count += 1;
                 }
                 Err(crate::GraphStoreError::GraphAlreadyExists { name }) => {
