@@ -709,7 +709,7 @@ impl AgentWorkflow {
             // so a `retire` signal can never trigger a continue-as-new.
             let drained = ctx.state_mut(drain_buckets);
             if let Some(reason) = drained.retirement {
-                return retire(ctx, &input.fs_handle, reason).await;
+                return retire(ctx, &input, reason).await;
             }
 
             // assemble → decide → log → dispatch.
@@ -745,7 +745,7 @@ impl AgentWorkflow {
                     // produces. That matches the in-process loop's
                     // behavior — Retire is observable as a final log
                     // line, not a deferred event.
-                    return retire(ctx, &input.fs_handle, reason).await;
+                    return retire(ctx, &input, reason).await;
                 }
                 // JAR2-80 (stage 5.3): spawn_child wired here. Calls
                 // the `register_child_in_structural_db` activity to
@@ -796,10 +796,55 @@ impl AgentWorkflow {
                 Decision::ReconcileChildren { sources, conflict } => {
                     reconcile_children(ctx, &input, sources, conflict).await;
                 }
-                Decision::RetireChild { .. } | Decision::ReplaceChild { .. } => unimplemented!(
-                    "stage 5.7: workflow-side dispatch for retire/replace \
-                     is not yet wired — see Stage 5 Project decisions 4 and 11"
-                ),
+                // JAR2-84 (stage 5.7): parent terminates a child. Fires
+                // the child's existing `retire` signal arm (JAR2-59)
+                // via the same SDK two-step external_workflow().signal()
+                // shape JAR2-81 uses for the reverse direction. Same
+                // log-and-continue failure semantics: if the child
+                // already exited (or the workflow id is wrong) the
+                // signal fails and the parent moves on — the
+                // `RetireChild` intent is durable in Temporal history
+                // and the workflow-state mutation (remove from
+                // `child_handles`) happens regardless so the parent's
+                // model of the live child set stays coherent.
+                //
+                // `staged_correction` is NOT cleared here for the same
+                // reason `SpawnChild` doesn't clear it: a RetireChild
+                // doesn't satisfy a prior tool-failure correction
+                // about the parent's own work.
+                Decision::RetireChild { child_ref, reason } => {
+                    retire_child(ctx, &child_ref, reason).await;
+                }
+                // JAR2-84 (stage 5.7): parent retires a child and
+                // spawns a fresh replacement with a new mandate. Two-
+                // step: signal the old child's `retire` arm (best-
+                // effort, same as `RetireChild`), then spawn a fresh
+                // child via the same path `Decision::SpawnChild` uses.
+                // Per Stage 5 Project decision: replacement is NOT in-
+                // place — the new child gets a fresh `agent_id` +
+                // `workflow_id` + `edges` row. The old `edges` row
+                // stays (audit trail; no `retired_at` column).
+                //
+                // Naming for the replacement: deterministic
+                // `replacement-of-<old_agent_id>` so no DB lookup is
+                // needed inside the workflow body. The kernel doesn't
+                // promise human-meaningful names for runtime spawns.
+                //
+                // Failure-mode: if `spawn_child` errors (structural DB
+                // failure, child_workflow start failure), the old
+                // child has already been retire-signaled. There is no
+                // rollback — the parent's "I want this replaced"
+                // intent is durable in Temporal history, and the error
+                // propagates so Temporal's activity-failure surface
+                // makes the partial state operator-visible.
+                Decision::ReplaceChild {
+                    child_ref,
+                    new_mandate,
+                } => {
+                    let replacement_name = format!("replacement-of-{}", child_ref.agent_id);
+                    retire_child(ctx, &child_ref, format!("replaced by {replacement_name}")).await;
+                    spawn_child(ctx, &input, replacement_name, new_mandate).await?;
+                }
             }
             // Bump the tick after non-retire arms so the *next* iteration's
             // decision lands at `decisions/<tick+1>.jsonl`. The retire arm
@@ -1029,29 +1074,38 @@ async fn emit_output(
         )
         .await?;
     if let Some(parent) = &input.parent_handle {
-        signal_parent_child_output(ctx, input, parent, output_id).await;
+        let trigger = Trigger::ChildOutput {
+            child_ref: AgentRef::new(ctx.workflow_id().to_string(), input.agent_id),
+            agent_name: input.agent_name.clone(),
+            output_id,
+        };
+        signal_parent_with_trigger(ctx, parent, trigger).await;
     }
     Ok(())
 }
 
-/// Build a `Trigger::ChildOutput` payload and fire it at the parent
-/// workflow via the SDK's `ExternalWorkflowHandle::signal`. Errors are
-/// logged + swallowed per Stage 5 Project decision 10.
+/// Fire a [`Trigger`] payload at the parent workflow via the SDK's
+/// `ExternalWorkflowHandle::signal`. Errors are logged + swallowed per
+/// Stage 5 Project decision 10 (cross-workflow signaling is best-effort
+/// — the child's data is durable on its own FS regardless of whether
+/// the parent observed the signal).
 ///
-/// Free function so the `emit_output` happy path stays compact and
-/// the err arm is the only place `tracing::warn!` is emitted on this
-/// edge.
-async fn signal_parent_child_output(
+/// JAR2-84 (stage 5.7) generalized this from the JAR2-81
+/// `signal_parent_child_output` shape so both `ChildOutput` (the
+/// `Decision::EmitOutput` path) and `ChildRetired` (the `retire` path)
+/// share the same call shape + failure semantics. Building the typed
+/// [`Trigger`] is the caller's job — `ChildOutput` and `ChildRetired`
+/// each carry distinct fields that depend on workflow-local state
+/// (output id vs. retirement reason) the helper shouldn't pretend to
+/// abstract over.
+///
+/// Free function so the call sites stay compact and the err arm is the
+/// only place `tracing::warn!` is emitted on this edge.
+async fn signal_parent_with_trigger(
     ctx: &WorkflowContext<AgentWorkflow>,
-    input: &AgentInput,
     parent: &ParentRef,
-    output_id: OutputId,
+    trigger: Trigger,
 ) {
-    let trigger = Trigger::ChildOutput {
-        child_ref: AgentRef::new(ctx.workflow_id().to_string(), input.agent_id),
-        agent_name: input.agent_name.clone(),
-        output_id,
-    };
     // SDK two-step: handle = external_workflow(workflow_id, run_id),
     // then handle.signal(SignalDef, payload). `run_id = None` targets
     // the latest run (the parent's currently-active execution).
@@ -1177,20 +1231,42 @@ fn decision_summary(decision: &Decision) -> String {
 /// Invoke the `persist_retirement` activity and return the workflow
 /// result. Shared between the retire-signal short-circuit and the
 /// `Decision::Retire` arm.
+///
+/// JAR2-84 (stage 5.7): after `persist_retirement` returns successfully
+/// and before the workflow exits, if `input.parent_handle.is_some()` the
+/// workflow body fires one final `Trigger::ChildRetired` at the parent
+/// via [`signal_parent_with_trigger`]. The signal is best-effort (Stage
+/// 5 Project decision 10): a failure is logged but does NOT prevent the
+/// child from exiting cleanly — `retirement.json` is durable on the
+/// child's own FS regardless of whether the parent observed the signal.
+///
+/// Orphan children (`parent_handle.is_none()`) skip the signal step
+/// entirely — there is no parent to notify.
 async fn retire(
     ctx: &WorkflowContext<AgentWorkflow>,
-    fs_handle: &FsHandle,
+    input: &AgentInput,
     reason: String,
 ) -> WorkflowResult<AgentResult> {
     ctx.start_activity(
         AgentActivities::persist_retirement,
         PersistRetirementInput {
-            fs_handle: fs_handle.clone(),
+            fs_handle: input.fs_handle.clone(),
             reason: reason.clone(),
         },
         activity_opts(),
     )
     .await?;
+    // JAR2-84: notify the parent (if any) that this child retired.
+    // Same call shape as JAR2-81's `ChildOutput` path — both share
+    // `signal_parent_with_trigger` post-generalization.
+    if let Some(parent) = &input.parent_handle {
+        let trigger = Trigger::ChildRetired {
+            child_ref: AgentRef::new(ctx.workflow_id().to_string(), input.agent_id),
+            agent_name: input.agent_name.clone(),
+            reason: reason.clone(),
+        };
+        signal_parent_with_trigger(ctx, parent, trigger).await;
+    }
     Ok(AgentResult::Retired { reason })
 }
 
@@ -1457,6 +1533,54 @@ async fn spawn_child(
             .push(AgentRef::new(child_workflow_id, child_agent_id));
     });
     Ok(())
+}
+
+/// JAR2-84 (stage 5.7): the `Decision::RetireChild` workflow arm body
+/// (also reused by the `Decision::ReplaceChild` arm's retire half).
+///
+/// Sequence:
+///
+/// 1. Fire `AgentWorkflow::retire` at the child's workflow via the SDK
+///    two-step `external_workflow().signal()` chain (matches the JAR2-81
+///    shape — same primitive, reverse direction). The signal payload is
+///    the typed `String` the JAR2-59 `retire` handler accepts.
+/// 2. Log + continue on signal failure (Stage 5 Project decision 10):
+///    if the child already exited (or its workflow id is wrong) the
+///    signal fails and the parent proceeds. The child's exit is
+///    durable on its own FS regardless of whether this signal lands.
+/// 3. Remove the child's `AgentRef` from `self.child_handles` so the
+///    parent's snapshot / future reconcile / future retire paths see
+///    only the live child set. Round-trips through CAN via the
+///    existing [`Carryover::child_handles`] slot.
+///
+/// Free function (matches `spawn_child` / `signal_parent_with_trigger`)
+/// so the loop body's `match` stays inside the line budget.
+async fn retire_child(ctx: &WorkflowContext<AgentWorkflow>, child_ref: &AgentRef, reason: String) {
+    let result = ctx
+        .external_workflow(child_ref.workflow_id.clone(), None)
+        .signal(AgentWorkflow::retire, reason)
+        .await;
+    if let Err(failure) = result {
+        // Same log-and-continue shape as `signal_parent_with_trigger`
+        // — see that helper's doc for the Stage 5 decision 10
+        // rationale. A child that already exited (e.g. retired
+        // naturally on a previous tick) is the common case here, not
+        // a hard error.
+        tracing::warn!(
+            child_workflow_id = %child_ref.workflow_id,
+            child_agent_id = %child_ref.agent_id,
+            error = ?failure,
+            "signal_external_workflow(retire) to child failed; parent continuing per Stage 5 decision 10"
+        );
+    }
+    // Drop the child from the parent's live-handle set regardless of
+    // signal outcome. The intent ("this child is gone from the
+    // parent's model") is the load-bearing state mutation; the
+    // signal is just the best-effort delivery.
+    let target_agent_id = child_ref.agent_id;
+    ctx.state_mut(|s| {
+        s.child_handles.retain(|h| h.agent_id != target_agent_id);
+    });
 }
 
 /// JAR2-82 (stage 5.5): the `Decision::ReconcileChildren` workflow arm
@@ -2202,6 +2326,127 @@ mod tests {
         let mut wf2 = AgentWorkflow::default();
         wf2.hydrate_from_carryover(c2);
         assert_eq!(wf2.child_handles, vec![h1, h2]);
+    }
+
+    // ---- JAR2-84 (stage 5.7) — lifecycle ops: retire_child + replace_child ----
+
+    /// JAR2-84: simulate the workflow-state mutation `Decision::RetireChild`
+    /// performs (drop the named child's [`AgentRef`] from `child_handles`)
+    /// and assert the surviving set round-trips through [`Carryover`].
+    ///
+    /// We cannot construct a `WorkflowContext` in a unit test (it's SDK-
+    /// private; smoke § 3.4), so we exercise the load-bearing invariants
+    /// at the workflow-state level — same pattern as the JAR2-67
+    /// `signal_handlers_bump_cumulative_counters_at_receipt` test. The
+    /// live test in `tests/lifecycle_ops_live.rs` covers the cross-
+    /// workflow signal + activity dispatch end-to-end.
+    #[test]
+    fn retire_child_removes_handle_and_survives_carryover() {
+        use uuid::Uuid;
+        let h1 = AgentRef::new(
+            "graphs/g1/agents/c1",
+            AgentId::new(Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap()),
+        );
+        let h2 = AgentRef::new(
+            "graphs/g1/agents/c2",
+            AgentId::new(Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap()),
+        );
+        let mut wf = AgentWorkflow::default();
+        wf.child_handles.push(h1.clone());
+        wf.child_handles.push(h2.clone());
+
+        // Simulate the `Decision::RetireChild { child_ref: h1, .. }` arm's
+        // state mutation — the `retire_child` helper's `state_mut` body.
+        let target_agent_id = h1.agent_id;
+        wf.child_handles.retain(|h| h.agent_id != target_agent_id);
+        assert_eq!(wf.child_handles, vec![h2.clone()]);
+
+        // Round-trip through the full CAN wire path.
+        let c = wf.encode_carryover();
+        let json = serde_json::to_string(&c).expect("serialize carryover");
+        let c2: Carryover = serde_json::from_str(&json).expect("deserialize carryover");
+        let mut wf2 = AgentWorkflow::default();
+        wf2.hydrate_from_carryover(c2);
+        assert_eq!(
+            wf2.child_handles,
+            vec![h2],
+            "retire_child's removal must survive the CAN boundary",
+        );
+    }
+
+    /// JAR2-84: simulate the workflow-state mutation `Decision::ReplaceChild`
+    /// performs (drop the old child's [`AgentRef`], add the replacement's)
+    /// and assert the swap round-trips through [`Carryover`].
+    ///
+    /// Same hermetic-state-mutation rationale as
+    /// `retire_child_removes_handle_and_survives_carryover` above.
+    #[test]
+    fn replace_child_swaps_handle_and_survives_carryover() {
+        use uuid::Uuid;
+        let old = AgentRef::new(
+            "graphs/g1/agents/c1",
+            AgentId::new(Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap()),
+        );
+        let other = AgentRef::new(
+            "graphs/g1/agents/c2",
+            AgentId::new(Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap()),
+        );
+        let replacement = AgentRef::new(
+            "graphs/g1/agents/c3",
+            AgentId::new(Uuid::parse_str("bbbbbbbb-cccc-dddd-eeee-ffffffffffff").unwrap()),
+        );
+        let mut wf = AgentWorkflow::default();
+        wf.child_handles.push(old.clone());
+        wf.child_handles.push(other.clone());
+
+        // Simulate the `Decision::ReplaceChild { child_ref: old, .. }`
+        // arm's two-step state mutation — `retire_child` drops `old`,
+        // then `spawn_child`'s state_mut pushes the replacement ref.
+        let target_agent_id = old.agent_id;
+        wf.child_handles.retain(|h| h.agent_id != target_agent_id);
+        wf.child_handles.push(replacement.clone());
+        assert_eq!(wf.child_handles, vec![other.clone(), replacement.clone()]);
+
+        // Round-trip through the full CAN wire path.
+        let c = wf.encode_carryover();
+        let json = serde_json::to_string(&c).expect("serialize carryover");
+        let c2: Carryover = serde_json::from_str(&json).expect("deserialize carryover");
+        let mut wf2 = AgentWorkflow::default();
+        wf2.hydrate_from_carryover(c2);
+        assert_eq!(
+            wf2.child_handles,
+            vec![other, replacement],
+            "replace_child's swap (old removed, replacement added) must survive the CAN boundary",
+        );
+    }
+
+    /// JAR2-84: `retire_child`'s retain step must not drop unrelated
+    /// children when the target id doesn't match anything in
+    /// `child_handles` (e.g. the LLM emitted a `RetireChild` for a
+    /// child the parent never spawned, or the same `RetireChild` arm
+    /// ran twice on a tick boundary). The set is unchanged in that
+    /// case — the signal still goes out (best-effort), but the
+    /// workflow-state mutation is a no-op.
+    #[test]
+    fn retire_child_with_unknown_id_leaves_handles_unchanged() {
+        use uuid::Uuid;
+        let h1 = AgentRef::new(
+            "graphs/g1/agents/c1",
+            AgentId::new(Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap()),
+        );
+        let h2 = AgentRef::new(
+            "graphs/g1/agents/c2",
+            AgentId::new(Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap()),
+        );
+        let mut wf = AgentWorkflow::default();
+        wf.child_handles.push(h1.clone());
+        wf.child_handles.push(h2.clone());
+
+        // Simulate retire_child for a never-spawned id.
+        let unknown_agent_id =
+            AgentId::new(Uuid::parse_str("dddddddd-eeee-ffff-0000-111111111111").unwrap());
+        wf.child_handles.retain(|h| h.agent_id != unknown_agent_id);
+        assert_eq!(wf.child_handles, vec![h1, h2]);
     }
 
     /// JAR2-68: the decision-log summary string is what the TUI phase 1
