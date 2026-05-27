@@ -66,7 +66,10 @@ use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 use uuid::Uuid;
 
 use jarvis_node::agent_ref::{AgentId, AgentRef, GraphId};
-use jarvis_node::decision::{ContextBundle, Decide, Decision, ReconcileSource};
+use jarvis_node::conflict::ConflictKind;
+use jarvis_node::decision::{
+    ConflictAlternative, ConflictRecordIntent, ContextBundle, Decide, Decision, ReconcileSource,
+};
 use jarvis_node::evidence::EvidenceRecord;
 use jarvis_node::fs::AgentFs;
 use jarvis_node::mandate::{Mandate, OutputId};
@@ -111,6 +114,12 @@ static PARENT_SCRIPT: OnceLock<Mutex<VecDeque<Decision>>> = OnceLock::new();
 type PendingReconcile = (Option<String>, Option<AgentId>, Option<OutputId>);
 static PARENT_PENDING_RECONCILE: OnceLock<Mutex<Option<PendingReconcile>>> = OnceLock::new();
 
+/// JAR2-83: optional `ConflictRecordIntent` the parent's reconcile
+/// synthesizer attaches to the `Decision::ReconcileChildren` it builds.
+/// `None` (default) reproduces JAR2-82's `conflict: None` behaviour;
+/// `Some` exercises 5.6's conflict-log writer.
+static PARENT_PENDING_CONFLICT: OnceLock<Mutex<Option<ConflictRecordIntent>>> = OnceLock::new();
+
 /// Serializes the two live tests in this binary so they don't
 /// share `PARENT_OBSERVED_TRIGGERS` or the per-role scripts.
 static LIVE_TEST_GUARD: Mutex<()> = Mutex::new(());
@@ -144,6 +153,9 @@ fn ensure_installed() -> Arc<MemoryStorage> {
         PARENT_PENDING_RECONCILE
             .set(Mutex::new(None))
             .expect("PARENT_PENDING_RECONCILE set exactly once");
+        PARENT_PENDING_CONFLICT
+            .set(Mutex::new(None))
+            .expect("PARENT_PENDING_CONFLICT set exactly once");
 
         install_decide(Arc::new(ReconcileRoutingDecide));
     });
@@ -280,12 +292,23 @@ fn synthesize_reconcile_or_wait() -> anyhow::Result<Decision> {
         _ => default_ref,
     };
     let output_id = oid_override.unwrap_or(default_output_id);
+
+    // JAR2-83: lift any pending `ConflictRecordIntent` planted by the
+    // conflict-emitting live test. Default `None` reproduces JAR2-82's
+    // concordance-fold behaviour.
+    let conflict = PARENT_PENDING_CONFLICT
+        .get()
+        .expect("PARENT_PENDING_CONFLICT installed")
+        .lock()
+        .expect("pending conflict mutex poisoned")
+        .take();
+
     Ok(Decision::ReconcileChildren {
         sources: vec![ReconcileSource {
             child_ref,
             output_id,
         }],
-        conflict: None,
+        conflict,
     })
 }
 
@@ -321,6 +344,11 @@ fn reset_observed_state() {
         .expect("PARENT_PENDING_RECONCILE installed")
         .lock()
         .expect("pending reconcile mutex poisoned") = None;
+    *PARENT_PENDING_CONFLICT
+        .get()
+        .expect("PARENT_PENDING_CONFLICT installed")
+        .lock()
+        .expect("pending conflict mutex poisoned") = None;
 }
 
 fn set_pending_reconcile(p: PendingReconcile) {
@@ -329,6 +357,14 @@ fn set_pending_reconcile(p: PendingReconcile) {
         .expect("PARENT_PENDING_RECONCILE installed")
         .lock()
         .expect("pending reconcile mutex poisoned") = Some(p);
+}
+
+fn set_pending_conflict(c: ConflictRecordIntent) {
+    *PARENT_PENDING_CONFLICT
+        .get()
+        .expect("PARENT_PENDING_CONFLICT installed")
+        .lock()
+        .expect("pending conflict mutex poisoned") = Some(c);
 }
 
 fn run_suffix() -> String {
@@ -382,6 +418,24 @@ async fn parent_reconcile_on_missing_child_output_stages_correction_and_continue
     }
     let _guard = LIVE_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     run_failure_path().await.expect("JAR2-82 failure path");
+}
+
+/// JAR2-83 (stage 5.6): live test for the conflict-log writer. Parent
+/// emits a `Decision::ReconcileChildren { conflict: Some(...) }` with
+/// `resolution: None`; we assert the parent's `conflicts/<id>.json`
+/// lands with `kind: HeldOpen` and the planted alternatives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn parent_reconcile_with_conflict_writes_held_open_record() {
+    if env::var("TEMPORAL_LIVE_TEST").ok().as_deref() != Some("1") {
+        eprintln!(
+            "skipping parent_reconcile_with_conflict_writes_held_open_record; \
+             set TEMPORAL_LIVE_TEST=1 with a local Temporal Server to run"
+        );
+        return;
+    }
+    let _guard = LIVE_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    run_conflict_path().await.expect("JAR2-83 conflict path");
 }
 
 async fn run_happy_path() -> Result<()> {
@@ -815,6 +869,236 @@ async fn drive_failure_path(
         "parent did not reach its scripted Retire arm after reconcile failure: {reason:?}"
     );
     eprintln!("JAR2-82 fail: parent retired normally after staged correction");
+    Ok(())
+}
+
+async fn run_conflict_path() -> Result<()> {
+    let suffix = run_suffix();
+    let task_queue = format!("jarvis-jar2-83-conflict-{suffix}");
+    let graph_id = GraphId::new(Uuid::new_v4());
+    let parent_agent_id = AgentId::new(Uuid::new_v4());
+    let child_agent_id =
+        AgentId::new(Uuid::parse_str("cccccccc-dddd-eeee-ffff-000000000001").unwrap());
+    let parent_prefix = format!("graphs/{graph_id}/agents/{parent_agent_id}");
+    let child_prefix = format!("graphs/{graph_id}/agents/{child_agent_id}");
+    let parent_workflow_id = parent_prefix.clone();
+    let child_workflow_id = child_prefix.clone();
+
+    let storage = ensure_installed();
+    reset_observed_state();
+
+    // Plant evidence the child's EmitOutput will cite.
+    let plant_mandate = Mandate::new("plant", Duration::from_millis(0), None);
+    let plant_storage: Arc<dyn AgentStorage> = storage.clone();
+    let plant_fs = AgentFs::new_with_storage(plant_storage, &child_prefix, &plant_mandate)
+        .await
+        .context("open planting AgentFs for child (conflict path)")?;
+    let planted_id = plant_fs
+        .record_evidence(EvidenceRecord::new(
+            "echo",
+            serde_json::json!({"k": "vvv"}),
+            serde_json::json!({"hit": true}),
+            Utc::now(),
+        ))
+        .await
+        .context("plant evidence for child EmitOutput (conflict path)")?;
+
+    // Plant a `ConflictRecordIntent` for the parent's reconcile
+    // synthesizer to lift. `resolution: None` → `HeldOpen`.
+    let alt_a_child = AgentRef::new(child_workflow_id.clone(), child_agent_id);
+    let alt_b_child = AgentRef::new(child_workflow_id.clone(), child_agent_id);
+    let alt_a = ConflictAlternative {
+        source_child: alt_a_child,
+        source_output_id: OutputId::from_hex("a1".repeat(32)),
+        claim: "JAR2-83 claim A".into(),
+    };
+    let alt_b = ConflictAlternative {
+        source_child: alt_b_child,
+        source_output_id: OutputId::from_hex("b2".repeat(32)),
+        claim: "JAR2-83 claim B".into(),
+    };
+    set_pending_conflict(ConflictRecordIntent {
+        alternatives: vec![alt_a.clone(), alt_b.clone()],
+        resolution: None,
+    });
+
+    let parent_script = vec![
+        reconcile_placeholder(),
+        Decision::Retire {
+            reason: "JAR2-83 conflict: scripted retire".into(),
+        },
+    ];
+    let child_script = vec![
+        Decision::EmitOutput {
+            content: "JAR2-83 child output".into(),
+            evidence: vec![planted_id.clone()],
+        },
+        Decision::Retire {
+            reason: "JAR2-83 child: scripted retire".into(),
+        },
+    ];
+    install_role_scripts(parent_script, child_script);
+
+    let runtime = build_runtime()?;
+    let client = build_client().await?;
+    let mut worker = build_worker(&runtime, client.clone(), &task_queue)?;
+    let shutdown = worker.shutdown_handle();
+
+    let driver = tokio::spawn({
+        let task_queue = task_queue.clone();
+        let parent_prefix = parent_prefix.clone();
+        let child_prefix = child_prefix.clone();
+        let parent_workflow_id = parent_workflow_id.clone();
+        let child_workflow_id = child_workflow_id.clone();
+        let storage_arc: Arc<MemoryStorage> = SHARED_STORAGE
+            .get()
+            .expect("SHARED_STORAGE installed")
+            .clone();
+        let alt_a = alt_a.clone();
+        let alt_b = alt_b.clone();
+        async move {
+            struct ShutdownGuard<F: Fn()>(F);
+            impl<F: Fn()> Drop for ShutdownGuard<F> {
+                fn drop(&mut self) {
+                    (self.0)();
+                }
+            }
+            let _g = ShutdownGuard(shutdown);
+            drive_conflict_path(
+                client,
+                &task_queue,
+                graph_id,
+                parent_agent_id,
+                child_agent_id,
+                &parent_workflow_id,
+                &child_workflow_id,
+                &parent_prefix,
+                &child_prefix,
+                storage_arc,
+                alt_a,
+                alt_b,
+            )
+            .await
+        }
+    });
+
+    let worker_result = tokio::time::timeout(Duration::from_secs(120), worker.run())
+        .await
+        .map_err(|_| anyhow::anyhow!("worker.run() timed out (120s)"))?
+        .map_err(|e| anyhow::anyhow!("worker.run() exited with error: {e}"));
+    let driver_result = driver.await.context("driver task panicked")?;
+    worker_result?;
+    driver_result?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_conflict_path(
+    client: Client,
+    task_queue: &str,
+    graph_id: GraphId,
+    parent_agent_id: AgentId,
+    child_agent_id: AgentId,
+    parent_workflow_id: &str,
+    child_workflow_id: &str,
+    parent_prefix: &str,
+    child_prefix: &str,
+    storage: Arc<MemoryStorage>,
+    alt_a: ConflictAlternative,
+    alt_b: ConflictAlternative,
+) -> Result<()> {
+    let parent_input = AgentInput {
+        cfg: Default::default(),
+        fs_handle: FsHandle {
+            prefix: parent_prefix.into(),
+        },
+        parent_handle: None,
+        carryover: None,
+        mandate: Mandate::new(PARENT_MANDATE_TEXT, Duration::from_millis(50), None),
+        graph_id,
+        agent_id: parent_agent_id,
+        agent_name: "parent".into(),
+    };
+    let parent_handle = client
+        .start_workflow(
+            AgentWorkflow::run,
+            parent_input,
+            WorkflowStartOptions::new(task_queue, parent_workflow_id).build(),
+        )
+        .await
+        .context("start_workflow(parent conflict)")?;
+    eprintln!("JAR2-83 conflict: parent started at {parent_workflow_id}");
+
+    let child_input = AgentInput {
+        cfg: Default::default(),
+        fs_handle: FsHandle {
+            prefix: child_prefix.into(),
+        },
+        parent_handle: Some(ParentRef {
+            workflow_id: parent_workflow_id.to_string(),
+            ..ParentRef::default()
+        }),
+        carryover: None,
+        mandate: Mandate::new(CHILD_MANDATE_TEXT, Duration::from_millis(50), None),
+        graph_id,
+        agent_id: child_agent_id,
+        agent_name: "fda_scraper".into(),
+    };
+    let child_handle = client
+        .start_workflow(
+            AgentWorkflow::run,
+            child_input,
+            WorkflowStartOptions::new(task_queue, child_workflow_id).build(),
+        )
+        .await
+        .context("start_workflow(child conflict)")?;
+    eprintln!("JAR2-83 conflict: child started at {child_workflow_id}");
+
+    let _child_result: AgentResult = child_handle
+        .get_result(WorkflowGetResultOptions::default())
+        .await
+        .context("child get_result (conflict path)")?;
+
+    let parent_result = tokio::time::timeout(
+        Duration::from_secs(90),
+        parent_handle.get_result(WorkflowGetResultOptions::default()),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("parent never retired in 90s (conflict path)"))?
+    .context("parent get_result (conflict path)")?;
+    let AgentResult::Retired { reason } = parent_result;
+    eprintln!("JAR2-83 conflict: parent retired ({reason})");
+
+    // Inspect the parent's `conflicts/` directory — the activity
+    // should have landed exactly one HeldOpen record matching the
+    // planted alternatives.
+    let inspect_mandate = Mandate::new("inspect", Duration::from_millis(0), None);
+    let inspect_storage: Arc<dyn AgentStorage> = storage.clone();
+    let parent_view = AgentFs::new_with_storage(
+        inspect_storage,
+        &format!("{parent_prefix}/"),
+        &inspect_mandate,
+    )
+    .await
+    .context("open inspecting AgentFs over parent (conflict path)")?;
+    let conflicts = parent_view
+        .list_conflicts()
+        .await
+        .context("list_conflicts on parent")?;
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "expected exactly one conflict record on parent; got {}",
+        conflicts.len()
+    );
+    let record = &conflicts[0];
+    assert_eq!(
+        record.kind,
+        ConflictKind::HeldOpen,
+        "planted resolution: None must produce HeldOpen"
+    );
+    assert!(record.resolution.is_none());
+    assert_eq!(record.alternatives, vec![alt_a, alt_b]);
     Ok(())
 }
 
