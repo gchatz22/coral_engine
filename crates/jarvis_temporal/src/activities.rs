@@ -58,6 +58,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use jarvis_node::agent_core;
 use jarvis_node::agent_ref::{AgentId, GraphId};
+use jarvis_node::conflict::ConflictRecord;
 use jarvis_node::decision::{
     ConflictId, ConflictRecordIntent, ContextBundle, CorrectionContext, Decide, Decision, FsOp,
     ReconcileSource, ToolCall,
@@ -288,10 +289,10 @@ pub struct ReconcileChildrenInput {
     pub parent_agent_id: AgentId,
     pub sources: Vec<ReconcileSource>,
     /// `Some` iff the parent observed disagreement among the cited
-    /// outputs. JAR2-82 leaves the conflict-log writer stubbed
-    /// (the writer + canonical-form bytes land in JAR2-83 / 5.6);
-    /// when `Some`, the activity emits a `tracing::warn!` and returns
-    /// `conflict_id: None`.
+    /// outputs. JAR2-83 (5.6) wires the writer: when `Some`, the
+    /// activity persists a content-addressed `ConflictRecord` under
+    /// the parent's `conflicts/<id>.json` and returns the id on
+    /// `ReconcileChildrenOutput.conflict_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict: Option<ConflictRecordIntent>,
 }
@@ -305,9 +306,10 @@ pub struct ReconcileChildrenInput {
 /// no workflow-state slot involved (Stage 5 Project decision 3 +
 /// JAR2-82 advisor item 4).
 ///
-/// `conflict_id` is always `None` in JAR2-82 — the writer ships in
-/// JAR2-83. The field exists on the wire today so 5.6's call-site
-/// upgrade is a value change, not a struct rev.
+/// `conflict_id` is `Some` iff `input.conflict.is_some()` and the
+/// activity wrote the conflict record successfully. JAR2-83 (5.6)
+/// shipped the writer; this is now a value change from the JAR2-82
+/// stub, not a struct rev.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReconcileChildrenOutput {
     pub synthetic_evidence: Vec<EvidenceId>,
@@ -334,6 +336,14 @@ pub enum ReconciliationError {
         agent_id: AgentId,
         output_id: OutputId,
     },
+    /// JAR2-83 (stage 5.6): the parent's `Decision::ReconcileChildren`
+    /// carried a `ConflictRecordIntent` with fewer than two
+    /// alternatives. A single-alternative "conflict" is meaningless and
+    /// signals an LLM-level mistake; non-retryable for the same reason
+    /// `ChildOutputNotFound` is — re-running the activity with the same
+    /// payload won't make a bad shape good.
+    #[error("reconcile: conflict intent has only {count} alternatives (need >= 2)")]
+    ConflictAlternativesTooFew { count: usize },
 }
 
 /// One JSONL entry written by [`AgentActivities::append_decision_log`].
@@ -937,10 +947,13 @@ impl AgentActivities {
     /// the parent's next-tick `assemble_context` picks the synthetic
     /// records up via the existing `list_recent_evidence` window.
     ///
-    /// Conflict-record writing stays in JAR2-83 (5.6). This activity
-    /// leaves a `tracing::warn!` at the call site when
-    /// `input.conflict.is_some()` and always returns `conflict_id:
-    /// None` — see [`reconcile_children_impl`] for the rationale.
+    /// JAR2-83 (5.6) wired the conflict-record writer: when
+    /// `input.conflict.is_some()`, the activity persists a
+    /// `ConflictRecord` under the parent's `conflicts/<id>.json` and
+    /// returns the resulting `ConflictId` in `output.conflict_id`. A
+    /// malformed intent (`alternatives.len() < 2`) surfaces as
+    /// [`ReconciliationError::ConflictAlternativesTooFew`] via the
+    /// same non-retryable path as `ChildOutputNotFound`.
     ///
     /// Error mapping: only typed [`ReconciliationError`]s surface as
     /// `ActivityError::Application(non_retryable)` — the workflow
@@ -1053,10 +1066,15 @@ pub async fn register_child_in_structural_db_impl(
 ///    `EvidenceId`, which the activity collects into the output's
 ///    `synthetic_evidence` vector.
 ///
-/// Conflict-record write: if `input.conflict.is_some()`, emit a
-/// `tracing::warn!` and return `conflict_id: None`. JAR2-83 (5.6)
-/// fills in the actual writer; this ticket leaves the call site as a
-/// TODO so 5.6 has one obvious place to land.
+/// Conflict-record write (JAR2-83 / 5.6): if `input.conflict.is_some()`,
+/// build a `ConflictRecord` via `ConflictRecord::new(now, alts, res)`
+/// and persist it to the parent's `conflicts/<id>.json` via
+/// `AgentFs::write_conflict`. The returned `ConflictId` lands in
+/// `ReconcileChildrenOutput.conflict_id`. A malformed intent
+/// (`alternatives.len() < 2`) returns
+/// `ReconciliationError::ConflictAlternativesTooFew` (mapped to
+/// non-retryable at the activity boundary — same path as
+/// `ChildOutputNotFound`).
 ///
 /// **Error discipline.** Only a genuine `FsError::OutputNotFound`
 /// (the cited child output doesn't resolve on the child's FS) is
@@ -1157,20 +1175,40 @@ pub async fn reconcile_children_impl(
         synthetic_evidence.push(ev_id);
     }
 
-    // Conflict-record stub. JAR2-83 (5.6) ships the writer; until
-    // then we surface a tracing line so an operator can see the
-    // intent landed at the boundary and was deliberately not
-    // persisted. Never returns a synthetic `ConflictId` — that would
-    // dangle a reference to a file that never gets written.
-    if input.conflict.is_some() {
-        tracing::warn!(
-            "JAR2-82: conflict intent received but conflict-log writer not yet implemented (JAR2-83 / 5.6)"
-        );
-    }
+    // JAR2-83 (stage 5.6): persist the conflict record (if any) to the
+    // parent's `conflicts/<id>.json`. The record is content-addressed
+    // over `(alternatives, resolution)` so a retried activity that
+    // re-writes here PUTs byte-identical bytes under the same key —
+    // `AgentFs::write_conflict` rides `put_if_absent` for the dedup.
+    //
+    // Validation: `alternatives.len() < 2` is a structural error from
+    // the LLM (a "conflict" with one side isn't a conflict). We
+    // pre-check before the FS call so the typed
+    // `ReconciliationError::ConflictAlternativesTooFew` reaches the
+    // workflow body even if a future `write_conflict` swap loses the
+    // FS-layer check — defence in depth, mirroring how
+    // `ChildOutputNotFound` is mapped at the cross-agent read site
+    // before the activity boundary's downcast picks it up.
+    //
+    // `kind` is *not* set here — `ConflictRecord::new` derives it from
+    // `resolution.is_some()` (Stage 5 Project decision 14 / advisor
+    // item 5: reader convenience, single source of truth).
+    let conflict_id = if let Some(intent) = input.conflict {
+        if intent.alternatives.len() < 2 {
+            return Err(ReconciliationError::ConflictAlternativesTooFew {
+                count: intent.alternatives.len(),
+            }
+            .into());
+        }
+        let record = ConflictRecord::new(now, intent.alternatives, intent.resolution);
+        Some(parent_fs.write_conflict(&record).await?)
+    } else {
+        None
+    };
 
     Ok(ReconcileChildrenOutput {
         synthetic_evidence,
-        conflict_id: None,
+        conflict_id,
     })
 }
 
@@ -2351,6 +2389,7 @@ mod tests {
                 assert_eq!(*agent_id, child_agent_id);
                 assert_eq!(*output_id, bogus);
             }
+            other => panic!("expected ChildOutputNotFound, got {other:?}"),
         }
 
         // No synthetic evidence landed on the parent's FS — the
@@ -2429,11 +2468,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_children_impl_with_conflict_intent_returns_no_conflict_id_yet() {
-        // JAR2-82 stubs the conflict-record writer with a TODO + warn;
-        // JAR2-83 (5.6) fills it. Confirm the activity returns
-        // `conflict_id: None` even when `input.conflict.is_some()`.
+    async fn reconcile_children_impl_with_held_open_conflict_writes_record_and_returns_id() {
+        // JAR2-83 (5.6) wires the writer. With `resolution: None` the
+        // activity must persist a `HeldOpen` conflict record under the
+        // parent's `conflicts/<id>.json` and return the id.
         use jarvis_node::agent_ref::AgentRef;
+        use jarvis_node::conflict::ConflictKind;
         use jarvis_node::decision::{ConflictAlternative, ConflictRecordIntent};
         use uuid::Uuid;
 
@@ -2444,6 +2484,69 @@ mod tests {
         let (child_wf, child_out, _ev) =
             plant_child_output(storage.clone(), graph_id, child_agent_id, "single claim").await;
 
+        let alt_x = ConflictAlternative {
+            source_child: AgentRef::new(child_wf.clone(), child_agent_id),
+            source_output_id: child_out.clone(),
+            claim: "value is X".into(),
+        };
+        let alt_y = ConflictAlternative {
+            source_child: AgentRef::new(child_wf.clone(), child_agent_id),
+            source_output_id: child_out.clone(),
+            claim: "value is Y".into(),
+        };
+        let conflict = ConflictRecordIntent {
+            alternatives: vec![alt_x.clone(), alt_y.clone()],
+            resolution: None,
+        };
+        let input = ReconcileChildrenInput {
+            parent_graph_id: graph_id,
+            parent_agent_id,
+            sources: vec![ReconcileSource {
+                child_ref: AgentRef::new(child_wf, child_agent_id),
+                output_id: child_out,
+            }],
+            conflict: Some(conflict),
+        };
+        let out = reconcile_children_impl(storage.clone(), input, fixed_now())
+            .await
+            .expect("reconcile with held-open conflict ok");
+        assert_eq!(out.synthetic_evidence.len(), 1);
+        let conflict_id = out
+            .conflict_id
+            .expect("JAR2-83: conflict_id is Some when input.conflict is Some");
+
+        // The record landed in the parent's FS and round-trips with
+        // the right shape.
+        let parent_view = AgentFs::open_for_agent(storage, graph_id, parent_agent_id);
+        let listed = parent_view.list_conflicts().await.unwrap();
+        assert_eq!(listed.len(), 1, "expected one conflict record");
+        let record = &listed[0];
+        assert_eq!(record.id, conflict_id);
+        assert_eq!(record.kind, ConflictKind::HeldOpen);
+        assert_eq!(record.alternatives, vec![alt_x, alt_y]);
+        assert!(record.resolution.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_children_impl_with_resolved_conflict_writes_resolution() {
+        use jarvis_node::agent_ref::AgentRef;
+        use jarvis_node::conflict::ConflictKind;
+        use jarvis_node::decision::{
+            ConflictAlternative, ConflictRecordIntent, ConflictResolution,
+        };
+        use uuid::Uuid;
+
+        let storage: Arc<dyn jarvis_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
+        let graph_id = GraphId::new(Uuid::new_v4());
+        let parent_agent_id = AgentId::new(Uuid::new_v4());
+        let child_agent_id = AgentId::new(Uuid::new_v4());
+        let (child_wf, child_out, _ev) =
+            plant_child_output(storage.clone(), graph_id, child_agent_id, "claim").await;
+
+        let resolution = ConflictResolution {
+            chosen_alternative_idx: 1,
+            reasoning: "second alternative cites more recent evidence".into(),
+        };
         let conflict = ConflictRecordIntent {
             alternatives: vec![
                 ConflictAlternative {
@@ -2457,6 +2560,56 @@ mod tests {
                     claim: "value is Y".into(),
                 },
             ],
+            resolution: Some(resolution.clone()),
+        };
+        let input = ReconcileChildrenInput {
+            parent_graph_id: graph_id,
+            parent_agent_id,
+            sources: vec![ReconcileSource {
+                child_ref: AgentRef::new(child_wf, child_agent_id),
+                output_id: child_out,
+            }],
+            conflict: Some(conflict),
+        };
+        let out = reconcile_children_impl(storage.clone(), input, fixed_now())
+            .await
+            .expect("reconcile with resolved conflict ok");
+        let conflict_id = out.conflict_id.expect("conflict_id is Some");
+
+        let parent_view = AgentFs::open_for_agent(storage, graph_id, parent_agent_id);
+        let record = parent_view
+            .read_conflict(&conflict_id)
+            .await
+            .unwrap()
+            .expect("conflict record present");
+        assert_eq!(record.kind, ConflictKind::Resolved);
+        assert_eq!(record.resolution.as_ref().unwrap(), &resolution);
+    }
+
+    #[tokio::test]
+    async fn reconcile_children_impl_rejects_fewer_than_two_alternatives() {
+        // JAR2-83: a `ConflictRecordIntent` with one alternative is a
+        // structural error; the activity returns the typed
+        // ReconciliationError::ConflictAlternativesTooFew (which the
+        // wrapper maps to non-retryable so the workflow body's
+        // correction-context path takes over).
+        use jarvis_node::agent_ref::AgentRef;
+        use jarvis_node::decision::{ConflictAlternative, ConflictRecordIntent};
+        use uuid::Uuid;
+
+        let storage: Arc<dyn jarvis_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
+        let graph_id = GraphId::new(Uuid::new_v4());
+        let parent_agent_id = AgentId::new(Uuid::new_v4());
+        let child_agent_id = AgentId::new(Uuid::new_v4());
+        let (child_wf, child_out, _ev) =
+            plant_child_output(storage.clone(), graph_id, child_agent_id, "claim").await;
+
+        let conflict = ConflictRecordIntent {
+            alternatives: vec![ConflictAlternative {
+                source_child: AgentRef::new(child_wf.clone(), child_agent_id),
+                source_output_id: child_out.clone(),
+                claim: "the only side".into(),
+            }],
             resolution: None,
         };
         let input = ReconcileChildrenInput {
@@ -2468,13 +2621,21 @@ mod tests {
             }],
             conflict: Some(conflict),
         };
-        let out = reconcile_children_impl(storage, input, fixed_now())
+        let err = reconcile_children_impl(storage.clone(), input, fixed_now())
             .await
-            .expect("reconcile with conflict intent ok");
-        assert_eq!(out.synthetic_evidence.len(), 1);
+            .expect_err("expected ConflictAlternativesTooFew");
+        match err.downcast_ref::<ReconciliationError>() {
+            Some(ReconciliationError::ConflictAlternativesTooFew { count }) => {
+                assert_eq!(*count, 1)
+            }
+            other => panic!("expected ConflictAlternativesTooFew, got {other:?}"),
+        }
+        // No conflict file landed in the parent's FS.
+        let parent_view = AgentFs::open_for_agent(storage, graph_id, parent_agent_id);
+        let listed = parent_view.list_conflicts().await.unwrap();
         assert!(
-            out.conflict_id.is_none(),
-            "JAR2-82 returns conflict_id: None even when input.conflict is Some (JAR2-83 fills in writer)"
+            listed.is_empty(),
+            "no conflict file should land for malformed intent; got {listed:?}"
         );
     }
 

@@ -16,6 +16,12 @@ pub mod agent_core;
 // variants and (in JAR2-79) by `Trigger::ChildOutput` / `ChildRetired`. See
 // `agent_ref.rs` module doc for the placement rationale.
 pub mod agent_ref;
+// JAR2-83 (stage 5.6): `ConflictRecord` + content-addressing constructor on
+// `ConflictId`. Re-exports `ConflictAlternative` / `ConflictResolution` /
+// `ConflictId` from `decision` for caller ergonomics. The FS writer
+// (`AgentFs::write_conflict` / `read_conflict` / `list_conflicts`) lives in
+// `fs.rs`.
+pub mod conflict;
 pub mod decide_llm;
 pub mod decision;
 pub mod evidence;
