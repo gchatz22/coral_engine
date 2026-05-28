@@ -9,6 +9,31 @@
 //! to replace it). Carrying `agent_name` on the payload is the cheapest
 //! path — keeps the prompt renderer from needing a `GraphStore` lookup
 //! in `assemble_context`.
+//!
+//! # Cross-agent variants + priority invariant
+//!
+//! [`Trigger::ChildOutput`] and [`Trigger::ChildRetired`] carry the
+//! child's stable [`AgentRef`] plus its operator-readable `agent_name`
+//! and the variant-specific payload ([`crate::mandate::OutputId`] or
+//! retirement reason). The renderer surfaces `agent_name` as a
+//! distinct field — it is *not* folded into the opaque `payload` blob
+//! that [`Trigger::External`] carries, so prompts and the TUI can
+//! distinguish "a child agent said this" from "an unknown external
+//! webhook said this" without an out-of-band lookup.
+//!
+//! [`crate::trigger_queue::TriggerQueue::drain_ordered`] sorts triggers
+//! by class so the agent loop always sees them in the same order
+//! regardless of arrival interleaving:
+//!
+//! ```text
+//! Human > External > ChildOutput / ChildRetired > Scheduled
+//! ```
+//!
+//! Operator signals always preempt cross-agent traffic; cross-agent
+//! traffic always preempts idle timers. `ChildRetired` shares the
+//! cross-agent class with `ChildOutput` (both represent a child telling
+//! the parent something actionable); within a class the order is FIFO
+//! by arrival.
 
 use crate::agent_ref::AgentRef;
 use crate::mandate::OutputId;

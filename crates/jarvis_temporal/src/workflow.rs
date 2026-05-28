@@ -74,6 +74,132 @@
 //! arrives only through `ctx.timer(Duration)`; FS reads/writes live
 //! inside activities. The loop is fully replayable against workflow
 //! history.
+//!
+//! ## Parent-child topology
+//!
+//! Multi-agent graphs run as detached parent and child workflows of the
+//! same [`AgentWorkflow`] type — there is no separate "parent workflow"
+//! or "child workflow" code path. Topology mutations are LLM-driven
+//! [`Decision`] variants the parent emits; the parent's loop body
+//! routes each variant to either an activity (kernel side effects:
+//! structural-DB write, cross-agent FS read, conflict-log write,
+//! retirement persist) or an SDK workflow command (the only path that
+//! can start a child workflow).
+//!
+//! ### `ParentRef` + `AgentInput.parent_handle`
+//!
+//! [`ParentRef`] is the child's view of its parent: an opaque workflow
+//! id plus a signal name. The parent's `Decision::SpawnChild` arm
+//! builds the child's [`AgentInput`] via [`build_child_input`] and
+//! populates `parent_handle: Some(ParentRef { .. })` so the child's
+//! workflow code can route output and retirement notifications back to
+//! the parent.
+//!
+//! `ParentRef.signal` is a `String` for wire stability, but at this
+//! version it is informational: the SDK binds signal targets at compile
+//! time via the typed marker the `#[signal]` macro generates, so the
+//! child's `external_workflow(..).signal(AgentWorkflow::external_signal,
+//! payload)` chain uses [`AgentWorkflow::external_signal`] regardless
+//! of what string the field holds. The field is kept on the wire for
+//! future signal-definition targets that may diverge from
+//! `external_signal`.
+//!
+//! Root agents (no parent) carry `parent_handle: None`; the
+//! `signal_parent_with_trigger` helper short-circuits in that case.
+//!
+//! ### `Decision` arms — what each routes to
+//!
+//! | Variant                       | Routes to                                                                                       |
+//! | ----------------------------- | ----------------------------------------------------------------------------------------------- |
+//! | [`Decision::SpawnChild`]      | `register_child_in_structural_db` **activity** → then `ctx.child_workflow(..)` **workflow command** |
+//! | [`Decision::ReconcileChildren`] | `reconcile_children` **activity** (cross-agent FS read + synthetic-evidence writes + conflict-log write) |
+//! | [`Decision::RetireChild`]     | `external_workflow(child_id, None).signal(AgentWorkflow::retire, reason)` — no activity         |
+//! | [`Decision::ReplaceChild`]    | retire-signal the old child, then `Decision::SpawnChild`'s sequence for the replacement         |
+//!
+//! `SpawnChild` is split deliberately: the structural-DB write needs
+//! activity-level durability (so a worker crash mid-write doesn't lose
+//! the edge row), but the actual child workflow start is an SDK
+//! workflow command (`ctx.child_workflow(..)`) — there is no
+//! "spawn_child_workflow" activity. The activity returns the freshly-
+//! minted `AgentId`, the workflow body composes the child's workflow
+//! id from it, and `ctx.child_workflow(..)` does the dispatch with
+//! [`ParentClosePolicy::Abandon`].
+//!
+//! ### `Trigger` arms — child → parent
+//!
+//! Children deliver outputs and retirement notifications upward as the
+//! cross-agent variants [`Trigger::ChildOutput`] and
+//! [`Trigger::ChildRetired`]. Both arrive through the existing
+//! [`AgentWorkflow::external_signal`] handler — there is no separate
+//! parent-side signal arm for cross-agent traffic. The handler pushes
+//! the typed payload onto `pending_triggers`; the loop drains it on
+//! the next wake and the LLM sees it in the [`ContextBundle`].
+//!
+//! ### `signal_external_workflow` SDK shape
+//!
+//! Cross-workflow signaling uses the SDK's two-step chain rather than a
+//! single `signal_external_workflow(..)` method (the latter does not
+//! exist in the Rust SDK at v0.4.0; see
+//! `scratch/temporal_rust_sdk_smoke.md` § 3.10):
+//!
+//! ```text
+//! ctx.external_workflow(workflow_id, run_id)              // -> ExternalWorkflowHandle
+//!    .signal(AgentWorkflow::external_signal, payload)     // SignalDef + typed payload
+//!    .await                                               // -> Result<SignalExternalOk, Failure>
+//! ```
+//!
+//! `run_id = None` targets the latest run of the named workflow.
+//! Signal failures (parent or child already exited, transient server
+//! error) are logged and swallowed by the cross-workflow signaling
+//! helpers — both the child → parent path and the parent → child
+//! retire path treat the signal as best-effort. The sender's data is
+//! durable on its own FS regardless of whether the recipient observed
+//! the signal, so the worst case is that the recipient never wakes on
+//! a particular cross-agent event; it never loses the underlying
+//! output, evidence, or retirement record.
+//!
+//! ### `reconcile_children` + synthetic evidence
+//!
+//! The parent's `reconcile_children` activity opens each cited child's
+//! per-agent FS read-only via
+//! [`AgentFs::open_for_agent`](jarvis_node::fs::AgentFs::open_for_agent),
+//! reads the cited [`Output`](jarvis_node::mandate::Output) via
+//! [`AgentFs::read_output`](jarvis_node::fs::AgentFs::read_output),
+//! and writes one synthetic
+//! [`EvidenceRecord`](jarvis_node::evidence::EvidenceRecord) per source
+//! into the **parent's** `evidence/` directory. The synthetic record's
+//! `tool` discriminator is the fixed string `"reconcile"`; its `args`
+//! capture the child's identity + cited `OutputId`; its `result` carries
+//! the child output verbatim.
+//!
+//! The parent's next tick picks the synthetic records up through the
+//! existing `list_recent_evidence` window in
+//! [`jarvis_node::decision::assemble_context`], and the LLM cites them
+//! on its next `EmitOutput` like any other evidence id. **This is the load-bearing move:** the
+//! existing provenance check in
+//! [`AgentFs::persist_output`](jarvis_node::fs::AgentFs::persist_output)
+//! — every cited evidence id must resolve to a file under
+//! `<agent_root>/evidence/` — keeps working unchanged. Cross-agent
+//! provenance becomes a normal evidence trail; no new contract or
+//! workflow-state slot is needed to thread "this came from a child"
+//! through the system.
+//!
+//! When the parent observes disagreement, the same activity additionally
+//! writes one [`ConflictRecord`](jarvis_node::conflict::ConflictRecord)
+//! under the parent's `conflicts/<id>.json` (content-addressed,
+//! [`HeldOpen`](jarvis_node::conflict::ConflictKind::HeldOpen) vs.
+//! [`Resolved`](jarvis_node::conflict::ConflictKind::Resolved) derived
+//! from `resolution.is_some()`). One file per disagreement; no append-
+//! only index because the directory is bounded per agent.
+//!
+//! ### `ParentClosePolicy::Abandon`
+//!
+//! Every child workflow is spawned with [`ParentClosePolicy::Abandon`].
+//! Children survive every parent boundary: continue-as-new, worker
+//! restart, parent retirement. The only kill path is
+//! [`Decision::RetireChild`]. This matches the runtime's "continuous,
+//! never-ending agents" framing: a parent CAN or restart is not a
+//! lifecycle event children should observe.
 
 use std::time::Duration;
 
