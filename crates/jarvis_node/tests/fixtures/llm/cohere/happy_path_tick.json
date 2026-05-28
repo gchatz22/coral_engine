@@ -1,7 +1,7 @@
 {
   "synthesized": true,
   "vendor": "cohere",
-  "note": "JAR2-21 happy-path tick for Cohere. Mirrors the Anthropic fixture but in Cohere V2 chat shape (per src/model_client/cohere.rs:parse_response unit tests): message.tool_calls is the tool-call array, arguments is a JSON-encoded string, usage.tokens.{input,output}_tokens. Hand-written; the maintainer's COHERE_API_KEY in the worktree env can re-record this via `JARVIS_LIVE_LLM=1 cargo test --features llm-cohere`.",
+  "note": "Happy-path tick for Cohere. Mirrors the Anthropic fixture but in Cohere V2 chat shape (per src/model_client/cohere.rs:parse_response unit tests): message.tool_calls is the tool-call array, arguments is a JSON-encoded string, usage.tokens.{input,output}_tokens. Hand-written; the maintainer's COHERE_API_KEY in the worktree env can re-record this via `JARVIS_LIVE_LLM=1 cargo test --features llm-cohere`.",
   "responses": [
     {
       "status": 200,

@@ -3,7 +3,7 @@ name = "jarvis_node"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Single-node runtime for the Jarvis Engine (bootstrap skeleton)."
+description = "Single-node runtime for the Jarvis Engine."
 license = "Apache-2.0 OR MIT"
 publish = false
 
@@ -31,23 +31,14 @@ required-features = ["mcp"]
 [[bin]]
 name = "node-run-llm"
 path = "src/bin/node_run_llm.rs"
-# `required-features` would pin a single conjunction; cargo does not
-# support OR. Vendor + `mcp` are gated at runtime inside the binary
-# instead, mirroring `model-call`. See the "Feature gating" doc-comment
-# in `src/bin/node_run_llm.rs`.
+# `required-features` would pin a single conjunction; cargo does not support OR.
+# Vendor + `mcp` are gated at runtime inside the binary instead.
 
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-# JAR2-51: `bytes::Bytes` is the agreed payload type for the `AgentStorage`
-# trait (see `scratch/agent_storage.md` § 13 decision 2). Arc-backed so
-# cheap to clone across layer transitions; standard across `aws-sdk-s3`,
-# `reqwest`, `tokio::io`, which keeps the future `S3Storage` impl friction-free.
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-# JAR2-38: `futures::future::join_all` for concurrent dispatch of K
-# parallel tool calls in `agent::dispatch`. Only `join_all` is used; the
-# rest of the crate stays out of scope.
 futures = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
@@ -59,34 +50,25 @@ thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 tracing = "0.1"
 ulid = { version = "1", features = ["serde"] }
-# JAR2-78 (stage 5.1): `AgentId` is a `Uuid` newtype matching the
-# structural DB's `agents.id` column (`crates/jarvis_graph` schema). The
-# kernel never *generates* one — those come from the 5.3
-# `register_child_in_structural_db` activity — so only `serde` is needed;
-# `v4` is opt-out to keep the bootstrap honest about where ids originate.
+# `v4` is opt-out: the kernel never generates `AgentId`s itself — they come from
+# the structural DB — so only `serde` is needed here.
 uuid = { version = "1", default-features = false, features = ["serde", "std"] }
 
 [features]
-# Default build is network-free: no `reqwest`, no live model adapters.
-# JAR2-14 lands the `ModelClient` trait + a hand-rolled Anthropic impl
-# behind the `llm-anthropic` feature so `cargo test` stays hermetic by
-# default. JAR2-22 added the `mcp` feature on the same opt-in pattern.
+# Default build is network-free: no `reqwest`, no live model adapters, so
+# `cargo test` stays hermetic.
 default = []
 llm-anthropic = ["dep:reqwest"]
 llm-cohere = ["dep:reqwest"]
 mcp = ["dep:rmcp"]
-# JAR2-51: opt-in to the in-memory `MemoryStorage` impl from non-test code.
-# Tests in any workspace crate always have access via `#[cfg(test)]`;
-# production binaries that want ephemeral / spike-testing behavior must
-# enable this feature explicitly, avoiding accidental shipping of
-# in-memory storage in a production build. See
-# `scratch/agent_storage.md` § 13 decision 6.
+# Opt-in to the in-memory `MemoryStorage` impl from non-test code. Tests in any
+# workspace crate always have access via `#[cfg(test)]`; production binaries
+# must enable this feature explicitly to avoid shipping in-memory storage.
 memory-storage = []
 
 # Clippy 1.88 promoted a handful of style lints (notably `uninlined_format_args`)
-# that fire on patterns the 1.84 toolchain accepted. Allowing them keeps the
-# pre-bump source untouched per JAR2-22's "smallest correct diff" rule;
-# revisit once we have a reason to broadly modernize formatting.
+# that fire on patterns the 1.84 toolchain accepted. Allow them until there's a
+# reason to broadly modernize formatting.
 [lints.clippy]
 uninlined_format_args = "allow"
 
@@ -94,5 +76,5 @@ uninlined_format_args = "allow"
 tempfile = "3"
 # `test-util` enables `tokio::time::pause`/`advance` and the `start_paused`
 # attribute on `#[tokio::test]`, used by the scheduler's deterministic
-# time-travel tests (JAR2-5).
+# time-travel tests.
 tokio = { version = "1", features = ["test-util"] }

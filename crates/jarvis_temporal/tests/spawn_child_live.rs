@@ -1,38 +1,14 @@
-//! Stage 5.3 (JAR2-80) — `Decision::SpawnChild` live integration test.
+//! `Decision::SpawnChild` live integration test.
 //!
 //! Env-gated behind `TEMPORAL_LIVE_TEST=1`. Scripts a parent workflow
-//! through `Idle → SpawnChild { agent_name: "fetcher", mandate: .. } →
-//! Retire` and asserts via the parent's Temporal history that:
+//! through `Idle → SpawnChild → Retire` and asserts via the parent's
+//! Temporal history that a `StartChildWorkflowExecutionInitiated`
+//! event lands with the expected child workflow id and
+//! `ParentClosePolicy::Abandon`.
 //!
-//! 1. A `StartChildWorkflowExecutionInitiated` event landed with the
-//!    expected child workflow id (`graphs/<parent_graph_id>/agents/<child_agent_id>`).
-//! 2. The event's `parent_close_policy == ParentClosePolicy::Abandon`
-//!    (Stage 5 Project decision 5 — children survive parent retirement).
-//! 3. The parent's `AgentResult::Retired` reason carries the scripted
-//!    retire text (proving the workflow body reached the Retire arm
-//!    after spawning the child, i.e. SpawnChild didn't bubble an error).
-//!
-//! ## What this test proves over `workflow_smoke.rs`
-//!
-//! `workflow_smoke.rs` (JAR2-68) drives the Idle / CallTools / EmitOutput
-//! / Retire arms end-to-end. This test exercises the JAR2-80
-//! `Decision::SpawnChild` arm — the new workflow path that calls the
-//! `register_child_in_structural_db` activity, then issues
-//! `ctx.child_workflow(..)` with `ParentClosePolicy::Abandon`, then
-//! drops the started handle without awaiting its `.result()`. The
-//! parent's history is the load-bearing observable that the new arm
-//! actually fires the child-start command with the right policy — the
-//! hermetic tests cover the helper functions in isolation.
-//!
-//! ## Structural DB
-//!
-//! Uses an in-memory `StructuralDbStore` fake (mirror of
-//! `MemoryStructuralDbStore` in `activities::tests`) installed via
-//! `install_structural_db_store`. We do NOT spin up Postgres here for
-//! the same reason `workflow_smoke.rs` uses `MemoryStorage` instead of
-//! `LocalStorage` — the live test asserts the workflow path, not the
-//! DB schema (DB-side coverage lives in
-//! `jarvis_graph::store::tests::structural_db_store_trait_adds_agent_and_edge`).
+//! Uses an in-memory `StructuralDbStore` fake installed via
+//! `install_structural_db_store` — DB schema coverage lives in
+//! `jarvis_graph::store::tests`.
 
 use std::env;
 use std::sync::{Arc, OnceLock};
@@ -73,9 +49,6 @@ static INIT: std::sync::Once = std::sync::Once::new();
 
 /// One recorded `add_agent` call. Struct (rather than 4-tuple) keeps
 /// clippy's `type_complexity` happy and the test assertions readable.
-/// Mirrors the equivalent fake in `activities::tests`; promoted to an
-/// inline copy here per "smallest correct diff" — promoting to a shared
-/// test surface waits until a second binary needs it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RecordedAgent {
     graph_id: GraphId,
@@ -179,11 +152,10 @@ fn ensure_installed() -> Arc<MemoryStructuralDb> {
         let dyn_db: Arc<dyn StructuralDbStore> = db;
         install_structural_db_store(dyn_db);
 
-        // JAR2-80: install a fallback `Decide` so the child workflow
-        // (which shares this process-wide static via the
-        // `decide_next_action` activity) has something to call after
-        // the parent drains the scripted decisions. See `LongIdleDecide`
-        // doc for the rationale.
+        // Fallback `Decide` so the child workflow (which shares this
+        // process-wide static via the `decide_next_action` activity)
+        // has something to call after the parent drains the scripted
+        // decisions. See `LongIdleDecide` doc for the rationale.
         let decide: Arc<dyn Decide> = Arc::new(LongIdleDecide);
         install_decide(decide);
     });
@@ -210,8 +182,8 @@ async fn build_client() -> Result<Client> {
     Ok(client)
 }
 
-/// JAR2-80 live test: scripts `Idle → SpawnChild → Retire` on a parent
-/// workflow and asserts the parent's history shows a
+/// Scripts `Idle → SpawnChild → Retire` on a parent workflow and
+/// asserts the parent's history shows a
 /// `StartChildWorkflowExecutionInitiated` event with the expected
 /// workflow id + `ParentClosePolicy::Abandon`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -238,8 +210,8 @@ async fn run_smoke() -> Result<()> {
     let task_queue = format!("jarvis-agents-spawn-child-test-{suffix}");
 
     // Script: Idle (so the loop drains the first wake), SpawnChild
-    // (the JAR2-80 path under test), Retire (so `get_result` returns
-    // and the test can fetch + assert against the parent's history).
+    // (the path under test), then a signalled retire (see comment below
+    // on why this is not in the script).
     let child_mandate = Mandate::new(
         "child mandate (spawn_child live test)",
         Duration::from_millis(500),
@@ -418,8 +390,8 @@ async fn drive(
                 assert_eq!(
                     a.parent_close_policy,
                     ParentClosePolicy::Abandon as i32,
-                    "JAR2-80: child workflow must be started with ParentClosePolicy::Abandon \
-                     (Stage 5 Project decision 5); got policy={}",
+                    "child workflow must be started with ParentClosePolicy::Abandon; \
+                     got policy={}",
                     a.parent_close_policy,
                 );
                 found = true;

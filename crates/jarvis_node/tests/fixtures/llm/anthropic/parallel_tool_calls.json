@@ -1,7 +1,7 @@
 {
   "synthesized": true,
   "vendor": "anthropic",
-  "note": "JAR2-38 parallel tool calls. Single Anthropic response carrying K=3 `tool_use` blocks for `call_tool` (the parallel-tool path). The parser folds these into a single `Decision::CallTools` with three entries; each entry's `tool_use_id` matches the per-block `id` (`toolu_read_a`, `_b`, `_c`). Hand-written against the wire shape documented in src/model_client/anthropic.rs::parse_response.",
+  "note": "Parallel tool calls. Single Anthropic response carrying K=3 `tool_use` blocks for `call_tool`. The parser folds these into a single `Decision::CallTools` with three entries; each entry's `tool_use_id` matches the per-block `id` (`toolu_read_a`, `_b`, `_c`). Hand-written against the wire shape documented in src/model_client/anthropic.rs::parse_response.",
   "responses": [
     {
       "status": 200,

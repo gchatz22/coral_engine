@@ -1,9 +1,7 @@
-//! Stage 5.9 (JAR2-86) — end-to-end multi-agent integration test:
-//! parent + 2 children + scripted disagreement, byte-checkable end-state.
-//!
-//! Env-gated behind `TEMPORAL_LIVE_TEST=1` (Stage 5 Project decision 11
-//! — no hermetic in-process multi-agent path; `AgentCore::dispatch` stays
-//! single-agent forever).
+//! End-to-end multi-agent integration test: parent + 2 children +
+//! scripted disagreement, byte-checkable end-state. Env-gated behind
+//! `TEMPORAL_LIVE_TEST=1`; there is no hermetic in-process multi-agent
+//! path.
 //!
 //! ## Topology
 //!
@@ -16,8 +14,9 @@
 //! Mirrors the `examples/smoke_multi_agent/graph.yaml` fixture. The
 //! fixture's YAML is parsed at test startup as a schema/topology
 //! regression-guard; the actual workflow dispatch uses
-//! `client.start_workflow` directly (per the test's implementer's-choice
-//! "Pattern A" — see PR body for the rationale).
+//! `client.start_workflow` directly because production `jarvis apply`
+//! always wires `LlmDecide` through the worker daemon and there is no
+//! production-supported seam to swap in `MockDecide`.
 //!
 //! ## End-state assertions (load-bearing)
 //!
@@ -33,34 +32,11 @@
 //!    `kind == HeldOpen`, `alternatives.len() == 2`, and `resolution ==
 //!    None`. Each `ConflictAlternative.source_child` +
 //!    `source_output_id` resolves correctly.
-//! 5. **Cross-FS provenance trail (load-bearing per JAR2-86 acceptance):**
-//!    starting from the parent's output, the cited evidence record's
-//!    `args.source_output_id` resolves to the child's
-//!    `outputs/<id>.json` via cross-agent `AgentFs::open_for_agent` —
-//!    no ambiguity, no string-shape guessing.
-//!
-//! ## Implementer's-choice — Pattern A
-//!
-//! The JAR2-86 ticket-acceptance reads "runs `jarvis apply
-//! graph.yaml` end-to-end via the post-JAR2-76 thin-client path."
-//! Production `jarvis apply` always wires `LlmDecide` (real LLM)
-//! through the worker daemon; there is no production-supported seam
-//! to swap in `MockDecide` from a YAML field or CLI flag. The two
-//! options were:
-//!
-//! - **Pattern A (chosen)**: bypass `jarvis apply`, construct the
-//!   multi-agent topology directly via `client.start_workflow` per
-//!   agent with `MockDecide` installed at the worker — the shape every
-//!   existing multi-agent live test uses (`spawn_child_live.rs`,
-//!   `child_parent_signal.rs`, `reconcile_children_live.rs`,
-//!   `lifecycle_ops_live.rs`).
-//! - **Pattern B**: extend the worker / `jarvis apply` with a
-//!   `--decide=mock` flag so MockDecide scripts load off disk. More
-//!   test-realistic; more invasive production-code surface.
-//!
-//! Pattern A wins on "smallest correct diff"; Pattern B is queued as a
-//! follow-up. The fixture YAML is still parsed at test startup so
-//! schema + topology shape regress here too.
+//! 5. **Cross-FS provenance trail:** starting from the parent's output,
+//!    the cited evidence record's `args.source_output_id` resolves to
+//!    the child's `outputs/<id>.json` via cross-agent
+//!    `AgentFs::open_for_agent` — no ambiguity, no string-shape
+//!    guessing.
 
 use std::collections::VecDeque;
 use std::env;
@@ -102,13 +78,12 @@ const DEFAULT_NAMESPACE: &str = "default";
 /// the strings encoded in `examples/smoke_multi_agent/graph.yaml`; if
 /// either side drifts, the test's `parse_and_validate` startup check
 /// fires before any workflow runs.
-const PARENT_MANDATE_TEXT: &str = "JAR2-86-parent";
-const CHILD_A_MANDATE_TEXT: &str = "JAR2-86-child-a";
-const CHILD_B_MANDATE_TEXT: &str = "JAR2-86-child-b";
+const PARENT_MANDATE_TEXT: &str = "multi-agent-parent";
+const CHILD_A_MANDATE_TEXT: &str = "multi-agent-child-a";
+const CHILD_B_MANDATE_TEXT: &str = "multi-agent-child-b";
 
 /// Path (relative to this crate's manifest dir) to the multi-agent
-/// fixture this test pins. Same shape as the JAR2-74 single-agent
-/// smoke's `GRAPH_YAML_REL`.
+/// fixture this test pins.
 const GRAPH_YAML_REL: &str = "../../examples/smoke_multi_agent/graph.yaml";
 
 /// Scripted child-A output content. The literal string surfaces in the
@@ -151,9 +126,9 @@ fn ensure_installed() -> Arc<MemoryStorage> {
         let dyn_storage: Arc<dyn AgentStorage> = storage;
         install_agent_storage(dyn_storage);
 
-        // Empty registry — JAR2-86 does not exercise tool dispatch. The
-        // `execute_tool` activity body still demands the OnceLock be
-        // installed, so we install an empty one.
+        // Empty registry — this test does not exercise tool dispatch.
+        // The `execute_tool` activity body still demands the OnceLock
+        // be installed, so we install an empty one.
         install_tool_registry(Arc::new(ToolRegistry::new()));
 
         PARENT_OBSERVED_TRIGGERS
@@ -198,8 +173,7 @@ impl Decide for RoutingDecide {
             CHILD_B_MANDATE_TEXT => decide_child(CHILD_B_SCRIPT.get().expect("CHILD_B_SCRIPT")),
             other => panic!(
                 "RoutingDecide saw unexpected mandate text: {other:?} \
-                 (JAR2-86 multi-agent test scripts only PARENT / CHILD_A / CHILD_B \
-                  mandate text)"
+                 (test scripts only PARENT / CHILD_A / CHILD_B mandate text)"
             ),
         }
     }
@@ -289,7 +263,7 @@ fn is_emit_placeholder(d: &Decision) -> bool {
 /// The reconcile decision's `conflict` carries both children's claims
 /// verbatim (`CHILD_A_CONTENT` / `CHILD_B_CONTENT`) so the
 /// `ConflictAlternative`s on disk pin the disagreement shape.
-/// `resolution: None` → `HeldOpen` per Stage 5 Project decision 14.
+/// `resolution: None` → `HeldOpen`.
 fn synthesize_reconcile_or_wait() -> anyhow::Result<Decision> {
     let observed = PARENT_OBSERVED_TRIGGERS
         .get()
@@ -363,9 +337,9 @@ fn synthesize_reconcile_or_wait() -> anyhow::Result<Decision> {
 /// Synthesize `Decision::EmitOutput { content, evidence }` from the
 /// synthetic evidence records the reconcile activity just wrote into
 /// the parent's `evidence/` directory. The records surface in this
-/// tick's `bundle.recent_evidence` (no workflow-state slot — Stage 5
-/// Project decision 3). If they're missing, push the placeholder back
-/// and idle so the next tick sees the freshly-written records.
+/// tick's `bundle.recent_evidence` (no workflow-state slot). If
+/// they're missing, push the placeholder back and idle so the next
+/// tick sees the freshly-written records.
 fn synthesize_emit_or_wait(bundle: &ContextBundle) -> anyhow::Result<Decision> {
     let synthetic_ids: Vec<EvidenceId> = bundle
         .recent_evidence
@@ -479,7 +453,7 @@ fn load_graph_yaml() -> Result<String> {
         .with_context(|| format!("reading multi-agent fixture from {}", path.display()))
 }
 
-/// JAR2-86 end-to-end live test. See module doc for the assertion list.
+/// End-to-end live test. See module doc for the assertion list.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn parent_two_children_disagreement_reconciles_with_held_open_conflict() {
@@ -490,16 +464,14 @@ async fn parent_two_children_disagreement_reconciles_with_held_open_conflict() {
         );
         return;
     }
-    run_end_to_end().await.expect("JAR2-86 end-to-end smoke");
+    run_end_to_end().await.expect("end-to-end smoke");
 }
 
 async fn run_end_to_end() -> Result<()> {
     // ---- 1. YAML schema/topology smoke-check --------------------------
     //
     // Parse the fixture so a future YAML edit that drifts mandate text
-    // or topology shape fails the test, not the workflow. We don't
-    // dispatch through `jarvis apply` (see Pattern A rationale in
-    // module doc); the schema-level pin still belongs here.
+    // or topology shape fails the test, not the workflow.
     let yaml_text = load_graph_yaml()?;
     let graph = parse_and_validate(&yaml_text).context("parse_and_validate multi-agent fixture")?;
     assert_eq!(graph.metadata.name, "smoke-multi-agent");
@@ -523,13 +495,12 @@ async fn run_end_to_end() -> Result<()> {
 
     // ---- 2. Per-run setup --------------------------------------------
     let suffix = run_suffix();
-    let task_queue = format!("jarvis-jar2-86-{suffix}");
+    let task_queue = format!("jarvis-multi-agent-{suffix}");
 
     // Unique graph_id per run so reruns don't collide. Per-agent
-    // workflow ids derive from `(graph_id, agent_id)` per Stage 5
-    // Project decision 6's flat scheme. `MemoryStorage` is
-    // process-wide so the per-graph UUID is what isolates this test
-    // from any other test in the same binary.
+    // workflow ids derive from `(graph_id, agent_id)` (flat scheme).
+    // `MemoryStorage` is process-wide so the per-graph UUID is what
+    // isolates this test from any other test in the same binary.
     let graph_id = GraphId::new(Uuid::new_v4());
     let parent_agent_id = AgentId::new(Uuid::new_v4());
     let child_a_agent_id = AgentId::new(Uuid::new_v4());
@@ -554,14 +525,12 @@ async fn run_end_to_end() -> Result<()> {
     // scripted EmitOutput resolves provenance. `AgentFs::persist_output`
     // rejects empty `evidence` (`FsError::EmptyEvidence`) — children
     // therefore need to cite *something*. The synthetic-evidence
-    // pattern (Stage 5 Project decision 3) is the parent's mechanism
-    // for cross-agent provenance and is orthogonal to whatever each
-    // child's own output cites.
+    // pattern is the parent's mechanism for cross-agent provenance and
+    // is orthogonal to whatever each child's own output cites.
     //
     // Distinct planted records per child (different `args` payload)
     // so the two `EvidenceId`s are distinct on disk — keeps the
-    // FS-end-state assertions sharp (child-a's evidence/ stays
-    // distinguishable from child-b's).
+    // FS-end-state assertions sharp.
     let plant_mandate = Mandate::new("plant", Duration::from_millis(0), None);
     let plant_storage_a: Arc<dyn AgentStorage> = storage.clone();
     let plant_fs_a = AgentFs::new_with_storage(plant_storage_a, &child_a_prefix, &plant_mandate)
@@ -610,7 +579,7 @@ async fn run_end_to_end() -> Result<()> {
             evidence: vec![planted_a_id.clone()],
         },
         Decision::Retire {
-            reason: "JAR2-86 child-a: scripted retire".into(),
+            reason: "child-a: scripted retire".into(),
         },
     ];
     let child_b_script = vec![
@@ -622,14 +591,14 @@ async fn run_end_to_end() -> Result<()> {
             evidence: vec![planted_b_id.clone()],
         },
         Decision::Retire {
-            reason: "JAR2-86 child-b: scripted retire".into(),
+            reason: "child-b: scripted retire".into(),
         },
     ];
     let parent_script = vec![
         reconcile_placeholder(),
         emit_with_synthetic_placeholder(),
         Decision::Retire {
-            reason: "JAR2-86 parent: smoke complete".into(),
+            reason: "parent: smoke complete".into(),
         },
     ];
     install_role_scripts(parent_script, child_a_script, child_b_script);
@@ -712,7 +681,7 @@ async fn drive(
     storage: Arc<MemoryStorage>,
 ) -> Result<()> {
     // Start parent first so it is addressable when each child fires
-    // its ChildOutput signal (mirrors the JAR2-81 / JAR2-82 ordering).
+    // its ChildOutput signal.
     let parent_input = AgentInput {
         cfg: Default::default(),
         fs_handle: FsHandle {
@@ -736,7 +705,7 @@ async fn drive(
         )
         .await
         .context("start_workflow(parent)")?;
-    eprintln!("JAR2-86: parent started at {parent_workflow_id}");
+    eprintln!("parent started at {parent_workflow_id}");
 
     let child_a_input = AgentInput {
         cfg: Default::default(),
@@ -761,7 +730,7 @@ async fn drive(
         )
         .await
         .context("start_workflow(child-a)")?;
-    eprintln!("JAR2-86: child-a started at {child_a_workflow_id}");
+    eprintln!("child-a started at {child_a_workflow_id}");
 
     let child_b_input = AgentInput {
         cfg: Default::default(),
@@ -786,23 +755,23 @@ async fn drive(
         )
         .await
         .context("start_workflow(child-b)")?;
-    eprintln!("JAR2-86: child-b started at {child_b_workflow_id}");
+    eprintln!("child-b started at {child_b_workflow_id}");
 
     // Wait for each child to retire (EmitOutput → Retire). Each
-    // signals the parent on its EmitOutput tick (JAR2-81 path) before
-    // retiring. The retirement also fires `Trigger::ChildRetired` at
-    // the parent (JAR2-84 path) — orthogonal to the reconcile assertion
-    // but exercises the lifecycle-signal path as a side effect.
+    // signals the parent on its EmitOutput tick before retiring. The
+    // retirement also fires `Trigger::ChildRetired` at the parent —
+    // orthogonal to the reconcile assertion but exercises the
+    // lifecycle-signal path as a side effect.
     let _child_a_result: AgentResult = child_a_handle
         .get_result(WorkflowGetResultOptions::default())
         .await
         .context("child-a get_result")?;
-    eprintln!("JAR2-86: child-a retired cleanly");
+    eprintln!("child-a retired cleanly");
     let _child_b_result: AgentResult = child_b_handle
         .get_result(WorkflowGetResultOptions::default())
         .await
         .context("child-b get_result")?;
-    eprintln!("JAR2-86: child-b retired cleanly");
+    eprintln!("child-b retired cleanly");
 
     // Parent loops on the reconcile_placeholder until both
     // ChildOutput triggers land, then synthesizes the reconcile
@@ -826,7 +795,7 @@ async fn drive(
             parent_handle
                 .signal(
                     AgentWorkflow::retire,
-                    "JAR2-86: test asked".to_string(),
+                    "test asked".to_string(),
                     WorkflowSignalOptions::default(),
                 )
                 .await
@@ -838,7 +807,7 @@ async fn drive(
         }
     };
     let AgentResult::Retired { reason } = parent_result;
-    eprintln!("JAR2-86: parent retired ({reason})");
+    eprintln!("parent retired ({reason})");
 
     // ---- 5. FS-end-state assertions ----------------------------------
     //
@@ -1082,7 +1051,7 @@ async fn assert_end_state(
     assert_eq!(alt_b.source_child.workflow_id, child_b_workflow_id);
     assert_eq!(alt_b.source_child.agent_id, child_b_agent_id);
 
-    // --- Cross-FS provenance trail (load-bearing per ticket) -----------
+    // --- Cross-FS provenance trail (load-bearing) ---------------------
     //
     // parent output → its evidence ids → resolve each via the
     // parent's own evidence/<id>.json → that record's

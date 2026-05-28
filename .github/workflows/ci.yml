@@ -13,22 +13,17 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # Single pin for the MCP reference server used by mcp-smoke and
-  # runbook-smoke. The smoke_mcp fixture's hardcoded evidence id
-  # (10c78548…) was computed against this version per JAR2-26's
-  # timeline; bumping requires recomputing that sha.
+  # Pinned MCP reference server for mcp-smoke and runbook-smoke. The smoke_mcp
+  # fixture's hardcoded evidence id (10c78548…) was computed against this
+  # version; bumping requires recomputing that sha.
   MCP_SERVER_EVERYTHING_VERSION: "2026.1.26"
 
 jobs:
   lint-and-test:
     name: build / clippy / fmt / test
     runs-on: ubuntu-latest
-    # JAR2-50: the `jarvis_graph` crate's `#[sqlx::test]`-based tests
-    # need a live Postgres. The service container below brings one up
-    # on `localhost:5432` matching the dev compose file's defaults so
-    # `cargo test` can use the same `DATABASE_URL` shape locally and in
-    # CI. Build still works without DATABASE_URL via the committed
-    # `.sqlx/` offline cache (`cargo sqlx prepare --workspace`).
+    # `jarvis_graph`'s `#[sqlx::test]` cases need live Postgres at runtime;
+    # build stays DB-free via the committed `.sqlx/` offline cache.
     services:
       postgres:
         image: postgres:16-alpine3.23
@@ -38,9 +33,8 @@ jobs:
           POSTGRES_DB: jarvis_structural
         ports:
           - 5432:5432
-        # `sqlx::test` creates ephemeral per-test databases under the
-        # connected role, so the role needs CREATEDB. The superuser the
-        # image hands to POSTGRES_USER has it.
+        # `sqlx::test` creates ephemeral per-test databases, so the connected
+        # role needs CREATEDB — the superuser bound to POSTGRES_USER has it.
         options: >-
           --health-cmd "pg_isready -U jarvis -d jarvis_structural"
           --health-interval 5s
@@ -48,13 +42,9 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://jarvis:jarvis@localhost:5432/jarvis_structural
-      # `SQLX_OFFLINE=true` is set at job scope so EVERY cargo
-      # invocation uses the `.sqlx/` cache for the compile-time
-      # query!/query_as! checks. The runtime side of `#[sqlx::test]`
-      # still consults DATABASE_URL (the env var above), so the test
-      # bodies hit the live service container. Holding both at job
-      # scope keeps build / clippy / test consistent and avoids the
-      # "test step silently recompiles against live DB" failure mode.
+      # Job-scope `SQLX_OFFLINE=true` forces every cargo invocation through the
+      # `.sqlx/` cache for compile-time query!/query_as! checks; `#[sqlx::test]`
+      # still uses DATABASE_URL at runtime to hit the service container.
       SQLX_OFFLINE: "true"
     steps:
       - uses: actions/checkout@v4
@@ -65,9 +55,7 @@ jobs:
           toolchain: "1.88"
           components: rustfmt, clippy
 
-      # `temporalio-sdk` pulls `prost-wkt-types` which needs `protoc` at
-      # build time. JAR2-41 added the SDK; this step is the workspace-level
-      # consequence. Confirmed via the build-script error in CI run 26342189004.
+      # `temporalio-sdk` pulls `prost-wkt-types`, which needs `protoc` at build time.
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
@@ -86,10 +74,8 @@ jobs:
   feature-matrix:
     name: feature matrix
     runs-on: ubuntu-latest
-    # Same Postgres service container as the primary lint-and-test job:
-    # `--workspace` test invocations include `jarvis_graph`, whose
-    # `#[sqlx::test]` cases need a live DB. Build remains DB-free via
-    # the `.sqlx/` offline cache.
+    # `--workspace` tests include `jarvis_graph`'s `#[sqlx::test]` cases, which
+    # need live Postgres at runtime; build stays DB-free via the `.sqlx/` cache.
     services:
       postgres:
         image: postgres:16-alpine3.23
@@ -106,11 +92,8 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://jarvis:jarvis@localhost:5432/jarvis_structural
-      # See the matching note in the lint-and-test job: setting
-      # SQLX_OFFLINE at job scope makes the compile-time query check
-      # use the `.sqlx/` cache uniformly across build, clippy, and the
-      # test compile, while `#[sqlx::test]` still uses DATABASE_URL at
-      # runtime to talk to the service container.
+      # Job-scope `SQLX_OFFLINE=true` routes compile-time query checks through
+      # the `.sqlx/` cache; `#[sqlx::test]` still hits DATABASE_URL at runtime.
       SQLX_OFFLINE: "true"
     strategy:
       matrix:
@@ -134,9 +117,8 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      # Features live on `jarvis_node`, not the workspace. After the
-      # JAR2-40 split, cross-crate selection takes the `<crate>/<feature>`
-      # form from any workspace-aware invocation.
+      # Features live on `jarvis_node`, not the workspace; cross-crate selection
+      # from workspace-aware invocations requires the `<crate>/<feature>` form.
       - name: cargo build [${{ matrix.name }}]
         run: cargo build --workspace --all-targets --locked --features "${{ matrix.features }}"
 
@@ -145,8 +127,7 @@ jobs:
 
   mcp-smoke:
     # Activates tests/smoke_mcp_server_everything.rs, which is gated behind
-    # JARVIS_SMOKE_MCP=1 and needs Node + a pinned server-everything on the
-    # runner. See JAR2-34 and examples/smoke_mcp/README.md.
+    # JARVIS_SMOKE_MCP=1 and needs Node + a pinned server-everything on the runner.
     name: mcp smoke (integration)
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -185,8 +166,7 @@ jobs:
   runbook-smoke:
     # Drives the user-facing runbook binaries (node-run + node-run-mcp) against
     # their committed fixtures and asserts on the durable artifacts they
-    # produce (retirement.json, evidence/<sha>.json, outputs/<ulid>.json). See
-    # JAR2-35.
+    # produce (retirement.json, evidence/<sha>.json, outputs/<ulid>.json).
     name: runbook binary smoke
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -254,21 +234,17 @@ jobs:
             ${{ runner.temp }}/jarvis-smoke-mcp-fs/
 
   temporal-workflow-smoke:
-    # JAR2-68 — workflow-driven smoke against `temporal server start-dev`.
-    # Closes the Stage 3 Temporal project: drives an `AgentWorkflow`
-    # end-to-end through Idle → CallTools(echo) → EmitOutput → Retire,
-    # asserts the same three durable artifacts `node-run-llm` produces
-    # in-process (outputs, retirement, decisions). Scripted-Decide
-    # (hermetic) — no LLM keys required. Live-vendor verification stays
-    # manual via `jarvis apply` against a worker daemon with vendor
-    # credentials configured (JAR2-76 deleted the standalone
-    # `jarvis-run-workflow` live-vendor smoke binary).
+    # Workflow-driven smoke against `temporal server start-dev`: drives
+    # `AgentWorkflow` end-to-end through Idle → CallTools(echo) → EmitOutput →
+    # Retire and asserts the same three durable artifacts `node-run-llm`
+    # produces in-process (outputs, retirement, decisions). Scripted-Decide,
+    # hermetic — no LLM keys required. Live-vendor verification stays manual
+    # via `jarvis apply` against a worker daemon with vendor credentials.
     name: temporal workflow smoke (live)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Several live tests write to the structural DB via the
-    # `register_child_in_structural_db` activity and the YAML walker. The
-    # job needs a real Postgres for them to hit at runtime; the schema is
+    # Live tests write to the structural DB via `register_child_in_structural_db`
+    # and the YAML walker, so a real Postgres is needed at runtime; schema is
     # migrated by `sqlx::migrate!` in test setup.
     services:
       postgres:
@@ -297,28 +273,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install protoc
-        # `temporalio-sdk` pulls `prost-wkt-types`; matches the
-        # lint-and-test job's pre-flight.
+        # `temporalio-sdk` pulls `prost-wkt-types`, which needs `protoc` at build time.
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install temporal CLI
-        # `start-dev` ships in the Temporal CLI (`temporal` binary).
-        # Pinned tarball release; the binary is statically linked.
+        # `start-dev` ships in the Temporal CLI (`temporal` binary); statically
+        # linked tarball release.
         run: |
           curl -sSf https://temporal.download/cli.sh | sh
           sudo install -m 0755 "$HOME/.temporalio/bin/temporal" /usr/local/bin/temporal
           temporal --version
 
       - name: Start Temporal dev server
-        # `--headless` skips the Web UI; we only need the gRPC frontend on
-        # :7233. `--log-level error` keeps the CI log small. The server
-        # process is left running in the background; the runner's tear-
-        # down kills it on job exit.
+        # `--headless` skips the Web UI; only the gRPC frontend on :7233 is needed.
+        # `--log-level error` keeps the CI log small. The server runs in the
+        # background; the runner's teardown kills it on job exit.
         run: |
           temporal server start-dev --headless --log-level error &
-          # Poll the gRPC port until the server is listening (typical
-          # boot: <2s). Cap at 30s so a stalled boot fails the step
-          # cleanly rather than running into the workflow timeout.
+          # Poll the gRPC port until the server is listening (typical boot <2s);
+          # cap at 30s so a stalled boot fails this step cleanly rather than
+          # running into the workflow timeout.
           for i in $(seq 1 30); do
             if nc -z localhost 7233; then
               echo "temporal server reachable after ${i}s"
@@ -338,31 +312,26 @@ jobs:
           cargo test --locked -p jarvis_temporal --test workflow_smoke -- --nocapture \
             2>&1 | tee ci-logs/workflow-smoke.log
 
-      # JAR2-74 — Stage 4.3 sibling smoke. Drives the same scripted-Decide
-      # sequence as `workflow_smoke` but routes the `AgentInput` + seed
-      # triggers through `jarvis_graph::yaml::{parse_and_validate,
+      # Drives the same scripted-Decide sequence as `workflow_smoke` but routes
+      # `AgentInput` + seed triggers through `jarvis_graph::yaml::{parse_and_validate,
       # into_agent_input, yaml_seed_triggers}` against
-      # `examples/smoke_llm_temporal/graph.yaml`. End-state assertion
-      # (same three durable artifacts) pins the YAML's content to the
-      # legacy JAR2-68 fixture pair. No Postgres dependency: the test
-      # skips `GraphStore::create_from_yaml` (DB write is covered by
-      # JAR2-73's own `#[sqlx::test]` cases in the lint-and-test job).
+      # `examples/smoke_llm_temporal/graph.yaml`. The end-state assertion (same
+      # three durable artifacts) pins the YAML's content to the fixture pair.
+      # No Postgres dependency: the test skips `GraphStore::create_from_yaml`.
       - name: Run jarvis-apply smoke
         env:
           TEMPORAL_LIVE_TEST: "1"
-          # `jarvis_graph`'s lib has compile-time-checked `sqlx::query!`
-          # macros via `GraphStore`. Route the compile through the committed
-          # `.sqlx/` cache instead of the live schema so cache-vs-live drift
-          # surfaces at `cargo sqlx prepare` time, not mid-CI.
+          # `jarvis_graph` has compile-time-checked `sqlx::query!` macros via
+          # `GraphStore`; route the compile through the `.sqlx/` cache so
+          # cache-vs-live drift surfaces at `cargo sqlx prepare` time, not mid-CI.
           SQLX_OFFLINE: "true"
         run: |
           set -o pipefail
           cargo test --locked -p jarvis_graph --test jarvis_apply_smoke -- --nocapture \
             2>&1 | tee ci-logs/jarvis-apply-smoke.log
 
-      # Per-test invocation (rather than one bulk `cargo test`) so a failure
-      # surfaces as a distinct red step instead of a single multi-thousand-
-      # line log.
+      # Per-test invocation rather than one bulk `cargo test` so a failure
+      # surfaces as a distinct red step instead of a multi-thousand-line log.
       - name: Run spawn_child live
         env:
           TEMPORAL_LIVE_TEST: "1"
@@ -398,7 +367,8 @@ jobs:
       - name: Run multi_agent live
         env:
           TEMPORAL_LIVE_TEST: "1"
-          # Same `sqlx::query!` macro concern as `jarvis-apply smoke` above.
+          # Route `jarvis_graph`'s compile-time `sqlx::query!` macros through
+          # the `.sqlx/` cache; runtime still hits the service container.
           SQLX_OFFLINE: "true"
         run: |
           set -o pipefail

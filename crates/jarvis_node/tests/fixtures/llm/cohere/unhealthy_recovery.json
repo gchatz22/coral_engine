@@ -1,7 +1,7 @@
 {
   "synthesized": true,
   "vendor": "cohere",
-  "note": "JAR2-21 unhealthy-recovery cycle for Cohere. Tick 1: both LlmDecide parse attempts fail (LlmDecide returns Err -> Agent's Decide-Err arm transitions to Unhealthy). Tick 2: a valid `idle` -> mark_tick_success recovers to Healthy. Tick 3: `retire` to terminate. Four upstream responses total. Hand-written; re-record via `JARVIS_LIVE_LLM=1 cargo test --features llm-cohere` with the maintainer's Cohere key.",
+  "note": "Unhealthy-recovery cycle for Cohere. Tick 1: both LlmDecide parse attempts fail (LlmDecide returns Err -> Agent's Decide-Err arm transitions to Unhealthy). Tick 2: a valid `idle` -> mark_tick_success recovers to Healthy. Tick 3: `retire` to terminate. Four upstream responses total. Hand-written; re-record via `JARVIS_LIVE_LLM=1 cargo test --features llm-cohere` with the maintainer's Cohere key.",
   "responses": [
     {
       "status": 200,

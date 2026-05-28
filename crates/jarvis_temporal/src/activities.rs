@@ -1,55 +1,9 @@
-//! Stage 3.4 (JAR2-60) — activity surface for `AgentWorkflow`.
-//!
-//! Six activities, one for each branch the workflow loop body wants to
-//! durably checkpoint:
-//!
-//! | activity              | invoked when                                             | real body lands in |
-//! | --------------------- | -------------------------------------------------------- | ------------------ |
-//! | `assemble_context`    | top of every tick (after drain)                          | JAR2-61            |
-//! | `decide_next_action`  | after `assemble_context` returns a bundle                | JAR2-62            |
-//! | `execute_tool`        | once per `ToolCall` in a `Decision::CallTools`           | JAR2-63            |
-//! | `persist_output`      | `Decision::EmitOutput`                                   | JAR2-64            |
-//! | `apply_fs_ops`        | `Decision::RewriteFs`                                    | JAR2-65            |
-//! | `persist_retirement`  | `Decision::Retire` *or* the `retire` signal short-circuit | JAR2-66           |
-//!
-//! Every body here is a stub returning a canned `Ok(...)` so the workflow
-//! loop runs end-to-end against `MockDecide`-style scripted decisions. The
-//! input/output types are real — JAR2-61..66 subagents replace bodies
-//! without touching the wire shape.
-//!
-//! As of JAR2-64, `persist_output` carries its real body: opens an
-//! [`jarvis_node::fs::AgentFs`] over the process-wide [`AgentStorage`]
-//! backend and delegates to `AgentFs::persist_output`. The body extracts
-//! into the free helper [`persist_output_impl`] so hermetic tests can
-//! exercise the FS-touching logic without an `ActivityContext` or the
-//! `OnceLock` install path.
-//!
-//! ## Test injection
-//!
-//! `decide_next_action` consults a static `OnceLock<Mutex<VecDeque<Decision>>>`
-//! before reaching for the installed [`Decide`] implementation. Tests
-//! call [`set_decision_script`] before starting the workflow; the
-//! activity pops from the script in order. This is the workflow-side
-//! analogue of `agent_core`'s `MockDecide` — same scripted behaviour,
-//! but reachable from inside an activity body (which must be a free
-//! function over a value-typed registered instance per SDK constraint
-//! § 3.4 of `temporal_rust_sdk_smoke.md`). When the script is empty
-//! the activity falls through to `worker::decide_impl()` (JAR2-62) and
-//! calls the installed `Decide::decide` once. Tests that don't install
-//! a real `Decide` must script every decision the workflow body will
-//! ask for — see `tests/workflow_loop.rs` for the canonical example.
-//!
-//! ## SDK constraints baked in
-//!
-//! - Each activity is a free `async fn` (not `&self`-receiver) per the
-//!   `#[activities]` macro shape (see `bin/temporal_smoke.rs::SmokeActivities`
-//!   line 76 and `examples/cancellation/workflows.rs::CancellationActivities`).
-//! - First parameter is `ActivityContext`; second is the typed input.
-//!   Return type is `Result<R, ActivityError>`. The `&self` form in the
-//!   ticket sketch does not match the macro.
-//! - `register_activities` takes the bare value, not `Arc<T>` (smoke § 3.4).
-//!   `AgentActivities` is a unit struct; the macro impls
-//!   `ActivityImplementer` for the bare type.
+//! Activity surface for `AgentWorkflow`. Each activity body is a free
+//! `async fn` taking `ActivityContext` and a typed input; the
+//! `#[activities]` macro registers them on a value-typed
+//! `AgentActivities`. Test-side decision injection lives in
+//! [`set_decision_script`] — `decide_next_action` consults the static
+//! script before reaching for the installed [`Decide`].
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -77,48 +31,23 @@ use temporalio_sdk::ApplicationFailure;
 use crate::worker::{agent_storage, structural_db_store};
 use crate::workflow::{AgentConfig, FsHandle};
 
-// ---------------------------------------------------------------------------
-// Input / output types
-//
-// Real fields chosen against the JAR2-61..66 target shapes
-// (`scratch/temporal_staged_plan.md` § 5 stages 3.5–3.10). Stubs ignore the
-// inputs and return canned outputs; the real bodies will plumb FS reads /
-// LLM calls / tool dispatch / FS writes through these payloads.
-
 /// Input to [`AgentActivities::assemble_context`]. Carries the per-tick
-/// drained signal buckets (`triggers`, `human_ops`, `mandate_patches`) plus
-/// the resolved [`Mandate`] + FS handle + prior-tick correction so the
-/// activity can call into [`jarvis_node::agent_core::drain_triggers`].
-///
-/// JAR2-61 promoted the prior `cfg: AgentConfig` placeholder to a real
-/// `mandate: Mandate` — `drain_triggers` requires a concrete `&Mandate`
-/// to seed the `ContextBundle` and to write `mandate.json` on first FS
-/// open. The other activity inputs (`ExecuteToolInput`, `PersistOutputInput`)
-/// still carry the `AgentConfig` placeholder; siblings JAR2-62..66 will
-/// promote each as their real bodies need it. No `Default` derive — the
-/// real `Mandate` has no `Default` and the placeholder construction lives
-/// at the workflow-body call site.
-///
-/// `mandate_patches` are surfaced here so JAR2-61 can apply them to the
-/// per-agent FS before assembling the bundle (the workflow body itself
-/// must not touch FS — see `scratch/temporal_staged_plan.md` § 2.5
-/// "Drain triggers (typed, ordered)" and the JAR2-60 ticket's notes on
-/// the drain/assemble merge in `agent_core`). Today the activity logs the
-/// patch count and drops them on the floor; stage 6 wires the consumption.
+/// drained signal buckets (`triggers`, `human_ops`, `mandate_patches`)
+/// plus the resolved [`Mandate`] + FS handle + prior-tick correction so
+/// the activity can call into [`jarvis_node::agent_core::drain_triggers`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssembleContextInput {
     pub mandate: Mandate,
     pub fs_handle: FsHandle,
     pub triggers: Vec<Trigger>,
-    /// Human overrides drained alongside `triggers`. JAR2-61 folds these
-    /// into the `Trigger::HumanOverride` taxonomy before calling
-    /// `drain_triggers`, appending them after the regular triggers so the
-    /// ordering matches the in-process loop (which sees the same signal
-    /// stream serialized through one mpsc receiver).
+    /// Human overrides drained alongside `triggers`. Folded into the
+    /// `Trigger::HumanOverride` taxonomy and appended after the regular
+    /// triggers so ordering matches the in-process loop (one mpsc
+    /// receiver, signals serialized in arrival order).
     pub human_ops: Vec<HumanOp>,
-    /// Mandate patches drained from the workflow's `pending_mandate_patches`
-    /// bucket. Stage 6 owns the consumption (apply patch → write FS →
-    /// re-resolve routing); the activity just records the count today.
+    /// Mandate patches drained from the workflow's
+    /// `pending_mandate_patches` bucket. The activity records the count
+    /// today; consumption is unwired.
     pub mandate_patches: Vec<MandatePatch>,
     /// Correction context staged by the previous tick — `Some` when the
     /// previous `DispatchOutcome` was `NeedsCorrection` or `ToolError`.
@@ -126,29 +55,25 @@ pub struct AssembleContextInput {
     pub prior_correction: Option<CorrectionContext>,
 }
 
-/// Output of [`AgentActivities::assemble_context`]. Real body returns the
-/// fully-populated [`ContextBundle`] from `agent_core::drain_triggers`;
-/// stub returns an empty bundle with a placeholder mandate so the
-/// downstream `decide_next_action` activity has something to serialize.
+/// Output of [`AgentActivities::assemble_context`]. Carries the
+/// fully-populated [`ContextBundle`] from `agent_core::drain_triggers`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AssembleContextOutput {
     pub bundle: ContextBundle,
 }
 
-/// Input to [`AgentActivities::decide_next_action`]. Real body wraps
-/// `LlmDecide::decide(bundle)`; stub consults the test script and falls
-/// back to a canned `Idle`.
+/// Input to [`AgentActivities::decide_next_action`]. Wraps
+/// `LlmDecide::decide(bundle)` after consulting the test script.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DecideInput {
     pub bundle: ContextBundle,
 }
 
-/// Input to [`AgentActivities::execute_tool`]. One activity invocation per
-/// `ToolCall` — the workflow body fans out via `workflows::join_all` so a
-/// partial parallel batch survives a worker crash (only in-flight calls
-/// re-execute on retry; completed ones already wrote their outcome to
-/// workflow history). See `scratch/temporal_staged_plan.md` § 2.5 +
-/// JAR2-60 ticket § "SDK constraints baked in" item 2.
+/// Input to [`AgentActivities::execute_tool`]. One activity invocation
+/// per `ToolCall`; the workflow body fans out via `workflows::join_all`
+/// so a partial parallel batch survives a worker crash (only in-flight
+/// calls re-execute on retry; completed ones already wrote their
+/// outcome to workflow history).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecuteToolInput {
     pub cfg: AgentConfig,
@@ -156,17 +81,15 @@ pub struct ExecuteToolInput {
     pub call: ToolCall,
 }
 
-/// Result of a single `execute_tool` activity invocation. Mirrors the
-/// shape `agent_core::dispatch_call_tools` already produces — successful
+/// Result of a single `execute_tool` activity invocation. Successful
 /// calls carry an `EvidenceId`; failed calls carry a structured
 /// [`ToolCallFailure`] the workflow can fold into next-tick correction
 /// context.
 ///
-/// **Why this mirrors `agent_core::ToolFailure` but isn't it.**
-/// `agent_core::ToolFailure` doesn't derive `Serialize`/`Deserialize` — and
-/// it must not, in this ticket: that crate is out of scope per JAR2-60
-/// guardrail 1. We carry the same three fields here so JAR2-63 can
-/// translate one to the other when wiring the real body.
+/// Mirrors `agent_core::ToolFailure`'s shape with serde derives so the
+/// value crosses the workflow ↔ activity boundary via Temporal's
+/// payload codec; the source type cannot derive serde directly because
+/// `agent_core` is out of scope for this surface.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ToolCallOutcome {
@@ -174,10 +97,9 @@ pub enum ToolCallOutcome {
     Failure { failure: ToolCallFailure },
 }
 
-/// Mirror of `jarvis_node::agent_core::ToolFailure` with serde derives so
-/// the value crosses the workflow ↔ activity boundary via Temporal's
-/// payload codec. JAR2-63's real `execute_tool` body converts the
-/// `agent_core::ToolFailure` from `dispatch_call_tools` into this shape.
+/// Mirror of `jarvis_node::agent_core::ToolFailure` with serde derives
+/// so the value crosses the workflow ↔ activity boundary via Temporal's
+/// payload codec.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolCallFailure {
     pub tool: String,
@@ -185,7 +107,7 @@ pub struct ToolCallFailure {
     pub error: String,
 }
 
-/// Input to [`AgentActivities::persist_output`]. Real body calls
+/// Input to [`AgentActivities::persist_output`]. The activity calls
 /// `AgentFs::persist_output` and returns the minted `OutputId`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PersistOutputInput {
@@ -197,20 +119,15 @@ pub struct PersistOutputInput {
 
 /// Input to [`AgentActivities::apply_fs_ops`].
 ///
-/// JAR2-65 carries a `Mandate` because [`jarvis_node::fs::AgentFs::new_with_storage`]
-/// requires one to reify an `AgentFs` against the shared storage. The
-/// mandate is decorative for this call path — `AgentFs::new_with_storage`
-/// only writes `mandate.json` when absent, and `apply_fs_ops` runs only
-/// against agents that have already gone through `assemble_context` at
-/// least once (so `mandate.json` already exists on disk). Carrying the
-/// real mandate, rather than fishing it out of disk inside the activity,
-/// keeps the activity body single-storage-roundtrip.
-///
-/// **Today** the workflow body passes a placeholder
-/// `Mandate::new("", Duration::ZERO, None)` because `AgentConfig` is the
-/// JAR2-58 placeholder unit struct. When `AgentConfig` grows a real
-/// mandate field (later stage), only the workflow call site changes —
-/// this input shape stays the same.
+/// Carries a `Mandate` because
+/// [`jarvis_node::fs::AgentFs::new_with_storage`] requires one to reify
+/// an `AgentFs` against the shared storage. The mandate is decorative
+/// for this call path — `AgentFs::new_with_storage` only writes
+/// `mandate.json` when absent, and `apply_fs_ops` runs only against
+/// agents that have already gone through `assemble_context` at least
+/// once (so `mandate.json` already exists on disk). Carrying the real
+/// mandate rather than fishing it out of disk keeps the activity body
+/// single-storage-roundtrip.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApplyFsOpsInput {
     pub fs_handle: FsHandle,
@@ -226,19 +143,17 @@ pub struct PersistRetirementInput {
     pub reason: String,
 }
 
-/// Input to [`AgentActivities::append_decision_log`].
-///
-/// JAR2-68 / plan § 8 decision 6 — one entry per tick, written to
-/// `<prefix>/decisions/<tick>.jsonl`. The workflow body calls the
-/// activity after [`decide`](crate::workflow) returns a `Decision`, so
-/// the entry is observable end-to-end (output decisions, retirements,
-/// idle ticks all land in the same artifact stream).
+/// Input to [`AgentActivities::append_decision_log`]. One entry per
+/// tick, written to `<prefix>/decisions/<tick>.jsonl`. Called after
+/// [`decide`](crate::workflow) returns a `Decision` so output
+/// decisions, retirements, and idle ticks all land in the same
+/// artifact stream.
 ///
 /// `decision_summary` is the human-readable rendering of the
-/// `Decision` enum variant. The full structured decision payload is
-/// already captured by Temporal workflow history; the on-disk log is a
-/// host-agnostic, FS-readable, replay-stable summary the TUI phase 1
-/// (stage 7.6) consumes without talking to Temporal.
+/// `Decision` enum variant. The full structured payload is captured
+/// by Temporal workflow history; the on-disk log is a host-agnostic,
+/// FS-readable, replay-stable summary the TUI consumes without
+/// talking to Temporal.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppendDecisionLogInput {
     pub fs_handle: FsHandle,
@@ -246,18 +161,15 @@ pub struct AppendDecisionLogInput {
     pub decision_summary: String,
 }
 
-/// JAR2-80 (stage 5.3) — input for the `register_child_in_structural_db`
-/// activity body. Carries the parent's `(graph_id, agent_id)` so the
-/// activity can write the child's `agents` row (scoped to the parent's
-/// graph) and the parent → child `edges` row in one transaction's worth
-/// of writes.
+/// Input for the `register_child_in_structural_db` activity. Carries
+/// the parent's `(graph_id, agent_id)` so the activity can write the
+/// child's `agents` row (scoped to the parent's graph) and the
+/// parent → child `edges` row in one transaction's worth of writes.
 ///
-/// `child_mandate_ref` is the opaque text handle from the structural-DB
-/// schema (`migrations/0001_initial.sql`). Runtime spawns
-/// (`Decision::SpawnChild`) pass `None` — the child's mandate travels
-/// via `AgentInput.mandate` per Stage 5 Project decision 9 and the
-/// runtime spawn never produces a stable text handle. YAML-driven
-/// spawns (5.8) may pass a real ref here once the resolver ships.
+/// `child_mandate_ref` is the opaque text handle from the
+/// structural-DB schema. Runtime spawns (`Decision::SpawnChild`) pass
+/// `None` — the child's mandate travels via `AgentInput.mandate` and
+/// the runtime spawn never produces a stable text handle.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegisterChildInStructuralDbInput {
     pub parent_graph_id: GraphId,
@@ -266,50 +178,44 @@ pub struct RegisterChildInStructuralDbInput {
     pub child_mandate_ref: Option<String>,
 }
 
-/// JAR2-80 (stage 5.3) — output of the `register_child_in_structural_db`
-/// activity. Returns the child's freshly-allocated `AgentId` so the
-/// workflow body can construct the child workflow id
-/// (`graphs/<gid>/agents/<aid>`) and pass it to `ctx.child_workflow(..)`.
+/// Output of the `register_child_in_structural_db` activity. Returns
+/// the child's freshly-allocated `AgentId` so the workflow body can
+/// construct the child workflow id (`graphs/<gid>/agents/<aid>`) and
+/// pass it to `ctx.child_workflow(..)`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegisterChildInStructuralDbOutput {
     pub child_agent_id: AgentId,
 }
 
-/// JAR2-82 (stage 5.5) — input to the `reconcile_children` activity.
-///
-/// Carries the parent's identity (so the activity can open the
-/// parent's FS and write the synthetic evidence) plus the cited
-/// child outputs and the optional conflict-record intent. Both
-/// `parent_graph_id` and every `sources[i].child_ref` must live in
-/// the same graph — cross-graph reads are explicitly out of scope per
-/// the Stage 5 Project description.
+/// Input to the `reconcile_children` activity. Carries the parent's
+/// identity (so the activity can open the parent's FS and write the
+/// synthetic evidence) plus the cited child outputs and the optional
+/// conflict-record intent. Both `parent_graph_id` and every
+/// `sources[i].child_ref` must live in the same graph — cross-graph
+/// reads are out of scope.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReconcileChildrenInput {
     pub parent_graph_id: GraphId,
     pub parent_agent_id: AgentId,
     pub sources: Vec<ReconcileSource>,
     /// `Some` iff the parent observed disagreement among the cited
-    /// outputs. JAR2-83 (5.6) wires the writer: when `Some`, the
-    /// activity persists a content-addressed `ConflictRecord` under
-    /// the parent's `conflicts/<id>.json` and returns the id on
-    /// `ReconcileChildrenOutput.conflict_id`.
+    /// outputs. When `Some`, the activity persists a content-addressed
+    /// `ConflictRecord` under the parent's `conflicts/<id>.json` and
+    /// returns the id on `ReconcileChildrenOutput.conflict_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict: Option<ConflictRecordIntent>,
 }
 
-/// JAR2-82 (stage 5.5) — output of the `reconcile_children` activity.
+/// Output of the `reconcile_children` activity.
 ///
 /// `synthetic_evidence[i]` is the freshly-minted `EvidenceId` for the
 /// `sources[i]` cross-agent fold (written into the parent's
 /// `evidence/<id>.json`). The parent's next-tick `assemble_context`
 /// picks these up via the existing `list_recent_evidence` window with
-/// no workflow-state slot involved (Stage 5 Project decision 3 +
-/// JAR2-82 advisor item 4).
+/// no workflow-state slot involved.
 ///
 /// `conflict_id` is `Some` iff `input.conflict.is_some()` and the
-/// activity wrote the conflict record successfully. JAR2-83 (5.6)
-/// shipped the writer; this is now a value change from the JAR2-82
-/// stub, not a struct rev.
+/// activity wrote the conflict record successfully.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReconcileChildrenOutput {
     pub synthetic_evidence: Vec<EvidenceId>,
@@ -317,14 +223,11 @@ pub struct ReconcileChildrenOutput {
     pub conflict_id: Option<ConflictId>,
 }
 
-/// JAR2-82 (stage 5.5) — typed reconciliation errors.
-///
-/// The reconcile_children activity wraps these as
-/// `ApplicationFailure::non_retryable` so Temporal's outer retry loop
-/// doesn't churn through them; the workflow body catches the
-/// activity failure and stages a `CorrectionContext` for the next
-/// tick (mirroring the existing `Decision::CallTools` tool-failure
-/// flow).
+/// Typed reconciliation errors. The `reconcile_children` activity
+/// wraps these as `ApplicationFailure::non_retryable` so Temporal's
+/// outer retry loop doesn't churn through them; the workflow body
+/// catches the failure and stages a `CorrectionContext` for the next
+/// tick.
 #[derive(Debug, thiserror::Error)]
 pub enum ReconciliationError {
     /// A `sources[i].output_id` did not resolve in the named child's
@@ -336,12 +239,11 @@ pub enum ReconciliationError {
         agent_id: AgentId,
         output_id: OutputId,
     },
-    /// JAR2-83 (stage 5.6): the parent's `Decision::ReconcileChildren`
-    /// carried a `ConflictRecordIntent` with fewer than two
-    /// alternatives. A single-alternative "conflict" is meaningless and
-    /// signals an LLM-level mistake; non-retryable for the same reason
-    /// `ChildOutputNotFound` is — re-running the activity with the same
-    /// payload won't make a bad shape good.
+    /// The parent's `Decision::ReconcileChildren` carried a
+    /// `ConflictRecordIntent` with fewer than two alternatives. A
+    /// single-alternative "conflict" is meaningless and signals an
+    /// LLM-level mistake; non-retryable because re-running with the
+    /// same payload won't make a bad shape good.
     #[error("reconcile: conflict intent has only {count} alternatives (need >= 2)")]
     ConflictAlternativesTooFew { count: usize },
 }
@@ -354,10 +256,9 @@ pub enum ReconciliationError {
 /// {"tick": 0, "decision_summary": "Idle { 50ms }", "ts": "2026-05-25T12:00:00Z"}
 /// ```
 ///
-/// Pinned as a typed struct (not free-form JSON) so the TUI phase 1
-/// reader has a stable shape. `#[non_exhaustive]` reserves room for
-/// per-tick health / cost meters (stage 7.6's "calibration" surface)
-/// without a wire break.
+/// Pinned as a typed struct (not free-form JSON) so the TUI reader has
+/// a stable shape. `#[non_exhaustive]` reserves room for per-tick
+/// health / cost meters without a wire break.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DecisionLogEntry {
@@ -377,15 +278,11 @@ impl DecisionLogEntry {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Test-injectable decision script
-//
-// Lives outside the impl block because activity bodies are free functions
-// over a value-typed registered instance (smoke § 3.4) — external
-// observation/control of the registered `AgentActivities` value isn't
-// available, so a process-wide static is the SDK-blessed workaround. The
-// scripted decide_next_action activity consults this before returning the
-// fallback `Decision::Idle`.
+// Test-injectable decision script. Lives outside the impl block because
+// activity bodies are free functions over a value-typed registered
+// instance — external observation/control of the registered
+// `AgentActivities` value isn't available, so a process-wide static is
+// the SDK-blessed workaround.
 
 static DECISION_SCRIPT: OnceLock<Mutex<VecDeque<Decision>>> = OnceLock::new();
 
@@ -414,14 +311,12 @@ fn pop_scripted_decision() -> Option<Decision> {
         .pop_front()
 }
 
-/// Substantive body of [`AgentActivities::apply_fs_ops`], factored out so
-/// hermetic unit tests can drive it against a `MemoryStorage` backend
-/// directly without the live-test-only `ActivityContext` indirection.
-///
-/// Builds an `AgentFs` over `storage` at the per-agent prefix and forwards
-/// the op batch. Returns `anyhow::Result<()>` so the activity-level `?`
-/// lifts the error into `ActivityError::Application(...)` via the SDK's
-/// blanket impl.
+/// Substantive body of [`AgentActivities::apply_fs_ops`], factored out
+/// so hermetic unit tests can drive it against a `MemoryStorage`
+/// backend without the live-test-only `ActivityContext` indirection.
+/// Returns `anyhow::Result<()>` so the activity-level `?` lifts the
+/// error into `ActivityError::Application(...)` via the SDK's blanket
+/// impl.
 async fn apply_fs_ops_impl(
     storage: std::sync::Arc<dyn jarvis_node::storage::AgentStorage>,
     input: ApplyFsOpsInput,
@@ -431,58 +326,27 @@ async fn apply_fs_ops_impl(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Activity body helpers
-//
-// Free functions extracted from the activity bodies so hermetic tests can
-// exercise the FS-touching logic without constructing an `ActivityContext`
-// (which has no `Default` impl and a non-trivial Core-tied constructor) or
-// installing the process-wide `OnceLock<AgentStorage>` (which would race
-// the `worker::install_then_access_*` test that already installs it in
-// the lib test binary). The activity body is a 3-line wrapper around
-// these helpers; the helpers carry the real shape.
+// Free functions extracted from the activity bodies so hermetic tests
+// can exercise the FS-touching logic without constructing an
+// `ActivityContext` or installing the process-wide
+// `OnceLock<AgentStorage>`. The activity body is a 3-line wrapper
+// around these helpers; the helpers carry the real shape.
 
-/// Stage 3.8 helper — open an `AgentFs` over `storage` at `prefix` and
-/// persist `content` as an output whose provenance trail is `evidence`.
-/// Returns the `OutputId`, which post-JAR2-70 is `sha256(content, evidence)`
-/// — see the `persist_output` doc comment for the idempotency contract.
-///
-/// `AgentFs::persist_output` rejects:
-/// - Empty `evidence` (`FsError::EmptyEvidence`).
-/// - Any cited id whose `evidence/<id>.json` is absent
-///   (`FsError::EvidenceNotFound`).
-///
-/// Both errors propagate via `?` through `anyhow::Error` →
-/// `ActivityError::Application`. The workflow body's next-tick
-/// correction-context staging (JAR2-60 `dispatch_call_tools`) is the
-/// agent-loop's mechanism for surfacing these failures to the LLM; the
-/// activity itself just reports.
-/// JAR2-68 helper — append a single [`DecisionLogEntry`] to the per-tick
-/// JSONL file at `<prefix>/decisions/<tick>.jsonl`. Stage 3.12 / plan
-/// § 8 decision 6.
-///
-/// Each tick gets its own file with exactly one line (one decision).
-/// This keeps Temporal-retry idempotency trivial: a retry of this
-/// activity with the same `(tick, decision_summary, ts)` triple PUTs
-/// byte-identical bytes via [`AgentStorage::put`]. The `ts` arrives
-/// from the workflow's `ctx.info().scheduled_time` for the same
-/// deterministic-across-retries property `persist_retirement` enforces.
-///
-/// The single-line-per-file shape is deliberate: a per-prefix append-
-/// log against a KV backend that has no native append would require a
-/// read-modify-write loop with optimistic concurrency, which is more
-/// machinery than this artifact justifies. The TUI phase 1 reader
-/// concatenates the files in tick order.
+/// Append a single [`DecisionLogEntry`] to the per-tick JSONL file at
+/// `<prefix>/decisions/<tick>.jsonl`. Each tick gets its own file with
+/// exactly one line. This keeps Temporal-retry idempotency trivial: a
+/// retry with the same `(tick, decision_summary, ts)` triple PUTs
+/// byte-identical bytes via [`AgentStorage::put`]. The TUI reader
+/// concatenates files in tick order.
 pub(crate) async fn append_decision_log_impl(
     storage: Arc<dyn AgentStorage>,
     prefix: &str,
     entry: &DecisionLogEntry,
 ) -> anyhow::Result<()> {
     let fs = AgentFs::attach(storage, prefix);
-    let prefix = fs.prefix(); // canonicalized with trailing '/'
+    let prefix = fs.prefix();
     let key = format!("{prefix}decisions/{tick}.jsonl", tick = entry.tick);
     let line = serde_json::to_string(entry)?;
-    // No trailing newline — one line per file, the TUI reader concatenates.
     fs.storage()
         .put(&key, bytes::Bytes::from(line.into_bytes()))
         .await?;
@@ -495,66 +359,33 @@ pub(crate) async fn persist_output_impl(
     content: &str,
     evidence: &[EvidenceId],
 ) -> anyhow::Result<OutputId> {
-    // Placeholder mandate matches `assemble_context`'s stub — `AgentFs`
-    // only writes `mandate.json` when absent, so the real mandate
-    // persisted by JAR2-61's `assemble_context` (or a prior boot of
-    // this same agent) is not clobbered when this activity opens the
-    // FS to persist an output.
+    // Placeholder mandate: `AgentFs` only writes `mandate.json` when
+    // absent, so the real mandate persisted by an earlier
+    // `assemble_context` (or prior agent boot) is not clobbered.
     let mandate = Mandate::new("", Duration::ZERO, None);
     let fs = AgentFs::new_with_storage(storage, prefix, &mandate).await?;
     let output = fs.persist_output(content, evidence).await?;
     Ok(output.id)
 }
 
-// ---------------------------------------------------------------------------
-// Activity impl
-//
-// `AgentActivities` is the new value-typed activity bundle replacing
-// JAR2-58's `NoopActivities`. The macro impls
-// `ActivityImplementer for AgentActivities`; `register_activities` wraps
-// in `Arc` internally (smoke § 3.4 — passing `Arc<AgentActivities>` is a
-// type error).
-//
-// Every body is a stub returning canned `Ok(...)`. The real bodies land
-// in JAR2-61..66; each one will:
-//
-// - `assemble_context` (JAR2-61): open the per-agent `AgentFs` from
-//   `fs_handle`, apply any drained `mandate_patches`, fold `human_ops`
-//   into the `Trigger` stream, call `agent_core::drain_triggers`.
-// - `decide_next_action` (JAR2-62): construct an `LlmDecide` from `cfg`
-//   (model routing, system prompt), call `.decide(bundle)`.
-// - `execute_tool` (JAR2-63): resolve `cfg.tools` against the registry,
-//   dispatch one `ToolCall`, record_evidence on success.
-// - `persist_output` (JAR2-64): re-open `AgentFs`, call `persist_output`.
-// - `apply_fs_ops` (JAR2-65): re-open `AgentFs`, call `apply_ops`.
-// - `persist_retirement` (JAR2-66): re-open `AgentFs`, call `persist_retirement`.
-
-/// Activity bundle registered on the worker. Replaces JAR2-58's
-/// `NoopActivities` — the bare value passes through `register_activities`
-/// unchanged (smoke § 3.4).
+/// Activity bundle registered on the worker. The `#[activities]` macro
+/// impls `ActivityImplementer` for the bare type; `register_activities`
+/// wraps in `Arc` internally (passing `Arc<AgentActivities>` is a type
+/// error).
 pub struct AgentActivities;
 
 #[activities]
 impl AgentActivities {
-    /// Stage 3.5 (JAR2-61). Build a per-tick [`AgentFs`] over the
-    /// worker-shared `AgentStorage` (JAR2-69) at the input's prefix, fold
-    /// drained `human_ops` into the `Trigger::HumanOverride` taxonomy,
-    /// then delegate to [`agent_core::drain_triggers`] for the
-    /// FS-assemble that yields the warm `ContextBundle`.
+    /// Build a per-tick [`AgentFs`] over the worker-shared
+    /// `AgentStorage` at the input's prefix, fold drained `human_ops`
+    /// into the `Trigger::HumanOverride` taxonomy, then delegate to
+    /// [`agent_core::drain_triggers`] for the FS-assemble that yields
+    /// the warm `ContextBundle`.
     ///
-    /// **Mandate patches.** Drained off the `mandate_update` signal
-    /// queue and surfaced on the input for stage 6 — the activity logs
-    /// the count and drops them today. Wiring the consumption (apply
-    /// patch → re-resolve routing → re-open FS) is JAR2-67+ territory.
-    ///
-    /// **FS open is idempotent** — `AgentFs::new_with_storage` only
-    /// writes `mandate.json` when absent, so passing the workflow's
-    /// mandate through on every tick is correct. The cost is one storage
-    /// `get` per tick + a one-time put on first open per agent.
-    ///
-    /// **`tokio` async is fine here** — activity bodies live outside
-    /// workflow-replay determinism rules; the workflow itself is the
-    /// piece that may only use `temporalio_sdk::workflows::*` primitives.
+    /// FS open is idempotent — `AgentFs::new_with_storage` only writes
+    /// `mandate.json` when absent, so passing the workflow's mandate
+    /// through on every tick is correct. The cost is one storage `get`
+    /// per tick + a one-time put on first open per agent.
     #[activity]
     pub async fn assemble_context(
         _ctx: ActivityContext,
@@ -564,11 +395,8 @@ impl AgentActivities {
         let fs = AgentFs::new_with_storage(storage, input.fs_handle.prefix.clone(), &input.mandate)
             .await?;
 
-        // Fold drained `human_ops` into the trigger stream as
-        // `Trigger::HumanOverride { op }`. Appended after the regular
-        // triggers so ordering matches the in-process loop (which sees
-        // every signal serialized through one mpsc receiver in arrival
-        // order).
+        // Human overrides appended after regular triggers so ordering
+        // matches the in-process loop (one mpsc receiver, arrival order).
         let mut triggers = input.triggers;
         triggers.extend(
             input
@@ -580,7 +408,7 @@ impl AgentActivities {
         if !input.mandate_patches.is_empty() {
             tracing::debug!(
                 count = input.mandate_patches.len(),
-                "assemble_context: dropping mandate_patches (stage 6 territory)"
+                "assemble_context: dropping mandate_patches (unwired)"
             );
         }
 
@@ -590,53 +418,40 @@ impl AgentActivities {
         Ok(AssembleContextOutput { bundle })
     }
 
-    /// Stage 3.6 (JAR2-62). Wraps the process-wide [`Decide`] impl
-    /// installed via [`crate::worker::install_decide`] (typically an
-    /// `LlmDecide` over a vendor `ModelClient`).
+    /// Wrap the process-wide [`Decide`] impl installed via
+    /// [`crate::worker::install_decide`] (typically an `LlmDecide` over
+    /// a vendor `ModelClient`).
     ///
-    /// **Script-first.** The activity consults the test-injected
+    /// Script-first: the activity consults the test-injected
     /// [`DECISION_SCRIPT`] *before* reaching for the installed
-    /// implementation. This is load-bearing: the live `workflow_loop`
-    /// test scripts every decision the workflow will ask for, and a
-    /// real LLM call would defeat both the test's determinism and the
-    /// CI envelope (no API keys, no network). The static-script
-    /// injection path predates JAR2-62 and must keep working — see
-    /// `tests/workflow_loop.rs` for the call site.
+    /// implementation, so tests that script every decision never touch
+    /// a real LLM.
     ///
-    /// **Error classification.** When the installed `Decide`
-    /// implementation returns an `anyhow::Error`, the activity
-    /// classifies it by downcasting to `&ModelError` (the typed error
-    /// the `LlmDecide` adapter passes through from
-    /// `ModelClient::complete`):
+    /// Error classification — downcasts the `anyhow::Error` to
+    /// `&ModelError`:
     ///
     /// - `ModelError::Transport` / `ModelError::RateLimit` →
-    ///   **retryable**. The Temporal worker will reschedule the
-    ///   activity per the workflow-side `ActivityOptions::retry_policy`
-    ///   (default Temporal policy today; per-activity tuning is a
-    ///   follow-up — see PR summary).
+    ///   **retryable**. Temporal reschedules per the workflow-side
+    ///   `ActivityOptions::retry_policy`.
     /// - `ModelError::Auth` / `ModelError::Parse` /
     ///   `ModelError::Other` → **non-retryable**. Bad credentials,
-    ///   malformed responses, and vendor-specific 4xxs don't get
-    ///   better by retrying.
-    /// - Downcast fails (e.g. `LlmDecide`'s "parse failed on all N
-    ///   attempts" `anyhow!` after exhausting the inner correction
-    ///   loop) → **non-retryable**. Validation failures bubble as
-    ///   activity-layer failures so the workflow body can stage a
-    ///   correction context on the next tick rather than retrying the
-    ///   same broken decision in place (guardrail 3 of the ticket).
+    ///   malformed responses, vendor-specific 4xxs don't improve on
+    ///   retry.
+    /// - Downcast fails (e.g. validation-exhaustion `anyhow!`) →
+    ///   **non-retryable**. Validation failures bubble as activity
+    ///   failures so the workflow can stage a correction context on
+    ///   the next tick rather than retry a broken decision in place.
     ///
-    /// **Heartbeats** are deliberately omitted in this revision. The
-    /// activity timeout is 30s (`workflow::ACTIVITY_TIMEOUT`), which
-    /// comfortably brackets a normal LLM call (sub-10s for short
-    /// prompts); a long-running streaming variant would need
-    /// heartbeats, but the batch-shape `ModelClient` doesn't.
+    /// Heartbeats are omitted: the 30s activity timeout
+    /// (`workflow::ACTIVITY_TIMEOUT`) comfortably brackets a normal
+    /// LLM call, and the batch-shape `ModelClient` doesn't stream.
     #[activity]
     pub async fn decide_next_action(
         _ctx: ActivityContext,
         input: DecideInput,
     ) -> Result<Decision, ActivityError> {
-        // Script-first (guardrail 5). If a scripted decision is
-        // queued, return it without touching the installed `Decide`.
+        // Script-first: scripted decisions short-circuit the installed
+        // `Decide` so tests never hit a real LLM.
         if let Some(d) = pop_scripted_decision() {
             return Ok(d);
         }
@@ -647,70 +462,38 @@ impl AgentActivities {
             .map_err(classify_decide_error)
     }
 
-    /// Stage 3.7 (JAR2-63). Real body: dispatches one `ToolCall` through
-    /// the process-wide [`ToolRegistry`] (installed at worker boot via
+    /// Dispatch one `ToolCall` through the process-wide
+    /// [`ToolRegistry`] (installed via
     /// [`crate::worker::install_tool_registry`]) and, on success,
-    /// persists the resulting `EvidenceRecord` via the per-agent
-    /// `AgentFs` facade backed by the installed
-    /// [`crate::worker::agent_storage`].
+    /// persist the resulting `EvidenceRecord` via the per-agent
+    /// `AgentFs` facade backed by [`crate::worker::agent_storage`].
     ///
     /// One activity invocation per `ToolCall`; the workflow body fans
     /// out N calls via `workflows::join_all` and stages a
-    /// `CorrectionContext` for next tick when any of them surface as
-    /// `Failure`. See [`crate::workflow::dispatch_call_tools`].
+    /// `CorrectionContext` for next tick when any surface as
+    /// `Failure`.
     ///
-    /// **Retry layering.** Tool calls themselves are dispatched
-    /// single-shot from this activity — `McpTool` (the production
-    /// `ToolRegistry` entry built by `register_mcp_server_with_policy`)
-    /// already runs its own `RetryPolicy` loop inside `Tool::call`
-    /// (`crates/jarvis_node/src/mcp/tool.rs` `call_with_retry`). Adding
-    /// a second retry loop here would compound those retries
-    /// multiplicatively. The per-call surface this activity returns —
-    /// `Success { evidence_id }` or `Failure { failure }` — already
-    /// matches the in-process `agent_core::dispatch_call_tools`
-    /// post-retry shape. The outer Temporal retry on activity errors
-    /// (heartbeat timeout, worker crash) stays safe because evidence
-    /// is content-addressed: a retried activity invocation with the
-    /// same `(tool, args, result)` triple resolves to the same
-    /// `EvidenceId` and `AgentFs::record_evidence` is idempotent via
-    /// `put_if_absent` (`crates/jarvis_node/src/fs.rs`).
+    /// Retry layering: tool calls are dispatched single-shot from this
+    /// activity — `McpTool` already runs its own `RetryPolicy` loop
+    /// inside `Tool::call`. Wrapping another retry here would compound
+    /// them multiplicatively. The outer Temporal retry on activity
+    /// errors stays safe because evidence is content-addressed: a
+    /// retried invocation with the same `(tool, args, result)` triple
+    /// resolves to the same `EvidenceId` and
+    /// `AgentFs::record_evidence` is idempotent via `put_if_absent`.
     ///
-    /// **Tool error → Failure (not ActivityError).** A tool that
-    /// errors after its own retry exhaustion does **not** surface as
-    /// `ActivityError` (which would trip Temporal's outer retry —
-    /// pointless work, given the inner retry already gave up). It
-    /// returns `Ok(ToolCallOutcome::Failure { failure })` so the
-    /// workflow body folds it into a `CorrectionContext` and the next
-    /// tick's LLM sees the failure. This mirrors the in-process
-    /// `DispatchOutcome::ToolError` semantics from
-    /// `agent_core::dispatch_call_tools` (`scratch/temporal_staged_plan.md`
-    /// § 2.5; JAR2-38). A tool name unknown to the registry takes the
-    /// same path; the in-process loop returned `NeedsCorrection` for
-    /// that case via a batch-wide pre-check, but at the per-call
-    /// granularity the unknown-name failure is observationally
-    /// identical to any other call-time error from the LLM's
-    /// perspective.
+    /// Tool errors return `Ok(ToolCallOutcome::Failure { failure })`
+    /// rather than `ActivityError`: the inner retry already gave up,
+    /// and surfacing as `ActivityError` would trip Temporal's outer
+    /// retry pointlessly. The workflow body folds the failure into a
+    /// `CorrectionContext` for the next tick. Unknown tool names take
+    /// the same path — at per-call granularity they're
+    /// observationally identical to any call-time error.
     ///
-    /// **Mandate placeholder.** `ExecuteToolInput.cfg` is the
-    /// JAR2-60-era `AgentConfig {}` empty struct; promotion to
-    /// `Mandate` lands later in the stack. `AgentFs::new_with_storage`
-    /// still wants a `&Mandate` to seed an `mandate.json` write on
-    /// first open — but that write is idempotent (read-then-PUT-only-
-    /// if-absent), so a placeholder mandate here cannot corrupt
-    /// whatever the agent's mandate-bearing path (e.g. JAR2-61's
-    /// `assemble_context`) wrote first. Matches the same trick the
-    /// `assemble_context` stub uses to construct its placeholder
-    /// `ContextBundle.mandate`.
-    ///
-    /// **Heartbeats deferred.** `ActivityContext::record_heartbeat`
-    /// exists on the pinned SDK (verified against
-    /// `temporalio-sdk-0.4.0/src/activities.rs:170`), but with
-    /// today's bootstrap tool surface — `EchoTool` (microseconds) and
-    /// `McpTool` (sub-second under the default retry policy of
-    /// 3×50ms) — neither approaches the workflow-set 30s
-    /// start-to-close timeout. Add a heartbeat loop here when a
-    /// tool's expected duration approaches or exceeds the timeout
-    /// (e.g. JAR2-68's MCP-server wiring with a long-running fetch).
+    /// Heartbeats are deferred: today's tools (`EchoTool` in
+    /// microseconds, `McpTool` sub-second under default retry policy)
+    /// don't approach the 30s start-to-close timeout. Add a heartbeat
+    /// loop when a tool's expected duration approaches it.
     #[activity]
     pub async fn execute_tool(
         _ctx: ActivityContext,
@@ -718,18 +501,15 @@ impl AgentActivities {
     ) -> Result<ToolCallOutcome, ActivityError> {
         let registry = crate::worker::tool_registry();
         // One-shot dispatch — the tool implementation owns its retry
-        // policy (see McpTool::call). Wrapping in another retry here
-        // would compound them multiplicatively.
+        // policy; another retry layer here would compound them.
         let call_result = registry
             .call(&input.call.name, input.call.args.clone())
             .await;
         match call_result {
             Ok(record) => {
-                // Persist evidence via the per-agent AgentFs facade.
-                // Construction is idempotent against the prefix's
-                // mandate file (read-then-PUT-only-if-absent), so the
-                // placeholder mandate below cannot overwrite a real
-                // mandate already on disk.
+                // Placeholder mandate is safe: `AgentFs::new_with_storage`
+                // is read-then-PUT-only-if-absent, so the real mandate
+                // written elsewhere is never overwritten.
                 let storage = crate::worker::agent_storage();
                 let placeholder_mandate = Mandate::new("", Duration::ZERO, None);
                 let fs = AgentFs::new_with_storage(
@@ -754,23 +534,14 @@ impl AgentActivities {
         }
     }
 
-    /// Stage 3.8 (JAR2-64). Real body: opens an [`AgentFs`] over the
-    /// process-wide [`AgentStorage`] backend (installed by the worker
-    /// boot or a test harness) at the agent's prefix, then delegates to
+    /// Open an [`AgentFs`] over the process-wide [`AgentStorage`]
+    /// backend at the agent's prefix and delegate to
     /// [`AgentFs::persist_output`] — which enforces the provenance
-    /// contract from JAR2-4 (every cited `EvidenceId` must resolve to a
-    /// file in `evidence/`) and updates the outputs tail-index from
-    /// JAR2-54.
+    /// contract (every cited `EvidenceId` must resolve to a file in
+    /// `evidence/`) and updates the outputs tail-index.
     ///
-    /// **Mandate placeholder.** `AgentFs::new_with_storage` only writes
-    /// `mandate.json` if the file is absent; the placeholder here is a
-    /// no-op when JAR2-61's `assemble_context` has already persisted the
-    /// real mandate. Sibling JAR2-61 will swap `PersistOutputInput.cfg`
-    /// to the real `Mandate` shape; until that lands, this body matches
-    /// the same placeholder `assemble_context` uses today.
-    ///
-    /// **Idempotency (JAR2-70).** `OutputId::new(content, evidence)` is
-    /// content-addressed, and `AgentFs::persist_output` uses
+    /// Idempotency: `OutputId::new(content, evidence)` is
+    /// content-addressed and `AgentFs::persist_output` uses
     /// `put_if_absent`, so a Temporal retry of a successful FS write +
     /// failed activity ack returns the same `OutputId` and does not
     /// land a second file or shuffle the tail-index entry. Two ticks
@@ -792,30 +563,20 @@ impl AgentActivities {
         Ok(id)
     }
 
-    /// Stage 3.9 (JAR2-65). Reify an [`AgentFs`] over the worker-shared
-    /// storage at the agent's prefix and apply the batch of [`FsOp`]s.
+    /// Reify an [`AgentFs`] over the worker-shared storage at the
+    /// agent's prefix and apply the batch of [`FsOp`]s. Path
+    /// validation (no traversal, must live under `notes/`) is enforced
+    /// inside [`AgentFs::apply_ops`].
     ///
-    /// Path validation (no traversal, must live under `notes/`) is
-    /// enforced inside [`AgentFs::apply_ops`]; this body does no
-    /// re-validation. The activity has no idempotency primitive of its
-    /// own — Temporal retries (heartbeat timeout, worker restart) re-run
-    /// the activity body, but `FsOp` is deterministic state: replaying
-    /// the same set of writes/deletes against the same prefix produces
-    /// the same file state. Mutable, not content-addressed; effectively
-    /// idempotent for the load-bearing case (Temporal-retry).
+    /// Idempotency: `FsOp` is deterministic state — replaying the same
+    /// set of writes/deletes against the same prefix produces the same
+    /// file state. Mutable, not content-addressed; effectively
+    /// idempotent for the Temporal-retry case.
     ///
-    /// Error mapping: [`apply_fs_ops_impl`] returns `anyhow::Result<()>`,
-    /// which `?` lifts into `ActivityError::Application(...)` via the
-    /// SDK's blanket `From<E> for ActivityError where E: Into<anyhow::Error>`.
-    /// Typed `FsError::PathTraversal` / `FsError::PathOutsideNotes` /
-    /// `FsError::Storage` all surface as application failures, which is
-    /// what Temporal expects from an activity-level reject.
-    ///
-    /// Body delegates to the free-function [`apply_fs_ops_impl`] so the
-    /// unit tests at the bottom of this module can exercise the storage
-    /// roundtrip without needing to construct an `ActivityContext`
-    /// (which requires an `Arc<CoreWorker>` and is therefore not
-    /// hermetically buildable in a `#[test]`).
+    /// Error mapping: typed `FsError::PathTraversal` /
+    /// `FsError::PathOutsideNotes` / `FsError::Storage` all surface as
+    /// `ActivityError::Application(...)` via the SDK's blanket
+    /// `From<E> for ActivityError`.
     #[activity]
     pub async fn apply_fs_ops(
         _ctx: ActivityContext,
@@ -825,40 +586,34 @@ impl AgentActivities {
         Ok(())
     }
 
-    /// Stage 3.10 (JAR2-66). Real body — write `retirement.json` via
-    /// [`AgentFs::persist_retirement`] using a deterministic timestamp
-    /// drawn from `ctx.info().scheduled_time`.
+    /// Write `retirement.json` via [`AgentFs::persist_retirement`]
+    /// using a deterministic timestamp drawn from
+    /// `ctx.info().scheduled_time`.
     ///
     /// # Why `AgentFs::attach` (not `new_with_storage`)
     ///
-    /// `new_with_storage` reads-or-writes `mandate.json` to confirm the
-    /// per-agent FS is initialized. At the retirement-signal short-
-    /// circuit (workflow.rs `Decision::Retire` arm or the `retire`
-    /// signal short-circuit ahead of `assemble_context`) no `Mandate`
-    /// is in scope — the workflow body never loaded one. `attach` is
-    /// the strictly weaker constructor that skips the mandate write
-    /// and the tail-index reconciliation. The retirement path writes
-    /// exactly one key (`retirement.json`) and exits, so neither side
-    /// effect is required.
+    /// `new_with_storage` reads-or-writes `mandate.json` to confirm
+    /// the per-agent FS is initialized. At the retirement-signal
+    /// short-circuit no `Mandate` is in scope — the workflow body
+    /// never loaded one. `attach` is the strictly weaker constructor
+    /// that skips the mandate write and the tail-index reconciliation.
+    /// The retirement path writes exactly one key (`retirement.json`)
+    /// and exits, so neither side effect is required.
     ///
     /// # Why `scheduled_time` (not `Utc::now()`)
     ///
     /// `Utc::now()` inside an activity body is wall-clock time at
-    /// execution. If the activity fails and Temporal retries it, the
-    /// retry attempt's `Utc::now()` differs from the first attempt's.
-    /// Two attempts that both reach the `put` call would write
-    /// different bytes to `retirement.json` — defeating the workflow-
-    /// replay byte-identicality property the rest of the kernel
-    /// promises. `ctx.info().scheduled_time` is stamped from workflow
-    /// history (when the workflow *scheduled* the activity), so it is
-    /// stable across retries.
+    /// execution. If Temporal retries the activity, the retry's
+    /// `Utc::now()` differs from the first attempt's — two attempts
+    /// reaching the `put` would write different bytes to
+    /// `retirement.json`, defeating workflow-replay byte-identicality.
+    /// `ctx.info().scheduled_time` is stamped from workflow history,
+    /// so it is stable across retries.
     ///
-    /// Fallback path: if `scheduled_time` is `None` (test harnesses
-    /// that bypass the worker's activity-info plumbing, or an SDK that
-    /// hasn't filled it in), we synthesize `Utc::now()` so the body
-    /// still completes. This costs the replay-determinism property in
-    /// that edge case; loud telemetry would make sense once
-    /// observability lands (out of scope here per JAR2-66 guardrail 1).
+    /// Fallback: if `scheduled_time` is `None` (test harnesses or an
+    /// SDK that hasn't filled it in), synthesize `Utc::now()` so the
+    /// body still completes. Costs the replay-determinism property in
+    /// that edge case.
     #[activity]
     pub async fn persist_retirement(
         ctx: ActivityContext,
@@ -868,22 +623,17 @@ impl AgentActivities {
         Ok(())
     }
 
-    /// Stage 3.12 (JAR2-68) — append a one-line JSONL entry describing
-    /// the decision the workflow just took to
-    /// `<prefix>/decisions/<tick>.jsonl`. Plan § 8 decision 6.
+    /// Append a one-line JSONL entry describing the decision the
+    /// workflow just took to `<prefix>/decisions/<tick>.jsonl`. One
+    /// activity invocation per tick, called from the workflow body
+    /// after `decide_next_action` returns. Idempotent: `<tick>.jsonl`
+    /// is a per-tick file containing exactly one line, and the
+    /// timestamp is sourced from `ctx.info().scheduled_time` so
+    /// retries PUT byte-identical bytes.
     ///
-    /// One activity invocation per tick, called from the workflow body
-    /// after `decide_next_action` returns (before the match-on-`Decision`
-    /// arms run). Idempotency is trivial: `<tick>.jsonl` is a per-tick
-    /// file containing exactly one line, and the timestamp is sourced
-    /// from `ctx.info().scheduled_time` so retries PUT byte-identical
-    /// bytes (same property `persist_retirement` enforces).
-    ///
-    /// **Fallback path** (mirror of `persist_retirement`): if
-    /// `scheduled_time` is `None` — test harnesses that bypass the
-    /// worker's activity-info plumbing — we synthesize `Utc::now()`.
-    /// Costs the replay-determinism property in that edge case; live
-    /// production workers always have `scheduled_time` filled in.
+    /// Fallback: if `scheduled_time` is `None`, synthesize `Utc::now()`
+    /// — costs replay-determinism in that edge case; live production
+    /// workers always have `scheduled_time` filled in.
     #[activity]
     pub async fn append_decision_log(
         ctx: ActivityContext,
@@ -899,36 +649,23 @@ impl AgentActivities {
         Ok(())
     }
 
-    /// JAR2-80 (stage 5.3) — write the child's `agents` row + the
-    /// parent → child `edges` row into the structural DB, returning
-    /// the freshly-allocated `AgentId`.
-    ///
-    /// Routed through the worker-shared [`crate::worker::StructuralDbStore`]
-    /// trait object (installed at worker boot via
-    /// [`crate::worker::install_structural_db_store`]). The trait
-    /// lives in `jarvis_temporal` rather than `jarvis_node` because
-    /// `jarvis_graph::GraphStore` (the production impl) already
-    /// imports from `jarvis_temporal`'s public API — taking
-    /// `jarvis_graph` as a dep here would cycle. See
-    /// `crate::worker::StructuralDbStore`'s doc for the dependency-
-    /// direction rationale.
+    /// Write the child's `agents` row + the parent → child `edges`
+    /// row into the structural DB, returning the freshly-allocated
+    /// `AgentId`. Routed through the worker-shared
+    /// [`crate::worker::StructuralDbStore`] trait object (installed
+    /// via [`crate::worker::install_structural_db_store`]).
     ///
     /// The activity does **not** write `mandate.json` to the child's
     /// FS — that's the child workflow's first-run `assemble_context`
-    /// (JAR2-61) job per Stage 5 Project decision 9. The activity's
-    /// scope is structural state only.
+    /// job. Scope is structural state only.
     ///
     /// Idempotency: not provided. Both writes are FK-bound — a
     /// retried activity invocation with a re-allocated child UUID
     /// would create a duplicate child row + duplicate edge. The
-    /// alternative — content-addressed `(graph_id, child_agent_name,
-    /// parent_agent_id)` keys — would require the DB schema to grow
-    /// a non-null `name`-uniqueness constraint per graph, which v1's
-    /// schema deliberately doesn't enforce (operator may want two
-    /// children with the same name). For now, Temporal's at-most-once
-    /// activity completion semantics keep the duplication
-    /// vanishingly rare; if it surfaces, the right fix is the schema
-    /// migration, not a workaround here.
+    /// schema deliberately doesn't enforce per-graph name uniqueness
+    /// (operators may want two children with the same name). Temporal's
+    /// at-most-once activity completion keeps duplication rare in
+    /// practice.
     #[activity]
     pub async fn register_child_in_structural_db(
         _ctx: ActivityContext,
@@ -939,16 +676,15 @@ impl AgentActivities {
         Ok(out)
     }
 
-    /// JAR2-82 (stage 5.5) — fold N cited child outputs into the
-    /// parent's `evidence/` directory as synthetic evidence records
-    /// (Stage 5 Project decision 3). One activity invocation per
-    /// `Decision::ReconcileChildren`; the workflow body does NOT
-    /// push the resulting evidence into any workflow-state slot —
-    /// the parent's next-tick `assemble_context` picks the synthetic
-    /// records up via the existing `list_recent_evidence` window.
+    /// Fold N cited child outputs into the parent's `evidence/`
+    /// directory as synthetic evidence records. One activity
+    /// invocation per `Decision::ReconcileChildren`; the workflow body
+    /// does NOT push the resulting evidence into any workflow-state
+    /// slot — the parent's next-tick `assemble_context` picks the
+    /// synthetic records up via the existing `list_recent_evidence`
+    /// window.
     ///
-    /// JAR2-83 (5.6) wired the conflict-record writer: when
-    /// `input.conflict.is_some()`, the activity persists a
+    /// When `input.conflict.is_some()`, the activity persists a
     /// `ConflictRecord` under the parent's `conflicts/<id>.json` and
     /// returns the resulting `ConflictId` in `output.conflict_id`. A
     /// malformed intent (`alternatives.len() < 2`) surfaces as
@@ -956,25 +692,20 @@ impl AgentActivities {
     /// same non-retryable path as `ChildOutputNotFound`.
     ///
     /// Error mapping: only typed [`ReconciliationError`]s surface as
-    /// `ActivityError::Application(non_retryable)` — the workflow
-    /// body catches the failure and stages a `CorrectionContext` for
-    /// the next tick (mirroring the existing tool-failure correction-
-    /// context flow). `non_retryable` because `ChildOutputNotFound` is
-    /// structural — re-running the activity with the same id won't
-    /// make it resolve; the LLM must emit a satisfiable decision on
-    /// the next tick.
+    /// `ActivityError::Application(non_retryable)` — the workflow body
+    /// catches the failure and stages a `CorrectionContext` for the
+    /// next tick. Non-retryable because `ChildOutputNotFound` is
+    /// structural; re-running with the same id won't make it resolve.
     ///
-    /// Every other error (storage backend errors, serde failures from
-    /// the cross-agent read, `record_evidence` write failures) is
-    /// surfaced as a *retryable* `ApplicationFailure` so Temporal's
-    /// default retry policy gets a chance — a transient infra blip
-    /// shouldn't be misreported to the LLM as a provenance miss.
+    /// Every other error (storage, serde, `record_evidence` write
+    /// failures) is surfaced as a *retryable* `ApplicationFailure` so
+    /// Temporal's default retry policy gets a chance — a transient
+    /// infra blip shouldn't be misreported to the LLM as a provenance
+    /// miss.
     ///
     /// `now` is sourced from `ctx.info().scheduled_time` so a retry
-    /// of this activity (transient worker failure between record-
-    /// evidence completion and ack) PUTs byte-identical bytes under
-    /// the same content-addressed `EvidenceId` — see the activity
-    /// helper doc for the determinism argument.
+    /// PUTs byte-identical bytes under the same content-addressed
+    /// `EvidenceId`.
     #[activity]
     pub async fn reconcile_children(
         ctx: ActivityContext,
@@ -992,13 +723,9 @@ impl AgentActivities {
                 let failure = if e.downcast_ref::<ReconciliationError>().is_some() {
                     ApplicationFailure::non_retryable(e)
                 } else {
-                    // Transient storage / serde / record_evidence
-                    // error — retryable so Temporal can re-run the
-                    // activity (idempotency: synthetic evidence is
-                    // content-addressed via `record_evidence`'s
-                    // `put_if_absent`, so a retry that completes
-                    // after a previous partial isn't duplicating
-                    // records).
+                    // Retryable: synthetic evidence is content-addressed
+                    // via `record_evidence`'s `put_if_absent`, so a retry
+                    // after a partial completion doesn't duplicate records.
                     ApplicationFailure::new(e)
                 };
                 Err(ActivityError::application(failure))
@@ -1007,18 +734,11 @@ impl AgentActivities {
     }
 }
 
-/// JAR2-80 (stage 5.3) — substantive body of
-/// [`AgentActivities::register_child_in_structural_db`], factored out so
-/// hermetic / DB-backed integration tests can drive it against any
+/// Substantive body of
+/// [`AgentActivities::register_child_in_structural_db`], factored out
+/// so hermetic / DB-backed integration tests can drive it against any
 /// [`crate::worker::StructuralDbStore`] without an `ActivityContext`
-/// (unconstructable outside a Worker per smoke § 3.4) or the
-/// process-wide `OnceLock` install (which would race the worker-test
-/// install). The activity-level wrapper above is a 3-line shim around
-/// this helper.
-///
-/// Mirrors the helper-extraction shape already in use for
-/// `apply_fs_ops_impl`, `persist_output_impl`, `append_decision_log_impl`,
-/// `persist_retirement_inner`.
+/// or the process-wide `OnceLock` install.
 pub async fn register_child_in_structural_db_impl(
     store: std::sync::Arc<dyn crate::worker::StructuralDbStore>,
     input: RegisterChildInStructuralDbInput,
@@ -1036,84 +756,58 @@ pub async fn register_child_in_structural_db_impl(
     Ok(RegisterChildInStructuralDbOutput { child_agent_id })
 }
 
-/// JAR2-82 (stage 5.5) — substantive body of
-/// [`AgentActivities::reconcile_children`], factored out so hermetic
-/// unit tests can drive it against a `MemoryStorage` backend without
-/// constructing an `ActivityContext` or racing the worker's
-/// process-wide storage install.
+/// Substantive body of [`AgentActivities::reconcile_children`],
+/// factored out for hermetic unit testing against a `MemoryStorage`
+/// backend.
 ///
 /// Per-source loop:
 ///
-/// 1. Open the child's FS read-only via
-///    [`AgentFs::open_for_agent`] (Stage 5 Project decision 6's
-///    flat workflow-id prefix — same shape `FsHandle::for_agent`
-///    minted at spawn time). No `mandate.json` read, no tail-index
-///    work — point lookup only.
+/// 1. Open the child's FS read-only via [`AgentFs::open_for_agent`].
 /// 2. Read the cited [`Output`](jarvis_node::mandate::Output) via
 ///    [`AgentFs::read_output`]. On miss, return
-///    [`ReconciliationError::ChildOutputNotFound`] so the workflow
-///    body's correction path takes over.
-/// 3. Build a synthetic [`EvidenceRecord`] with
-///    `tool = "reconcile"`, the `(child_agent_id, child_workflow_id,
-///    source_output_id)` triple as `args`, and the serialized child
-///    `Output` as `result`. `EvidenceId` is content-addressed over
-///    `(tool, args, result)` — same convention as every other
-///    evidence record on disk, so the parent's existing provenance
-///    contract (`persist_output` rejects unresolvable evidence ids)
-///    keeps working with zero extensions.
+///    [`ReconciliationError::ChildOutputNotFound`].
+/// 3. Build a synthetic [`EvidenceRecord`] with `tool = "reconcile"`,
+///    the `(child_agent_id, child_workflow_id, source_output_id)`
+///    triple as `args`, and the serialized child `Output` as
+///    `result`. `EvidenceId` is content-addressed over
+///    `(tool, args, result)` so the parent's existing provenance
+///    contract keeps working with zero extensions.
 /// 4. Write the synthetic record to the **parent's** `evidence/`
-///    directory via [`AgentFs::record_evidence`]. Returns the
-///    `EvidenceId`, which the activity collects into the output's
-///    `synthetic_evidence` vector.
+///    directory via [`AgentFs::record_evidence`].
 ///
-/// Conflict-record write (JAR2-83 / 5.6): if `input.conflict.is_some()`,
-/// build a `ConflictRecord` via `ConflictRecord::new(now, alts, res)`
-/// and persist it to the parent's `conflicts/<id>.json` via
+/// Conflict-record write: if `input.conflict.is_some()`, persist a
+/// `ConflictRecord` to the parent's `conflicts/<id>.json` via
 /// `AgentFs::write_conflict`. The returned `ConflictId` lands in
-/// `ReconcileChildrenOutput.conflict_id`. A malformed intent
-/// (`alternatives.len() < 2`) returns
-/// `ReconciliationError::ConflictAlternativesTooFew` (mapped to
-/// non-retryable at the activity boundary — same path as
-/// `ChildOutputNotFound`).
+/// `ReconcileChildrenOutput.conflict_id`. `alternatives.len() < 2`
+/// returns `ReconciliationError::ConflictAlternativesTooFew`.
 ///
-/// **Error discipline.** Only a genuine `FsError::OutputNotFound`
-/// (the cited child output doesn't resolve on the child's FS) is
+/// Error discipline: only a genuine `FsError::OutputNotFound` is
 /// wrapped as the typed [`ReconciliationError::ChildOutputNotFound`]
-/// — that signals an LLM-level mistake the workflow body folds into
-/// a `CorrectionContext` and Temporal does NOT retry. Every other
-/// failure (storage backend errors from the cross-agent read,
-/// `serde_json` failures, `record_evidence` write errors) propagates
-/// as a plain `anyhow::Error`, which the activity wrapper surfaces
-/// as a *retryable* `ApplicationFailure`. Conflating the two would
-/// mean a transient storage blip lies to the next-tick LLM about
-/// provenance AND skips Temporal's retry — both wrong.
+/// (LLM-level mistake, non-retryable). Every other failure (storage,
+/// serde, write errors) propagates as a plain `anyhow::Error` for
+/// the activity wrapper to mark retryable. Conflating the two would
+/// either lie to the LLM about provenance OR skip Temporal's retry.
 ///
-/// **Pre-validation pass.** Every source is read before any
+/// Pre-validation pass: every source is read before any
 /// `record_evidence` write so a single bad source doesn't leave a
-/// partial trail of synthetic evidence on the parent's FS. Cost: one
-/// extra in-memory traversal per source over `sources.len()`;
-/// negligible at the typical fan-in of a few children. The
-/// alternative (write-as-you-go) would land good records before the
-/// activity errored and the parent's next tick would see partial
-/// provenance for a reconciliation it never completed — confusing
-/// for both the LLM and human reviewers.
+/// partial trail of synthetic evidence on the parent's FS. Atomicity
+/// is load-bearing — a partial trail would confuse both the LLM and
+/// human reviewers about a reconciliation that never completed.
 ///
-/// `now` is supplied by the caller so the activity body sources it
-/// from `ctx.info().scheduled_time` (deterministic across Temporal
-/// retries — load-bearing because the synthetic record's
-/// `created_at` is part of the on-disk bytes and a retried activity
-/// must PUT byte-identical content under the same content-addressed
-/// id). The hermetic test passes a fixed timestamp.
+/// `now` is supplied by the caller so the activity sources it from
+/// `ctx.info().scheduled_time` — deterministic across retries because
+/// the synthetic record's `created_at` is part of the on-disk bytes
+/// and a retried activity must PUT byte-identical content under the
+/// same content-addressed id.
 pub async fn reconcile_children_impl(
     storage: std::sync::Arc<dyn jarvis_node::storage::AgentStorage>,
     input: ReconcileChildrenInput,
     now: DateTime<Utc>,
 ) -> anyhow::Result<ReconcileChildrenOutput> {
     // Parent FS — write target. `open_for_agent` uses `attach`
-    // semantics (no mandate read, no tail reconcile) because the
-    // parent's `assemble_context` activity has already written
-    // `mandate.json` on its first tick. `record_evidence` itself
-    // doesn't depend on the mandate file existing.
+    // semantics (no mandate read, no tail reconcile); the parent's
+    // `assemble_context` has already written `mandate.json` on its
+    // first tick, and `record_evidence` doesn't need it.
     let parent_fs = AgentFs::open_for_agent(
         storage.clone(),
         input.parent_graph_id,
@@ -1126,11 +820,8 @@ pub async fn reconcile_children_impl(
     // at the activity layer.
     let mut child_outputs = Vec::with_capacity(input.sources.len());
     for source in &input.sources {
-        // Cross-agent read: open the child's FS root over the shared
-        // storage backend at the child's `(graph_id, agent_id)`
-        // prefix. Both agents share `parent_graph_id` per Stage 5
-        // Project decision 6's flat scheme (cross-graph reads are
-        // out-of-scope project-wide).
+        // Cross-agent read: both agents share `parent_graph_id`
+        // (cross-graph reads are out of scope).
         let child_fs = AgentFs::open_for_agent(
             storage.clone(),
             input.parent_graph_id,
@@ -1146,9 +837,8 @@ pub async fn reconcile_children_impl(
                     output_id: source.output_id.clone(),
                 })
             } else {
-                // Storage-level failure or other infra error —
-                // bubble verbatim so the activity wrapper marks it
-                // retryable and Temporal can re-run the activity.
+                // Bubble verbatim so the activity wrapper marks it
+                // retryable.
                 e
             }
         })?;
@@ -1156,14 +846,10 @@ pub async fn reconcile_children_impl(
     }
 
     // Phase 2: write one synthetic evidence record per source.
-    // `serde_json::to_value` / `record_evidence` failures here
-    // propagate as anyhow → retryable at the activity layer.
     let mut synthetic_evidence = Vec::with_capacity(input.sources.len());
     for (source, child_output) in input.sources.iter().zip(child_outputs.iter()) {
-        // Synthetic evidence record. `tool = "reconcile"` is the
-        // wire-locked discriminator (Stage 5 Project decision 3 +
-        // JAR2-82 ticket "Decisions baked in"); do NOT introduce a
-        // new EvidenceKind / sub-tool taxonomy.
+        // `tool = "reconcile"` is the wire-locked discriminator; do
+        // NOT introduce a new EvidenceKind / sub-tool taxonomy.
         let args = serde_json::json!({
             "child_agent_id": source.child_ref.agent_id,
             "child_workflow_id": source.child_ref.workflow_id,
@@ -1175,24 +861,18 @@ pub async fn reconcile_children_impl(
         synthetic_evidence.push(ev_id);
     }
 
-    // JAR2-83 (stage 5.6): persist the conflict record (if any) to the
-    // parent's `conflicts/<id>.json`. The record is content-addressed
-    // over `(alternatives, resolution)` so a retried activity that
-    // re-writes here PUTs byte-identical bytes under the same key —
-    // `AgentFs::write_conflict` rides `put_if_absent` for the dedup.
+    // Persist the conflict record (if any). The record is
+    // content-addressed over `(alternatives, resolution)` so a retried
+    // activity PUTs byte-identical bytes under the same key
+    // (`AgentFs::write_conflict` rides `put_if_absent`).
     //
-    // Validation: `alternatives.len() < 2` is a structural error from
-    // the LLM (a "conflict" with one side isn't a conflict). We
-    // pre-check before the FS call so the typed
+    // Pre-check `alternatives.len() < 2` so the typed
     // `ReconciliationError::ConflictAlternativesTooFew` reaches the
-    // workflow body even if a future `write_conflict` swap loses the
-    // FS-layer check — defence in depth, mirroring how
-    // `ChildOutputNotFound` is mapped at the cross-agent read site
-    // before the activity boundary's downcast picks it up.
+    // workflow body — defence in depth, mirroring how
+    // `ChildOutputNotFound` is mapped at the cross-agent read site.
     //
-    // `kind` is *not* set here — `ConflictRecord::new` derives it from
-    // `resolution.is_some()` (Stage 5 Project decision 14 / advisor
-    // item 5: reader convenience, single source of truth).
+    // `kind` is not set here — `ConflictRecord::new` derives it from
+    // `resolution.is_some()`.
     let conflict_id = if let Some(intent) = input.conflict {
         if intent.alternatives.len() < 2 {
             return Err(ReconciliationError::ConflictAlternativesTooFew {
@@ -1212,16 +892,12 @@ pub async fn reconcile_children_impl(
     })
 }
 
-/// Body of [`AgentActivities::persist_retirement`], factored out so the
-/// hermetic test in this file can call it without constructing an
-/// `ActivityContext` (whose `pub fn new(...)` takes an `Arc<CoreWorker>`
-/// — only reachable from inside a worker).
-///
-/// Sources the storage backend from [`agent_storage`] (the process-wide
-/// `OnceLock` installed at worker boot per JAR2-69) and the timestamp
-/// from `scheduled_time` — both load-bearing for the activity contract.
-/// See the activity-method doc for why `scheduled_time` and not
-/// `Utc::now()`.
+/// Body of [`AgentActivities::persist_retirement`], factored out so
+/// hermetic tests can call it without constructing an
+/// `ActivityContext`. Sources the storage backend from
+/// [`agent_storage`] and the timestamp from `scheduled_time` — both
+/// load-bearing for the activity contract. See the activity doc for
+/// why `scheduled_time` and not `Utc::now()`.
 pub async fn persist_retirement_inner(
     input: &PersistRetirementInput,
     scheduled_time: Option<std::time::SystemTime>,
@@ -1235,17 +911,10 @@ pub async fn persist_retirement_inner(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// JAR2-62 helpers — pulled out of the activity body so unit tests can call
-// the inner shape directly without faking an `ActivityContext`. The split
-// also keeps the `#[activity]`-decorated body short.
-
 /// Call the supplied [`Decide`] with the activity's input. Separated
-/// from [`AgentActivities::decide_next_action`] so the hermetic test in
-/// this module can exercise the wiring against an arbitrary `Decide`
-/// (typically a `MockDecide`) without going through the
-/// `worker::decide_impl()` static — the unit test injects its own
-/// dependency.
+/// from [`AgentActivities::decide_next_action`] so hermetic tests can
+/// inject an arbitrary `Decide` without going through the
+/// `worker::decide_impl()` static.
 async fn decide_with(decide: &dyn Decide, input: DecideInput) -> anyhow::Result<Decision> {
     decide.decide(input.bundle).await
 }
@@ -1254,15 +923,11 @@ async fn decide_with(decide: &dyn Decide, input: DecideInput) -> anyhow::Result<
 /// [`ActivityError`] with retryability flagged per the categorization
 /// rules in [`AgentActivities::decide_next_action`].
 ///
-/// The downcast to `&ModelError` is the contract `LlmDecide` exposes:
-/// its `model_err_to_anyhow` helper wraps the typed `ModelError` via
-/// `anyhow::Error::new` (see `decide_llm/llm_decide.rs::model_err_to_anyhow`),
-/// so the source chain preserves the category. Non-`ModelError` causes
-/// — `LlmDecide`'s "parse failed on all attempts" `anyhow!`, or any
-/// other `Decide` impl's bespoke error — fall through to the
-/// non-retryable default. That matches guardrail 3 of the ticket:
-/// validation failures don't retry at the activity layer, they become
-/// correction contexts in the next workflow tick.
+/// Downcasts to `&ModelError` to extract the category; `LlmDecide`
+/// wraps typed `ModelError` via `anyhow::Error::new` so the source
+/// chain preserves it. Non-`ModelError` causes fall through to
+/// non-retryable: validation failures don't retry at the activity
+/// layer, they become correction contexts in the next workflow tick.
 fn classify_decide_error(err: anyhow::Error) -> ActivityError {
     let retryable = matches!(
         err.downcast_ref::<ModelError>(),
@@ -1277,14 +942,10 @@ fn classify_decide_error(err: anyhow::Error) -> ActivityError {
 }
 
 // Compile-time witness that `crate::worker::decide_impl()` returns
-// exactly `Arc<dyn Decide>`. Catches any future refactor that changes
-// the worker-side signature out from under us — the activity body
-// passes the result through `Arc::as_ref` to `decide_with`, which
-// only works if the function returns an `Arc`-shaped trait object.
-// The closure is never invoked; `let _ = ...` only references the
-// function item, so the static analysis fires at compile time and
-// nothing runs at startup. (Important: invoking `decide_impl()` here
-// would panic when no `Decide` is installed.)
+// exactly `Arc<dyn Decide>`. The activity body passes the result
+// through `Arc::as_ref`, which only works if the function returns an
+// `Arc`-shaped trait object. Never invoked — calling `decide_impl()`
+// here would panic when no `Decide` is installed.
 const _: fn() = || {
     fn assert_arc_dyn_decide() -> Arc<dyn Decide> {
         crate::worker::decide_impl()
@@ -1294,15 +955,9 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod tests {
-    //! Hermetic unit coverage for the activity surface.
-    //!
-    //! The activity bodies are stubs; tests assert (a) the
-    //! `set_decision_script` / pop pair round-trips a scripted decision,
-    //! (b) the canned-fallback fires when the script is empty, and (c)
-    //! every input/output type round-trips through serde (Temporal's
-    //! payload codec uses serde under the hood). The live tests in
-    //! `tests/workflow_loop.rs` exercise the activities through the real
-    //! workflow against a Temporal Server.
+    //! Hermetic unit coverage for the activity surface. Live tests in
+    //! `tests/workflow_loop.rs` exercise the activities through the
+    //! real workflow against a Temporal Server.
 
     use super::*;
     use jarvis_node::decision::MockDecide;
@@ -1310,8 +965,7 @@ mod tests {
 
     // Serializes the two tests below that mutate the process-wide
     // `DECISION_SCRIPT` static. Without this they race under cargo's
-    // default parallel runner (CI hit it; locally they happened to
-    // schedule far enough apart to pass).
+    // default parallel runner.
     static SCRIPT_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Build an empty `ContextBundle` for tests that exercise the
@@ -1375,12 +1029,9 @@ mod tests {
 
     #[test]
     fn assemble_context_input_empty_buckets_pin_shape() {
-        // JAR2-61 dropped the `Default` derive on `AssembleContextInput`
-        // when promoting `cfg: AgentConfig` → `mandate: Mandate` (the
-        // real `Mandate` has no `Default`). The empty-bucket invariant
-        // is preserved via explicit construction so a future refactor
-        // that adds a non-`Default` field has to think about the bucket
-        // init the same way.
+        // No `Default` derive (real `Mandate` has none). Explicit
+        // construction so future non-`Default` fields force the same
+        // bucket-init discipline.
         let i = AssembleContextInput {
             mandate: Mandate::new("", Duration::ZERO, None),
             fs_handle: FsHandle::default(),
@@ -1490,12 +1141,9 @@ mod tests {
         let _back: PersistRetirementInput = serde_json::from_str(&s).unwrap();
     }
 
-    // ---------- JAR2-62: decide_with + classify_decide_error -------------
-
-    /// Bespoke `Decide` impl that returns the supplied error verbatim on
-    /// every `decide` call. Lets us drive the activity body's error
-    /// classification path without standing up a full `LlmDecide` over
-    /// a `MockModelClient` (cross-crate; lives in `decide_llm` tests).
+    /// Bespoke `Decide` impl that returns the supplied error verbatim
+    /// on every `decide` call. Drives the activity body's error
+    /// classification path without standing up a full `LlmDecide`.
     struct ErrDecide {
         make_err: fn() -> anyhow::Error,
     }
@@ -1508,10 +1156,7 @@ mod tests {
     }
 
     /// Happy path: `decide_with` forwards the bundle to the trait
-    /// method and returns the trait's decision verbatim. Uses
-    /// `MockDecide` (the in-tree scripted impl from
-    /// `jarvis_node::decision`) so this test never touches a real
-    /// vendor or its features.
+    /// method and returns the trait's decision verbatim.
     #[tokio::test]
     async fn decide_with_returns_trait_decision_on_success() {
         let want = Decision::Idle {
@@ -1542,10 +1187,8 @@ mod tests {
         );
     }
 
-    /// Rate-limit failures classify as retryable. Same shape as
-    /// Transport; vendor-side backoff handling lives outside the
-    /// activity (and is out of scope for JAR2-62 — see PR summary
-    /// about the missing per-activity retry policy).
+    /// Rate-limit failures classify as retryable. Vendor-side backoff
+    /// handling lives outside the activity.
     #[test]
     fn classify_decide_error_rate_limit_is_retryable() {
         let err = anyhow::Error::new(ModelError::RateLimit("slow down".into()));
@@ -1596,18 +1239,10 @@ mod tests {
         }
     }
 
-    // ---- JAR2-65: apply_fs_ops hermetic coverage -----------------------
-    //
     // Exercise the substantive `apply_fs_ops_impl` body against a
-    // `MemoryStorage` backend. Bypasses `worker::agent_storage()` (the
-    // process-wide `OnceLock` is consumed by `worker::tests`) and the
-    // `ActivityContext` (unconstructable without `Arc<CoreWorker>`).
-    // Both happy-path and traversal-rejection are covered here; the live
-    // path through Temporal is in `tests/workflow_loop.rs`.
-    //
-    // Imports `AgentStorage`/`Arc` already in scope via `use super::*`;
-    // `FsError` and `MemoryStorage` are imported by JAR2-64's tests
-    // block further down — no duplicate `use` here.
+    // `MemoryStorage` backend. Bypasses `worker::agent_storage()` and
+    // the `ActivityContext` (unconstructable without `Arc<CoreWorker>`).
+    // `FsError` and `MemoryStorage` are imported further down.
 
     fn fresh_storage_and_input(ops: Vec<FsOp>) -> (Arc<dyn AgentStorage>, ApplyFsOpsInput) {
         let storage: Arc<dyn AgentStorage> = Arc::new(MemoryStorage::new());
@@ -1638,9 +1273,8 @@ mod tests {
             .await
             .expect("apply_fs_ops_impl");
 
-        // Both files land at the agent-prefixed `notes/` key. Hit the
-        // backend directly so we don't accidentally couple the assertion
-        // to `AgentFs` read methods.
+        // Hit the backend directly so the assertion doesn't couple to
+        // `AgentFs` read methods.
         let a = storage
             .get("graphs/g/agents/a/notes/a.md")
             .await
@@ -1710,9 +1344,9 @@ mod tests {
     }
 
     /// Non-`ModelError` causes (e.g. `LlmDecide`'s parse-exhaustion
-    /// `anyhow!(...)`) classify as non-retryable. Guardrail 3:
-    /// validation failures don't retry at the activity layer; they
-    /// become correction contexts on the next workflow tick.
+    /// `anyhow!(...)`) classify as non-retryable; validation failures
+    /// don't retry at the activity layer, they become correction
+    /// contexts on the next workflow tick.
     #[test]
     fn classify_decide_error_non_model_error_is_non_retryable() {
         let err = anyhow::anyhow!("LlmDecide: parse failed on all 2 attempt(s)");
@@ -1766,16 +1400,11 @@ mod tests {
         assert!(failure.is_non_retryable());
     }
 
-    // -----------------------------------------------------------------
-    // JAR2-64 — `persist_output_impl` hermetic coverage.
-    //
-    // The tests below exercise the activity-body logic through the
-    // extracted free helper so they don't need an `ActivityContext`
-    // (no `Default` impl, non-trivial Core-tied construction) or the
-    // process-wide `OnceLock<AgentStorage>` install path (which
-    // `worker::install_then_access_*` already touches in the same
-    // test binary). Each test creates its own `MemoryStorage` and
-    // exercises the storage-prefix shape `<graph_id>/<agent_id>/`.
+    // `persist_output_impl` hermetic coverage — exercises the
+    // extracted free helper without an `ActivityContext` or the
+    // process-wide `OnceLock<AgentStorage>` install. Each test creates
+    // its own `MemoryStorage` and exercises the storage-prefix shape
+    // `<graph_id>/<agent_id>/`.
 
     use chrono::Utc;
     use jarvis_node::evidence::EvidenceRecord;
@@ -1793,11 +1422,9 @@ mod tests {
         args: serde_json::Value,
         result: serde_json::Value,
     ) -> EvidenceId {
-        // Open an `AgentFs` over the *same* storage Arc + prefix the
-        // activity body will open against. This is the load-bearing
-        // shape: a separate `MemoryStorage` instance would never share
-        // evidence with the activity's view because `MemoryStorage` is
-        // in-process state, not a connected backend.
+        // Same storage Arc + prefix the activity will open against —
+        // `MemoryStorage` is in-process state, not a connected backend,
+        // so a separate instance would not share evidence.
         let mandate = Mandate::new("plant", Duration::from_millis(0), None);
         let fs = AgentFs::new_with_storage(storage, prefix, &mandate)
             .await
@@ -1839,10 +1466,8 @@ mod tests {
         .await
         .expect("persist_output_impl ok");
 
-        // Inspect what landed via a fresh `AgentFs` view over the same
-        // storage. `list_recent_outputs` exercises the tail-index path
-        // from JAR2-54 too — proving the activity body inherits that
-        // wiring for free.
+        // Inspect via a fresh `AgentFs` view; `list_recent_outputs`
+        // exercises the tail-index path too.
         let mandate = Mandate::new("inspect", Duration::from_millis(0), None);
         let fs = AgentFs::new_with_storage(storage, prefix, &mandate)
             .await
@@ -1889,10 +1514,8 @@ mod tests {
 
     #[tokio::test]
     async fn persist_output_impl_rejects_empty_evidence_list() {
-        // Provenance contract from JAR2-4: an output with no evidence
-        // is rejected before the file write. The activity body
-        // inherits this — Temporal sees the error, the workflow's
-        // next-tick correction-context staging gets the message.
+        // Provenance contract: an output with no evidence is rejected
+        // before the file write.
         let storage: Arc<dyn jarvis_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
         let prefix = "graphs/g1/agents/a-empty/";
 
@@ -1902,8 +1525,6 @@ mod tests {
         let typed = err.downcast_ref::<FsError>().expect("typed FsError");
         assert!(matches!(typed, FsError::EmptyEvidence));
     }
-
-    // ---- JAR2-65: apply_fs_ops additional coverage (path validation + replay) ----
 
     #[tokio::test]
     async fn apply_fs_ops_rejects_path_outside_notes() {
@@ -1962,12 +1583,9 @@ mod tests {
         assert_eq!(b.as_ref(), b"v1");
     }
 
-    // ---- JAR2-68: append_decision_log hermetic coverage ----------------
-
-    /// `append_decision_log_impl` writes exactly `<prefix>decisions/<tick>.jsonl`
-    /// containing one JSON line that deserializes back to the same entry.
-    /// Mirror shape of `persist_retirement_inner` coverage — same
-    /// `MemoryStorage`-backed roundtrip, no `ActivityContext` plumbing.
+    /// `append_decision_log_impl` writes exactly
+    /// `<prefix>decisions/<tick>.jsonl` containing one JSON line that
+    /// deserializes back to the same entry.
     #[tokio::test]
     async fn append_decision_log_impl_writes_per_tick_jsonl() {
         let storage: Arc<dyn jarvis_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
@@ -1998,10 +1616,9 @@ mod tests {
         assert_eq!(parsed, entry);
     }
 
-    /// Temporal-retry idempotency proxy: re-running the helper with the
+    /// Temporal-retry idempotency: re-running the helper with the
     /// same `(tick, decision_summary, ts)` triple writes byte-identical
-    /// bytes. This is the load-bearing property `append_decision_log`'s
-    /// real activity body inherits by sourcing `ts` from
+    /// bytes. Load-bearing because the activity sources `ts` from
     /// `ctx.info().scheduled_time` (stable across retries).
     #[tokio::test]
     async fn append_decision_log_impl_is_idempotent_on_replay() {
@@ -2030,16 +1647,11 @@ mod tests {
         assert_eq!(first.as_ref(), second.as_ref());
     }
 
-    // ---- JAR2-80: register_child_in_structural_db_impl hermetic test ----
-
-    /// In-memory `StructuralDbStore` fake. Records every `add_agent` /
-    /// `add_edge` call so the hermetic tests can assert against them
-    /// without spinning up Postgres. Mirrors the role
-    /// `MemoryStorage` plays for the `AgentStorage` test surface.
-    /// One recorded call to [`MemoryStructuralDbStore::add_agent`].
-    /// Extracted to a struct (rather than a 4-tuple field on the fake)
-    /// to keep clippy's `type_complexity` lint happy and to give the
-    /// assertion below readable field names.
+    /// In-memory `StructuralDbStore` fake. Records every `add_agent`
+    /// / `add_edge` call so hermetic tests can assert without Postgres.
+    /// Extracted to a struct (rather than a 4-tuple) to keep clippy's
+    /// `type_complexity` lint happy and give the assertions readable
+    /// field names.
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct RecordedAgent {
         graph_id: GraphId,
@@ -2096,9 +1708,6 @@ mod tests {
     /// Activity-body hermetic coverage: the helper writes one agent
     /// row + one parent → child edge with the right endpoints, and
     /// the returned child id matches the recorded agent row's id.
-    /// Mirrors the helper-extraction shape of
-    /// `apply_fs_ops_impl_*` tests (drive the substantive logic against
-    /// an in-memory backend, no `ActivityContext`).
     #[tokio::test]
     async fn register_child_in_structural_db_impl_records_agent_name_and_edge_endpoints() {
         let fake = std::sync::Arc::new(MemoryStructuralDbStore::new());
@@ -2132,17 +1741,10 @@ mod tests {
         assert_eq!(edges[0].1, out.child_agent_id);
     }
 
-    // ---- JAR2-80: register_child_in_structural_db wire-shape tests ----
-
-    /// Pin the wire shape of the new activity's input/output types so
-    /// a future field addition (e.g. inheritance metadata) shows up as
-    /// a test miss. The activity body itself can't be hermetically
-    /// driven without constructing an `ActivityContext` (unbuildable
-    /// outside a Worker per smoke § 3.4) + installing a process-wide
-    /// `StructuralDbStore` (would race the JAR2-80 worker tests that
-    /// already install one); the live coverage lives in the live
-    /// integration test gated on `TEMPORAL_LIVE_TEST=1` +
-    /// `DATABASE_URL`.
+    /// Pin the wire shape of the activity's input/output types so a
+    /// future field addition shows up as a test miss. Live coverage of
+    /// the activity body lives in the integration test gated on
+    /// `TEMPORAL_LIVE_TEST=1` + `DATABASE_URL`.
     #[test]
     fn register_child_input_round_trips_through_json() {
         use uuid::Uuid;
@@ -2219,13 +1821,10 @@ mod tests {
         assert_eq!(e, back2);
     }
 
-    // ---- JAR2-82 (stage 5.5): reconcile_children_impl hermetic coverage ----
-
     /// Deterministic timestamp for the synthetic-evidence records the
-    /// reconcile activity writes — chosen so the resulting `EvidenceId`
-    /// hashes (content-addressed over `(tool, args, result)`, NOT
-    /// `created_at`) and the on-disk JSON bytes are byte-stable across
-    /// test runs.
+    /// reconcile activity writes. `EvidenceId` hashes
+    /// `(tool, args, result)`, NOT `created_at`, but the on-disk JSON
+    /// bytes do include the timestamp.
     fn fixed_now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-05-25T15:00:00Z")
             .unwrap()
@@ -2260,8 +1859,7 @@ mod tests {
             .persist_output(content, &[ev.clone()])
             .await
             .expect("plant child output");
-        // Workflow id matches the canonical scheme that
-        // `FsHandle::for_agent` mints.
+        // Canonical scheme minted by `FsHandle::for_agent`.
         let child_workflow_id = format!("graphs/{graph_id}/agents/{child_agent_id}");
         (child_workflow_id, out.id, ev)
     }
@@ -2306,12 +1904,11 @@ mod tests {
         assert_eq!(out.synthetic_evidence.len(), 2);
         assert!(
             out.conflict_id.is_none(),
-            "JAR2-82 always returns conflict_id: None",
+            "no conflict intent: conflict_id must be None",
         );
 
-        // Open the parent's FS and verify both synthetic evidence
-        // records landed under the parent's prefix with the right
-        // `tool` + `args` shape.
+        // Verify both synthetic evidence records landed under the
+        // parent's prefix with the right `tool` + `args` shape.
         let parent_view = AgentFs::open_for_agent(storage, graph_id, parent_agent_id);
         let evs = parent_view
             .list_recent_evidence(8)
@@ -2469,9 +2066,9 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_children_impl_with_held_open_conflict_writes_record_and_returns_id() {
-        // JAR2-83 (5.6) wires the writer. With `resolution: None` the
-        // activity must persist a `HeldOpen` conflict record under the
-        // parent's `conflicts/<id>.json` and return the id.
+        // With `resolution: None` the activity must persist a
+        // `HeldOpen` conflict record under the parent's
+        // `conflicts/<id>.json` and return the id.
         use jarvis_node::agent_ref::AgentRef;
         use jarvis_node::conflict::ConflictKind;
         use jarvis_node::decision::{ConflictAlternative, ConflictRecordIntent};
@@ -2513,7 +2110,7 @@ mod tests {
         assert_eq!(out.synthetic_evidence.len(), 1);
         let conflict_id = out
             .conflict_id
-            .expect("JAR2-83: conflict_id is Some when input.conflict is Some");
+            .expect("conflict_id is Some when input.conflict is Some");
 
         // The record landed in the parent's FS and round-trips with
         // the right shape.
@@ -2588,11 +2185,11 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_children_impl_rejects_fewer_than_two_alternatives() {
-        // JAR2-83: a `ConflictRecordIntent` with one alternative is a
+        // A `ConflictRecordIntent` with one alternative is a
         // structural error; the activity returns the typed
-        // ReconciliationError::ConflictAlternativesTooFew (which the
+        // ReconciliationError::ConflictAlternativesTooFew, which the
         // wrapper maps to non-retryable so the workflow body's
-        // correction-context path takes over).
+        // correction-context path takes over.
         use jarvis_node::agent_ref::AgentRef;
         use jarvis_node::decision::{ConflictAlternative, ConflictRecordIntent};
         use uuid::Uuid;
@@ -2638,8 +2235,6 @@ mod tests {
             "no conflict file should land for malformed intent; got {listed:?}"
         );
     }
-
-    // ---- JAR2-82: ReconcileChildrenInput / Output wire-shape ----
 
     #[test]
     fn reconcile_children_input_round_trips_through_json_with_no_conflict() {

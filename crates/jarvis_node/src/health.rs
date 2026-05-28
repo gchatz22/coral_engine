@@ -1,20 +1,13 @@
 //! Agent health — Healthy/Unhealthy state, retry budget, and `health.json`.
 //!
-//! Per `scratch/post_bootstrap_followups.md` § A1, both inference failures
-//! (parse/transport/rate-limit-after-backoff) and tool-call failures share
-//! a single per-tick retry budget. When the budget is exhausted on a tick,
-//! the agent transitions to `Unhealthy`, the tick aborts, and `health.json`
-//! captures the failing decision/call, the retry trail, and the last
-//! error. The run loop does **not** halt: the agent stays subscribed to
-//! its trigger queue, and a subsequent successful tick flips state back to
-//! `Healthy` and archives the prior incident under `health/<timestamp>.json`.
-//! Repeated failure while already `Unhealthy` updates `health.json` in
-//! place. `retirement.json` is orthogonal and untouched by this path.
-//!
-//! This ticket (JAR2-18) ships the module in isolation. The agent-loop
-//! wiring lives in JAR2-19 (A1.6 inference retries) and JAR2-25 (A2.4
-//! tool-call retries); both call into the small public surface here so the
-//! state machine is implemented once.
+//! Inference and tool-call failures share a single per-tick retry budget.
+//! Budget exhaustion flips the agent to `Unhealthy`, aborts the tick, and
+//! writes the failing call + retry trail to `health.json`. The run loop
+//! does **not** halt: the agent stays subscribed to its trigger queue and
+//! a subsequent successful tick flips state back to `Healthy`, archiving
+//! the prior incident under `health/<transitioned_at>.json`. Repeated
+//! failure while already `Unhealthy` updates `health.json` in place.
+//! `retirement.json` is orthogonal and untouched by this path.
 //!
 //! # On-disk layout
 //!
@@ -24,28 +17,19 @@
 //!   health/<ISO-8601-timestamp>.json      — archived prior incidents
 //! ```
 //!
-//! `health.json` is **always present** once a tracker has been opened on a
-//! root, regardless of whether the agent is Healthy or Unhealthy. The
-//! file's `state` discriminator (`"Healthy"` / `"Unhealthy"`) carries the
-//! semantic meaning — its mere existence does not. On recovery the prior
-//! Unhealthy incident is copied to `health/<transitioned_at>.json` and the
-//! live file is overwritten with a Healthy record (rather than removed),
-//! so external observers see a continuous file timeline.
+//! `health.json` is always present once a tracker has been opened; the
+//! `state` discriminator carries the semantic meaning, not the file's
+//! existence. On recovery the prior Unhealthy incident is copied to the
+//! archive and the live file is overwritten with a Healthy record so
+//! external observers see a continuous file timeline. `Healthy.since` is
+//! the timestamp of the transition into the current Healthy run, not the
+//! last successful tick — touching it per-tick would mean per-tick disk
+//! churn at the millions-of-subagents target. Archive filenames use the
+//! `transitioned_at` timestamp so failures can be replayed in order.
 //!
-//! For Healthy records, `since` is the timestamp of the *transition into
-//! the current Healthy run* (initial `open` of a fresh root, or recovery
-//! from Unhealthy). It is **not** updated on each successful tick — that
-//! would mean per-tick disk churn at a target of millions of subagents.
-//! Archive filenames use the `transitioned_at` timestamp of the incident
-//! being archived, so audit can reconstruct the order in which failures
-//! happened.
-//!
-//! # Atomic writes
-//!
-//! Unlike `src/fs.rs`, this module writes the live `health.json` via
+//! Writes to the live `health.json` and archive files go through a
 //! write-to-temp + rename so a crash mid-write cannot leave a corrupt
-//! file. Archive writes use the same path. (`src/fs.rs` uses plain
-//! `fs::write` today — fixing that is out of scope for this ticket.)
+//! file.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -58,8 +42,8 @@ const HEALTH_FILE: &str = "health.json";
 const ARCHIVE_DIR: &str = "health";
 const SCHEMA_VERSION: u32 = 1;
 
-/// Typed errors raised by `HealthTracker`. Callers in JAR2-19/JAR2-25 match
-/// on these to distinguish budget exhaustion from real I/O failures.
+/// Typed errors raised by `HealthTracker`. Callers match on these to
+/// distinguish budget exhaustion from real I/O failures.
 #[derive(Debug, Error)]
 pub enum HealthError {
     /// `record_failure` was called after the per-tick budget was already
@@ -100,16 +84,16 @@ impl HealthError {
 #[serde(rename_all = "PascalCase")]
 pub enum FailureKind {
     /// Inference failure: parse error, transport error, or rate-limit
-    /// after backoff. Sourced from the `Decide` adapter (JAR2-19).
+    /// after backoff. Sourced from the `Decide` adapter.
     Inference,
     /// Tool-call failure: `Tool::call` returned an error or the underlying
-    /// MCP server reported one. Sourced from tool dispatch (JAR2-25).
+    /// MCP server reported one. Sourced from tool dispatch.
     ToolCall,
 }
 
 /// Per-tick retry budget. Each kind has an independent counter; either
 /// overflowing trips exhaustion. Defaults are 1 inference retry and 3
-/// tool-call retries per the plan in `post_bootstrap_followups.md` § A1.
+/// tool-call retries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetryBudget {
     pub max_inference: u32,
@@ -134,8 +118,8 @@ impl RetryBudget {
     }
 }
 
-/// One entry in a retry trail. Built by the caller (JAR2-19/JAR2-25); the
-/// tracker just round-trips it through `health.json`.
+/// One entry in a retry trail. Built by the caller; the tracker just
+/// round-trips it through `health.json`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attempt {
     pub attempt: u32,
@@ -278,10 +262,10 @@ impl HealthTracker {
     /// Reset the per-tick counters. Called at the start of a *fresh* tick
     /// — one driven by an external trigger or a `ScheduledWake`. The run
     /// loop deliberately **skips** this call when the only triggers being
-    /// drained are synthetic-correction triggers (JAR2-19): such an
-    /// iteration is a continuation of the prior failed attempt, and the
-    /// budget must accumulate across it for exhaustion to mean anything.
-    /// Does not touch state.
+    /// drained are synthetic-correction triggers: such an iteration is a
+    /// continuation of the prior failed attempt, and the budget must
+    /// accumulate across it for exhaustion to mean anything. Does not
+    /// touch state.
     pub fn begin_tick(&mut self) {
         self.inference_used = 0;
         self.tool_used = 0;
@@ -295,10 +279,10 @@ impl HealthTracker {
     /// tick and call `transition_to_unhealthy` with a populated
     /// `HealthIncident`.
     ///
-    /// `error` is currently advisory (not stored on the tracker — the
-    /// caller assembles the retry trail and the final `last_error`). It
-    /// is part of the signature so future tracing-span work can hook in
-    /// without an API break.
+    /// `error` is advisory: the tracker does not store it (the caller
+    /// assembles the retry trail and the final `last_error`); the param
+    /// is kept on the signature so tracing-span hooks can land without
+    /// an API break.
     pub fn record_failure(&mut self, kind: FailureKind, error: &str) -> Result<(), HealthError> {
         let _ = error;
         match kind {
@@ -338,10 +322,10 @@ impl HealthTracker {
     }
 
     /// Mark the agent `Healthy` after a successful tick. If the agent
-    /// was previously `Unhealthy`, the live `health.json` is copied to
+    /// is `Unhealthy`, the live `health.json` is copied to
     /// `health/<transitioned_at>.json` (archive) and then overwritten in
     /// place with a fresh Healthy record (`since = now`). If the agent
-    /// was already Healthy, this is a no-op — `health.json` is not
+    /// is already Healthy, this is a no-op — `health.json` is not
     /// rewritten and `since` is preserved (avoids per-tick disk churn).
     /// Per-tick counters are reset in either case.
     ///

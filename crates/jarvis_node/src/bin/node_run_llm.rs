@@ -11,12 +11,12 @@
 //!
 //! # Feature gating
 //!
-//! The `[[bin]]` entry no longer pins `required-features` because cargo
-//! does not support OR in that field. Instead, the per-vendor dispatch
-//! arms and the MCP-using body are gated with `#[cfg(feature = "...")]`;
-//! a build with neither `mcp` nor a vendor feature still compiles the
-//! binary but every `--vendor` choice errors at runtime with a "rebuild
-//! with --features ..." hint. Mirrors `src/bin/model_call.rs`.
+//! Cargo's `required-features` does not support OR, so the per-vendor
+//! dispatch arms and the MCP-using body are gated with
+//! `#[cfg(feature = "...")]`; a build with neither `mcp` nor a vendor
+//! feature still compiles the binary but every `--vendor` choice errors
+//! at runtime with a "rebuild with --features ..." hint. Mirrors
+//! `src/bin/model_call.rs`.
 //!
 //! # Usage
 //!
@@ -298,8 +298,6 @@ async fn run_inner(args: Args) -> Result<()> {
     let client = Arc::new(client);
 
     let mut tools = ToolRegistry::new();
-    // JAR2-31: thread `Mandate::retry_policy` (when set) into every
-    // `McpTool` we mint for this agent. `None` keeps JAR2-25 defaults.
     let registered = tools
         .register_mcp_server_with_policy(Arc::clone(&client), mandate.retry_policy)
         .await

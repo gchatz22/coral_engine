@@ -1,21 +1,9 @@
-//! Rust types mirroring the structural-DB schema (stage 1.3, JAR2-48).
-//!
-//! Every struct corresponds 1:1 with a table from
-//! `migrations/0001_initial.sql`. Field names and types align with the
-//! column shapes; serde derives let the structs round-trip through JSON
-//! (e.g. for API surfaces and snapshot fixtures), and `sqlx::FromRow`
-//! lets the CRUD API in stage 1.4 (JAR2-49) decode query rows directly
-//! into them.
-//!
-//! ## Cross-crate conversions
-//!
-//! `jarvis_node::Trigger` is *execution* state — the queue of pending
-//! triggers an agent processes on each tick. It lives in Temporal
-//! (per `scratch/durability_substrate.md` § 2), not the structural
-//! DB. There is deliberately no `Trigger` table here and no
-//! conversion to/from one; documenting that absence is the
-//! conversion. If a downstream consumer wants Trigger persistence,
-//! the right layer is the Temporal workflow's signal queue.
+//! Rust types mirroring the structural-DB schema. Every struct
+//! corresponds 1:1 with a table from `migrations/0001_initial.sql`.
+//! `sqlx::FromRow` lets the `GraphStore` CRUD API decode query rows
+//! directly into them. `jarvis_node::Trigger` is execution state and
+//! lives in Temporal, not here — there is deliberately no `Trigger`
+//! table.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

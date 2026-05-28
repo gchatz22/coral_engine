@@ -1,13 +1,12 @@
--- Initial structural-DB schema for the Jarvis Engine (stage 1.2, JAR2-47).
+-- Initial structural-DB schema for the Jarvis Engine.
 --
--- Tables here own the *structural* state layer described in
--- `scratch/durability_substrate.md` § 2: what graphs exist, what agents
--- are in each, parent->child edges, and registered tools. Authored
--- mandates live outside this DB (git-versioned `graph.yaml` + per-node
--- versioning); `agents.mandate_ref` is an opaque text handle to one.
--- Working memory (outputs, evidence, notes, claims, health) stays on
--- disk under the per-agent FS; execution state (trigger queue,
--- scheduler cursor, in-flight ticks) lives in Temporal.
+-- Tables here own the structural state layer: what graphs exist, what
+-- agents are in each, parent->child edges, and registered tools.
+-- Authored mandates live outside this DB (git-versioned `graph.yaml` +
+-- per-node versioning); `agents.mandate_ref` is an opaque text handle
+-- to one. Working memory (outputs, evidence, notes, claims, health)
+-- stays on disk under the per-agent FS; execution state (trigger
+-- queue, scheduler cursor, in-flight ticks) lives in Temporal.
 --
 -- Per-table design notes:
 --
@@ -17,17 +16,12 @@
 -- - `TIMESTAMPTZ DEFAULT now()` everywhere a created_at exists, matching
 --   the dev compose stack's UTC default.
 -- - Foreign keys use `ON DELETE CASCADE` so dropping a graph deletes its
---   agents/edges/etc. cleanly without orphan rows. The structural DB is
---   write-once-from-`jarvis apply` and rarely deleted; cascades make
---   teardown trivial in tests.
+--   agents/edges/etc. cleanly without orphan rows.
 -- - `_sqlx_migrations` (added implicitly by `sqlx::migrate!`) tracks
 --   which migration files have been applied; re-runs are idempotent.
 --   These files use plain `CREATE TABLE` rather than `IF NOT EXISTS`
 --   so a corrupted migration tracker surfaces loudly.
--- - No extra indexes beyond PK / FK / explicit UNIQUE constraints. The
---   structural DB is small (one row per agent in a graph) and read
---   patterns are not yet pinned; add indexes deliberately when a query
---   in stage 1.4 shows up that warrants one.
+-- - No extra indexes beyond PK / FK / explicit UNIQUE constraints.
 --
 -- Decisions worth flagging for review (see PR body):
 --
@@ -37,13 +31,13 @@
 --    in this DB. The cost is no referential integrity for the handle;
 --    this matches how other ref-by-name shapes in the engine work.
 -- 2. `tools.kind` is `TEXT NOT NULL`, not a Postgres enum, because
---    enums are sticky (every new variant is a migration). Tickets that
---    introduce new kinds in stage 5+ stay one-line.
+--    enums are sticky (every new variant is a migration). New kinds
+--    stay one-line.
 -- 3. `edges` has no `graph_id` column. A cross-graph edge would be
 --    nonsense, but the minimal-diff move is to skip the constraint and
 --    flag as a follow-up — adding a column + CHECK constraint later is
---    a single migration. (Same-graph invariant is enforced in
---    application code in stage 1.4 if needed.)
+--    a single migration. (Same-graph invariant can be enforced in
+--    application code if a query path requires it.)
 
 CREATE TABLE graphs (
     id          UUID         PRIMARY KEY,

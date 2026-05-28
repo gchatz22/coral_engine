@@ -1,14 +1,8 @@
-//! `Trigger` — what wakes the agent loop.
-//!
-//! The bootstrap taxonomy (see `scratch/minimal_node_backend.md` § 6 row 1)
-//! was minimal: scheduled wake, an external signal carrying an opaque
-//! payload, and a human override carrying an opaque op. Stage 5
-//! (`scratch/temporal_staged_plan.md` § 5) adds two cross-agent variants:
-//! `ChildOutput` (a child emitted an output the parent may want to
-//! reconcile) and `ChildRetired` (a child stopped, parent decides if/how
-//! to replace it). Carrying `agent_name` on the payload is the cheapest
-//! path — keeps the prompt renderer from needing a `GraphStore` lookup
-//! in `assemble_context`.
+//! `Trigger` — what wakes the agent loop. Five classes: scheduled wake,
+//! external signal with opaque payload, human override with opaque op,
+//! and the two cross-agent variants `ChildOutput` / `ChildRetired`. The
+//! cross-agent variants carry `agent_name` on the payload so the prompt
+//! renderer doesn't need a `GraphStore` lookup in `assemble_context`.
 
 use crate::agent_ref::AgentRef;
 use crate::mandate::OutputId;
@@ -25,14 +19,14 @@ pub enum Trigger {
         kind: String,
         payload: serde_json::Value,
     },
-    /// A human is forcing a mutation. Shape is deliberately opaque for
-    /// the bootstrap; the kernel does not yet enforce override semantics.
+    /// A human is forcing a mutation. Shape is deliberately opaque; the
+    /// kernel does not yet enforce override semantics.
     HumanOverride { op: HumanOp },
     /// A child agent emitted an output. Carries the child's structural
     /// reference + the `OutputId` the parent can later cite in a
-    /// `ReconcileChildren` decision (Stage 5.5). `agent_name` is the
-    /// human-readable child name surfaced into the prompt — kept on the
-    /// payload so the renderer doesn't need a `GraphStore` handle.
+    /// `ReconcileChildren` decision. `agent_name` is the human-readable
+    /// child name surfaced into the prompt — kept on the payload so the
+    /// renderer doesn't need a `GraphStore` handle.
     ChildOutput {
         child_ref: AgentRef,
         agent_name: String,
@@ -65,13 +59,10 @@ impl HumanOp {
 
 /// Opaque newtype around the JSON payload describing a mandate patch.
 ///
-/// Carried by the `mandate_update` signal on the workflow host (JAR2-59)
-/// — operators ship updated routing/budget/tooling preferences mid-flight
-/// and the agent picks them up on the next tick. The kernel does not yet
-/// enforce a schema; stage 6 wires the consumption path and stage 1's
-/// three-layer resolution (`scratch/temporal_staged_plan.md` § 4 decision
-/// 4) defines what fields are legal. Today this is structural plumbing
-/// only — semantics are deferred.
+/// Carried by the `mandate_update` signal on the workflow host — operators
+/// ship updated routing/budget/tooling preferences mid-flight and the
+/// agent picks them up on the next tick. The kernel does not yet enforce
+/// a schema; this is structural plumbing only — semantics are deferred.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct MandatePatch(pub serde_json::Value);
@@ -148,7 +139,7 @@ mod tests {
         assert!(s.contains("\"type\":\"external\""));
     }
 
-    // ---- JAR2-79: Stage 5.2 cross-agent variants -----------------------
+    // ---- Cross-agent variants -----------------------------------------
 
     use crate::agent_ref::AgentId;
     use uuid::Uuid;
@@ -183,7 +174,7 @@ mod tests {
         let s = serde_json::to_string(&t).unwrap();
         assert!(s.contains("\"type\":\"child_output\""), "wire shape: {s}");
         // `agent_name` is on the payload so the renderer can surface it
-        // without a DB lookup (Stage 5 Project decision 5).
+        // without a DB lookup.
         assert!(
             s.contains("\"agent_name\":\"fda_scraper\""),
             "wire shape: {s}"

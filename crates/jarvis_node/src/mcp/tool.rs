@@ -1,33 +1,25 @@
 //! `Tool` adapter that bridges a single MCP-advertised tool into the
-//! `ToolRegistry`.
+//! `ToolRegistry`. `McpTool` shares an `Arc<McpClient>` with sibling tools
+//! registered against the same server, and `Tool::call` forwards to
+//! `McpClient::call_tool`, mapping `McpError` into `anyhow::Error`.
 //!
-//! `McpTool` holds an `Arc<McpClient>` shared with sibling tools registered
-//! against the same server, plus the `McpToolDescriptor` so its name (and,
-//! later, schema) survive the trip into the registry. `Tool::call` forwards
-//! to `McpClient::call_tool`, mapping `McpError` into `anyhow::Error` since
-//! the `Tool` trait's failure type is `anyhow::Result`.
-//!
-//! # Retry policy (JAR2-25)
+//! # Retry policy
 //!
 //! Tool calls that fail with a *transient* `McpError` (`Transport`,
 //! `Protocol`) are retried up to [`RetryPolicy::max_attempts`] times in
 //! total, sleeping `RetryPolicy::backoff` between attempts. Caller bugs
-//! (`McpError::Parse` — e.g. non-object arguments) and deliberate
-//! server error frames (`McpError::ServerError`) are **not** retried:
-//! parse failures will never become correct, and server errors are a
-//! contract the peer is asserting on purpose. After retries are
-//! exhausted the final error surfaces to the caller, which is the
-//! signal the agent run loop uses to feed the shared per-tick health
-//! budget (`FailureKind::ToolCall`) — see `src/health.rs` for the
-//! state-machine contract this layer feeds without duplicating.
+//! (`McpError::Parse`) and deliberate server error frames
+//! (`McpError::ServerError`) are **not** retried: parse failures will
+//! never become correct, and server errors are a contract the peer is
+//! asserting on purpose. After retries are exhausted the final error
+//! surfaces to the caller, which the agent run loop uses to feed the
+//! shared per-tick health budget (`FailureKind::ToolCall`) — see
+//! `src/health.rs` for the state-machine contract this layer feeds.
 //!
 //! "Max retries" inside this module and `RetryBudget::max_tool` in
-//! `src/health.rs` are two distinct concepts: the former bounds attempts
-//! within one tool call, the latter bounds exhausted tool calls within
-//! one tick before the agent transitions to `Unhealthy`.
-//!
-//! Bulk registration (`ToolRegistry::register_mcp_server`) and process
-//! supervision live in JAR2-24 and the parent ticket respectively.
+//! `src/health.rs` are distinct: the former bounds attempts within one
+//! tool call, the latter bounds exhausted tool calls within one tick
+//! before the agent transitions to `Unhealthy`.
 
 use std::sync::Arc;
 
@@ -38,12 +30,6 @@ use tracing::warn;
 use crate::mandate::RetryPolicy;
 use crate::mcp::{McpClient, McpError, McpToolDescriptor};
 use crate::tools::Tool;
-
-// `RetryPolicy` itself lives in `crate::mandate` (JAR2-31) so it can be a
-// field on `Mandate` without forcing that struct's API or wire format to
-// depend on the `mcp` cargo feature. The retry mechanics — what counts as
-// transient, when to back off, when to surface — still live here because
-// that is where `McpTool::call` exercises them.
 
 /// `Tool` impl that proxies one named MCP tool to a shared `McpClient`.
 ///
@@ -66,9 +52,9 @@ impl McpTool {
     /// Build an `McpTool` with an explicit retry policy. Intended for
     /// callers that want an override (e.g. a high-cost or non-idempotent
     /// tool that should retry zero or one times). Per-mandate overrides
-    /// reach this constructor via `ToolRegistry::register_mcp_server_with_policy`
-    /// (JAR2-31), which consults `Mandate::retry_policy` at registration
-    /// time.
+    /// reach this constructor via
+    /// `ToolRegistry::register_mcp_server_with_policy`, which consults
+    /// `Mandate::retry_policy` at registration time.
     pub fn with_retry_policy(
         descriptor: McpToolDescriptor,
         client: Arc<McpClient>,
@@ -82,8 +68,8 @@ impl McpTool {
     }
 
     /// Borrow the underlying descriptor (name + optional description +
-    /// input schema). Useful for callers — e.g. `register_mcp_server` in
-    /// JAR2-24 — that need the schema after construction.
+    /// input schema). Useful for callers that need the schema after
+    /// construction.
     pub fn descriptor(&self) -> &McpToolDescriptor {
         &self.descriptor
     }
@@ -193,10 +179,8 @@ mod tests {
     use std::time::Duration;
     use tokio::io::duplex;
 
-    /// Hand-built fake server. Mirrors the one in `mcp::tests` (kept local
-    /// rather than factored, per the ticket's "duplicate the minimum" note —
-    /// tests in sibling modules don't share the parent's `#[cfg(test)]`
-    /// items without scope expansion).
+    /// Hand-built fake server. Mirrors the one in `mcp::tests`; tests in
+    /// sibling modules can't share the parent's `#[cfg(test)]` items.
     #[derive(Clone)]
     struct FakeServer {
         fail_with: Option<(i32, String)>,
@@ -338,12 +322,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn transport_drop_mid_call_surfaces_as_tool_error() {
-        // JAR2-31: under `start_paused`, the 50 ms server-side sleep and
-        // the per-retry backoff inside `McpTool::call` advance virtually,
-        // so the test no longer pays the ~100 ms wall-clock cost JAR2-25
-        // added. The zero-backoff `test_immediate` policy is belt-and-
-        // braces: even without paused time, the retry loop would not
-        // sleep between attempts.
+        // Under `start_paused`, the server-side sleep and the per-retry
+        // backoff inside `McpTool::call` advance virtually. The
+        // zero-backoff `test_immediate` policy is belt-and-braces.
         let (client_io, server_io) = duplex(8 * 1024);
         let (server_read, server_write) = tokio::io::split(server_io);
 
@@ -401,8 +382,6 @@ mod tests {
         drop(tool);
         let _ = server.await;
     }
-
-    // ---- JAR2-25: retry policy ----
 
     /// "Success on first try" — the happy path under a non-default policy
     /// uses zero retries beyond the original attempt. Pinned here so the

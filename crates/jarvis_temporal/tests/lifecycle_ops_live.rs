@@ -1,37 +1,12 @@
-//! Stage 5.7 (JAR2-84) — `Decision::RetireChild` + `Decision::ReplaceChild`
-//! live integration tests.
+//! Live integration tests for `Decision::RetireChild` and
+//! `Decision::ReplaceChild`.
 //!
-//! Env-gated behind `TEMPORAL_LIVE_TEST=1`. Mirrors the JAR2-80
-//! `spawn_child_live.rs` shape: a parent `MockDecide` script drives the
-//! parent through `Idle → SpawnChild → <lifecycle op>`; the test then
-//! signals the parent to retire and inspects:
-//!
-//! Test 1 — `retire_child_signals_child_and_drops_handle`: `RetireChild`
-//! arm fires `AgentWorkflow::retire` at the child via the same SDK
-//! two-step `external_workflow().signal()` chain JAR2-81 uses for
-//! `ChildOutput` (reverse direction). The child exits cleanly with the
-//! parent's reason; the child's own retirement path fires a
-//! `Trigger::ChildRetired` back at the parent before exit (per the
-//! JAR2-84 extension to the `retire()` helper).
-//!
-//! Test 2 — `replace_child_retires_old_and_spawns_fresh_with_new_mandate`:
-//! `ReplaceChild` arm signals the old child's retire AND spawns a fresh
-//! replacement via the same `register_child_in_structural_db` +
-//! `ctx.child_workflow(..)` path as `SpawnChild`. The structural-DB
-//! fake records exactly two `agents` rows + two `edges` rows (both the
-//! original child and the replacement — the old edge stays per Stage
-//! 5.7 decision "no `retired_at` column"); the old child workflow
-//! exits.
-//!
-//! ## Why these live tests + not hermetic
-//!
-//! Per Stage 5 Project decision 11: there is no hermetic in-process
-//! multi-workflow path in v1 — every multi-agent integration test is
-//! `TEMPORAL_LIVE_TEST=1` gated. The hermetic shape only covers
-//! workflow-state mutation invariants (see
-//! `workflow::tests::retire_child_removes_handle_and_survives_carryover`
-//! et al.); cross-workflow signaling + abandon semantics need a real
-//! Temporal Server in the loop.
+//! Env-gated behind `TEMPORAL_LIVE_TEST=1`. A scripted parent drives
+//! `Idle -> SpawnChild -> <lifecycle op>`, then the driver signals the
+//! parent retire and inspects child exit state, the trigger payload
+//! sent back to the parent, and the structural-DB invariants. There is
+//! no hermetic in-process multi-workflow path; cross-workflow signaling
+//! and abandon semantics need a real Temporal Server in the loop.
 
 use std::collections::VecDeque;
 use std::env;
@@ -63,33 +38,27 @@ use jarvis_temporal::workflow::{agent_workflow_id, AgentInput, AgentResult, Agen
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
 const DEFAULT_NAMESPACE: &str = "default";
 
-/// Shared backends installed exactly once for this binary's two live
-/// tests (same `OnceLock` + `Once` pattern as `spawn_child_live.rs`).
+/// Shared backends installed exactly once for the live tests in this
+/// binary.
 static SHARED_STORAGE: OnceLock<Arc<MemoryStorage>> = OnceLock::new();
 static SHARED_DB: OnceLock<Arc<MemoryStructuralDb>> = OnceLock::new();
 static INIT: std::sync::Once = std::sync::Once::new();
 
-/// Serializes the live tests in this binary so they don't share the
-/// `MemoryStructuralDb` state across parallel runs (the assertions
-/// count `agents` / `edges` rows by length, which would race if two
-/// tests touched the DB concurrently).
+/// Serializes the live tests so they don't race over the
+/// `MemoryStructuralDb`; assertions count `agents` / `edges` rows by
+/// length.
 static LIVE_TEST_GUARD: Mutex<()> = Mutex::new(());
 
-/// Per-role decision script — keyed by the agent's mandate text so the
-/// shared `Decide` impl can route the parent vs. the spawned children
-/// to different scripts without leaking state across tests.
+/// Per-role decision script keyed by mandate text so the shared
+/// `Decide` impl can route the parent vs. spawned children separately.
 static PARENT_SCRIPT: OnceLock<Mutex<VecDeque<Decision>>> = OnceLock::new();
 
-/// Every `Trigger` the parent's `decide_next_action` activity ever sees
-/// in its [`ContextBundle`]. Populated by [`RoutingDecide::decide`] when
-/// the routing key matches the parent. The post-retire assertions read
-/// this snapshot to confirm the `ChildRetired` signal the child fires
-/// (per the JAR2-84 extension to the `retire()` helper) actually
-/// landed on the parent's `pending_triggers` and was drained into a
-/// per-tick bundle.
+/// Every `Trigger` the parent observed in its `ContextBundle`. Read by
+/// the post-retire assertions to confirm the `ChildRetired` signal
+/// landed on the parent and was drained into a per-tick bundle.
 static PARENT_OBSERVED_TRIGGERS: OnceLock<Arc<Mutex<Vec<Trigger>>>> = OnceLock::new();
 
-const PARENT_MANDATE_TEXT: &str = "JAR2-84-parent";
+const PARENT_MANDATE_TEXT: &str = "lifecycle-parent";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RecordedAgent {
@@ -156,20 +125,18 @@ impl StructuralDbStore for MemoryStructuralDb {
     }
 }
 
-/// `Decide` impl shared across the parent + all children. Routes by
-/// `bundle.mandate.text`: the parent gets the scripted decisions, every
-/// other workflow (children spawned at runtime) falls back to a long
-/// `Idle` so they stay alive in the test window without polling the
-/// parent's script.
+/// Shared across parent + all children. Routes by mandate text: the
+/// parent runs the scripted decisions, every other workflow falls back
+/// to a long `Idle` so children stay alive in the test window.
 struct RoutingDecide;
 
 #[async_trait]
 impl Decide for RoutingDecide {
     async fn decide(&self, bundle: ContextBundle) -> anyhow::Result<Decision> {
         if bundle.mandate.text == PARENT_MANDATE_TEXT {
-            // Record every trigger the parent observes this tick so
-            // the post-RetireChild / post-ReplaceChild assertions can
-            // verify a `Trigger::ChildRetired` actually landed.
+            // Record every trigger the parent observes so the
+            // post-lifecycle assertions can verify a
+            // `Trigger::ChildRetired` actually landed.
             if !bundle.triggers.is_empty() {
                 let log = PARENT_OBSERVED_TRIGGERS
                     .get()
@@ -298,8 +265,8 @@ async fn wait_for_agent_count(db: &MemoryStructuralDb, expected_agents: usize) -
     }
 }
 
-/// JAR2-84 live test: `Decision::RetireChild` fires the child's retire
-/// signal and removes the child's handle from the parent's state.
+/// `Decision::RetireChild` fires the child's retire signal and removes
+/// the child's handle from the parent's state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn retire_child_signals_child_and_drops_handle() {
@@ -311,9 +278,7 @@ async fn retire_child_signals_child_and_drops_handle() {
         return;
     }
     let _guard = LIVE_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-    run_retire_smoke()
-        .await
-        .expect("JAR2-84 retire_child live test");
+    run_retire_smoke().await.expect("retire_child live test");
 }
 
 async fn run_retire_smoke() -> Result<()> {
@@ -324,25 +289,19 @@ async fn run_retire_smoke() -> Result<()> {
     let parent_graph_id = GraphId::new(Uuid::new_v4());
     let parent_agent_id = AgentId::new(Uuid::new_v4());
     let suffix = run_suffix();
-    let task_queue = format!("jarvis-jar2-84-retire-{suffix}");
+    let task_queue = format!("jarvis-lifecycle-retire-{suffix}");
 
-    // The parent's scripted decisions: Idle (drain first wake), Spawn,
-    // Idle (let the child come up), then RetireChild. We DON'T script
-    // a final Retire — the test driver signals it externally after
-    // observing the child's retirement, matching `spawn_child_live.rs`'s
-    // rationale.
-    let child_mandate = Mandate::new(
-        "JAR2-84 retire-child target",
-        Duration::from_millis(500),
-        Some(8),
-    );
+    // The parent's scripted decisions are Idle, Spawn, then RetireChild
+    // (injected later, see below). We don't script a final Retire; the
+    // test driver signals it externally after observing the child's
+    // retirement.
+    let child_mandate = Mandate::new("retire-child target", Duration::from_millis(500), Some(8));
 
     // We can't know the child's allocated agent_id until the
-    // `register_child_in_structural_db` activity runs — so the
-    // RetireChild decision needs to be queued *after* the spawn has
-    // landed. Strategy: script SpawnChild as the parent's first
-    // scripted decision, poll the structural-DB fake until the child
-    // is registered, then inject RetireChild as the next script entry.
+    // `register_child_in_structural_db` activity runs, so the
+    // RetireChild decision must be queued *after* the spawn lands.
+    // Script SpawnChild first, poll the structural-DB fake until the
+    // child is registered, then inject RetireChild.
 
     install_parent_script(vec![
         Decision::Idle {
@@ -429,15 +388,14 @@ async fn drive_retire(
     let child_workflow_id =
         agent_workflow_id(&parent_graph_id.to_string(), &child_agent_id.to_string());
     eprintln!(
-        "JAR2-84 retire: child registered at workflow_id={child_workflow_id} agent_id={child_agent_id}"
+        "retire: child registered at workflow_id={child_workflow_id} agent_id={child_agent_id}"
     );
 
-    // Now inject the RetireChild decision. The parent's loop will
-    // pick it up on its next wake; the wake cadence is the prior
-    // Idle's 50ms so it lands within that budget.
+    // Inject the RetireChild decision. The parent's loop picks it up
+    // on its next wake; the wake cadence is the prior Idle's 50ms.
     install_parent_script(vec![Decision::RetireChild {
         child_ref: jarvis_node::agent_ref::AgentRef::new(child_workflow_id.clone(), child_agent_id),
-        reason: "JAR2-84: scripted retire-child".into(),
+        reason: "scripted retire-child".into(),
     }]);
 
     // Wait for the child workflow to actually exit. The parent's
@@ -459,14 +417,12 @@ async fn drive_retire(
         reason.contains("scripted retire-child"),
         "child should retire with parent's scripted reason; got: {reason:?}"
     );
-    eprintln!("JAR2-84 retire: child exited with reason={reason:?}");
+    eprintln!("retire: child exited with reason={reason:?}");
 
     // The child's `retire()` helper fires a `Trigger::ChildRetired`
-    // back at the parent before exit (per the JAR2-84 extension).
-    // Poll the parent's `inspect_state` until that trigger has landed
-    // on workflow state — this is the load-bearing acceptance
-    // criterion. Mirrors JAR2-81's `child_emit_signals_parent_with_child_output_trigger`
-    // gating pattern.
+    // back at the parent before exit. Poll `inspect_state` until that
+    // trigger lands on workflow state, the load-bearing acceptance
+    // criterion here.
     let poll_start = std::time::Instant::now();
     let poll_budget = Duration::from_secs(30);
     let mut last_err: Option<anyhow::Error> = None;
@@ -505,7 +461,7 @@ async fn drive_retire(
     parent_handle
         .signal(
             AgentWorkflow::retire,
-            "JAR2-84 retire-child: parent retire".to_string(),
+            "retire-child: parent retire".to_string(),
             WorkflowSignalOptions::default(),
         )
         .await
@@ -522,9 +478,8 @@ async fn drive_retire(
     );
 
     // The structural DB should have exactly one agent (the original
-    // doomed_fetcher child). RetireChild does NOT add a new row —
-    // and per the Stage 5.7 decision the old edge stays without a
-    // `retired_at` marker.
+    // doomed_fetcher child). RetireChild does NOT add a new row, and
+    // the old edge stays without a `retired_at` marker.
     let agents = db.agents.lock().unwrap().clone();
     let edges = db.edges.lock().unwrap().clone();
     assert_eq!(
@@ -541,10 +496,9 @@ async fn drive_retire(
     assert_eq!(edges[0].0, parent_agent_id);
     assert_eq!(edges[0].1, child_agent_id);
 
-    // Trigger payload assertion: the parent's `RoutingDecide` recorded
-    // every drained trigger. There must be at least one
-    // `Trigger::ChildRetired` carrying the matching child_ref +
-    // agent_name + reason. Mirrors JAR2-81's payload assertion.
+    // Trigger payload assertion: at least one `Trigger::ChildRetired`
+    // carrying the matching child_ref + agent_name + reason must be in
+    // the recorded set.
     let observed = parent_observed_triggers_snapshot();
     let child_retired: Vec<&Trigger> = observed
         .iter()
@@ -582,8 +536,8 @@ async fn drive_retire(
     Ok(())
 }
 
-/// JAR2-84 live test: `Decision::ReplaceChild` retires the old child
-/// and spawns a fresh replacement with the new mandate.
+/// `Decision::ReplaceChild` retires the old child and spawns a fresh
+/// replacement with the new mandate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn replace_child_retires_old_and_spawns_fresh_with_new_mandate() {
@@ -595,9 +549,7 @@ async fn replace_child_retires_old_and_spawns_fresh_with_new_mandate() {
         return;
     }
     let _guard = LIVE_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-    run_replace_smoke()
-        .await
-        .expect("JAR2-84 replace_child live test");
+    run_replace_smoke().await.expect("replace_child live test");
 }
 
 async fn run_replace_smoke() -> Result<()> {
@@ -608,13 +560,9 @@ async fn run_replace_smoke() -> Result<()> {
     let parent_graph_id = GraphId::new(Uuid::new_v4());
     let parent_agent_id = AgentId::new(Uuid::new_v4());
     let suffix = run_suffix();
-    let task_queue = format!("jarvis-jar2-84-replace-{suffix}");
+    let task_queue = format!("jarvis-lifecycle-replace-{suffix}");
 
-    let old_mandate = Mandate::new(
-        "JAR2-84 replace-child target",
-        Duration::from_millis(500),
-        Some(8),
-    );
+    let old_mandate = Mandate::new("replace-child target", Duration::from_millis(500), Some(8));
 
     install_parent_script(vec![
         Decision::Idle {
@@ -702,12 +650,12 @@ async fn drive_replace(
         &old_child_agent_id.to_string(),
     );
     eprintln!(
-        "JAR2-84 replace: old child registered at workflow_id={old_child_workflow_id} agent_id={old_child_agent_id}"
+        "replace: old child registered at workflow_id={old_child_workflow_id} agent_id={old_child_agent_id}"
     );
 
     // Inject the ReplaceChild decision pointing at the live old child.
     let new_mandate = Mandate::new(
-        "JAR2-84 replace-child: new mandate",
+        "replace-child: new mandate",
         Duration::from_millis(500),
         Some(8),
     );
@@ -728,7 +676,7 @@ async fn drive_replace(
         &new_child_agent_id.to_string(),
     );
     eprintln!(
-        "JAR2-84 replace: new child registered at workflow_id={new_child_workflow_id} agent_id={new_child_agent_id}"
+        "replace: new child registered at workflow_id={new_child_workflow_id} agent_id={new_child_agent_id}"
     );
 
     // The old child should exit cleanly after the parent's retire
@@ -747,16 +695,13 @@ async fn drive_replace(
         "old child should retire with the replacement-of marker; got: {old_reason:?}"
     );
 
-    // Sanity: the replacement child is alive (its workflow handle is
-    // valid; we don't poll for a specific state, just confirm the
-    // workflow exists in Temporal). The handle constructor is
-    // infallible; any structural-DB miss would have failed
+    // Sanity: the replacement child is alive. The handle constructor
+    // is infallible; any structural-DB miss would have failed
     // `wait_for_agent_count(2)` already.
     let _new_handle = client.get_workflow_handle::<AgentWorkflow>(new_child_workflow_id.clone());
 
     // Wait for the parent to observe the old child's `ChildRetired`
-    // signal before tearing it down. Same poll-on-cumulative-counter
-    // shape as `drive_retire`.
+    // signal before tearing it down.
     let poll_start = std::time::Instant::now();
     let poll_budget = Duration::from_secs(30);
     let mut last_err: Option<anyhow::Error> = None;
@@ -795,7 +740,7 @@ async fn drive_replace(
     parent_handle
         .signal(
             AgentWorkflow::retire,
-            "JAR2-84 replace-child: parent retire".to_string(),
+            "replace-child: parent retire".to_string(),
             WorkflowSignalOptions::default(),
         )
         .await
@@ -810,10 +755,10 @@ async fn drive_replace(
         "parent should retire via signal; got reason: {pr:?}"
     );
 
-    // Structural DB invariants per Stage 5.7:
+    // Structural DB invariants:
     // - Two agents rows (old + replacement).
-    // - Two edges rows (parent→old, parent→replacement). The old
-    //   edge STAYS (no `retired_at` column, no deletion).
+    // - Two edges rows (parent->old, parent->replacement). The old
+    //   edge stays (no `retired_at` column, no deletion).
     let agents = db.agents.lock().unwrap().clone();
     let edges = db.edges.lock().unwrap().clone();
     assert_eq!(
@@ -836,8 +781,7 @@ async fn drive_replace(
     assert_eq!(edges[1], (parent_agent_id, new_child_agent_id));
 
     // Trigger payload assertion: the parent must have observed the
-    // old child's `ChildRetired` signal — same load-bearing
-    // invariant as in `drive_retire`.
+    // old child's `ChildRetired` signal.
     let observed = parent_observed_triggers_snapshot();
     let child_retired: Vec<&Trigger> = observed
         .iter()

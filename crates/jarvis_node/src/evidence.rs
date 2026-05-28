@@ -1,27 +1,12 @@
 //! Evidence — content-addressed records of tool calls.
 //!
-//! `EvidenceId` is the sha256 of the canonical JSON serialization of the
-//! `(tool, args, result)` triple, hex-encoded. Identical inputs always
-//! produce the same id; differing inputs produce different ids with
-//! cryptographic probability. Determinism comes from sorting object keys
-//! during serialization, so two records that round-trip through serde
-//! into different in-memory key orderings still hash the same.
-//!
-//! The full `result` is in the hash by design, not by accident. Content
-//! addressing on the whole triple is what lets identical calls dedup,
-//! conflicts surface, and provenance chains stay tamper-evident — hashing
-//! only `(tool, args)` would let two calls with the same inputs but
-//! different outputs collide in the evidence store and silently corrupt
-//! the chain. The cost is bounded: the id is computed once at capture
-//! time inside `EvidenceRecord::new`, stored on the record, and never
-//! recomputed on read. With sha256 at ~2 GB/s on hardware-accelerated
-//! CPUs and a comparable O(size) cost for the canonical-JSON walk,
-//! encoding plus hashing runs in microseconds for typical KB-sized
-//! results and milliseconds for MB-sized ones — orders of magnitude
-//! under the I/O that produced the result. If a profile ever points at
-//! this path, the cheapest mitigation is streaming the canonical
-//! encoder directly into `Sha256::update` instead of buffering the full
-//! output first.
+//! `EvidenceId` is the hex-encoded sha256 of the canonical JSON
+//! serialization of the `(tool, args, result)` triple. Object keys are
+//! sorted during serialization so logically-equal records hash equal
+//! regardless of in-memory key order. The full `result` is hashed by
+//! design: hashing only `(tool, args)` would let two calls with the same
+//! inputs but different outputs collide in the evidence store and
+//! silently corrupt provenance chains.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -37,8 +22,8 @@ impl EvidenceId {
     /// Build an id by hashing the canonical JSON of `(tool, args, result)`.
     pub fn new(tool: &str, args: &serde_json::Value, result: &serde_json::Value) -> Self {
         let mut buf = Vec::with_capacity(256);
-        // Canonical envelope: a JSON object with three fixed keys.
-        // Writing them in fixed lexical order is itself canonical.
+        // Three fixed keys emitted in lexical order so the envelope is
+        // itself canonical.
         buf.push(b'{');
         write_json_string(&mut buf, "args");
         buf.push(b':');
@@ -109,17 +94,15 @@ impl EvidenceRecord {
 
 /// Recursively serialize `v` into `buf` with sorted object keys.
 ///
-/// Numbers are written via `serde_json` (which already produces a
-/// canonical-enough form for our purposes — ints stay ints, floats use
-/// the JSON spec form). Strings are escaped per JSON. Object members are
-/// emitted in lexical (byte-order) sort of their UTF-8 keys.
+/// Numbers are emitted via `serde_json::Number`'s `Display`, strings are
+/// JSON-escaped, and object members are written in lexical sort of their
+/// UTF-8 keys.
 fn write_canonical(buf: &mut Vec<u8>, v: &serde_json::Value) {
     match v {
         serde_json::Value::Null => buf.extend_from_slice(b"null"),
         serde_json::Value::Bool(true) => buf.extend_from_slice(b"true"),
         serde_json::Value::Bool(false) => buf.extend_from_slice(b"false"),
         serde_json::Value::Number(n) => {
-            // serde_json's Number Display already matches JSON syntax.
             buf.extend_from_slice(n.to_string().as_bytes());
         }
         serde_json::Value::String(s) => write_json_string(buf, s),
@@ -152,8 +135,6 @@ fn write_canonical(buf: &mut Vec<u8>, v: &serde_json::Value) {
 
 /// Write `s` as a JSON-escaped string (including the surrounding quotes).
 fn write_json_string(buf: &mut Vec<u8>, s: &str) {
-    // Delegate escaping to serde_json so we share one set of escaping
-    // rules instead of re-implementing them.
     let v = serde_json::Value::String(s.to_string());
     let bytes = serde_json::to_vec(&v).expect("string serialization is infallible");
     buf.extend_from_slice(&bytes);
@@ -179,8 +160,6 @@ mod tests {
 
     #[test]
     fn evidence_id_is_stable_across_object_key_orderings() {
-        // Build the same logical args two different ways. Both should
-        // hash to the same id because canonical serialization sorts keys.
         let a = EvidenceId::new(
             "echo",
             &json!({"a": 1, "b": 2, "nested": {"x": 1, "y": 2}}),
@@ -221,7 +200,6 @@ mod tests {
     fn evidence_id_serde_round_trip() {
         let id = EvidenceId::new("echo", &json!({"k": "v"}), &json!(1));
         let s = serde_json::to_string(&id).unwrap();
-        // `transparent` should serialize as a bare JSON string.
         assert!(s.starts_with('"') && s.ends_with('"'));
         let back: EvidenceId = serde_json::from_str(&s).unwrap();
         assert_eq!(back, id);
@@ -233,8 +211,6 @@ mod tests {
         let s = serde_json::to_string(&rec).unwrap();
         let back: EvidenceRecord = serde_json::from_str(&s).unwrap();
         assert_eq!(rec, back);
-        // The id stored in the record matches what `EvidenceId::new` would
-        // produce from the same triple.
         let recomputed = EvidenceId::new(&rec.tool, &rec.args, &rec.result);
         assert_eq!(rec.id, recomputed);
     }

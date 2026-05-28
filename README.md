@@ -7,7 +7,7 @@ The Jarvis Engine is an OS for autonomous research: a runtime for graphs of long
 ## Repo layout
 
 - `crates/jarvis_node` — runtime types and agent core (`Agent::run`, `AgentFs`, `Mandate`, `Trigger`, `Decision`, ...). Today's library; foundation for the workspace.
-- `crates/jarvis_temporal` — Temporal-hosted agent workflow runtime (stage 0 stub today; real implementation lands in stage 3 per the staged plan).
+- `crates/jarvis_temporal` — Temporal-hosted agent workflow runtime.
 - `scratch/` — design notes. `scratch/temporal_staged_plan.md` is the current execution plan; read it before non-trivial work.
 - `examples/` — runnable smokes (FS, MCP, LLM-driven).
 - `docker-compose.yml` + `crates/jarvis_temporal/Dockerfile` — local dev environment, documented below.
@@ -17,8 +17,6 @@ The Jarvis Engine is an OS for autonomous research: a runtime for graphs of long
 The day-to-day dev loop runs **backing services in Docker** and the **worker natively** via `cargo run`. Native worker = fast incremental builds, native debugger, no Docker rebuild between iterations. The container-shape worker exists in `docker-compose.yml` (profile `container-worker`) so the production path stays exercised — but it's not the default.
 
 **Operator CLIs dispatch to the daemon.** Per `scratch/temporal_staged_plan.md` § 2.6, operator-facing CLIs (`jarvis apply`, future `jarvis signal` / `inspect` / `retire`) are thin Temporal clients — they connect to Temporal, dispatch onto the canonical task queue `jarvis-agents` (exported as `jarvis_temporal::worker::DEFAULT_TASK_QUEUE`), and exit. The long-lived worker daemon — the binary at `crates/jarvis_temporal/src/bin/worker.rs`, either run natively or as the `worker` compose service — is what executes the workflows.
-
-> JAR2-76 finished the thin-client refactor: `jarvis apply` now dispatches against the running daemon on `jarvis-agents` (overrideable via `TEMPORAL_TASK_QUEUE`), and the legacy `jarvis-run-workflow` smoke binary was deleted along the way. The sibling CLIs (`jarvis signal` / `inspect` / `retire`) ship in Stage 6 proper.
 
 ### Prerequisites
 
@@ -37,7 +35,7 @@ What this starts:
 
 | Service | Image | Host port | Purpose |
 |---|---|---|---|
-| `postgres` | `postgres:16-alpine3.23` | `5432` | Backs both Temporal (its own DBs) and the structural DB (`jarvis_structural`, schema lands in stage 1). |
+| `postgres` | `postgres:16-alpine3.23` | `5432` | Backs both Temporal (its own DBs) and the structural DB (`jarvis_structural`). |
 | `temporal` | `temporalio/auto-setup:1.29.6` | `7233` | Temporal frontend (gRPC). Single-container "all services in one" dev image; production-shape splits these. |
 | `temporal-ui` | `temporalio/ui:2.50.0` | `8233` | Temporal Web UI. Reachable at <http://localhost:8233>. |
 | `worker` | built locally (`jarvis-worker:dev`) | — | Worker container scaffold. Built on demand; not started by default (profile `container-worker`). |
@@ -103,6 +101,6 @@ The dev-environment work doesn't add Rust deps; if either command starts failing
 
 ## Status
 
-Pre-production. Stage 0 of the staged plan in `scratch/temporal_staged_plan.md`. The Temporal-hosted workflow runtime arrives in stage 3; today's `jarvis_node` is a single in-process agent loop with provenance-enforced FS state.
+Pre-production. See `scratch/temporal_staged_plan.md` for the staged plan. Today's `jarvis_node` is a single in-process agent loop with provenance-enforced FS state.
 
 See `DEVELOPMENT.md` for contribution rules: smallest correct diff, tests with the change, Linear-driven planning, Graphite-managed stacked PRs.

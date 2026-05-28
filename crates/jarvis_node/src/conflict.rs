@@ -1,7 +1,6 @@
-//! JAR2-83 (stage 5.6) — `ConflictRecord` + content-addressed `ConflictId`.
-//!
-//! The kernel-visible side of the conflict-log FS schema. Every disagreement
-//! the parent's `reconcile_children` activity records lands as
+//! `ConflictRecord` + content-addressed `ConflictId` — the kernel-visible
+//! side of the conflict-log FS schema. Every disagreement the parent's
+//! `reconcile_children` activity records lands as
 //! `<agent_root>/conflicts/<id>.json`, content-addressed over
 //! `(alternatives, resolution)` so a retried activity PUTs byte-identical
 //! bytes under the same key and `put_if_absent` dedupes cleanly.

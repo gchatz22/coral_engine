@@ -1,61 +1,7 @@
-//! `graph.yaml` schema types + parser + validator (Stage 4.1, JAR2-72;
-//! Stage 5.8 multi-agent extension, JAR2-85).
-//!
-//! Operator-facing surface for "the graph is the program" (VISION.md § 4).
-//! Source of truth: `scratch/graph_yaml_schema.md` § 2 (single-agent
-//! shape) and § 3 (multi-agent hierarchical strawman). JAR2-85 extends
-//! the JAR2-72 parser with the hierarchical `children:` form, top-level
-//! `defaults:` inheritance, `policy:` pass-through, and seed targeting
-//! by any agent in the tree.
-//!
-//! ## Public surface
-//!
-//! - [`parse_graph_yaml`] — `&str` → [`GraphYaml`], with source-located
-//!   errors (`line:col`) via `serde_yaml::Error::location()`.
-//! - [`validate`] — enforces invariants the type system cannot reject
-//!   on its own (`apiVersion` + `kind` exact-match, URL-path-safe names,
-//!   tool-ref resolution, agent-id uniqueness across the tree,
-//!   seed.triggers[].agent resolves to some agent in the tree).
-//! - [`GraphYamlError`] — the unified error surface.
-//! - [`is_multi_agent`] — apply-binary helper to dispatch between the
-//!   single-agent and multi-agent walkers (today both walkers are the
-//!   same code; the helper exists so the operator-visible single-agent
-//!   path can stay byte-identically named).
-//!
-//! ## What this module deliberately does NOT do
-//!
-//! - DB writes / Temporal workflow instantiation — `jarvis-apply` binary.
-//! - `policy:` enforcement — pass-through only; stored as
-//!   `graphs.metadata` jsonb. Post-Stage-8.
-//! - Flat `parent:`-ref YAML form — Project decision 12; hierarchical
-//!   only at v1.
-//!
-//! ## `kind: mcp` rejection — explicit parse + validator branch
-//!
-//! `Tool` is `#[serde(tag = "kind", rename_all = "snake_case")]` with
-//! both `Builtin` and `Mcp` variants present even though `Mcp` is rejected
-//! at validation. This lets us emit the targeted error message
-//! ("MCP-in-worker is JAR2-63's flagged follow-up") instead of serde's
-//! generic "unknown variant `mcp`".
-//!
-//! ## Names: strict validate, do not normalize
-//!
-//! `metadata.name` and every `agents[].id` (at any nesting level) must
-//! match `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`. We reject uppercase rather
-//! than lowercasing on read, so the structural-DB row stores exactly
-//! what the operator wrote and the workflow-id derivation has one
-//! canonical input.
-//!
-//! ## JAR2-89 (subsumed by JAR2-85): UUIDs from `GraphStore`, not
-//!   synthetic
-//!
-//! `into_agent_input` no longer mints synthetic UUIDs. The apply binary
-//! calls `GraphStore::create_from_yaml` first, which returns an
-//! [`AppliedGraph`] carrying the freshly-allocated `(graph_id, agent_id)`
-//! pairs in parents-first DFS order. The walker then builds each
-//! `AgentInput` against the real UUIDs so `AgentInput.agent_id` matches
-//! `agents.id` — required by Stage 5.5's cross-agent FS reads, which
-//! look agents up by UUID.
+//! `graph.yaml` schema types, parser, and validator. Converts the
+//! operator-authored YAML into the `AgentInput`s the runtime starts
+//! workflows from. Names are strict-validated (URL-path-safe) and not
+//! normalized; UUIDs come from `GraphStore`, not synthesized here.
 
 use jarvis_node::agent_ref::{AgentId, GraphId};
 use jarvis_node::mandate::Mandate as NodeMandate;
@@ -66,25 +12,16 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// The exact `apiVersion` literal v1 accepts. Bump only when the schema
-/// breaks.
+/// The exact `apiVersion` literal v1 accepts.
 pub const API_VERSION: &str = "jarvis.engine/v1alpha1";
 
 /// The exact `kind` literal v1 accepts.
 pub const KIND: &str = "Graph";
 
-/// Top-level document type for `graph.yaml`. Read
-/// `scratch/graph_yaml_schema.md` § 2 (single-agent) and § 3 (multi-
-/// agent hierarchical) for the strawman this mirrors.
-///
-/// `seed` is optional in the strawman but required at apply time today —
-/// the workflow's first tick would otherwise drain an empty trigger queue
-/// and send the LLM an empty prompt. Validation enforces non-empty
-/// `seed.triggers`.
-///
-/// JAR2-85: `defaults:` and `policy:` are top-level optional blocks.
-/// `agents:` is a forest (top-level `Vec<Agent>`); each `Agent` may
-/// nest `children:`.
+/// Top-level document type for `graph.yaml`. `agents:` is a forest;
+/// each `Agent` may nest `children:`. Validation enforces a non-empty
+/// `seed.triggers` so the workflow's first tick is not handed an empty
+/// queue.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GraphYaml {
@@ -94,21 +31,17 @@ pub struct GraphYaml {
     /// Must be `"Graph"`. Validated in [`validate`].
     pub kind: String,
     pub metadata: Metadata,
-    /// JAR2-85: top-level defaults applied to every agent unless
-    /// overridden inline. Today only `idle_period` and `max_ticks` are
-    /// declarable here, matching the two `Mandate`-derived knobs the
-    /// inline mandate currently surfaces.
+    /// Top-level defaults applied to every agent unless overridden
+    /// inline.
     #[serde(default)]
     pub defaults: Option<AgentDefaults>,
     pub tools: Vec<Tool>,
     pub agents: Vec<Agent>,
     pub seed: Seed,
-    /// JAR2-85: operator-level policy block. **Pass-through only** in v1
-    /// — stored verbatim into `graphs.metadata` jsonb (under a `"policy"`
-    /// key). The runtime does not enforce these knobs today; cost-budget
-    /// and conflict-resolution enforcement is post-Stage-8. Schema kept
-    /// `serde_json::Value`-opaque so future extensions don't force a
-    /// wire bump here every time a knob lands.
+    /// Operator-level policy block, stored verbatim into
+    /// `graphs.metadata` jsonb. Pass-through only; no knobs are enforced
+    /// yet. Schema is opaque JSON so adding knobs does not force a wire
+    /// bump.
     #[serde(default)]
     pub policy: Option<PolicyYaml>,
 }
@@ -117,192 +50,154 @@ pub struct GraphYaml {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Metadata {
-    /// URL-path-safe name (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`). Strict-
-    /// validated in [`validate`]; not lowercased.
+    /// URL-path-safe name (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`).
     pub name: String,
-    /// Free-form text. Tolerates `|` block scalars per the strawman.
     #[serde(default)]
     pub description: Option<String>,
 }
 
 /// A tool registration. `kind` is the discriminant; `Builtin` is the
-/// only variant accepted at validate-time today. `Mcp` is parseable so
-/// we can reject it with a targeted error message.
-///
-/// Intentionally **no** `#[serde(deny_unknown_fields)]` here — the
-/// `#[serde(flatten)]` + `deny_unknown_fields` combo on a parent struct
-/// is incompatible (serde flattens via a `MapAccess` adapter that
-/// `deny_unknown_fields` cannot see through). The inner `ToolKind`
-/// enum carries `deny_unknown_fields` per-variant, which is the actual
-/// guard we want; the outer struct only carries `id`.
+/// only variant accepted at validate-time. `Mcp` is parseable so it can
+/// be rejected with a targeted error rather than serde's generic
+/// "unknown variant" message.
+//
+// No `deny_unknown_fields` on this outer struct: it is incompatible
+// with `#[serde(flatten)]`. The inner `ToolKind` enum carries the
+// per-variant guard.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct Tool {
-    /// Reference id used by `agents[].tools`. URL-path-safe (same regex
-    /// as `metadata.name` — checked in [`validate`]).
+    /// Reference id used by `agents[].tools`. URL-path-safe.
     pub id: String,
     #[serde(flatten)]
     pub kind: ToolKind,
 }
 
-/// Discriminated `kind:` for [`Tool`]. `Mcp` is rejected at validate-
-/// time per <JAR2-71> ("MCP-in-worker is JAR2-63's flagged follow-up").
+/// Discriminated `kind:` for [`Tool`]. `Mcp` is rejected at validate
+/// time; only `Builtin` is accepted in v1.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolKind {
-    /// Tool registered against the in-process bootstrap `ToolRegistry`
-    /// (today: `EchoTool`). The `builtin` field names which one (e.g.
-    /// `echo`).
+    /// Tool registered against the in-process bootstrap `ToolRegistry`.
     Builtin {
         /// Identifier of the in-process tool to register (`"echo"` etc).
         builtin: String,
     },
-    /// MCP server. Parseable so [`validate`] can emit the targeted
-    /// "JAR2-63 follow-up" hint; not allowed in v1.
+    /// MCP server. Parseable so [`validate`] can emit a targeted error;
+    /// not allowed in v1.
     Mcp {
-        /// Command to spawn for the MCP server (e.g. `"mcp-web-search"`).
+        /// Command to spawn for the MCP server.
         command: String,
         #[serde(default)]
         args: Vec<String>,
     },
 }
 
-/// `agents[i]`. JAR2-85: any node in the agent forest. `children:` makes
-/// the YAML schema recursive — DFS the tree to discover every agent.
+/// One node in the agent forest. `children:` makes the schema recursive;
+/// the validator DFS-walks the tree.
 ///
-/// `mandate.idle_period` is `Option<Duration>` here because the top-level
-/// `defaults:` block may provide it; the validator (`resolve_mandate`)
-/// reports a typed error if neither inline nor default supplies a value.
+/// `mandate.idle_period` is `Option<Duration>` because the top-level
+/// `defaults:` block may provide it; the validator reports a typed
+/// error if neither inline nor default supplies a value.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Agent {
-    /// URL-path-safe id (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`); strict-
-    /// validated in [`validate`]. **Operator-authored**, distinct from
-    /// the structural-DB UUID `GraphStore::add_agent` allocates. The
-    /// apply walker maps this id to the allocated `AgentId` via
-    /// [`AppliedGraph::id_map`].
+    /// URL-path-safe operator-authored id, distinct from the structural-
+    /// DB UUID `GraphStore::add_agent` allocates. The apply walker maps
+    /// this id to the allocated `AgentId` via [`AppliedGraph::id_map`].
     pub id: String,
     pub mandate: Mandate,
-    /// References by id into the top-level `tools:`. Resolved + checked
-    /// for misses in [`validate`].
+    /// References by id into the top-level `tools:`. Resolved in
+    /// [`validate`].
     #[serde(default)]
     pub tools: Vec<String>,
-    /// JAR2-85: nested child agents. Empty for leaves. The validator
-    /// enforces unique `id`s across the whole tree and defensive
-    /// no-cycles. Hierarchical-only at v1 (Project decision 12); flat
-    /// `parent:`-ref form deferred.
+    /// Nested child agents. Empty for leaves. The validator enforces
+    /// unique `id`s across the whole tree.
     #[serde(default)]
     pub children: Vec<Agent>,
 }
 
-/// `agents[].mandate:` — the standing instruction. **Not** the same wire
-/// shape as `jarvis_node::mandate::Mandate` (which is ms-integers +
-/// `retry_policy` + `context_policy`); kept distinct because the YAML is
-/// the authored / human-edited surface and `jarvis_node::Mandate` is the
-/// runtime/wire shape. Conversion lives in [`into_agent_input`] /
-/// [`apply_to_workflow_starts`].
-///
-/// `from_file:` (`scratch/graph_yaml_schema.md` § 4.5) is rejected by
-/// `deny_unknown_fields`; v1 is inline-only.
-///
-/// JAR2-85: `idle_period` and `max_ticks` are `Option` here because the
-/// top-level [`AgentDefaults`] block may supply them. `resolve_mandate`
-/// merges inline → defaults → error.
+/// `agents[].mandate:` — the standing instruction. Distinct from
+/// `jarvis_node::mandate::Mandate` (the runtime/wire shape); conversion
+/// happens in [`into_agent_input`] / [`build_workflow_starts`].
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Mandate {
     /// Free-form mandate text. YAML block scalars (`|`) are fine.
     pub text: String,
     /// Wake cadence when no signal arrives. Accepts the
-    /// [`humantime`](https://docs.rs/humantime) duration grammar:
-    /// `100ms`, `5m`, `1h30m`, `1h 30m`, etc. Parsed via
-    /// `humantime::parse_duration`. Empty / malformed values surface as
-    /// [`GraphYamlError::Parse`] (the adapter raises a serde error
-    /// mid-deserialize so `serde_yaml::Location` pins the `line:col`).
+    /// [`humantime`](https://docs.rs/humantime) duration grammar
+    /// (`100ms`, `5m`, `1h30m`, ...). Malformed values surface as
+    /// [`GraphYamlError::Parse`] with a `line:col`.
     ///
-    /// JAR2-85: optional inline so [`AgentDefaults::idle_period`] can
-    /// supply the value. Validator emits
-    /// [`GraphYamlError::MissingMandateIdlePeriod`] if neither inline
-    /// nor default supplies a value for a given agent.
+    /// Optional so [`AgentDefaults::idle_period`] can supply the value;
+    /// the validator emits [`GraphYamlError::MissingMandateIdlePeriod`]
+    /// if neither inline nor default is present.
     #[serde(default, deserialize_with = "deserialize_duration_opt")]
     #[schemars(with = "Option<String>")]
     pub idle_period: Option<Duration>,
     /// Optional safety cap on loop iterations. `None` ⇒ run until
-    /// `Retire`. Mirrors `jarvis_node::mandate::Mandate::max_ticks`.
-    /// May be supplied via [`AgentDefaults::max_ticks`].
+    /// `Retire`. May be supplied via [`AgentDefaults::max_ticks`].
     #[serde(default)]
     pub max_ticks: Option<u64>,
 }
 
-/// JAR2-85: top-level `defaults:` block — knobs applied to every agent
-/// unless overridden inline. Today this only carries the two
-/// `Mandate`-derived knobs (`idle_period`, `max_ticks`) — the surface
-/// matches what the inline `Mandate` declares and grows together.
-///
-/// **Why a separate type from `Mandate`:** `mandate.text` is per-agent
-/// (each child has its own narrow mandate); a default text wouldn't be
-/// meaningful. Splitting the type makes that explicit.
+/// Top-level `defaults:` block — knobs applied to every agent unless
+/// overridden inline.
+//
+// Separate from `Mandate` because `mandate.text` is per-agent (each
+// child has its own narrow mandate); a default text would not be
+// meaningful.
 #[derive(Clone, Debug, PartialEq, Eq, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDefaults {
-    /// Default `idle_period` — used when an agent's inline
-    /// `mandate.idle_period` is absent. Same `humantime` grammar as
-    /// the inline field.
+    /// Default `idle_period` when an agent's inline value is absent.
+    /// Same `humantime` grammar as the inline field.
     #[serde(default, deserialize_with = "deserialize_duration_opt")]
     #[schemars(with = "Option<String>")]
     pub idle_period: Option<Duration>,
-    /// Default `max_ticks` — used when an agent's inline
-    /// `mandate.max_ticks` is absent. `None` ⇒ no cap by default.
+    /// Default `max_ticks` when an agent's inline value is absent.
+    /// `None` ⇒ no cap by default.
     #[serde(default)]
     pub max_ticks: Option<u64>,
 }
 
-/// JAR2-85: `policy:` block — operator-level constraints. **Pass-through
-/// in v1**: the parser stores it verbatim into `graphs.metadata` jsonb
-/// under a `"policy"` key. No knob is enforced today; cost-budget /
-/// conflict-resolution enforcement is post-Stage-8 (Project decision per
-/// the parent ticket).
-///
-/// Modeled as `serde_json::Value`-flavored opaque so the schema doesn't
-/// pin field names that will reshape when enforcement lands. The shape
-/// `scratch/graph_yaml_schema.md` § 3 sketches (`cost_budget:`,
-/// `on_budget_exhausted:`, `conflict_resolution:`) survives this lossy
-/// pass-through — it's preserved on disk for operators to read back.
+/// `policy:` block — operator-level constraints. Pass-through only:
+/// stored verbatim into `graphs.metadata` jsonb under a `"policy"` key.
+/// No knob is enforced yet. Opaque JSON so the schema does not pin
+/// field names that will reshape when enforcement lands.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct PolicyYaml(#[schemars(with = "serde_json::Value")] pub serde_json::Value);
 
-/// `seed:` — what kicks the graph off. v1 requires `triggers` to be
-/// non-empty (see [`GraphYaml`] doc for the empty-prompt guardrail).
+/// `seed:` — what kicks the graph off. Validation requires `triggers`
+/// to be non-empty so the workflow's first tick is not handed an empty
+/// queue.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Seed {
     pub triggers: Vec<SeedTrigger>,
 }
 
-/// One row under `seed.triggers:`. Mirrors the strawman § 2 shape:
-/// addressed to an agent, fired `at: start`, carrying an `external:`
-/// envelope. `scripted_decisions:` is rejected by `deny_unknown_fields`
-/// on [`Seed`] — vanished with real `Decide` per <JAR2-71>.
+/// One row under `seed.triggers:` — an external signal addressed to an
+/// agent and fired `at: start`.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SeedTrigger {
     /// Target agent id. Validated against `agents[].id` in [`validate`].
     pub agent: String,
-    /// When to fire. Today only `start` is accepted; future stages may
-    /// add `every: <duration>`, `at: <iso8601>`, etc. v1 enforces the
-    /// literal in [`validate`].
+    /// When to fire. Only `"start"` is accepted in v1.
     pub at: String,
-    /// External-signal payload. Mirror of `jarvis_node::trigger::Trigger::External`.
+    /// External-signal payload. Mirror of
+    /// `jarvis_node::trigger::Trigger::External`.
     pub external: ExternalEnvelope,
 }
 
 /// Payload of `seed.triggers[].external:`. The runtime translates this
-/// into `Trigger::External { kind, payload }` at apply time (JAR2-73).
+/// into `Trigger::External { kind, payload }` at apply time.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalEnvelope {
     pub kind: String,
-    /// Opaque JSON. Mirrors `Trigger::External::payload`'s shape.
     #[serde(default)]
     #[schemars(with = "serde_json::Value")]
     pub payload: serde_json::Value,
@@ -310,9 +205,7 @@ pub struct ExternalEnvelope {
 
 // --- duration deserializer -----------------------------------------------
 
-/// JAR2-85: serde adapter for `Option<Duration>`. Calls
-/// `humantime::parse_duration` when the field is present; returns
-/// `Ok(None)` when absent (the `#[serde(default)]` path).
+/// Serde adapter for `Option<Duration>` using `humantime::parse_duration`.
 fn deserialize_duration_opt<'de, D>(de: D) -> Result<Option<Duration>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -328,11 +221,7 @@ where
 
 // --- error type ---------------------------------------------------------
 
-/// 1-indexed `(line, column)` pair into the original YAML source. Used
-/// by validation variants that the parser can locate via a small
-/// source-text scan (today: tool-reference miss). `serde_yaml::Location`
-/// is the equivalent for parse errors and is preserved via
-/// `GraphYamlError::Parse`'s wrapping.
+/// 1-indexed `(line, column)` pair into the original YAML source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Location {
     pub line: u32,
@@ -345,25 +234,17 @@ impl std::fmt::Display for Location {
     }
 }
 
-/// Unified error surface for [`parse_graph_yaml`] + [`validate`].
-///
-/// `Parse` wraps `serde_yaml::Error` directly so JAR2-73 can pretty-
-/// print using `.location()` if desired; the `Display` impl below
-/// already prepends `line:col` when one is available, which is the
-/// common case operators want to see.
-///
-/// Validation variants do not carry locations by default — [`validate`]
-/// is pure over a typed value with no source access. [`parse_and_validate`]
-/// is the convenience wrapper that runs both and enriches the
-/// `UnknownToolReference` variant (the one the JAR2-72 acceptance bar
-/// names) with a source-scanned `Location`. JAR2-73 can call it directly
-/// for CLI-grade error messages.
+/// Unified error surface for [`parse_graph_yaml`] + [`validate`]. The
+/// `Display` impl prepends `line:col` whenever the source location is
+/// available. Validation variants do not carry locations by default;
+/// [`parse_and_validate`] enriches `UnknownToolReference` via a small
+/// source-text scan.
 #[derive(Debug, thiserror::Error)]
 pub enum GraphYamlError {
     /// `serde_yaml` failed to deserialize the document — structural
-    /// mismatch, missing required field, unknown field
-    /// (`deny_unknown_fields` rejection), or duration adapter failure.
-    /// `serde_yaml::Error::location()` may carry `line:col`.
+    /// mismatch, missing required field, unknown field, or duration
+    /// adapter failure. `serde_yaml::Error::location()` may carry
+    /// `line:col`.
     #[error("{}", format_parse_error(.0))]
     Parse(#[from] serde_yaml::Error),
 
@@ -381,42 +262,37 @@ pub enum GraphYamlError {
     )]
     UnsupportedKind { actual: String },
 
-    /// `agents:` was empty. JAR2-85: multi-agent supports any forest
-    /// shape, but the empty forest is nonsense — there'd be nothing to
-    /// kick off.
+    /// `agents:` was empty. The forest must contain at least one root.
     #[error("`agents:` is empty; at least one root agent is required")]
     NoAgents,
 
-    /// JAR2-85: two agents in the tree share the same operator-authored
-    /// `id`. The id is the lookup key for `seed.triggers[].agent` and
-    /// for the apply walker's `id_map` — duplicates would silently fire
-    /// triggers at the wrong workflow.
+    /// Two agents in the tree share the same operator-authored `id`.
+    /// The id is the lookup key for `seed.triggers[].agent` and for the
+    /// apply walker's `id_map`; duplicates would silently fire triggers
+    /// at the wrong workflow.
     #[error(
         "duplicate agent id {agent_id:?} in the agent tree (every `agents[].id`, including nested `children:` ids, must be unique)"
     )]
     DuplicateAgentId { agent_id: String },
 
-    /// JAR2-85: a defensive guard against cyclic `children:` references.
-    /// The YAML shape (recursive `Vec<Agent>`) cannot structurally
-    /// express a cycle today; this variant exists so the validator's
-    /// promise ("the tree is a tree") survives a future schema change
-    /// that might add a `parent:` ref form.
+    /// Defensive guard against cyclic `children:` references. The
+    /// recursive `Vec<Agent>` shape cannot structurally express a cycle,
+    /// but the validator's promise that the tree is a tree should
+    /// survive a future schema change that adds a `parent:` ref form.
     #[error("cyclic `children:` detected via agent {agent_id:?}")]
     CyclicChildren { agent_id: String },
 
-    /// JAR2-85: an agent's mandate has no `idle_period` and no
+    /// An agent's mandate has no `idle_period` and no
     /// `defaults.idle_period` is provided. The runtime requires a
-    /// concrete wake cadence; surface a typed error rather than
-    /// defaulting silently to zero.
+    /// concrete wake cadence rather than defaulting silently to zero.
     #[error(
         "agent {agent_id:?} has no `mandate.idle_period` and `defaults.idle_period` is not set (declare one or the other)"
     )]
     MissingMandateIdlePeriod { agent_id: String },
 
-    /// A `tools[]` entry was `kind: mcp`. v1 builds register only
-    /// `EchoTool`; MCP-in-worker is queued.
+    /// A `tools[]` entry was `kind: mcp`, which v1 does not support.
     #[error(
-        "tool {tool_id:?} has `kind: mcp`, which is not supported in v1 (MCP-in-worker is JAR2-63's flagged follow-up; remove the tool or wait for that ticket)"
+        "tool {tool_id:?} has `kind: mcp`, which is not supported in v1 (mcp-tool support is a planned follow-up; remove the tool or wait for that work)"
     )]
     McpToolRejected { tool_id: String },
 
@@ -427,10 +303,9 @@ pub enum GraphYamlError {
     )]
     InvalidName { field: &'static str, value: String },
 
-    /// `agents[0].tools` referenced an id missing from the top-level
+    /// An agent's `tools` referenced an id missing from the top-level
     /// `tools:` list. `location` is populated by [`parse_and_validate`]
-    /// (which has the source text) via a small source scan; pure
-    /// [`validate`] leaves it `None`.
+    /// via a source scan; pure [`validate`] leaves it `None`.
     #[error(
         "{loc_prefix}agent {agent_id:?} references tool id {tool_id:?} which is not defined under top-level `tools:` (define it, or remove the reference)",
         loc_prefix = location.map(|l| format!("{l}: ")).unwrap_or_default(),
@@ -438,8 +313,6 @@ pub enum GraphYamlError {
     UnknownToolReference {
         agent_id: String,
         tool_id: String,
-        /// Filled in by [`parse_and_validate`]; `None` when produced by
-        /// pure [`validate`].
         location: Option<Location>,
     },
 
@@ -450,15 +323,14 @@ pub enum GraphYamlError {
     UnknownTriggerAgent { agent_id: String },
 
     /// `seed.triggers[].at` was not the literal `"start"`. v1 supports
-    /// only kickoff-at-apply; future stages may add `every: <duration>`.
+    /// only kickoff-at-apply.
     #[error(
         "seed trigger has `at: {actual:?}`; v1 supports only `at: \"start\"` (timed seeds are deferred)"
     )]
     UnsupportedTriggerAt { actual: String },
 
-    /// `seed.triggers:` was empty. The workflow's first tick would drain
-    /// an empty queue and send the LLM a zero-length prompt — JAR2-68's
-    /// `triggers.jsonl` loader has the same guardrail.
+    /// `seed.triggers:` was empty; the workflow's first tick would
+    /// otherwise drain an empty queue and send the LLM an empty prompt.
     #[error(
         "seed.triggers is empty; at least one initial trigger is required (the workflow's first tick would otherwise drain an empty queue and send the LLM an empty prompt)"
     )]
@@ -469,11 +341,8 @@ pub enum GraphYamlError {
     DuplicateToolId { tool_id: String },
 }
 
-/// Render a `serde_yaml::Error` with the source location prefixed when
-/// available. `serde_yaml::Error`'s own `Display` already includes the
-/// location in most cases, but the format is `at line N column M`; we
-/// surface it as `line:col` up front so CLI output matches the convention
-/// `cargo` / `rustc` use.
+/// Render a `serde_yaml::Error` with the source location prefixed as
+/// `line:col` so CLI output matches the `cargo` / `rustc` convention.
 fn format_parse_error(e: &serde_yaml::Error) -> String {
     match e.location() {
         Some(loc) => format!("{}:{}: {e}", loc.line(), loc.column()),
@@ -483,24 +352,19 @@ fn format_parse_error(e: &serde_yaml::Error) -> String {
 
 // --- parser -------------------------------------------------------------
 
-/// Parse a `graph.yaml` document into a [`GraphYaml`]. The returned
-/// error preserves `serde_yaml::Error::location()` so the `Display`
-/// impl can prefix `line:col`. Validation is **separate** — call
-/// [`validate`] before consuming the value.
-///
-/// `apiVersion` / `kind` exact-match lives in [`validate`] rather than
-/// here so that a typo in either field still parses to a typed value
-/// (giving the validator the chance to emit a descriptive error
-/// referring to both fields' actual contents).
+/// Parse a `graph.yaml` document into a [`GraphYaml`]. Validation is
+/// separate — call [`validate`] (or [`parse_and_validate`]) before
+/// consuming the value. `apiVersion` / `kind` exact-match lives in the
+/// validator so a typo in either field still parses to a typed value
+/// the validator can describe.
 pub fn parse_graph_yaml(text: &str) -> Result<GraphYaml, GraphYamlError> {
     serde_yaml::from_str(text).map_err(GraphYamlError::from)
 }
 
 // --- validator ----------------------------------------------------------
 
-/// URL-path-safe name regex, expressed as a hand-rolled check so the
-/// crate doesn't take a `regex` dep just for one validation. Mirrors
-/// `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`.
+/// Hand-rolled `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` check; avoids pulling
+/// in `regex` for a single validation.
 fn is_url_path_safe_name(s: &str) -> bool {
     if s.is_empty() {
         return false;
@@ -515,15 +379,12 @@ fn is_url_path_safe_name(s: &str) -> bool {
     bytes.iter().all(|&b| is_alnum(b) || b == b'-')
 }
 
-/// Enforce invariants the type system cannot. Run **after**
+/// Enforce invariants the type system cannot. Run after
 /// [`parse_graph_yaml`] and before handing the value to anything that
-/// expects valid invariants (DB writes, workflow start).
-///
-/// Order of checks is chosen so the most operator-actionable errors
-/// surface first: apiVersion / kind mismatch (the document is the wrong
-/// kind entirely) → non-empty agents → name shape → tool registry shape
-/// → tree-walk invariants (tool refs, agent-id uniqueness, mandate
-/// defaults resolution) → seeds.
+/// depends on those invariants (DB writes, workflow start). Checks are
+/// ordered so the most operator-actionable errors surface first:
+/// apiVersion / kind → non-empty agents → name shape → tools → tree
+/// walk → seeds.
 pub fn validate(g: &GraphYaml) -> Result<(), GraphYamlError> {
     if g.api_version != API_VERSION {
         return Err(GraphYamlError::UnsupportedApiVersion {
@@ -547,7 +408,6 @@ pub fn validate(g: &GraphYaml) -> Result<(), GraphYamlError> {
         return Err(GraphYamlError::NoAgents);
     }
 
-    // Tool-list shape: reject MCP, dedupe ids, sanity-check builtin id.
     let mut seen = std::collections::HashSet::new();
     for tool in &g.tools {
         if !seen.insert(tool.id.as_str()) {
@@ -568,17 +428,11 @@ pub fn validate(g: &GraphYaml) -> Result<(), GraphYamlError> {
     let registered: std::collections::HashSet<&str> =
         g.tools.iter().map(|t| t.id.as_str()).collect();
 
-    // Tree walk: per-agent invariants + duplicate-id guard + tool-ref
-    // resolution + mandate-defaults resolution. Defensive cycle check
-    // via a `visiting` set on the DFS frame (the YAML shape can't
-    // structurally express cycles but the validator's promise needs to
-    // survive a future schema change).
     let mut seen_agent_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for root in &g.agents {
         validate_agent_tree(root, &registered, &g.defaults, &mut seen_agent_ids)?;
     }
 
-    // Seeds: non-empty, target some agent in the tree, `at: start` only.
     if g.seed.triggers.is_empty() {
         return Err(GraphYamlError::EmptySeedTriggers);
     }
@@ -598,11 +452,9 @@ pub fn validate(g: &GraphYaml) -> Result<(), GraphYamlError> {
     Ok(())
 }
 
-/// Recursive helper for [`validate`]. DFS the agent subtree rooted at
-/// `agent`, enforcing per-node invariants (id shape, tool refs, mandate
-/// resolves with defaults) and accumulating ids into `seen_agent_ids`
-/// (raising [`GraphYamlError::DuplicateAgentId`] on collision —
-/// duplicates across nesting levels are not allowed).
+/// DFS the agent subtree rooted at `agent`, enforcing per-node
+/// invariants and accumulating ids into `seen_agent_ids` (raising
+/// [`GraphYamlError::DuplicateAgentId`] on collision).
 fn validate_agent_tree(
     agent: &Agent,
     registered_tools: &std::collections::HashSet<&str>,
@@ -620,9 +472,6 @@ fn validate_agent_tree(
             agent_id: agent.id.clone(),
         });
     }
-    // Mandate must resolve to a concrete `idle_period` once defaults are
-    // applied. `max_ticks` is `None` by design (run-until-Retire); only
-    // `idle_period` is required.
     if agent.mandate.idle_period.is_none()
         && defaults.as_ref().and_then(|d| d.idle_period).is_none()
     {
@@ -630,8 +479,6 @@ fn validate_agent_tree(
             agent_id: agent.id.clone(),
         });
     }
-    // Tool-reference resolution: every id under this agent's `tools:`
-    // must exist in top-level `tools[]`.
     for tool_id in &agent.tools {
         if !registered_tools.contains(tool_id.as_str()) {
             return Err(GraphYamlError::UnknownToolReference {
@@ -642,11 +489,8 @@ fn validate_agent_tree(
         }
     }
     for child in &agent.children {
-        // Defensive: the YAML can't express a cycle, but if a child's
-        // id == parent's id we'd hit the duplicate-id check above.
-        // Surface that as `CyclicChildren` when the duplicate is
-        // structurally a parent's own id — preserves operator
-        // expressiveness of the error message.
+        // Surface a child id matching its parent's id as
+        // `CyclicChildren` rather than the generic duplicate-id error.
         if child.id == agent.id {
             return Err(GraphYamlError::CyclicChildren {
                 agent_id: child.id.clone(),
@@ -657,21 +501,16 @@ fn validate_agent_tree(
     Ok(())
 }
 
-/// JAR2-85: `true` if this YAML uses any multi-agent feature (more than
-/// one root agent, OR any agent has nested `children:`). Single-agent
-/// YAML (one root, no children) is the degenerate case that the
-/// multi-agent walker handles identically; the helper exists so the
-/// apply binary can keep its current operator-facing output for
-/// single-agent applies (workflow id format etc.) without surprising
-/// JAR2-71/72/73/74/76 reviewers.
+/// `true` if this YAML uses any multi-agent feature: more than one root
+/// agent, or any agent has nested `children:`.
 pub fn is_multi_agent(g: &GraphYaml) -> bool {
     g.agents.len() > 1 || g.agents.iter().any(|a| !a.children.is_empty())
 }
 
-/// JAR2-85: resolve an agent's mandate against the top-level defaults.
-/// Returns the concrete [`NodeMandate`] the runtime consumes. Caller
-/// must have already run [`validate`] — this function panics on a
-/// missing `idle_period` (validator should have caught it).
+/// Resolve an agent's mandate against the top-level defaults, returning
+/// the concrete [`NodeMandate`] the runtime consumes. Panics if no
+/// `idle_period` is resolvable; callers must have already run
+/// [`validate`].
 pub(crate) fn resolve_mandate(agent: &Agent, defaults: &Option<AgentDefaults>) -> NodeMandate {
     let idle_period = agent
         .mandate
@@ -685,17 +524,11 @@ pub(crate) fn resolve_mandate(agent: &Agent, defaults: &Option<AgentDefaults>) -
     NodeMandate::new(agent.mandate.text.clone(), idle_period, max_ticks)
 }
 
-/// Parse + validate in one shot, with `line:col` enrichment for the
-/// errors validation produces from a typed value (today:
-/// [`GraphYamlError::UnknownToolReference`]). JAR2-73's `jarvis apply`
-/// is the intended caller — operator-facing CLI output gets `line:col`
-/// for tool-reference misses without the binary having to thread the
-/// source text through itself.
-///
-/// Pure [`validate`] and pure [`parse_graph_yaml`] remain available for
-/// callers that already have the parsed value (e.g. unit tests, or
-/// future round-trip serialization paths) and don't want the source-
-/// scan overhead.
+/// Parse and validate in one shot, with `line:col` enrichment for the
+/// validator errors that can be located in the source text (currently
+/// [`GraphYamlError::UnknownToolReference`]). Pure [`validate`] and
+/// pure [`parse_graph_yaml`] remain available for callers that already
+/// have the parsed value and don't want the source-scan overhead.
 pub fn parse_and_validate(text: &str) -> Result<GraphYaml, GraphYamlError> {
     let g = parse_graph_yaml(text)?;
     match validate(&g) {
@@ -707,10 +540,9 @@ pub fn parse_and_validate(text: &str) -> Result<GraphYaml, GraphYamlError> {
     }
 }
 
-/// Source-scan enrichment for validator errors. Currently only fills in
-/// `UnknownToolReference::location`; other variants are left as-is
-/// (their messages already pin the offender by name). Extend per
-/// follow-up tickets that surface a need.
+/// Source-scan enrichment for validator errors. Currently only fills
+/// in `UnknownToolReference::location`; other variants pin the offender
+/// by name in the message itself.
 fn enrich_with_source(err: &mut GraphYamlError, source: &str) {
     if let GraphYamlError::UnknownToolReference {
         agent_id,
@@ -724,26 +556,16 @@ fn enrich_with_source(err: &mut GraphYamlError, source: &str) {
 
 /// Find the `line:col` of the missing `tool_id` token within the named
 /// agent's `tools:` list. Heuristic: anchor on `id: <agent_id>`, walk
-/// forward to the next `tools:` line under that agent, then scan that
-/// line and any continuation lines for the bare token. Bails to `None`
+/// forward to the next `tools:` line, then scan that line and any
+/// block-style continuation lines for the bare token. Returns `None`
 /// rather than guessing if the structure doesn't match expectations.
-///
-/// Sufficient for v1's single-agent shape; multi-agent topology
-/// (Stage 5) will need a more disciplined locator (likely operating on
-/// a serde_yaml AST). Kept here as a private helper so JAR2-73's binary
-/// doesn't have to know the heuristic.
 fn locate_agent_tool_reference(source: &str, agent_id: &str, tool_id: &str) -> Option<Location> {
-    // Find the line containing the agent's `id: <agent_id>`. We accept
-    // any indent (the agent record may live under `agents:` or
-    // `agents[]` flow-style; v1 only uses the block style).
     let agent_anchor = format!("id: {agent_id}");
     let mut lines = source.lines().enumerate();
     let mut after_agent = false;
     for (idx, line) in lines.by_ref() {
         if line.contains(&agent_anchor) {
             after_agent = true;
-            // Don't break — fall through to the next loop body below
-            // by continuing to scan from the next line.
             let _ = idx;
             break;
         }
@@ -752,36 +574,25 @@ fn locate_agent_tool_reference(source: &str, agent_id: &str, tool_id: &str) -> O
         return None;
     }
 
-    // Walk forward to find the agent's `tools:` line.
     for (line_no, line) in lines.by_ref() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("tools:") {
-            // The agent's `tools:` line itself may be either flow-style
-            // (`tools: [a, b, c]`) or block-style with following items.
-            // Scan the rest of this line first.
             if let Some(loc) = locate_token_in_line(line, line_no, tool_id) {
                 return Some(loc);
             }
-            // Block-style continuation: scan subsequent indented lines
-            // until indent drops back to the agent's level or a new key
-            // sibling appears.
             for (cont_no, cont_line) in lines.by_ref() {
                 let ct = cont_line.trim_start();
                 if ct.is_empty() {
                     continue;
                 }
-                // Block-style tool list entries start with `- `. Once we
-                // see a line that isn't a list continuation or whose
-                // indent matches the agent's `tools:` key, give up.
                 if !cont_line.starts_with(' ') && !cont_line.starts_with('\t') {
                     return None;
                 }
                 if let Some(loc) = locate_token_in_line(cont_line, cont_no, tool_id) {
                     return Some(loc);
                 }
-                // If this line looks like another agent-level key
-                // (`mandate:`, etc.) at the same indent as `tools:`,
-                // stop scanning — we've left the tools list.
+                // Sibling key at the same indent as `tools:` — left the
+                // tools list, give up.
                 if !ct.starts_with('-')
                     && !ct.starts_with(',')
                     && !ct.starts_with('[')
@@ -797,10 +608,9 @@ fn locate_agent_tool_reference(source: &str, agent_id: &str, tool_id: &str) -> O
     None
 }
 
-/// Find the column of a bare `tool_id` token in a single line of YAML.
-/// "Bare token" = the id is bounded on each side by characters that are
-/// not letters / digits / `-` (the URL-path-safe alphabet). Returns
-/// 1-indexed `(line_no_plus_one, col_plus_one)`.
+/// Find the column of a bare `tool_id` token in a single line of YAML;
+/// "bare" meaning bounded on each side by non-id characters. Returns
+/// 1-indexed `(line, column)`.
 fn locate_token_in_line(
     line: &str,
     line_no_zero_indexed: usize,
@@ -829,55 +639,42 @@ fn locate_token_in_line(
     None
 }
 
-// --- YAML → workflow input conversion (Stage 4.2 + 5.8) ----------------
+// --- YAML → workflow input conversion ----------------------------------
 
-/// JAR2-85 + JAR2-89 (subsumed): one resolved agent in the apply walk —
-/// the operator-authored id paired with the structural-DB UUIDs
-/// `GraphStore::create_from_yaml` allocated.
-///
-/// The walker phase returns these in DFS parents-first order so the
-/// downstream workflow-start phase can build each child's
-/// `parent_handle` against an already-allocated parent workflow id.
+/// One resolved agent in the apply walk: the operator-authored id paired
+/// with the structural-DB UUIDs `GraphStore::create_from_yaml`
+/// allocated. The walker returns these in DFS parents-first order so
+/// each child's `parent_handle` can reference an already-allocated
+/// parent workflow id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedAgent {
-    /// Operator-authored `agents[].id` from the YAML (the lookup key for
-    /// `seed.triggers[].agent` and for `id_map`).
+    /// Operator-authored `agents[].id` from the YAML.
     pub operator_id: String,
     /// Freshly-allocated structural-DB UUID from `GraphStore::add_agent`.
     pub db_agent_id: AgentId,
-    /// The parent's `db_agent_id`, when this is a non-root node. `None`
-    /// for the top-level forest entries (true roots; each gets a
-    /// `parent_handle: None`).
+    /// The parent's `db_agent_id`, or `None` for forest roots.
     pub parent_db_agent_id: Option<AgentId>,
 }
 
-/// JAR2-85 + JAR2-89: the apply binary's primary handoff from the
-/// structural-DB phase to the workflow-start phase. Carries the freshly-
-/// allocated `graph_id`, the resolved agent list (parents-first DFS
-/// order), and the lookup map from operator-authored agent id to
-/// allocated UUID + workflow id.
+/// Handoff from the structural-DB phase to the workflow-start phase.
+/// Carries the allocated `graph_id`, the resolved agent list in DFS
+/// parents-first order, and the lookup map from operator-authored agent
+/// id to allocated UUID + workflow id.
 #[derive(Clone, Debug)]
 pub struct AppliedGraph {
-    /// The graph's structural-DB UUID. Same value that
-    /// `GraphStore::create_from_yaml` returned via the `graphs.id` row.
     pub graph_id: GraphId,
-    /// Operator-authored graph name. Identity for operator-facing
-    /// output (CLI stdout, log lines). Not used in workflow-id
-    /// derivation (we use UUIDs there for cross-agent FS lookup
-    /// consistency — see JAR2-89).
+    /// Operator-authored graph name, used in CLI / log output. Not
+    /// used in workflow-id derivation; UUIDs go there.
     pub graph_name: String,
-    /// Every agent the YAML declared, in DFS parents-first order. Each
-    /// entry pairs the operator-authored id with the structural-DB
-    /// UUIDs.
+    /// Every agent the YAML declared, in DFS parents-first order.
     pub agents: Vec<ResolvedAgent>,
     /// Map from operator-authored agent id → `(db_agent_id,
-    /// workflow_id)`. The workflow id is the canonical UUID-shaped form
-    /// `graphs/<graph_uuid>/agents/<agent_uuid>` (Project decision 6 +
-    /// JAR2-89's cross-agent FS alignment).
+    /// workflow_id)`. Workflow id is the canonical UUID-shaped form
+    /// `graphs/<graph_uuid>/agents/<agent_uuid>`.
     pub id_map: HashMap<String, ResolvedAgentWorkflow>,
 }
 
-/// JAR2-85 + JAR2-89: bundled `(db_agent_id, workflow_id)` value for
+/// Bundled `(db_agent_id, workflow_id)` value for
 /// [`AppliedGraph::id_map`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedAgentWorkflow {
@@ -887,57 +684,41 @@ pub struct ResolvedAgentWorkflow {
     pub workflow_id: String,
 }
 
-/// JAR2-85 + JAR2-89: one workflow to start, with its `AgentInput`. The
-/// apply binary iterates this vector in DFS parents-first order so each
-/// child's `parent_handle.workflow_id` references a workflow id that
-/// has already been issued (`start_workflow` succeeds even before the
-/// parent has produced its first activation, so we don't need to wait
-/// on the parent's actual start; we only need the parent's id).
+/// One workflow to start, with its `AgentInput`. The apply binary
+/// iterates this vector in DFS parents-first order so each child's
+/// `parent_handle.workflow_id` references a workflow id already issued
+/// earlier in the list.
 #[derive(Clone, Debug)]
 pub struct WorkflowStart {
-    /// `graphs/<graph_uuid>/agents/<agent_uuid>` — UUID-shaped.
+    /// `graphs/<graph_uuid>/agents/<agent_uuid>`.
     pub workflow_id: String,
-    /// Resolved `AgentInput` for `client.start_workflow(...)`. Builds
-    /// via [`build_root_input`] for roots and [`build_child_input`] for
-    /// children, in both cases with the real allocated UUIDs (the
-    /// JAR2-89 fix).
     pub input: AgentInput,
 }
 
-/// JAR2-85: one seed trigger paired with its resolved target workflow
-/// id. The apply binary signals each `(workflow_id, trigger)` pair via
-/// `client.signal_workflow(workflow_id, "external_signal", trigger)`
-/// (or, with a `handle`, `handle.signal(...)`).
+/// One seed trigger paired with the workflow id its target agent
+/// resolved to.
 #[derive(Clone, Debug)]
 pub struct ResolvedSeedTrigger {
-    /// The resolved `workflow_id` from [`AppliedGraph::id_map`].
     pub workflow_id: String,
-    /// The translated [`NodeTrigger::External`].
     pub trigger: NodeTrigger,
 }
 
-/// JAR2-85 + JAR2-89: build the list of [`WorkflowStart`]s the apply
-/// binary feeds to the Temporal client, against the
-/// `GraphStore`-allocated UUIDs in [`AppliedGraph`]. Hermetic — no DB,
-/// no Temporal client, no filesystem.
+/// Build the [`WorkflowStart`] list the apply binary feeds to the
+/// Temporal client, against the `GraphStore`-allocated UUIDs in
+/// [`AppliedGraph`]. Hermetic — no DB, no Temporal client, no
+/// filesystem.
 ///
-/// The single-agent path (`agents.len() == 1`, no children) is the
-/// degenerate one-element case. The output preserves DFS parents-first
-/// order so children's `parent_handle.workflow_id` references workflows
-/// already in the list (the binary starts them in this order).
+/// The output preserves DFS parents-first order so each child's
+/// `parent_handle.workflow_id` references a workflow id earlier in the
+/// list.
 ///
 /// Caller invariants:
 ///
-/// - `graph` must have passed [`validate`] (every node has a resolvable
-///   mandate, ids are unique, tool refs resolve).
+/// - `graph` must have passed [`validate`].
 /// - `applied.agents` must be in DFS parents-first order, matching the
-///   order [`GraphStore::create_from_yaml`] allocates UUIDs. The
-///   `id_map` must contain every entry's `operator_id`.
+///   order [`crate::store::GraphStore::create_from_yaml`] allocates
+///   UUIDs. The `id_map` must contain every entry's `operator_id`.
 pub fn build_workflow_starts(graph: &GraphYaml, applied: &AppliedGraph) -> Vec<WorkflowStart> {
-    // Build the agent-yaml lookup by walking the tree in DFS order so
-    // we can pair each `ResolvedAgent` with its mandate / tools by
-    // operator id. Operator ids are unique tree-wide (validator
-    // enforces) — a flat HashMap suffices.
     let mut yaml_by_id: HashMap<&str, &Agent> = HashMap::new();
     for root in &graph.agents {
         index_agents(root, &mut yaml_by_id);
@@ -965,10 +746,6 @@ pub fn build_workflow_starts(graph: &GraphYaml, applied: &AppliedGraph) -> Vec<W
                 AgentConfig::default(),
             ),
             Some(parent_db_id) => {
-                // Look the parent's workflow id up through the id_map.
-                // The lookup is keyed by operator id, which we recover
-                // by scanning `applied.agents` (parents-first order
-                // guarantees the parent is before us in the list).
                 let parent_operator_id = applied
                     .agents
                     .iter()
@@ -997,8 +774,8 @@ pub fn build_workflow_starts(graph: &GraphYaml, applied: &AppliedGraph) -> Vec<W
     starts
 }
 
-/// JAR2-85: index the agent tree under `root` into `out`, keyed by
-/// operator id. Validator pre-condition: ids are unique tree-wide.
+/// Index the agent tree under `root` into `out`, keyed by operator id.
+/// Validator pre-condition: ids are unique tree-wide.
 fn index_agents<'a>(root: &'a Agent, out: &mut HashMap<&'a str, &'a Agent>) {
     out.insert(root.id.as_str(), root);
     for child in &root.children {
@@ -1006,28 +783,14 @@ fn index_agents<'a>(root: &'a Agent, out: &mut HashMap<&'a str, &'a Agent>) {
     }
 }
 
-/// JAR2-85 + JAR2-89 (back-compat shim): build a single-agent
-/// `AgentInput` from a validated single-agent YAML, using
-/// [`GraphStore`]-allocated UUIDs.
-///
-/// **JAR2-89 fix**: this no longer mints synthetic UUIDs. The caller
-/// (the `jarvis-apply` binary) calls
-/// [`crate::store::GraphStore::create_from_yaml`] first, threads the
-/// allocated `(graph_id, agent_id)` through, and gets back an
-/// `AgentInput` whose identity matches the structural-DB rows. Stage
-/// 5.5's cross-agent FS reads (which look agents up by `agent_id`) now
-/// resolve.
+/// Single-agent shim that builds an `AgentInput` from a validated YAML
+/// using `GraphStore`-allocated UUIDs.
 ///
 /// Caller invariants:
 ///
 /// - The YAML must have passed [`validate`].
-/// - `graph` must be single-agent (`agents.len() == 1`, no nested
-///   children). Use [`build_workflow_starts`] for the general
-///   multi-agent case; this is the single-agent ergonomic shim
-///   preserved for the JAR2-74 smoke test surface.
-///
-/// `cfg`, `parent_handle`, `carryover` defaults are unchanged from the
-/// pre-JAR2-89 shape — only the UUID source changes.
+/// - `graph` must be single-agent (`agents.len() == 1`, no children).
+///   Use [`build_workflow_starts`] for the multi-agent case.
 pub fn into_agent_input(graph: &GraphYaml, graph_id: GraphId, agent_id: AgentId) -> AgentInput {
     debug_assert_eq!(
         graph.agents.len(),
@@ -1051,13 +814,11 @@ pub fn into_agent_input(graph: &GraphYaml, graph_id: GraphId, agent_id: AgentId)
     )
 }
 
-/// JAR2-85: translate the YAML's `seed.triggers` into resolved
+/// Translate the YAML's `seed.triggers` into resolved
 /// `(workflow_id, Trigger::External)` pairs the binary signals against.
-/// Order is preserved.
-///
-/// Returns [`GraphYamlError::UnknownTriggerAgent`] if a trigger target
-/// isn't in `applied.id_map` — but [`validate`] should have caught this
-/// upstream; the runtime error is a belt-and-braces guard.
+/// Order is preserved. Returns [`GraphYamlError::UnknownTriggerAgent`]
+/// as a belt-and-braces guard; [`validate`] should have caught this
+/// upstream.
 pub fn yaml_seed_triggers(
     graph: &GraphYaml,
     applied: &AppliedGraph,
@@ -1089,12 +850,7 @@ pub fn yaml_seed_triggers(
 mod tests {
     use super::*;
 
-    /// The canonical v1 happy-path fixture. Mirrors today's
-    /// `examples/smoke_llm_temporal/config.json` + `triggers.jsonl`
-    /// content into one document; JAR2-74 lands the actual on-disk
-    /// fixture under `examples/`. Kept inline here so this ticket's
-    /// scope stays "schema + parser + validator" without a fixture
-    /// file edit.
+    /// The canonical v1 happy-path fixture.
     const HAPPY_YAML: &str = r#"
 apiVersion: jarvis.engine/v1alpha1
 kind: Graph
@@ -1162,13 +918,6 @@ seed:
 
     // --- `deny_unknown_fields` rejections (parse-time) -----------------
 
-    // JAR2-85: `children:`, `defaults:`, `policy:` are now legal fields.
-    // The previously-rejected `rejects_children_field_on_agent`,
-    // `rejects_top_level_defaults_block`, and `rejects_top_level_policy_block`
-    // tests have been replaced with positive-acceptance assertions
-    // (`children:` round-trips; `defaults:` round-trips; `policy:`
-    // round-trips) under the "JAR2-85 multi-agent" section below.
-
     #[test]
     fn rejects_scripted_decisions_under_seed() {
         let yaml = HAPPY_YAML.replace(
@@ -1194,13 +943,13 @@ seed:
     // --- Validator rejections ------------------------------------------
 
     #[test]
-    fn rejects_mcp_tool_with_jar2_63_hint() {
+    fn rejects_mcp_tool_with_unsupported_hint() {
         let yaml = HAPPY_YAML
             .replace(
                 "  - id: echo\n    kind: builtin\n    builtin: echo\n",
                 "  - id: web\n    kind: mcp\n    command: mcp-web-search\n",
             )
-            // Also drop the agent's tool reference so the validator gets to
+            // Drop the agent's tool reference so the validator reaches
             // the MCP check before the unknown-tool-ref check.
             .replace("    tools: [echo]\n", "    tools: []\n");
         let err = validate_err(&yaml);
@@ -1209,13 +958,14 @@ seed:
             matches!(err, GraphYamlError::McpToolRejected { ref tool_id } if tool_id == "web"),
             "got {err:?}",
         );
-        assert!(msg.contains("JAR2-63"), "expected JAR2-63 hint, got: {msg}");
+        assert!(
+            msg.contains("not supported in v1"),
+            "expected mcp-not-supported hint, got: {msg}",
+        );
     }
 
     #[test]
     fn rejects_zero_agents() {
-        // JAR2-85: replaced `WrongAgentCount { actual: 0 }` with
-        // `NoAgents`. The forest must contain at least one root.
         let yaml = HAPPY_YAML.replace(
             "agents:\n  - id: root\n    mandate:\n      text: |\n        Your task: call the `echo` tool exactly once with arguments {\"msg\": \"hello from temporal\"},\n        then on the next tick emit an Output via the `emit_output` decision whose `content` is a short\n        summary citing the resulting evidence id, then retire. Do not call any other tool; do not loop;\n        do not idle except as a last resort.\n      idle_period: 1s\n      max_ticks: 8\n    tools: [echo]\n",
             "agents: []\n",
@@ -1225,10 +975,7 @@ seed:
     }
 
     #[test]
-    fn accepts_multiple_top_level_agents_jar2_85() {
-        // JAR2-85: multiple top-level agents is no longer an error. The
-        // validator only enforces unique ids tree-wide + every other
-        // invariant (tool refs resolve, idle_period resolves, etc.).
+    fn accepts_multiple_top_level_agents() {
         let yaml = HAPPY_YAML.to_string().replace(
             "    tools: [echo]\n",
             "    tools: [echo]\n  - id: second\n    mandate:\n      text: x\n      idle_period: 1s\n    tools: []\n",
@@ -1258,8 +1005,8 @@ seed:
     #[test]
     fn rejects_non_path_safe_agent_id() {
         let yaml = HAPPY_YAML.replace("  - id: root\n", "  - id: Root!\n");
-        // Also fix the seed trigger so it doesn't unknown-agent before
-        // the id-shape check; we want this test to bite on the id.
+        // Adjust the seed trigger so the unknown-agent check doesn't
+        // fire before the id-shape check.
         let yaml = yaml.replace("    - agent: root\n", "    - agent: Root!\n");
         let err = validate_err(&yaml);
         assert!(
@@ -1289,19 +1036,12 @@ seed:
             ),
             "got {err:?}",
         );
-        // The error should name the missing id verbatim so operators can
-        // grep for it in their YAML.
         let msg = format!("{err}");
         assert!(msg.contains("\"missing\""), "{msg}");
     }
 
     #[test]
     fn parse_and_validate_enriches_tool_reference_miss_with_line_col() {
-        // `parse_and_validate` is the convenience that combines parser
-        // + validator and runs the source-scan enrichment for the
-        // tool-ref-miss case. Verifies the JAR2-72 acceptance bar:
-        // "Errors point at line:col for at least: ... tool-reference
-        // miss."
         let yaml = HAPPY_YAML.replace("    tools: [echo]\n", "    tools: [echo, missing]\n");
         let err = parse_and_validate(&yaml).expect_err("missing tool ref must fail");
         match err {
@@ -1313,19 +1053,13 @@ seed:
                 assert_eq!(agent_id, "root");
                 assert_eq!(tool_id, "missing");
                 let loc = location.expect("parse_and_validate should populate location");
-                // The replaced line is the agent's `tools:` row. Find
-                // the exact line number from the source to keep the
-                // assertion robust to future fixture edits.
                 let expected_line = yaml
                     .lines()
                     .position(|l| l.contains("tools: [echo, missing]"))
                     .map(|i| i + 1)
                     .expect("the modified tools line must be present");
                 assert_eq!(loc.line as usize, expected_line, "got {loc}");
-                // The column should point at the `missing` token, not
-                // the start of the line. Sanity-check it's > 1.
                 assert!(loc.column > 1, "expected non-trivial column, got {loc}");
-                // Display should embed the location prefix.
                 let msg = format!(
                     "{}",
                     GraphYamlError::UnknownToolReference {
@@ -1342,9 +1076,6 @@ seed:
 
     #[test]
     fn rejects_unknown_tool_kind_with_line_col() {
-        // Serde's "unknown variant" path is one of the four error
-        // categories the JAR2-72 acceptance bar names. Confirm it
-        // surfaces `line:col` via the parser.
         let yaml = HAPPY_YAML.replace(
             "  - id: echo\n    kind: builtin\n    builtin: echo\n",
             "  - id: echo\n    kind: bogus\n",
@@ -1355,7 +1086,6 @@ seed:
             msg.contains("unknown variant") || msg.contains("bogus"),
             "expected unknown-variant error, got: {msg}",
         );
-        // Prefix should carry `line:col`.
         let prefix: &str = msg.split_once(' ').map(|(p, _)| p).unwrap_or(msg.as_str());
         assert!(prefix.contains(':'), "expected line:col prefix, got: {msg}",);
     }
@@ -1371,11 +1101,9 @@ seed:
 
     #[test]
     fn rejects_bogus_extra_field_on_tool_via_inner_deny_unknown_fields() {
-        // The `Tool` outer struct deliberately *doesn't* carry
-        // `deny_unknown_fields` (incompatible with `#[serde(flatten)]`).
-        // The inner `ToolKind` enum's variant-level guard is what
-        // actually rejects extra fields. Confirm an extra field on the
-        // builtin variant is rejected with a `line:col`.
+        // The `Tool` outer struct can't carry `deny_unknown_fields`
+        // (incompatible with `#[serde(flatten)]`); the inner `ToolKind`
+        // enum's variant-level guard does the rejection.
         let yaml = HAPPY_YAML.replace(
             "  - id: echo\n    kind: builtin\n    builtin: echo\n",
             "  - id: echo\n    kind: builtin\n    builtin: echo\n    surprise: extra\n",
@@ -1386,7 +1114,6 @@ seed:
             msg.contains("unknown field `surprise`") || msg.contains("surprise"),
             "expected unknown-field error, got: {msg}",
         );
-        // Prefix should carry `line:col`.
         let prefix: &str = msg.split_once(' ').map(|(p, _)| p).unwrap_or(msg.as_str());
         assert!(prefix.contains(':'), "expected line:col prefix, got: {msg}",);
     }
@@ -1511,17 +1238,13 @@ seed:
 
     #[test]
     fn parse_error_display_includes_line_col() {
-        // Force a structural mismatch (`tools` should be a list, not a
-        // scalar) so serde_yaml reports a `Location`.
+        // Force a structural mismatch so serde_yaml reports a Location.
         let yaml = HAPPY_YAML.replace(
             "tools:\n  - id: echo\n    kind: builtin\n    builtin: echo\n",
             "tools: \"this is not a list\"\n",
         );
         let err = parse_err(&yaml);
         let msg = format!("{err}");
-        // `format_parse_error` prefixes `<line>:<col>: ` when the
-        // underlying `serde_yaml::Error::location()` returns Some. Look
-        // for that shape at the start of the message.
         let prefix: &str = msg.split_once(' ').map(|(p, _)| p).unwrap_or(msg.as_str());
         let (line_str, col_part) = prefix
             .split_once(':')
@@ -1530,8 +1253,6 @@ seed:
             line_str.parse::<usize>().is_ok(),
             "expected numeric line in prefix, got: {msg}",
         );
-        // `col_part` is `"<col>:"` (with trailing colon from the `:` we
-        // print after the column). Strip it and parse the column.
         let col_str = col_part.trim_end_matches(':');
         assert!(
             col_str.parse::<usize>().is_ok(),
@@ -1563,12 +1284,10 @@ seed:
         assert!(!is_url_path_safe_name("foo.bar"));
     }
 
-    // --- YAML → AgentInput conversion (Stage 4.2 + JAR2-89 fix) -----
+    // --- YAML -> AgentInput conversion --------------------------------
 
-    /// Build a small synthetic [`AppliedGraph`] for the single-agent
-    /// fixture so the seed-trigger tests don't need a live DB. Uses
-    /// deterministic UUIDs derived from a counter so assertions can
-    /// pin specific prefix strings without flake.
+    /// Build a synthetic [`AppliedGraph`] for the single-agent fixture
+    /// so seed-trigger tests don't need a live DB.
     fn synthetic_applied(graph: &GraphYaml, root_id: &str) -> super::AppliedGraph {
         let graph_uuid = uuid::Uuid::new_v4();
         let agent_uuid = uuid::Uuid::new_v4();
@@ -1604,8 +1323,6 @@ seed:
         let agent_id = jarvis_node::agent_ref::AgentId::new(agent_uuid);
         let input = super::into_agent_input(&g, graph_id, agent_id);
 
-        // `mandate.text`, `idle_period`, `max_ticks` round-trip from the
-        // YAML's inline mandate.
         assert!(
             input
                 .mandate
@@ -1617,34 +1334,29 @@ seed:
         assert_eq!(input.mandate.idle_period, Duration::from_secs(1));
         assert_eq!(input.mandate.max_ticks, Some(8));
 
-        // Defaults that v1 YAML does not surface.
         assert!(input.mandate.retry_policy.is_none());
         assert_eq!(
             input.mandate.context_policy,
             jarvis_node::mandate::ContextPolicy::default(),
         );
 
-        // JAR2-89: FS handle prefix is derived from the GraphStore-
-        // allocated UUIDs (NOT the operator-authored name) so cross-
-        // agent FS reads keyed off `agent_id` resolve correctly.
+        // FS handle prefix is derived from the GraphStore-allocated
+        // UUIDs (not the operator-authored name) so cross-agent FS
+        // reads keyed off `agent_id` resolve correctly.
         assert_eq!(
             input.fs_handle.prefix,
             format!("graphs/{graph_uuid}/agents/{agent_uuid}"),
         );
-        // Identity triple round-trips through the helper.
         assert_eq!(input.graph_id, graph_id);
         assert_eq!(input.agent_id, agent_id);
         assert_eq!(input.agent_name, "root");
 
-        // Parent + carryover are None on a fresh apply (first run).
         assert!(input.parent_handle.is_none());
         assert!(input.carryover.is_none());
     }
 
     #[test]
     fn into_agent_input_propagates_humanized_idle_period_units() {
-        // Cover the duration adapter end-to-end through the conversion
-        // — `100ms` survives as `Duration::from_millis(100)`, etc.
         let yaml = HAPPY_YAML.replace("      idle_period: 1s\n", "      idle_period: 100ms\n");
         let g = parse_and_validate(&yaml).expect("happy path");
         let graph_id = jarvis_node::agent_ref::GraphId::new(uuid::Uuid::new_v4());
@@ -1655,8 +1367,6 @@ seed:
 
     #[test]
     fn into_agent_input_propagates_max_ticks_none_when_absent() {
-        // `max_ticks` is optional in the YAML; missing → `None` on the
-        // way through (matches `Mandate::new`'s contract).
         let yaml = HAPPY_YAML.replace("      max_ticks: 8\n", "");
         let g = parse_and_validate(&yaml).expect("happy path");
         let graph_id = jarvis_node::agent_ref::GraphId::new(uuid::Uuid::new_v4());
@@ -1667,10 +1377,9 @@ seed:
 
     #[test]
     fn yaml_seed_triggers_translates_external_envelopes_in_order() {
-        // Two ordered seeds, both targeting the same agent. The binary
-        // will signal them in the YAML's declared order; assert the
-        // translated vector preserves that order verbatim and resolves
-        // each to the correct workflow id via the id_map.
+        // Two ordered seeds, both targeting the same agent. The
+        // translated vector must preserve declared order and resolve
+        // each to the right workflow id via the id_map.
         let yaml = HAPPY_YAML.replace(
             "  triggers:\n    - agent: root\n      at: start\n      external:\n        kind: kickoff\n        payload: {}\n",
             "  triggers:\n    - agent: root\n      at: start\n      external:\n        kind: kickoff\n        payload: {}\n    - agent: root\n      at: start\n      external:\n        kind: heartbeat\n        payload:\n          beat: 1\n",
@@ -1700,9 +1409,6 @@ seed:
 
     #[test]
     fn yaml_seed_triggers_passes_arbitrary_json_payloads_through() {
-        // Payload is `serde_json::Value`; non-trivial shapes (nested
-        // objects, arrays, scalars) must survive the YAML → JSON
-        // translation unmangled.
         let yaml = HAPPY_YAML.replace(
             "        payload: {}\n",
             "        payload:\n          nested:\n            list: [1, 2, 3]\n            flag: true\n            text: hello\n",
@@ -1729,13 +1435,11 @@ seed:
         }
     }
 
-    // --- JAR2-85 multi-agent tests -------------------------------------
+    // --- Multi-agent tests -------------------------------------------
 
-    /// Strawman from `scratch/graph_yaml_schema.md` § 3, condensed to
-    /// the parse-only surface (no MCP tools — those are still rejected
-    /// per JAR2-71). Demonstrates the hierarchical `children:` form, the
-    /// top-level `defaults:` block, the pass-through `policy:` block,
-    /// and a `seed.triggers[].agent` targeting a non-root agent.
+    /// Hierarchical fixture: `children:`, top-level `defaults:`,
+    /// pass-through `policy:`, and a `seed.triggers[].agent` targeting
+    /// a non-root agent.
     const HIERARCHICAL_YAML: &str = r#"
 apiVersion: jarvis.engine/v1alpha1
 kind: Graph
@@ -1801,25 +1505,21 @@ policy:
         let root = &g.agents[0];
         assert_eq!(root.id, "root");
         assert_eq!(root.children.len(), 3);
-        // `competitive-landscape` has its own children.
         let comp = root
             .children
             .iter()
             .find(|a| a.id == "competitive-landscape")
             .unwrap();
         assert_eq!(comp.children.len(), 2);
-        // Defaults inheritance: root has inline 4h, drug-alpha uses
-        // defaults.idle_period (1h).
         assert!(g.defaults.is_some());
         assert_eq!(
             g.defaults.as_ref().unwrap().idle_period,
             Some(Duration::from_secs(3600))
         );
-        // Drug-alpha has no inline idle_period — the validator allowed
-        // that because defaults provides one.
+        // drug-alpha has no inline idle_period; the validator allows
+        // that only because defaults provides one.
         let alpha = root.children.iter().find(|a| a.id == "drug-alpha").unwrap();
         assert!(alpha.mandate.idle_period.is_none());
-        // Policy round-trips as opaque JSON.
         assert!(g.policy.is_some());
     }
 
@@ -1834,7 +1534,6 @@ policy:
         let single = parse_and_validate(HAPPY_YAML).expect("single-agent happy");
         assert!(!super::is_multi_agent(&single));
 
-        // Two roots, no children: still multi-agent.
         let two_roots_yaml = HAPPY_YAML.to_string().replace(
             "    tools: [echo]\n",
             "    tools: [echo]\n  - id: second\n    mandate:\n      text: x\n      idle_period: 1s\n    tools: []\n",
@@ -1849,7 +1548,6 @@ policy:
         let root = &g.agents[0];
         let alpha = root.children.iter().find(|a| a.id == "drug-alpha").unwrap();
         let mandate = super::resolve_mandate(alpha, &g.defaults);
-        // Defaults.idle_period (1h) wins because alpha has no inline.
         assert_eq!(mandate.idle_period, Duration::from_secs(3600));
         assert_eq!(mandate.text, "Watch Drug Alpha");
     }
@@ -1859,14 +1557,11 @@ policy:
         let g = parse_and_validate(HIERARCHICAL_YAML).expect("happy");
         let root = &g.agents[0];
         let mandate = super::resolve_mandate(root, &g.defaults);
-        // Root's inline idle_period (4h) wins over defaults (1h).
         assert_eq!(mandate.idle_period, Duration::from_secs(4 * 3600));
     }
 
     #[test]
     fn rejects_duplicate_agent_id_across_tree() {
-        // Two agents with `id: dupe` at different nesting levels — the
-        // validator's tree walk must catch this.
         let yaml = r#"
 apiVersion: jarvis.engine/v1alpha1
 kind: Graph
@@ -1910,9 +1605,8 @@ seed:
 
     #[test]
     fn rejects_cyclic_children_via_direct_self_reference() {
-        // Defensive: a child whose `id` matches its parent's id (in
-        // the same `children:` list) is reported as `CyclicChildren`
-        // rather than `DuplicateAgentId` — more operator-actionable.
+        // A child whose `id` matches its parent's id should surface as
+        // `CyclicChildren` rather than the generic duplicate-id error.
         let yaml = r#"
 apiVersion: jarvis.engine/v1alpha1
 kind: Graph
@@ -1951,7 +1645,6 @@ seed:
 
     #[test]
     fn rejects_unresolved_seed_trigger_target_across_tree() {
-        // Targets `ghost` which is nowhere in the tree.
         let yaml = HIERARCHICAL_YAML.replace("- agent: root", "- agent: ghost");
         let err = validate_err(&yaml);
         assert!(
@@ -1962,8 +1655,6 @@ seed:
 
     #[test]
     fn rejects_missing_mandate_idle_period_when_no_defaults() {
-        // Agent has no inline `idle_period`; no top-level `defaults`.
-        // Validator must reject with the typed error.
         let yaml = r#"
 apiVersion: jarvis.engine/v1alpha1
 kind: Graph
@@ -2002,8 +1693,6 @@ seed:
 
     #[test]
     fn unresolved_tool_reference_in_deep_child_is_caught() {
-        // The validator's tree walk must enforce tool-ref resolution
-        // at every nesting level, not just the root.
         let yaml = HIERARCHICAL_YAML.replace("tools: [fda-feed]\n", "tools: [fda-feed, missing]\n");
         let err = validate_err(&yaml);
         assert!(
@@ -2020,16 +1709,13 @@ seed:
 
     #[test]
     fn build_workflow_starts_produces_dfs_parents_first_with_real_uuids() {
-        // Hermetic — uses a synthetic AppliedGraph that mirrors what
-        // GraphStore::create_from_yaml would return. Asserts root +
-        // children + grandchildren land in parents-first DFS order,
-        // each with `parent_handle.workflow_id` pointing at the parent
-        // already in the list.
+        // Hermetic synthetic AppliedGraph mirroring what
+        // GraphStore::create_from_yaml would return; asserts DFS
+        // parents-first order with `parent_handle.workflow_id` pointing
+        // earlier in the list.
         let g = parse_and_validate(HIERARCHICAL_YAML).expect("happy");
         let graph_uuid = uuid::Uuid::new_v4();
         let graph_id = jarvis_node::agent_ref::GraphId::new(graph_uuid);
-        // Walk the YAML to mint UUIDs in DFS parents-first order
-        // (matches the GraphStore walker's allocation order).
         let mut resolved = Vec::new();
         let mut id_map = std::collections::HashMap::new();
         fn walk(
@@ -2069,14 +1755,11 @@ seed:
         let starts = super::build_workflow_starts(&g, &applied);
         // 6 agents: root + 3 children + 2 grandchildren.
         assert_eq!(starts.len(), 6);
-        // Root first.
         assert!(
             starts[0].input.parent_handle.is_none(),
             "root has no parent_handle"
         );
         assert_eq!(starts[0].input.agent_name, "root");
-        // Every non-root has a parent_handle pointing at a workflow id
-        // that appears earlier in the list.
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for start in &starts {
             if let Some(parent) = &start.input.parent_handle {
@@ -2089,12 +1772,9 @@ seed:
             }
             seen_ids.insert(start.workflow_id.clone());
         }
-        // FsHandle prefix matches the workflow id (UUID-shaped).
         for start in &starts {
             assert_eq!(start.input.fs_handle.prefix, start.workflow_id);
         }
-        // Defaults propagation: drug-alpha's mandate.idle_period
-        // came from `defaults.idle_period`.
         let alpha_start = starts
             .iter()
             .find(|s| s.input.agent_name == "drug-alpha")
@@ -2107,12 +1787,10 @@ seed:
 
     // --- Schema-drift regression --------------------------------------
 
-    /// Re-derive the JSON schema from the `JsonSchema` derives and assert
-    /// byte-equality against the checked-in `examples/graph.schema.json`.
-    ///
-    /// Regeneration path: run `cargo test -p jarvis_graph yaml::tests::regenerate_graph_schema -- --ignored --include-ignored`
-    /// with `JARVIS_REGENERATE_SCHEMA=1` to overwrite the file. The
-    /// drift-check below then passes again.
+    /// Re-derive the JSON schema from the `JsonSchema` derives and
+    /// assert byte-equality against the checked-in
+    /// `examples/graph.schema.json`. Regenerate via
+    /// `JARVIS_REGENERATE_SCHEMA=1 cargo test -p jarvis_graph regenerate_graph_schema -- --ignored`.
     #[test]
     fn graph_schema_json_matches_schemars_derive() {
         let actual = render_schema();
@@ -2131,10 +1809,10 @@ seed:
         );
     }
 
-    /// Regenerator: writes `examples/graph.schema.json` from the current
-    /// `JsonSchema` derives. Gated by `JARVIS_REGENERATE_SCHEMA=1` to
-    /// avoid accidentally rewriting the file during a routine test run.
-    /// Skipped from the default test sweep via `#[ignore]`.
+    /// Writes `examples/graph.schema.json` from the current
+    /// `JsonSchema` derives. Gated by `JARVIS_REGENERATE_SCHEMA=1` and
+    /// `#[ignore]` to avoid rewriting the file during a routine test
+    /// run.
     #[test]
     #[ignore = "regenerator: run via `JARVIS_REGENERATE_SCHEMA=1 cargo test ... -- --ignored`"]
     fn regenerate_graph_schema() {
@@ -2153,10 +1831,6 @@ seed:
 
     fn render_schema() -> String {
         let schema = schemars::schema_for!(GraphYaml);
-        // Pretty-print so the checked-in file is human-reviewable in
-        // diff. Trailing newline matched by the byte-equality test
-        // (we `trim_end` both sides above to be tolerant of editors
-        // that strip / add a trailing newline).
         let mut out = serde_json::to_string_pretty(&schema)
             .expect("schemars schemas serialize without error");
         out.push('\n');
@@ -2164,8 +1838,6 @@ seed:
     }
 
     fn examples_graph_schema_path() -> std::path::PathBuf {
-        // `CARGO_MANIFEST_DIR` is `crates/jarvis_graph` at test time;
-        // the schema lives at `<workspace>/examples/graph.schema.json`.
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         manifest_dir
             .parent()

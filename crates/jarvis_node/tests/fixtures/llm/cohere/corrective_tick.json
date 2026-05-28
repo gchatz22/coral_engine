@@ -1,7 +1,7 @@
 {
   "synthesized": true,
   "vendor": "cohere",
-  "note": "JAR2-21 corrective-tick fixture for Cohere. Response 1: an unknown tool name 'send_email' that fails LlmDecide's parse step. Response 2: a valid `idle` decision. Exercises the JAR2-19 parse-retry path; both responses contribute to last_tick_calls()/last_tick_totals(). Hand-written against the Cohere V2 chat wire shape.",
+  "note": "Corrective-tick fixture for Cohere. Response 1: an unknown tool name 'send_email' that fails LlmDecide's parse step. Response 2: a valid `idle` decision. Exercises the parse-retry path; both responses contribute to last_tick_calls()/last_tick_totals(). Hand-written against the Cohere V2 chat wire shape.",
   "responses": [
     {
       "status": 200,

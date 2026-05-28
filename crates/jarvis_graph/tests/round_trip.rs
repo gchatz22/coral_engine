@@ -1,20 +1,8 @@
-//! Integration test for stage 1 (JAR2-50).
-//!
-//! Reads like a runbook for the cold-start path stage-4's `jarvis apply`
-//! will take: write a graph with a parent + child + edge + tool, then
-//! read every piece back via the `GraphStore` API and assert the graph
-//! reconstructs.
-//!
-//! Uses `#[sqlx::test(migrator = "jarvis_graph::MIGRATOR")]` so the
-//! test gets its own ephemeral per-test database with the schema
-//! applied. Requires `DATABASE_URL` at run time — `cargo test` against
-//! the dev Postgres in `docker-compose.yml` Just Works:
-//!
-//! ```sh
-//! docker compose up -d postgres
-//! export DATABASE_URL=postgres://jarvis:jarvis@localhost:5432/jarvis_structural
-//! cargo test -p jarvis_graph --test round_trip
-//! ```
+//! Cold-start integration test: write a graph with a parent + child +
+//! edge + tool, then read every piece back via the `GraphStore` API and
+//! assert the graph reconstructs. Uses `#[sqlx::test(migrator =
+//! "jarvis_graph::MIGRATOR")]` for an ephemeral per-test database;
+//! requires `DATABASE_URL` at run time.
 
 use jarvis_graph::{GraphStore, MIGRATOR};
 use sqlx::PgPool;
@@ -74,8 +62,7 @@ async fn applies_a_simple_parent_child_graph_and_reads_it_back(pool: PgPool) -> 
     assert_eq!(edges.len(), 1);
     assert_eq!(edges[0].id, edge.id);
 
-    // Step 8: walk parent -> children. The integration-test acceptance
-    // criterion in JAR2-50 calls out this exact assertion.
+    // Step 8: walk parent -> children.
     let children = store.list_children(parent.id).await?;
     assert_eq!(
         children.iter().map(|a| a.id).collect::<Vec<_>>(),

@@ -6,9 +6,8 @@ server advertises, the run loop drives a scripted decision that calls
 one of those tools, persists an `EvidenceRecord` for the call, and
 emits an `Output` that references that evidence by id.
 
-It is the runbook companion to JAR2-26 (parent: JAR2-22). The
-`MockDecide` script keeps the demo deterministic — the real-LLM
-end-to-end smoke is a separate concern once both A1 and A2 land.
+The `MockDecide` script keeps the demo deterministic; the real-LLM
+end-to-end smoke lives in `smoke_llm_mcp/` and runs separately.
 
 ## Prerequisites
 
@@ -125,8 +124,8 @@ This is the gate the test prints when it is skipped.
 
 ## Adjacent follow-ups
 
-* **CI integration.** Wired in JAR2-34 (`mcp-smoke` job) and JAR2-35
-  (`runbook-smoke` job) in `.github/workflows/ci.yml`. Both pin
+* **CI integration.** The `mcp-smoke` and `runbook-smoke` jobs in
+  `.github/workflows/ci.yml` pin
   `@modelcontextprotocol/server-everything` via the workflow-level
   `MCP_SERVER_EVERYTHING_VERSION` env var; bumping that version
   requires recomputing the evidence id hardcoded in

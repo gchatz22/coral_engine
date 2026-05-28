@@ -1,35 +1,31 @@
-# Stage 5.9 (JAR2-86) — Multi-agent fixture: parent + 2 children with a
-# deliberate disagreement on the same claim.
-#
-# Topology (mirrors `scratch/graph_yaml_schema.md` § 3 strawman, trimmed
-# to the smallest shape that exercises 5.3 spawn → 5.4 child→parent
-# signal → 5.5 reconcile → 5.6 conflict-log + cross-agent FS read):
+# Multi-agent fixture: parent + 2 children with a deliberate disagreement
+# on the same claim. Smallest shape that exercises spawn, child→parent
+# signaling, reconcile + synthetic evidence, and conflict-log writing.
 #
 #   root
 #   ├── child-a   (emits claim "X")
 #   └── child-b   (emits claim "NOT-X")
 #
-# Each agent uses an empty `tools:` list — `MockDecide` scripts the
-# entire decision sequence; no tool dispatch is needed for the
-# topology / signal-path / reconciliation / conflict-log assertions
-# this fixture's integration test makes. (The top-level `tools:` list
-# below carries a single `echo` registration because every YAML must
-# declare a `tools:` block, but no agent references it.)
+# Each agent uses an empty `tools:` list — `MockDecide` scripts the entire
+# decision sequence; no tool dispatch is needed for the topology / signal
+# / reconciliation / conflict-log assertions this fixture's integration
+# test makes. The top-level `tools:` list carries a single `echo`
+# registration because every YAML must declare a `tools:` block, but no
+# agent references it.
 #
-# Mandate text is intentionally short — this is not a content test.
-# The `mandate.text` strings the `RoutingDecide` in the integration
-# test uses (`JAR2-86-parent`, `JAR2-86-child-a`, `JAR2-86-child-b`)
-# discriminate which scripted role each agent plays at decide time.
+# Mandate text is intentionally short — not a content test. The
+# `mandate.text` strings (`multi-agent-parent`, `multi-agent-child-a`,
+# `multi-agent-child-b`) discriminate which scripted role each agent
+# plays at decide time.
 apiVersion: jarvis.engine/v1alpha1
 kind: Graph
 metadata:
   name: smoke-multi-agent
   description: |
-    Stage 5.9 fixture for the multi-agent integration smoke. Parent +
-    2 children + scripted disagreement. Drives 5.3 spawn → 5.4
-    child→parent signal → 5.5 reconcile + synthetic evidence → 5.6
-    conflict-log writer end-to-end. MockDecide throughout — no live
-    LLM (Stage 5 Project decision 11 + ticket-baked decision).
+    Multi-agent integration smoke fixture. Parent + 2 children +
+    scripted disagreement. Drives spawn → child→parent signal →
+    reconcile + synthetic evidence → conflict-log writer end-to-end.
+    MockDecide throughout — no live LLM.
 defaults:
   idle_period: 100ms
 tools:
@@ -42,16 +38,16 @@ tools:
 agents:
   - id: root
     mandate:
-      text: JAR2-86-parent
+      text: multi-agent-parent
     tools: []
     children:
       - id: child-a
         mandate:
-          text: JAR2-86-child-a
+          text: multi-agent-child-a
         tools: []
       - id: child-b
         mandate:
-          text: JAR2-86-child-b
+          text: multi-agent-child-b
         tools: []
 seed:
   triggers:

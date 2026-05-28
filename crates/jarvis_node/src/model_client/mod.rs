@@ -1,30 +1,6 @@
-//! `ModelClient` — vendor-neutral trait for "ask a model what to say next".
-//!
-//! VISION § 4 wants the engine vendor-substitutable from day one. The trait
-//! defined here is the abstraction boundary: the prompt renderer (JAR2-16)
-//! and the `LlmDecide` adapter (JAR2-19) talk to a `dyn ModelClient` and
-//! never to a concrete vendor type. Day-one impls are Anthropic
-//! (`anthropic.rs`, this ticket) and Cohere (JAR2-15, sibling ticket).
-//!
-//! The trait surface is intentionally tiny:
-//!
-//! ```text
-//! complete(req: CompleteRequest) -> Result<CompleteResponse, ModelError>
-//! ```
-//!
-//! Only the shapes both vendors share live on the trait — text + tool-use
-//! content, a token-count usage block, and a small `ModelError` enum that
-//! categorizes failures by what the caller can do about them. Anything
-//! vendor-specific (model id strings, beta headers, sampling knobs unique
-//! to one provider) lives on the impl as a configuration field.
-//!
-//! # Why "complete" instead of "stream"
-//!
-//! Streaming, caching, and cost metering are separate tickets. The batch
-//! shape is the lowest-common-denominator surface that both vendors return
-//! today, and it lets the JAR2-19 wiring land before streaming infra
-//! exists. A streaming sibling method can be added later without breaking
-//! the batch path.
+//! Vendor-neutral trait for "ask a model what to say next". Only the shapes
+//! both vendors share live on the trait; vendor-specific knobs live on the
+//! impls.
 
 use serde::{Deserialize, Serialize};
 
@@ -110,9 +86,8 @@ pub enum ContentBlock {
 /// A tool the model is allowed to call.
 ///
 /// Field shape mirrors Anthropic's `tools[]` entry verbatim
-/// (`name + description + input_schema`). Cohere's wire format is a near
-/// trivial transformation of the same three fields, so promoting them onto
-/// the trait costs nothing today and saves a wrapper struct in JAR2-15.
+/// (`name + description + input_schema`); Cohere's wire format is a near
+/// trivial transformation of the same three fields.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
@@ -154,14 +129,11 @@ pub struct CompleteRequest {
 /// `tool_calls` is a flat projection of `content` for callers that only
 /// care about "did the model want to invoke a tool?". The same call appears
 /// once in `content` (as a `ToolUse` block) and once in `tool_calls`; the
-/// duplication is intentional — JAR2-17's Decision parser walks `content`,
-/// while a future router walks `tool_calls`.
+/// duplication is intentional.
 ///
-/// `stats` carries the JAR2-20 cost/latency accounting block. It composes
-/// `usage` rather than duplicating its token fields, plus the model id,
-/// vendor tag, and wall-clock latency measured around the upstream call.
-/// Real $/token pricing and budget enforcement are out of scope here —
-/// raw counts only.
+/// `stats` carries the cost/latency accounting block, composing `usage`
+/// plus the model id, vendor tag, and wall-clock latency measured around
+/// the upstream call. Raw counts only; pricing translation lives elsewhere.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompleteResponse {
     pub content: Vec<ContentBlock>,
@@ -190,11 +162,6 @@ pub struct Usage {
 /// Which vendor produced a `CallStats`. Small closed enum rather than a
 /// `String` so callers can match on it cheaply and tracing field rendering
 /// stays allocation-free.
-///
-/// No `Default` impl on purpose: a `CallStats` always carries a real vendor
-/// — the parse-then-stamp split in each vendor adapter guarantees that. See
-/// `ParsedComplete` in `anthropic`/`cohere` for the shape `parse_response`
-/// returns before `complete` mints the final `CallStats`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Vendor {
@@ -212,20 +179,15 @@ impl Vendor {
     }
 }
 
-/// Per-call cost + latency accounting block (JAR2-20).
+/// Per-call cost + latency accounting block.
 ///
 /// Composes `Usage` rather than duplicating the token counts so there is
-/// exactly one source of truth for tokens-in / tokens-out across the
-/// codebase. Real pricing translation and budget enforcement live in
-/// future tickets — this struct intentionally ships only the raw inputs
-/// those layers will need.
+/// exactly one source of truth for tokens-in / tokens-out. Ships only raw
+/// inputs; pricing translation and budget enforcement live elsewhere.
 ///
 /// No `Default` impl: a `CallStats` is only ever constructed by a vendor
 /// adapter's `complete` method, which knows the real vendor, latency, and
-/// model id. The pure `parse_response` helpers return a
-/// vendor-private `ParsedComplete` (content + tool_calls + usage) and
-/// `complete` mints the final `CompleteResponse` from it. That keeps
-/// "stats with a placeholder vendor" unrepresentable.
+/// model id. That keeps "stats with a placeholder vendor" unrepresentable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallStats {
     pub usage: Usage,
@@ -235,20 +197,16 @@ pub struct CallStats {
     /// Vendor that produced this call. See `Vendor::as_str` for the
     /// stable tracing string.
     pub vendor: Vendor,
-    /// Model id the call hit. `&'static str` would be the natural choice
-    /// for a fixed enum of models, but model ids are configurable
-    /// (`ANTHROPIC_MODEL` / `COHERE_MODEL` env vars + `with_model`), so
-    /// an owned `String` is the right shape.
+    /// Model id the call hit. Owned `String` because model ids are
+    /// configurable via env vars and `with_model`.
     pub model: String,
 }
 
 impl CallStats {
-    /// Convenience accessor matching the field name in the ticket spec.
     pub fn tokens_in(&self) -> u32 {
         self.usage.input_tokens
     }
 
-    /// Convenience accessor matching the field name in the ticket spec.
     pub fn tokens_out(&self) -> u32 {
         self.usage.output_tokens
     }
@@ -279,17 +237,14 @@ pub enum ModelError {
     Other(String),
 }
 
-/// The trait every model adapter implements. The prompt renderer (JAR2-16)
-/// and the `LlmDecide` adapter (JAR2-19) hold this as `Arc<dyn ModelClient>`
-/// — the trait is the substitution boundary VISION § 4 calls for.
+/// The trait every model adapter implements. Held as `Arc<dyn ModelClient>`
+/// by callers — the substitution boundary across vendors.
 #[async_trait::async_trait]
 pub trait ModelClient: Send + Sync {
     async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse, ModelError>;
 }
 
-// Compile-time sanity: a `dyn ModelClient` is `Send + Sync`, so callers can
-// stash one in an `Arc` and share it across worker tasks. Property is
-// load-bearing for the run-loop wiring in JAR2-19.
+// `dyn ModelClient: Send + Sync` is load-bearing for sharing across tasks.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync + ?Sized>() {}
     assert_send_sync::<dyn ModelClient>();

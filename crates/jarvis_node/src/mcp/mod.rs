@@ -1,14 +1,7 @@
-//! MCP client wrapper around the official `rmcp` SDK.
-//!
-//! `McpClient` connects to an MCP server over stdio (spawning a subprocess
-//! via `rmcp::transport::TokioChildProcess`), folds the MCP `initialize` +
-//! `initialized` handshake into the connect step, and exposes typed
-//! `list_tools` / `call_tool` methods over JSON-RPC.
-//!
-//! Errors are normalized into `McpError`, distinguishing transport failures,
-//! protocol violations, JSON-RPC server errors, and parse problems. Higher
-//! layers — `Tool for McpTool` (JAR2-23), `ToolRegistry::register_mcp_server`
-//! (JAR2-24), retry/health wiring (JAR2-25) — live in follower tickets.
+//! MCP client wrapper around the official `rmcp` SDK. Connects to an MCP
+//! server over stdio, folds the `initialize` + `initialized` handshake into
+//! the connect step, and exposes typed `list_tools` / `call_tool` methods.
+//! Errors are normalized into `McpError`.
 
 use std::sync::Arc;
 
@@ -178,14 +171,10 @@ impl ToolRegistry {
     /// order the server announced them.
     ///
     /// Trusts the server's advertised schemas — no in-engine re-validation.
-    /// Spec (JAR2-24) suggested `&self`; this implementation takes
-    /// `&mut self` to match the existing `ToolRegistry::register` surface
-    /// rather than introduce interior mutability for one helper.
     ///
     /// **Duplicate-name policy.** Reuses `ToolRegistry::register`, which
     /// errors on collision. If the server advertises a name already in the
-    /// registry (because another MCP server or built-in tool got there
-    /// first), the helper returns `Err` on that descriptor — first-wins.
+    /// registry, the helper returns `Err` on that descriptor — first-wins.
     /// Registration is *not* atomic: descriptors that registered before the
     /// collision remain in the registry. Pre-check with
     /// `ToolRegistry::contains` if atomicity matters.
@@ -199,11 +188,9 @@ impl ToolRegistry {
     /// Same as [`Self::register_mcp_server`], but threads an optional
     /// `RetryPolicy` (typically from `Mandate::retry_policy`) through to
     /// each registered `McpTool`. `None` preserves the
-    /// `RetryPolicy::default()` semantics JAR2-25 wired at
-    /// `McpTool::new`; `Some(p)` calls `McpTool::with_retry_policy(p)`
-    /// for every descriptor advertised by the server. JAR2-31 completes
-    /// the JAR2-25 punt by giving callers a single seam at which
-    /// per-mandate retry overrides land.
+    /// `RetryPolicy::default()` semantics at `McpTool::new`; `Some(p)`
+    /// calls `McpTool::with_retry_policy(p)` for every descriptor
+    /// advertised by the server.
     pub async fn register_mcp_server_with_policy(
         &mut self,
         client: Arc<McpClient>,
@@ -475,8 +462,7 @@ mod tests {
     /// Fake MCP server that advertises two tools — `repeat` (echoes its
     /// `text` argument) and `shout` (echoes the same text uppercased) —
     /// for exercising `ToolRegistry::register_mcp_server`'s bulk-register
-    /// path. Kept separate from the single-tool `FakeServer` above per the
-    /// "duplicate the minimum" convention used in `mcp::tool::tests`.
+    /// path.
     #[derive(Clone)]
     struct MultiToolServer;
 
@@ -657,14 +643,10 @@ mod tests {
         let _ = server.await;
     }
 
-    // ---- JAR2-31: per-mandate retry policy plumbing ----
-
-    /// `register_mcp_server` (no policy override) still registers and
-    /// calls tools end-to-end after the JAR2-31 plumbing. The
-    /// "default-policy values" assertion lives in
+    /// `register_mcp_server` (no policy override) registers and calls
+    /// tools end-to-end. The default-policy values assertion lives in
     /// `mandate::tests::retry_policy_default_is_3_attempts_50ms`; this
-    /// test pins the back-compat call surface (legacy callers do not
-    /// have to pass `None` explicitly to get the historical behavior).
+    /// test pins the call surface where callers omit a `RetryPolicy`.
     #[tokio::test]
     async fn register_mcp_server_without_override_still_registers_and_calls_tools() {
         let (client, server) = paired(FakeServer::ok()).await;
@@ -687,7 +669,7 @@ mod tests {
         let _ = server.await;
     }
 
-    /// JAR2-31 override behavior: when a mandate supplies a non-default
+    /// Override behavior: when a mandate supplies a non-default
     /// `RetryPolicy`, the policy reaches the tools constructed for that
     /// agent and shapes their retry behavior.
     ///
@@ -695,10 +677,10 @@ mod tests {
     /// then drop the server so every subsequent call surfaces a transient
     /// `Transport` error. Under the default policy that would cost 2
     /// backoff sleeps (~100 ms virtual); with the override it surfaces
-    /// after exactly one attempt and zero backoffs. We assert the latter
-    /// via virtual time (`tokio::time::Instant::now()` delta under
-    /// `start_paused`) — a real behavioral check on the retry loop, not
-    /// just a getter sanity check.
+    /// after exactly one attempt and zero backoffs. Asserted via virtual
+    /// time (`tokio::time::Instant::now()` delta under `start_paused`) —
+    /// a real behavioral check on the retry loop, not just a getter
+    /// sanity check.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn register_mcp_server_with_policy_propagates_to_tools() {
         let (client_io, server_io) = duplex(8 * 1024);
@@ -723,11 +705,8 @@ mod tests {
             .expect("client handshake");
         let client = Arc::new(client);
 
-        // Per-mandate override: `max_attempts = 1` means "one shot only",
-        // so the retry loop never sleeps no matter how long `backoff`
-        // says. Plumbing through `register_mcp_server_with_policy` is the
-        // production path a `node-run-mcp`-shaped caller takes when it
-        // reads `mandate.retry_policy`.
+        // `max_attempts = 1` means one shot only, so the retry loop never
+        // sleeps no matter how long `backoff` says.
         let mut registry = ToolRegistry::new();
         registry
             .register_mcp_server_with_policy(
@@ -746,8 +725,6 @@ mod tests {
             .expect_err("server is gone; call should fail");
         let elapsed = start.elapsed();
 
-        // The error is the same surface JAR2-25 already pinned; what's
-        // new here is the *speed* it surfaces at.
         let msg = format!("{err:#}");
         assert!(
             msg.contains("repeat"),

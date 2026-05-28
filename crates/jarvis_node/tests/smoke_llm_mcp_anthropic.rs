@@ -91,17 +91,10 @@ fn read_json_dir(dir: &Path) -> Vec<Value> {
     out
 }
 
-/// JAR2-38 parallel-tool smoke. Issues a mandate asking for K=3
-/// concurrent `get-sum` calls in a single tick and asserts the run
-/// completes Healthy within `max_ticks = 4` (1 parallel batch + 1
-/// emit + 1 retire, with 1 slack tick). Pre-JAR2-38 the model was
-/// forced through N+1 sequential ticks (3 calls + 1 emit + 1 retire = 5),
-/// which would either trip the 4-tick cap or saturate it; either way
-/// produces a non-Healthy retirement (`max_ticks (4) reached`). With
-/// the parallel-tool path live, the model can batch all three in one
-/// response and the agent retires cleanly with the model's own reason.
-///
-/// Gated identically to the single-call smoke above. Skips on missing
+/// Parallel-tool smoke: mandate asks for K=3 concurrent `get-sum` calls
+/// in a single tick and the run must complete Healthy within
+/// `max_ticks = 4` (1 parallel batch + 1 emit + 1 retire, with 1 slack
+/// tick). Gated identically to the single-call smoke; skips on missing
 /// env vars rather than failing so the hermetic CI matrix stays clean.
 #[test]
 fn end_to_end_parallel_call_tools_against_server_everything() {
@@ -117,11 +110,9 @@ fn end_to_end_parallel_call_tools_against_server_everything() {
     let parent_dir = TempDir::new().expect("tempdir");
     let (cmd, args) = spawn_command();
     let bin = env!("CARGO_BIN_EXE_node-run-llm");
-    // Post-JAR2-40 workspace split: `CARGO_MANIFEST_DIR` is now
-    // `<root>/crates/jarvis_node`; the runbook `examples/` fixture
-    // dirs still live at the workspace root, so step out two levels.
+    // `CARGO_MANIFEST_DIR` is `<root>/crates/jarvis_node`; the runbook
+    // `examples/` dirs live at the workspace root, two levels up.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    // The JAR2-38 parallel mandate, distinct from the single-call one.
     let config = format!("{manifest_dir}/../../examples/smoke_llm_mcp/config_parallel.json");
     let triggers = format!("{manifest_dir}/../../examples/smoke_llm_mcp/triggers.jsonl");
 
@@ -153,10 +144,6 @@ fn end_to_end_parallel_call_tools_against_server_everything() {
         serde_json::from_slice(&std::fs::read(&retirement_path).expect("read retirement"))
             .expect("parse retirement");
     let reason = retirement["reason"].as_str().expect("reason string");
-    // Pre-JAR2-38 the model needs N+1 ticks (3 calls + 1 emit + 1
-    // retire = 5) and would hit `max_ticks (4) reached`. With the
-    // parallel path live, the model should retire cleanly with its own
-    // reason — not the safety-cap reason.
     assert!(
         !reason.contains("max_ticks"),
         "agent should retire on its own reason within the 4-tick cap, got: {reason}"
@@ -247,8 +234,7 @@ fn end_to_end_llm_decide_against_server_everything() {
     // overhead from inside the test.
     let bin = env!("CARGO_BIN_EXE_node-run-llm");
 
-    // See note in `parallel_smoke_llm_mcp_anthropic`: examples/ lives
-    // at the workspace root, two levels up from this crate.
+    // `examples/` lives at the workspace root, two levels up from this crate.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let config = format!("{manifest_dir}/../../examples/smoke_llm_mcp/config.json");
     let triggers = format!("{manifest_dir}/../../examples/smoke_llm_mcp/triggers.jsonl");
@@ -320,8 +306,7 @@ fn end_to_end_llm_decide_against_server_everything() {
     );
 
     // Every evidence id in every Output must resolve to a file on disk
-    // under `evidence/<id>.json`. This is the JAR2-12 parent-acceptance
-    // assertion in test form.
+    // under `evidence/<id>.json` — the parent-acceptance contract.
     let evidence_dir = fs_root.join("evidence");
     for out in &outputs {
         let evidence = out["evidence"]
