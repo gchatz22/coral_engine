@@ -266,6 +266,26 @@ jobs:
     name: temporal workflow smoke (live)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Several live tests write to the structural DB via the
+    # `register_child_in_structural_db` activity and the YAML walker. The
+    # job needs a real Postgres for them to hit at runtime; the schema is
+    # migrated by `sqlx::migrate!` in test setup.
+    services:
+      postgres:
+        image: postgres:16-alpine3.23
+        env:
+          POSTGRES_USER: jarvis
+          POSTGRES_PASSWORD: jarvis
+          POSTGRES_DB: jarvis_structural
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jarvis -d jarvis_structural"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://jarvis:jarvis@localhost:5432/jarvis_structural
     steps:
       - uses: actions/checkout@v4
 
@@ -330,18 +350,60 @@ jobs:
       - name: Run jarvis-apply smoke
         env:
           TEMPORAL_LIVE_TEST: "1"
-          # `jarvis_graph`'s lib carries compile-time-checked `sqlx::query!`
-          # macros (via `GraphStore`). Compiling the test binary brings the
-          # lib along, so we need either a live DB or the committed `.sqlx/`
-          # cache. The `temporal-workflow-smoke` job intentionally has no
-          # Postgres service container (the runtime path skips
-          # `create_from_yaml`), so route the build through the offline
-          # cache — same shape `lint-and-test` uses at job scope.
+          # `jarvis_graph`'s lib has compile-time-checked `sqlx::query!`
+          # macros via `GraphStore`. Route the compile through the committed
+          # `.sqlx/` cache instead of the live schema so cache-vs-live drift
+          # surfaces at `cargo sqlx prepare` time, not mid-CI.
           SQLX_OFFLINE: "true"
         run: |
           set -o pipefail
           cargo test --locked -p jarvis_graph --test jarvis_apply_smoke -- --nocapture \
             2>&1 | tee ci-logs/jarvis-apply-smoke.log
+
+      # Per-test invocation (rather than one bulk `cargo test`) so a failure
+      # surfaces as a distinct red step instead of a single multi-thousand-
+      # line log.
+      - name: Run spawn_child live
+        env:
+          TEMPORAL_LIVE_TEST: "1"
+        run: |
+          set -o pipefail
+          cargo test --locked -p jarvis_temporal --test spawn_child_live -- --nocapture \
+            2>&1 | tee ci-logs/spawn-child-live.log
+
+      - name: Run child_parent_signal live
+        env:
+          TEMPORAL_LIVE_TEST: "1"
+        run: |
+          set -o pipefail
+          cargo test --locked -p jarvis_temporal --test child_parent_signal -- --nocapture \
+            2>&1 | tee ci-logs/child-parent-signal-live.log
+
+      - name: Run reconcile_children live
+        env:
+          TEMPORAL_LIVE_TEST: "1"
+        run: |
+          set -o pipefail
+          cargo test --locked -p jarvis_temporal --test reconcile_children_live -- --nocapture \
+            2>&1 | tee ci-logs/reconcile-children-live.log
+
+      - name: Run lifecycle_ops live
+        env:
+          TEMPORAL_LIVE_TEST: "1"
+        run: |
+          set -o pipefail
+          cargo test --locked -p jarvis_temporal --test lifecycle_ops_live -- --nocapture \
+            2>&1 | tee ci-logs/lifecycle-ops-live.log
+
+      - name: Run multi_agent live
+        env:
+          TEMPORAL_LIVE_TEST: "1"
+          # Same `sqlx::query!` macro concern as `jarvis-apply smoke` above.
+          SQLX_OFFLINE: "true"
+        run: |
+          set -o pipefail
+          cargo test --locked -p jarvis_graph --test multi_agent -- --nocapture \
+            2>&1 | tee ci-logs/multi-agent-live.log
 
       - name: Upload workflow smoke logs on failure
         if: failure()
