@@ -806,4 +806,61 @@ mod tests {
         drop(registry);
         drop(client);
     }
+
+    /// `connect_stdio_with_env` must (a) deliver each passed `(key, value)`
+    /// to the spawned child and (b) leave the inherited parent environment
+    /// intact for variables it does not name. We can't drive a full MCP
+    /// handshake through a plain shell, so we spawn an `sh` script that
+    /// records both variables to a file and exits: the subprocess runs the
+    /// script before the handshake can complete, so the recorded file proves
+    /// the env reached the child even though the connect itself fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_stdio_with_env_delivers_passed_var_and_inherits_parent_env() {
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("env.txt");
+
+        let inherited_key = "CORAL_MCP_ENV_TEST_INHERITED";
+        let passed_key = "CORAL_MCP_ENV_TEST_PASSED";
+        std::env::set_var(inherited_key, "from-parent");
+
+        let script = format!(
+            "printf '%s\\n%s\\n' \"${passed_key}\" \"${inherited_key}\" > {}",
+            out.display()
+        );
+
+        let _ = McpClient::connect_stdio_with_env(
+            "sh",
+            &["-c", &script],
+            &[(passed_key.to_string(), "from-env-map".to_string())],
+        )
+        .await;
+
+        let mut recorded = String::new();
+        for _ in 0..50 {
+            if let Ok(mut f) = std::fs::File::open(&out) {
+                recorded.clear();
+                f.read_to_string(&mut recorded).expect("read env file");
+                if recorded.lines().count() >= 2 {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        std::env::remove_var(inherited_key);
+
+        let mut lines = recorded.lines();
+        assert_eq!(
+            lines.next(),
+            Some("from-env-map"),
+            "passed env var should reach the child; recorded: {recorded:?}"
+        );
+        assert_eq!(
+            lines.next(),
+            Some("from-parent"),
+            "non-passed parent env var should still inherit; recorded: {recorded:?}"
+        );
+    }
 }
