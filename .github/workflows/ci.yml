@@ -22,26 +22,26 @@ jobs:
   lint-and-test:
     name: build / clippy / fmt / test
     runs-on: ubuntu-latest
-    # `jarvis_graph`'s `#[sqlx::test]` cases need live Postgres at runtime;
+    # `coral_graph`'s `#[sqlx::test]` cases need live Postgres at runtime;
     # build stays DB-free via the committed `.sqlx/` offline cache.
     services:
       postgres:
         image: postgres:16-alpine3.23
         env:
-          POSTGRES_USER: jarvis
-          POSTGRES_PASSWORD: jarvis
-          POSTGRES_DB: jarvis_structural
+          POSTGRES_USER: coral
+          POSTGRES_PASSWORD: coral
+          POSTGRES_DB: coral_structural
         ports:
           - 5432:5432
         # `sqlx::test` creates ephemeral per-test databases, so the connected
         # role needs CREATEDB — the superuser bound to POSTGRES_USER has it.
         options: >-
-          --health-cmd "pg_isready -U jarvis -d jarvis_structural"
+          --health-cmd "pg_isready -U coral -d coral_structural"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
     env:
-      DATABASE_URL: postgres://jarvis:jarvis@localhost:5432/jarvis_structural
+      DATABASE_URL: postgres://coral:coral@localhost:5432/coral_structural
       # Job-scope `SQLX_OFFLINE=true` forces every cargo invocation through the
       # `.sqlx/` cache for compile-time query!/query_as! checks; `#[sqlx::test]`
       # still uses DATABASE_URL at runtime to hit the service container.
@@ -74,37 +74,37 @@ jobs:
   feature-matrix:
     name: feature matrix
     runs-on: ubuntu-latest
-    # `--workspace` tests include `jarvis_graph`'s `#[sqlx::test]` cases, which
+    # `--workspace` tests include `coral_graph`'s `#[sqlx::test]` cases, which
     # need live Postgres at runtime; build stays DB-free via the `.sqlx/` cache.
     services:
       postgres:
         image: postgres:16-alpine3.23
         env:
-          POSTGRES_USER: jarvis
-          POSTGRES_PASSWORD: jarvis
-          POSTGRES_DB: jarvis_structural
+          POSTGRES_USER: coral
+          POSTGRES_PASSWORD: coral
+          POSTGRES_DB: coral_structural
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U jarvis -d jarvis_structural"
+          --health-cmd "pg_isready -U coral -d coral_structural"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
     env:
-      DATABASE_URL: postgres://jarvis:jarvis@localhost:5432/jarvis_structural
+      DATABASE_URL: postgres://coral:coral@localhost:5432/coral_structural
       # Job-scope `SQLX_OFFLINE=true` routes compile-time query checks through
       # the `.sqlx/` cache; `#[sqlx::test]` still hits DATABASE_URL at runtime.
       SQLX_OFFLINE: "true"
     strategy:
       matrix:
         include:
-          - features: "jarvis_node/llm-anthropic"
+          - features: "coral_node/llm-anthropic"
             name: "llm-anthropic"
-          - features: "jarvis_node/llm-cohere"
+          - features: "coral_node/llm-cohere"
             name: "llm-cohere"
-          - features: "jarvis_node/mcp"
+          - features: "coral_node/mcp"
             name: "mcp"
-          - features: "jarvis_node/llm-anthropic,jarvis_node/llm-cohere,jarvis_node/mcp"
+          - features: "coral_node/llm-anthropic,coral_node/llm-cohere,coral_node/mcp"
             name: "all features"
     steps:
       - uses: actions/checkout@v4
@@ -117,7 +117,7 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      # Features live on `jarvis_node`, not the workspace; cross-crate selection
+      # Features live on `coral_node`, not the workspace; cross-crate selection
       # from workspace-aware invocations requires the `<crate>/<feature>` form.
       - name: cargo build [${{ matrix.name }}]
         run: cargo build --workspace --all-targets --locked --features "${{ matrix.features }}"
@@ -127,7 +127,7 @@ jobs:
 
   mcp-smoke:
     # Activates tests/smoke_mcp_server_everything.rs, which is gated behind
-    # JARVIS_SMOKE_MCP=1 and needs Node + a pinned server-everything on the runner.
+    # CORAL_SMOKE_MCP=1 and needs Node + a pinned server-everything on the runner.
     name: mcp smoke (integration)
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -148,12 +148,12 @@ jobs:
 
       - name: Run smoke_mcp_server_everything against pinned server
         env:
-          JARVIS_SMOKE_MCP: "1"
-          JARVIS_SMOKE_MCP_CMD: "npx -y @modelcontextprotocol/server-everything@${{ env.MCP_SERVER_EVERYTHING_VERSION }}"
+          CORAL_SMOKE_MCP: "1"
+          CORAL_SMOKE_MCP_CMD: "npx -y @modelcontextprotocol/server-everything@${{ env.MCP_SERVER_EVERYTHING_VERSION }}"
         run: |
           mkdir -p ci-logs
           set -o pipefail
-          cargo test -p jarvis_node --features mcp --test smoke_mcp_server_everything --locked -- --nocapture \
+          cargo test -p coral_node --features mcp --test smoke_mcp_server_everything --locked -- --nocapture \
             2>&1 | tee ci-logs/mcp-smoke.log
 
       - name: Upload mcp-smoke logs on failure
@@ -189,16 +189,16 @@ jobs:
         run: |
           mkdir -p ci-logs
           set -o pipefail
-          cargo run --locked -p jarvis_node --bin node-run -- \
+          cargo run --locked -p coral_node --bin node-run -- \
             examples/smoke/config.json \
             examples/smoke/triggers.jsonl \
-            "${RUNNER_TEMP}/jarvis-smoke-fs" \
+            "${RUNNER_TEMP}/coral-smoke-fs" \
             2>&1 | tee ci-logs/node-run.log
 
       - name: Assert node-run artifacts
         run: |
           bash scripts/ci/assert_smoke.sh \
-            "${RUNNER_TEMP}/jarvis-smoke-fs" \
+            "${RUNNER_TEMP}/coral-smoke-fs" \
             "1d6a153a69d110156ca44ed281f859ca09d9875747e3ed16b9964c52632fd96e" \
             "echo" \
             '{"hello":"smoke"}' \
@@ -207,17 +207,17 @@ jobs:
       - name: Run node-run-mcp against examples/smoke_mcp fixture
         run: |
           set -o pipefail
-          cargo run --locked -p jarvis_node --features jarvis_node/mcp --bin node-run-mcp -- \
+          cargo run --locked -p coral_node --features coral_node/mcp --bin node-run-mcp -- \
             examples/smoke_mcp/config.json \
             examples/smoke_mcp/triggers.jsonl \
-            "${RUNNER_TEMP}/jarvis-smoke-mcp-fs" \
+            "${RUNNER_TEMP}/coral-smoke-mcp-fs" \
             -- npx -y "@modelcontextprotocol/server-everything@${MCP_SERVER_EVERYTHING_VERSION}" \
             2>&1 | tee ci-logs/node-run-mcp.log
 
       - name: Assert node-run-mcp artifacts
         run: |
           bash scripts/ci/assert_smoke.sh \
-            "${RUNNER_TEMP}/jarvis-smoke-mcp-fs" \
+            "${RUNNER_TEMP}/coral-smoke-mcp-fs" \
             "10c7854829677f9d39acaafa5aa5ae4e9fa59ae5cba2a1dafc941c4c9f4938de" \
             "get-sum" \
             '{"a":2,"b":3}' \
@@ -230,8 +230,8 @@ jobs:
           name: runbook-smoke-artifacts
           path: |
             ci-logs/
-            ${{ runner.temp }}/jarvis-smoke-fs/
-            ${{ runner.temp }}/jarvis-smoke-mcp-fs/
+            ${{ runner.temp }}/coral-smoke-fs/
+            ${{ runner.temp }}/coral-smoke-mcp-fs/
 
   temporal-workflow-smoke:
     # Workflow-driven smoke against `temporal server start-dev`: drives
@@ -239,7 +239,7 @@ jobs:
     # Retire and asserts the same three durable artifacts `node-run-llm`
     # produces in-process (outputs, retirement, decisions). Scripted-Decide,
     # hermetic — no LLM keys required. Live-vendor verification stays manual
-    # via `jarvis apply` against a worker daemon with vendor credentials.
+    # via `coral apply` against a worker daemon with vendor credentials.
     name: temporal workflow smoke (live)
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -250,18 +250,18 @@ jobs:
       postgres:
         image: postgres:16-alpine3.23
         env:
-          POSTGRES_USER: jarvis
-          POSTGRES_PASSWORD: jarvis
-          POSTGRES_DB: jarvis_structural
+          POSTGRES_USER: coral
+          POSTGRES_PASSWORD: coral
+          POSTGRES_DB: coral_structural
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U jarvis -d jarvis_structural"
+          --health-cmd "pg_isready -U coral -d coral_structural"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
     env:
-      DATABASE_URL: postgres://jarvis:jarvis@localhost:5432/jarvis_structural
+      DATABASE_URL: postgres://coral:coral@localhost:5432/coral_structural
     steps:
       - uses: actions/checkout@v4
 
@@ -309,26 +309,26 @@ jobs:
         run: |
           mkdir -p ci-logs
           set -o pipefail
-          cargo test --locked -p jarvis_temporal --test workflow_smoke -- --nocapture \
+          cargo test --locked -p coral_temporal --test workflow_smoke -- --nocapture \
             2>&1 | tee ci-logs/workflow-smoke.log
 
       # Drives the same scripted-Decide sequence as `workflow_smoke` but routes
-      # `AgentInput` + seed triggers through `jarvis_graph::yaml::{parse_and_validate,
+      # `AgentInput` + seed triggers through `coral_graph::yaml::{parse_and_validate,
       # into_agent_input, yaml_seed_triggers}` against
       # `examples/smoke_llm_temporal/graph.yaml`. The end-state assertion (same
       # three durable artifacts) pins the YAML's content to the fixture pair.
       # No Postgres dependency: the test skips `GraphStore::create_from_yaml`.
-      - name: Run jarvis-apply smoke
+      - name: Run coral-apply smoke
         env:
           TEMPORAL_LIVE_TEST: "1"
-          # `jarvis_graph` has compile-time-checked `sqlx::query!` macros via
+          # `coral_graph` has compile-time-checked `sqlx::query!` macros via
           # `GraphStore`; route the compile through the `.sqlx/` cache so
           # cache-vs-live drift surfaces at `cargo sqlx prepare` time, not mid-CI.
           SQLX_OFFLINE: "true"
         run: |
           set -o pipefail
-          cargo test --locked -p jarvis_graph --test jarvis_apply_smoke -- --nocapture \
-            2>&1 | tee ci-logs/jarvis-apply-smoke.log
+          cargo test --locked -p coral_graph --test coral_apply_smoke -- --nocapture \
+            2>&1 | tee ci-logs/coral-apply-smoke.log
 
       # Per-test invocation rather than one bulk `cargo test` so a failure
       # surfaces as a distinct red step instead of a multi-thousand-line log.
@@ -337,7 +337,7 @@ jobs:
           TEMPORAL_LIVE_TEST: "1"
         run: |
           set -o pipefail
-          cargo test --locked -p jarvis_temporal --test spawn_child_live -- --nocapture \
+          cargo test --locked -p coral_temporal --test spawn_child_live -- --nocapture \
             2>&1 | tee ci-logs/spawn-child-live.log
 
       - name: Run child_parent_signal live
@@ -345,7 +345,7 @@ jobs:
           TEMPORAL_LIVE_TEST: "1"
         run: |
           set -o pipefail
-          cargo test --locked -p jarvis_temporal --test child_parent_signal -- --nocapture \
+          cargo test --locked -p coral_temporal --test child_parent_signal -- --nocapture \
             2>&1 | tee ci-logs/child-parent-signal-live.log
 
       - name: Run reconcile_children live
@@ -353,7 +353,7 @@ jobs:
           TEMPORAL_LIVE_TEST: "1"
         run: |
           set -o pipefail
-          cargo test --locked -p jarvis_temporal --test reconcile_children_live -- --nocapture \
+          cargo test --locked -p coral_temporal --test reconcile_children_live -- --nocapture \
             2>&1 | tee ci-logs/reconcile-children-live.log
 
       - name: Run lifecycle_ops live
@@ -361,18 +361,18 @@ jobs:
           TEMPORAL_LIVE_TEST: "1"
         run: |
           set -o pipefail
-          cargo test --locked -p jarvis_temporal --test lifecycle_ops_live -- --nocapture \
+          cargo test --locked -p coral_temporal --test lifecycle_ops_live -- --nocapture \
             2>&1 | tee ci-logs/lifecycle-ops-live.log
 
       - name: Run multi_agent live
         env:
           TEMPORAL_LIVE_TEST: "1"
-          # Route `jarvis_graph`'s compile-time `sqlx::query!` macros through
+          # Route `coral_graph`'s compile-time `sqlx::query!` macros through
           # the `.sqlx/` cache; runtime still hits the service container.
           SQLX_OFFLINE: "true"
         run: |
           set -o pipefail
-          cargo test --locked -p jarvis_graph --test multi_agent -- --nocapture \
+          cargo test --locked -p coral_graph --test multi_agent -- --nocapture \
             2>&1 | tee ci-logs/multi-agent-live.log
 
       # Exercises the production worker wiring: the real `GraphStore` installed
@@ -381,12 +381,12 @@ jobs:
       - name: Run spawn_child DB live
         env:
           TEMPORAL_LIVE_TEST: "1"
-          # `jarvis_worker` pulls `jarvis_graph` (compile-time `sqlx::query!`);
+          # `coral_worker` pulls `coral_graph` (compile-time `sqlx::query!`);
           # route the build through the `.sqlx/` cache, runtime hits the service.
           SQLX_OFFLINE: "true"
         run: |
           set -o pipefail
-          cargo test --locked -p jarvis_worker --test spawn_child_db_live -- --nocapture \
+          cargo test --locked -p coral_worker --test spawn_child_db_live -- --nocapture \
             2>&1 | tee ci-logs/spawn-child-db-live.log
 
       - name: Upload workflow smoke logs on failure

@@ -123,7 +123,7 @@ What's not asserted on the docs.rs page: a 1.0 stability claim, an MSRV, or a pr
 
 ### 4.4 Custom in-crate (sqlite-journaled run loop)
 
-**What it gives us.** Stay in `jarvis_node`. No external dependency. Concretely: persist the trigger queue and scheduler cursor to sqlite (or to JSONL files, but sqlite gives us atomic transactions for free) at every tick boundary. Journal a small typed record per tick: `{tick_id, drained_triggers, decision, applied_at, evidence_ids}`. On restart, read the last tick's journal entry; if the previous tick's decision was applied (output written / evidence recorded / scheduler updated), advance; if not, re-execute the decision idempotently (replay-safe because tool calls dedup on content-addressed evidence).
+**What it gives us.** Stay in `coral_node`. No external dependency. Concretely: persist the trigger queue and scheduler cursor to sqlite (or to JSONL files, but sqlite gives us atomic transactions for free) at every tick boundary. Journal a small typed record per tick: `{tick_id, drained_triggers, decision, applied_at, evidence_ids}`. On restart, read the last tick's journal entry; if the previous tick's decision was applied (output written / evidence recorded / scheduler updated), advance; if not, re-execute the decision idempotently (replay-safe because tool calls dedup on content-addressed evidence).
 
 **Operational footprint.** Zero. A sqlite file inside `<agent_root>/journal.db`. Sovereign deploy = `cargo run`.
 

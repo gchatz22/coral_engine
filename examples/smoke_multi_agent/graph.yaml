@@ -17,7 +17,7 @@
 # `mandate.text` strings (`multi-agent-parent`, `multi-agent-child-a`,
 # `multi-agent-child-b`) discriminate which scripted role each agent
 # plays at decide time.
-apiVersion: jarvis.engine/v1alpha1
+apiVersion: coral.engine/v1alpha1
 kind: Graph
 metadata:
   name: smoke-multi-agent

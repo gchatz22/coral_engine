@@ -1,6 +1,6 @@
 # Temporal Rust SDK smoke (stage 0.2 / JAR2-41)
 
-*Status: findings record. Updated by the JAR2-41 smoke run; supersedes the "verify before committing" caveat in `scratch/durability_substrate.md` § 4.1 and § 8 decision 3. The smoke binary lives at `crates/jarvis_temporal/src/bin/temporal_smoke.rs`; this doc is what the maintainer reads when deciding whether stage 3 can build on this substrate or needs a different one.*
+*Status: findings record. Updated by the JAR2-41 smoke run; supersedes the "verify before committing" caveat in `scratch/durability_substrate.md` § 4.1 and § 8 decision 3. The smoke binary lives at `crates/coral_temporal/src/bin/temporal_smoke.rs`; this doc is what the maintainer reads when deciding whether stage 3 can build on this substrate or needs a different one.*
 
 ---
 
@@ -46,7 +46,7 @@ Each row maps to a primitive `scratch/agent_runtime.md` § 4 lists. "Worked" mea
 | `start_child_workflow` with `parent_close_policy=Abandon` | **WORKED** | `ChildWorkflowOptions { parent_close_policy: ParentClosePolicy::Abandon, .. }` lines 214–219; `ctx.child_workflow(...)` line 222 | Path lives at `temporalio_common::protos::temporal::api::enums::v1::ParentClosePolicy::Abandon` — a deep proto-derived path that's awkward to type but it's the real one (verified by reading `crates/sdk/src/workflow_context/options.rs` v0.4.0 line 21). The smoke deliberately does NOT `.result().await` the child, letting the parent return while the child keeps running — that's the whole point of `Abandon`. Stage 5's parent–child topology can use this directly. |
 | `continue_as_new` (`ctx.continue_as_new(&carryover, opts)`) | **WORKED** | `ContinueAsNewSmokeWorkflow` line 291; `ctx.continue_as_new(&(current + 1, max), ContinueAsNewOptions::default())` line 302 | API returns `Err(WorkflowTermination::continue_as_new(...))` — calling it terminates the current run, the SDK schedules a fresh run with the new carryover. The smoke iterates current→max with `max=3` and verifies the final return value. **For stage 3.11**: the trigger should be `ctx.continue_as_new_suggested()` (or `ctx.history_length()`), which the SDK exposes — not a turn-count heuristic. Both are visible on `WorkflowContext` per `workflow_context.rs` lines 618 and 650. |
 | Dynamic activity registration (one activity routing arbitrary tool names) | **MISSING** | `tool_echo` + `tool_reverse` lines 98–117 as the static workaround | **No `#[activity(dynamic = true)]`, no `register_activity_by_name`, no `unknown_activity_handler` on `WorkerOptions`.** Verified by reading `crates/sdk/src/activities.rs` v0.4.0 lines 353–420 — only `ActivityImplementer` (compile-time) and `register_activity[ies]` are exposed. The Go/Python SDKs have dynamic dispatch; Rust does not. **Stage 3.7's `execute_tool` design depends on this.** Workarounds, in order of preference: (a) register every known tool by name at build time — works for a closed set of MCP tools, doesn't work for dynamically-loaded tools; (b) one `execute_tool` activity that takes `(tool_name: String, args: serde_json::Value)` and does its own dispatch inside the activity body — loses Temporal's per-activity-type retry config but keeps stage 3.7's shape; (c) upstream contribution to add dynamic registration. Option (b) is the realistic stage 3.7 path until (c) lands; the smoke doc records this as a **blocker on the original stage 3.7 design**, not on Temporal itself. |
-| `signal_external_workflow` (parent ← child output signaling, stage 5.4) | **WORKED-WITH-CAVEATS** | `crates/jarvis_temporal/src/workflow.rs::signal_parent_child_output` — child's `Decision::EmitOutput` arm fires through this | **Stage 5.4 / JAR2-81 exercised this end-to-end against `temporal server start-dev`** via `crates/jarvis_temporal/tests/child_parent_signal.rs` (happy path + parent-unreachable failure path). The API surface differs from what the JAR2-41 row above assumed: there is **no single `ctx.signal_external_workflow(workflow_id, signal_name, payload)` method**. The real shape is the two-step typed chain documented in row 8 of § 3 below. The signal-name string therefore can't be threaded through dynamically — it's bound at compile time via the `SignalDefinition` marker the `#[signal]` macro generates. |
+| `signal_external_workflow` (parent ← child output signaling, stage 5.4) | **WORKED-WITH-CAVEATS** | `crates/coral_temporal/src/workflow.rs::signal_parent_child_output` — child's `Decision::EmitOutput` arm fires through this | **Stage 5.4 / JAR2-81 exercised this end-to-end against `temporal server start-dev`** via `crates/coral_temporal/tests/child_parent_signal.rs` (happy path + parent-unreachable failure path). The API surface differs from what the JAR2-41 row above assumed: there is **no single `ctx.signal_external_workflow(workflow_id, signal_name, payload)` method**. The real shape is the two-step typed chain documented in row 8 of § 3 below. The signal-name string therefore can't be threaded through dynamically — it's bound at compile time via the `SignalDefinition` marker the `#[signal]` macro generates. |
 
 ---
 
@@ -92,7 +92,7 @@ This is the single biggest gap relative to where the Go/Java/Python SDKs are. It
 
 ### 3.8 `tokio` patch surface
 
-The SDK pins `tokio = "1.47"`. Our `jarvis_node` uses tokio with semver-compatible features and no specific version pin — they unify cleanly. Cargo.lock confirms a single `tokio 1.52` build was selected; no patch surface conflicts. Worth re-checking when stage 3 lands real production code, but for now there's no friction.
+The SDK pins `tokio = "1.47"`. Our `coral_node` uses tokio with semver-compatible features and no specific version pin — they unify cleanly. Cargo.lock confirms a single `tokio 1.52` build was selected; no patch surface conflicts. Worth re-checking when stage 3 lands real production code, but for now there's no friction.
 
 ### 3.9 Edition 2024 in `temporalio-sdk`
 
@@ -112,9 +112,9 @@ ctx.external_workflow(workflow_id, run_id)            // -> ExternalWorkflowHand
 
 Two consequences:
 
-1. **The signal name is bound at compile time** via the `SignalDefinition` marker the `#[signal]` macro generates (e.g. `AgentWorkflow::external_signal` is the const auto-generated from the `#[signal] fn external_signal(...)` method). There is no `handle.signal_by_name(&str, payload)` path; the macro-emitted const is the only way to address the signal. **Implication for `ParentRef.signal: String`** (`crates/jarvis_temporal/src/workflow.rs`): it's informational in v1 — the workflow body ignores it because the dispatch target is the compile-time `AgentWorkflow::external_signal` marker regardless. The field stays on the wire for future non-`AgentWorkflow` targets that would use a different `SignalDefinition`.
+1. **The signal name is bound at compile time** via the `SignalDefinition` marker the `#[signal]` macro generates (e.g. `AgentWorkflow::external_signal` is the const auto-generated from the `#[signal] fn external_signal(...)` method). There is no `handle.signal_by_name(&str, payload)` path; the macro-emitted const is the only way to address the signal. **Implication for `ParentRef.signal: String`** (`crates/coral_temporal/src/workflow.rs`): it's informational in v1 — the workflow body ignores it because the dispatch target is the compile-time `AgentWorkflow::external_signal` marker regardless. The field stays on the wire for future non-`AgentWorkflow` targets that would use a different `SignalDefinition`.
 
-2. **The result is `Result<SignalExternalOk, Failure>`** (`SignalExternalWfResult` in `temporalio-sdk-0.4.0/src/lib.rs:1049`). A failed signal-to-nonexistent-workflow surfaces as `Err(Failure)` after server acknowledgment — JAR2-81's failure-mode live test (`crates/jarvis_temporal/tests/child_parent_signal.rs::child_continues_normally_when_parent_signal_fails`) confirms this: the child's `signal(...)` call returns `Err`, the `signal_parent_child_output` helper in `workflow.rs` logs + continues per Stage 5 Project decision 10, and the child completes normally.
+2. **The result is `Result<SignalExternalOk, Failure>`** (`SignalExternalWfResult` in `temporalio-sdk-0.4.0/src/lib.rs:1049`). A failed signal-to-nonexistent-workflow surfaces as `Err(Failure)` after server acknowledgment — JAR2-81's failure-mode live test (`crates/coral_temporal/tests/child_parent_signal.rs::child_continues_normally_when_parent_signal_fails`) confirms this: the child's `signal(...)` call returns `Err`, the `signal_parent_child_output` helper in `workflow.rs` logs + continues per Stage 5 Project decision 10, and the child completes normally.
 
 **No upstream issue filed** — the divergence is doc-only (the SDK works as designed; the assumed name was speculative in the smoke + ticket text). If a future ticket needs name-keyed dispatch against a workflow type that isn't statically importable from inside the worker crate, that's the upstream filing trigger; today every signal target is `AgentWorkflow`, which is in scope.
 
@@ -174,11 +174,11 @@ brew install temporal protobuf
 temporal server start-dev   # binds :7233 (gRPC) + :8233 (web UI)
 
 # Run the smoke binary in another:
-cd /path/to/jarvis-engine
-cargo run -p jarvis_temporal --bin temporal-smoke
+cd /path/to/coral-engine
+cargo run -p coral_temporal --bin temporal-smoke
 
 # Or run the env-gated `#[tokio::test]`:
-TEMPORAL_LIVE_TEST=1 cargo test -p jarvis_temporal --bin temporal-smoke -- live_temporal_smoke --nocapture
+TEMPORAL_LIVE_TEST=1 cargo test -p coral_temporal --bin temporal-smoke -- live_temporal_smoke --nocapture
 
 # Default `cargo test` is hermetic — the live test no-ops without the env var:
 cargo test --workspace   # green, fast, no Temporal Server required
@@ -192,7 +192,7 @@ Output: a verdict table on stdout, `MISSING:` lines on stderr for any gaps, exit
 
 ## 7. References
 
-- The smoke binary: `crates/jarvis_temporal/src/bin/temporal_smoke.rs`.
+- The smoke binary: `crates/coral_temporal/src/bin/temporal_smoke.rs`.
 - SDK repo: <https://github.com/temporalio/sdk-rust> (note: NOT `sdk-core`, which is a separate repo).
 - SDK crate: <https://crates.io/crates/temporalio-sdk> (v0.4.0, 2026-04-29).
 - API docs: <https://docs.rs/temporalio-sdk/0.4.0/temporalio_sdk/>.

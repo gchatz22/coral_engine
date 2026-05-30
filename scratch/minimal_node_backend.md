@@ -45,7 +45,7 @@ These two together define what "minimal" means in this doc. Anything not derivab
 ### 2. Crate layout
 
 ```
-Cargo.toml                 # bin "node-run" + lib "jarvis_node"
+Cargo.toml                 # bin "node-run" + lib "coral_node"
 src/
   lib.rs                   # re-exports
   agent.rs                 # Agent struct, run loop
@@ -220,7 +220,7 @@ Each ticket: rules 1–4 from `DEVELOPMENT.md`, runs in one `cargo test`. Ticket
 
 Defaults proposed; flag if you want to override before I file tickets.
 
-1. **Crate name** — `jarvis_node`. (Picks the import path forever.)
+1. **Crate name** — `coral_node`. (Picks the import path forever.)
 2. **MSRV / toolchain** — pin stable 1.84.
 3. **Async runtime** — tokio.
 4. **Error type** — `anyhow` for the bootstrap, switch to `thiserror`-typed errors at module boundaries later.

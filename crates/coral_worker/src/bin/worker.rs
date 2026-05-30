@@ -1,0 +1,180 @@
+//! Long-lived Coral worker daemon. Connects to a Temporal Server,
+//! installs the process-wide backends every activity body reaches for
+//! (agent storage, the `Decide` impl, the tool registry, and the
+//! structural-DB store), registers [`coral_temporal::workflow::AgentWorkflow`]
+//! and [`coral_temporal::activities::AgentActivities`] against the
+//! canonical task queue, and runs until SIGINT.
+//!
+//! Required env: `DATABASE_URL` — Postgres URL for the structural DB. The
+//! daemon installs a `GraphStore`-backed [`StructuralDbStore`] so
+//! `Decision::SpawnChild`'s `register_child_in_structural_db` activity can
+//! write child `agents` + `edges` rows. The worker does **not** run
+//! migrations; apply the schema via `coral apply` first.
+//!
+//! Optional env: `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`,
+//! `TEMPORAL_TASK_QUEUE`, `AGENT_FS_ROOT`, `CORAL_MODEL_VENDOR`,
+//! `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`, `COHERE_API_KEY` /
+//! `COHERE_MODEL`. Vendor-specific `Decide` construction is `#[cfg]`-gated
+//! behind this crate's `llm-anthropic` / `llm-cohere` features; a build with
+//! no vendor compiles but errors at boot when no `Decide` impl can be
+//! installed.
+
+use std::env;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{anyhow, Context, Result};
+use coral_graph::GraphStore;
+use coral_node::storage::LocalStorage;
+use coral_node::tools::{EchoTool, ToolRegistry};
+use sqlx::postgres::PgPoolOptions;
+use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
+use temporalio_common::telemetry::TelemetryOptions;
+use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
+use tracing::info;
+
+use coral_temporal::worker::{
+    build_decide_from_env, build_worker, install_agent_storage, install_decide,
+    install_structural_db_store, install_tool_registry, StructuralDbStore, DEFAULT_TASK_QUEUE,
+};
+
+const DEFAULT_ADDRESS: &str = "http://localhost:7233";
+const DEFAULT_NAMESPACE: &str = "default";
+const DEFAULT_FS_ROOT: &str = "./agent-fs";
+const DATABASE_URL_ENV: &str = "DATABASE_URL";
+const DB_POOL_MAX_CONNECTIONS: u32 = 8;
+
+/// Resolve the structural-DB connection string from the raw env value.
+/// Required: without it the daemon has no `StructuralDbStore` and the first
+/// `Decision::SpawnChild` fails mid-workflow. Failing here turns that
+/// deferred panic into a clean boot-time error.
+fn require_database_url(value: Option<String>) -> Result<String> {
+    match value {
+        Some(url) if !url.is_empty() => Ok(url),
+        _ => Err(anyhow!(
+            "{DATABASE_URL_ENV} must be set; the worker installs the structural-DB store at boot \
+             so Decision::SpawnChild can register child agents (see crates/coral_worker/README.md)"
+        )),
+    }
+}
+
+async fn build_client() -> Result<Client> {
+    let address = env::var("TEMPORAL_ADDRESS").unwrap_or_else(|_| DEFAULT_ADDRESS.into());
+    let namespace = env::var("TEMPORAL_NAMESPACE").unwrap_or_else(|_| DEFAULT_NAMESPACE.into());
+
+    let url = Url::parse(&address).context("parsing TEMPORAL_ADDRESS")?;
+    let connection_options = ConnectionOptions::new(url).build();
+    let connection = Connection::connect(connection_options)
+        .await
+        .context("connecting to Temporal Server")?;
+    let client_options = ClientOptions::new(namespace).build();
+    let client = Client::new(connection, client_options).context("building Temporal client")?;
+    Ok(client)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,temporalio=warn")),
+        )
+        .try_init();
+
+    let task_queue = env::var("TEMPORAL_TASK_QUEUE").unwrap_or_else(|_| DEFAULT_TASK_QUEUE.into());
+
+    let fs_root = env::var("AGENT_FS_ROOT").unwrap_or_else(|_| DEFAULT_FS_ROOT.into());
+    let fs_root_path = PathBuf::from(&fs_root);
+    let storage = Arc::new(
+        LocalStorage::new(fs_root_path.clone())
+            .with_context(|| format!("opening LocalStorage at {fs_root}"))?,
+    );
+    install_agent_storage(storage);
+    info!(fs_root = fs_root.as_str(), "installed AgentStorage backend");
+
+    let (vendor_tag, decide) = build_decide_from_env()?;
+    install_decide(decide);
+    info!(vendor = vendor_tag, "installed Decide backend");
+
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Arc::new(EchoTool))
+        .context("registering EchoTool in worker boot ToolRegistry")?;
+    install_tool_registry(Arc::new(registry));
+    info!("installed ToolRegistry with tools: echo");
+
+    // Structural-DB store: installed before the worker serves any task so
+    // `register_child_in_structural_db` always finds a real `GraphStore`.
+    // The URL is kept out of the logs because it carries the DB password.
+    let database_url = require_database_url(env::var(DATABASE_URL_ENV).ok())?;
+    let pool = PgPoolOptions::new()
+        .max_connections(DB_POOL_MAX_CONNECTIONS)
+        .connect(&database_url)
+        .await
+        .with_context(|| format!("connecting to structural DB at {DATABASE_URL_ENV}"))?;
+    let store: Arc<dyn StructuralDbStore> = Arc::new(GraphStore::new(pool));
+    install_structural_db_store(store);
+    info!("installed StructuralDbStore backend (GraphStore over DATABASE_URL)");
+
+    let telemetry_options = TelemetryOptions::builder().build();
+    let runtime = CoreRuntime::new_assume_tokio(
+        RuntimeOptions::builder()
+            .telemetry_options(telemetry_options)
+            .build()
+            .map_err(|e| anyhow::anyhow!("RuntimeOptions build failed: {e}"))?,
+    )?;
+
+    let client = build_client().await?;
+    let mut worker = build_worker(&runtime, client, &task_queue)?;
+    let shutdown = worker.shutdown_handle();
+
+    // SIGINT handler runs on a spawned task because `Worker` is not `Send`
+    // and must stay pinned to the main task.
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("received Ctrl-C; initiating worker shutdown");
+        shutdown();
+    });
+
+    info!(
+        task_queue = task_queue.as_str(),
+        vendor = vendor_tag,
+        "coral worker starting; registered: AgentWorkflow + AgentActivities"
+    );
+    worker
+        .run()
+        .await
+        .map_err(|e| anyhow::anyhow!("worker.run() exited with error: {e}"))?;
+    info!("coral worker exited cleanly");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn require_database_url_returns_value_when_set() {
+        let got = require_database_url(Some("postgres://coral@localhost/db".to_string()))
+            .expect("set url accepted");
+        assert_eq!(got, "postgres://coral@localhost/db");
+    }
+
+    #[test]
+    fn require_database_url_errors_when_unset() {
+        let err = require_database_url(None).expect_err("missing url rejected");
+        assert!(
+            format!("{err}").contains(DATABASE_URL_ENV),
+            "error should name the env var; got: {err}"
+        );
+    }
+
+    #[test]
+    fn require_database_url_errors_when_empty() {
+        let err = require_database_url(Some(String::new())).expect_err("empty url rejected");
+        assert!(
+            format!("{err}").contains(DATABASE_URL_ENV),
+            "error should name the env var; got: {err}"
+        );
+    }
+}

@@ -93,7 +93,7 @@ Properties:
 - **No node-local state for agents.** All durable agent state lives in S3 (FS), Postgres (topology), or Temporal (execution).
 - **Cold-start latency is real.** A worker that hasn't seen agent X recently has nothing in cache; tick 1 takes a network round-trip per state object.
 - **Cost is per-operation.** S3 charges per PUT/GET/LIST. At scale this becomes a budget line.
-- **Inspection is via API, not POSIX.** Operators look at agent state through the TUI, a `jarvis fs cat` debug command, or the S3 console — never `cat` directly.
+- **Inspection is via API, not POSIX.** Operators look at agent state through the TUI, a `coral fs cat` debug command, or the S3 console — never `cat` directly.
 
 This is the shape we have to make work. Once it does, the simpler shapes (3.1, 3.2) come for free.
 
@@ -230,7 +230,7 @@ Authentication: standard AWS credential chain (env vars, IAM role, profile, inst
 
 ### 6.3. Backends we considered and rejected
 
-- **NFS / EFS / CephFS** — works transparently behind `LocalStorage` against any mounted POSIX directory. Not a separate impl; users who want this just point `--storage local --root /mnt/nfs/jarvis`. We test against this configuration but don't ship a special backend.
+- **NFS / EFS / CephFS** — works transparently behind `LocalStorage` against any mounted POSIX directory. Not a separate impl; users who want this just point `--storage local --root /mnt/nfs/coral`. We test against this configuration but don't ship a special backend.
 - **GCS, Azure Blob** — same API shape as S3 with different SDKs. If demand emerges, implement against the relevant SDK; the trait already accommodates them. MinIO + S3 SDK covers the "S3-compatible" mass.
 - **JuiceFS / S3-FUSE** — S3 mounted as a POSIX FS. Reintroduces semantics (rename, append) that we'd just abstracted away; behavior is hard to predict under load. Not worth the indirection.
 - **Postgres bytea** — wrong shape; Postgres isn't a blob store; outputs grow without bound.
@@ -346,7 +346,7 @@ When a worker pod that has never seen agent X picks up X's workflow: assemble_co
 Without `cat`/`ls`/`grep`, operators need another path to read agent state. Three:
 
 1. **The TUI** (`scratch/graph_tui.md`). The `GraphSource` trait already plans for `FsGraphSource` (today) → `KernelGraphSource` (later). Both read through `AgentStorage` once the trait lands. Operator opens the TUI, walks agents, drills into outputs/evidence/notes/claims — works the same way regardless of backend.
-2. **A `jarvis fs` debug command.** `jarvis fs cat <key>`, `jarvis fs ls <prefix>`, `jarvis fs get <key> --raw > file.json`. Small CLI wrapper around `AgentStorage`. Useful for forensics.
+2. **A `coral fs` debug command.** `coral fs cat <key>`, `coral fs ls <prefix>`, `coral fs get <key> --raw > file.json`. Small CLI wrapper around `AgentStorage`. Useful for forensics.
 3. **The S3 console / `aws s3 ls`.** Backend-native inspection. Operators familiar with S3 don't need anything from us; the bucket is laid out predictably (`graphs/<graph_id>/agents/<agent_id>/outputs/<ulid>.json` etc.).
 
 The TUI is the primary surface; the CLI and console are escape hatches.
@@ -368,7 +368,7 @@ Stage 2.5 is the upfront-cost step the maintainer signed off on. It costs ~3–4
 
 ### 11.1. Stage 2.5 sub-tickets (proposed)
 
-- **2.5.1 — Trait definition + `MemoryStorage`.** Define `AgentStorage` trait in `jarvis_node` (or a new submodule). Implement `MemoryStorage` (HashMap-backed) for unit tests. Trait tests against `MemoryStorage`.
+- **2.5.1 — Trait definition + `MemoryStorage`.** Define `AgentStorage` trait in `coral_node` (or a new submodule). Implement `MemoryStorage` (HashMap-backed) for unit tests. Trait tests against `MemoryStorage`.
 - **2.5.2 — `LocalStorage` impl.** Port today's `AgentFs` behavior (atomic write-then-rename, `O_EXCL` for `put_if_absent`, `read_dir` for `list`). Reuses existing path-resolution code where applicable.
 - **2.5.3 — `AgentFs` facade refactor.** Refactor `AgentFs` to hold `Arc<dyn AgentStorage>` + a key prefix; every existing method translates to one or a few trait calls. All callers (`Agent`, tests, binaries) take `AgentFs` exactly as before — no upstream changes. The 71+ existing tests stay green.
 - **2.5.4 — Tail-index integration.** Replace the current `read_recent_json` directory-scan with the tail-index pattern in `AgentFs`. Local-FS impl can keep using `read_dir` as a fallback; the tail index is the primary path. Aligns with B1.
@@ -382,7 +382,7 @@ Sketched here so future-us knows what's coming. File when actually needed.
 - 9.3 MinIO-in-docker-compose for hermetic-ish tests.
 - 9.4 Live-S3 smoke (env-gated).
 - 9.5 Deployment doc: bucket layout, IAM/credentials, lifecycle policy templates.
-- 9.6 `jarvis fs` debug CLI.
+- 9.6 `coral fs` debug CLI.
 - 9.7 Per-worker in-memory cache (read-through, invalidate-on-own-write).
 
 ---
@@ -403,7 +403,7 @@ Sketched here so future-us knows what's coming. File when actually needed.
 
 The seven questions raised during plan review have been resolved. Each decision and its rationale, recorded for the implementation tickets to reference.
 
-1. **Trait location.** Module inside `jarvis_node` (path: `jarvis_node::storage`) at stage 2.5. Promote to a standalone `jarvis_storage` sub-crate at stage 9 when the AWS SDK dep needs to be gated behind a feature flag and the local-vs-s3 surface area grows. *Why:* avoid premature crate-splitting; the trait stays small at stage 2.5 and doesn't justify its own crate. Once S3 lands with its dep footprint, the crate boundary earns its keep.
+1. **Trait location.** Module inside `coral_node` (path: `coral_node::storage`) at stage 2.5. Promote to a standalone `coral_storage` sub-crate at stage 9 when the AWS SDK dep needs to be gated behind a feature flag and the local-vs-s3 surface area grows. *Why:* avoid premature crate-splitting; the trait stays small at stage 2.5 and doesn't justify its own crate. Once S3 lands with its dep footprint, the crate boundary earns its keep.
 
 2. **Bytes representation.** `bytes::Bytes` everywhere — both arguments and returns. *Why:* de facto standard across `aws-sdk-s3`, `reqwest`, `tokio::io`. Cheap clone (Arc-backed) avoids the copy that `Vec<u8>` would force on every layer transition.
 
@@ -411,7 +411,7 @@ The seven questions raised during plan review have been resolved. Each decision 
 
 4. **Error type.** Trait-level `Result<T, StorageError>` where `StorageError` is a `thiserror`-derived enum with variants `NotFound`, `Conflict` (failed put-if-absent), `Transient` (retryable network/IO), `Permanent` (auth, bad key, exceeded quota), and `Other(anyhow::Error)` as the escape hatch. *Why:* `AgentFs` and the Temporal activity layer need to distinguish "not found" (often expected — `get` returns `None` semantically) from "transient" (worth retrying) from "permanent" (fail the activity hard). Anyhow alone loses that distinction; typed errors recover it.
 
-5. **Crate name when promoted.** `jarvis_storage`. *Why:* matches the workspace naming convention (`jarvis_node`, `jarvis_temporal`, `jarvis_graph`, `jarvis_tui`).
+5. **Crate name when promoted.** `coral_storage`. *Why:* matches the workspace naming convention (`coral_node`, `coral_temporal`, `coral_graph`, `coral_tui`).
 
 6. **`MemoryStorage` placement.** Shipped in the storage module, gated behind `#[cfg(any(test, feature = "memory-storage"))]`. *Why:* tests in any workspace crate get it for free via `#[cfg(test)]`; production callers who want ephemeral / spike-testing behavior opt in via the feature. Avoids accidentally shipping in-memory storage into a production binary.
 

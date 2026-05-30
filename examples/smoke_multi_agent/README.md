@@ -10,7 +10,7 @@ one final output citing the synthetic evidence ids before retiring.
 
 ## What this fixture proves
 
-The integration test in `crates/jarvis_graph/tests/multi_agent.rs`
+The integration test in `crates/coral_graph/tests/multi_agent.rs`
 asserts every artifact below lands on disk in its byte-checkable
 shape, and that the cross-agent provenance trail resolves
 transitively:
@@ -56,14 +56,14 @@ Mandate text on each agent (`multi-agent-parent`, `multi-agent-child-a`,
 
 This fixture is **integration-test-only**. The acceptance bar is the
 `TEMPORAL_LIVE_TEST=1`-gated test in
-`crates/jarvis_graph/tests/multi_agent.rs`, not an interactive
-`jarvis apply` invocation.
+`crates/coral_graph/tests/multi_agent.rs`, not an interactive
+`coral apply` invocation.
 
 ```sh
 # Bring up the dev stack (Temporal + Postgres) — see top-level README.
-DATABASE_URL=postgres://jarvis:jarvis@localhost:5432/jarvis_structural \
+DATABASE_URL=postgres://coral:coral@localhost:5432/coral_structural \
 TEMPORAL_LIVE_TEST=1 \
-cargo test -p jarvis_graph --test multi_agent --all-features -- --nocapture
+cargo test -p coral_graph --test multi_agent --all-features -- --nocapture
 ```
 
 The test takes <30s on a healthy local stack. Without
@@ -72,18 +72,18 @@ The test takes <30s on a healthy local stack. Without
 
 ## Test, not CLI — implementer's choice
 
-The production `jarvis apply` binary always wires `LlmDecide` (real
+The production `coral apply` binary always wires `LlmDecide` (real
 LLM) through the worker daemon — there is no production-supported
 seam for swapping in `MockDecide` from a YAML field or CLI flag. The
 two viable patterns were:
 
-- **Pattern A** *(chosen)*: bypass `jarvis apply` and construct the
+- **Pattern A** *(chosen)*: bypass `coral apply` and construct the
   multi-agent topology directly via `client.start_workflow` per agent
   with `MockDecide` installed at the worker — the shape every
   multi-agent live test uses (`spawn_child_live.rs`,
   `child_parent_signal.rs`, `reconcile_children_live.rs`,
   `lifecycle_ops_live.rs`).
-- **Pattern B**: extend the worker / `jarvis apply` with a
+- **Pattern B**: extend the worker / `coral apply` with a
   `--decide=mock` flag or env var so MockDecide scripts load off disk.
   More test-realistic; more invasive (production-code surface that
   must be `#[cfg(test)]`- or env-gated so MockDecide doesn't run in

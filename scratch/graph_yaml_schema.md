@@ -46,7 +46,7 @@ This is the "the graph is the program" framing from `VISION.md` § 4 made concre
 The smoke fixture (`examples/smoke/`) is the smallest interesting case — one agent, one tool, scripted decisions, one trigger. Today it's three loose files (`config.json`, `decisions.jsonl`, `triggers.jsonl`); the YAML collapses to one:
 
 ```yaml
-apiVersion: jarvis.engine/v1alpha1
+apiVersion: coral.engine/v1alpha1
 kind: Graph
 metadata:
   name: smoke
@@ -101,7 +101,7 @@ Compared to the current three-file form, this gives one source of truth. Worth d
 The same format scales to a graph. Hierarchical nesting under `children:` keeps shallow graphs readable; we may need a flat form with explicit `parent:` references later for machine-generated graphs.
 
 ```yaml
-apiVersion: jarvis.engine/v1alpha1
+apiVersion: coral.engine/v1alpha1
 kind: Graph
 metadata:
   name: fda-monitor
@@ -232,7 +232,7 @@ agents:
 
 ```yaml
 # Option A — k8s-style
-apiVersion: jarvis.engine/v1alpha1
+apiVersion: coral.engine/v1alpha1
 kind: Graph
 
 # Option B — simple
@@ -274,7 +274,7 @@ For long mandates, inline YAML (`|` block scalar) starts to dominate the file. A
 
 #### 4.6. Reconciliation semantics — what does "apply this YAML" mean?
 
-This is the Terraform question. When the operator runs `jarvis apply graph.yaml` against an existing graph:
+This is the Terraform question. When the operator runs `coral apply graph.yaml` against an existing graph:
 
 - **Agents in YAML, missing in runtime:** spawn them.
 - **Agents in YAML, present in runtime with different mandate:** edit the mandate (treat as a `MandateUpdate` trigger).
@@ -335,7 +335,7 @@ Sequencing the schema's evolution against the bootstrap follow-ups in `scratch/p
 |---|---|---|
 | 1. Single-agent YAML for `node-run` | Group A1 (real Decide adapter) | Replaces the three-file fixture. One agent, one tool, no scripted decisions (real Decide takes over). |
 | 2. Multi-agent YAML | Group C2 (parent–child topology) | Hierarchical agents, tool references, defaults. No `policy:`. |
-| 3. Apply / reconcile loop | After C2 stabilizes | `jarvis apply graph.yaml`, the warn-and-leave reconciliation. |
+| 3. Apply / reconcile loop | After C2 stabilizes | `coral apply graph.yaml`, the warn-and-leave reconciliation. |
 | 4. Dynamic-spawn integration | After C2 + apply loop | Hybrid sidecar approach from § 4.7. |
 | 5. Policy block | After cost accounting + conflict log primitives exist | The `policy:` block fills in. |
 | 6. JSON Schema export + editor support | Anytime after step 1 | `schemars` derive, ship `graph.schema.json`. |
@@ -352,7 +352,7 @@ Steps 1 and 6 are each a single ticket. Steps 2–5 are each a parent issue or s
 4. **Imports / includes.** `!include other-graph.yaml` so a graph can compose subgraphs. Powerful, but every templating system in YAML is a small landmine.
 5. **Tool-level config secrets.** `from_env: WEB_SEARCH_KEY` works for env-vars; what about secret managers (vault, AWS SM)? Probably out of scope until someone deploys for real.
 6. **Mandate localization / i18n.** A graph for a non-English operator. Probably out of scope; mandates can be in any language as long as the model handles it.
-7. **Hot reload.** Does `jarvis apply` reload a running graph in place, or does it require restart? Lean: in-place (else what's the point).
+7. **Hot reload.** Does `coral apply` reload a running graph in place, or does it require restart? Lean: in-place (else what's the point).
 
 ---
 

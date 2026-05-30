@@ -226,6 +226,102 @@ dependencies = [
 ]
 
 [[package]]
+name = "coral_graph"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "coral_node",
+ "coral_temporal",
+ "humantime",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sqlx",
+ "tempfile",
+ "temporalio-client",
+ "temporalio-common",
+ "temporalio-sdk",
+ "temporalio-sdk-core",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "coral_node"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "hex",
+ "reqwest",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "ulid",
+ "uuid",
+]
+
+[[package]]
+name = "coral_temporal"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "coral_node",
+ "futures",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "temporalio-client",
+ "temporalio-common",
+ "temporalio-macros",
+ "temporalio-sdk",
+ "temporalio-sdk-core",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "coral_worker"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "coral_graph",
+ "coral_node",
+ "coral_temporal",
+ "serde_json",
+ "sqlx",
+ "temporalio-client",
+ "temporalio-common",
+ "temporalio-sdk-core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1182,102 +1278,6 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
-
-[[package]]
-name = "jarvis_graph"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "humantime",
- "jarvis_node",
- "jarvis_temporal",
- "schemars",
- "serde",
- "serde_json",
- "serde_yaml",
- "sqlx",
- "tempfile",
- "temporalio-client",
- "temporalio-common",
- "temporalio-sdk",
- "temporalio-sdk-core",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "jarvis_node"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "chrono",
- "futures",
- "hex",
- "reqwest",
- "rmcp",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "ulid",
- "uuid",
-]
-
-[[package]]
-name = "jarvis_temporal"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "chrono",
- "futures",
- "futures-util",
- "jarvis_node",
- "serde",
- "serde_json",
- "temporalio-client",
- "temporalio-common",
- "temporalio-macros",
- "temporalio-sdk",
- "temporalio-sdk-core",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "jarvis_worker"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "jarvis_graph",
- "jarvis_node",
- "jarvis_temporal",
- "serde_json",
- "sqlx",
- "temporalio-client",
- "temporalio-common",
- "temporalio-sdk-core",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "js-sys"

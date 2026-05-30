@@ -11,7 +11,7 @@
       }
     },
     "apiVersion": {
-      "description": "Must be `\"jarvis.engine/v1alpha1\"`. Validated in [`validate`].",
+      "description": "Must be `\"coral.engine/v1alpha1\"`. Validated in [`validate`].",
       "type": "string"
     },
     "defaults": {
@@ -138,7 +138,7 @@
       ]
     },
     "Mandate": {
-      "description": "`agents[].mandate:` — the standing instruction. Distinct from\n`jarvis_node::mandate::Mandate` (the runtime/wire shape); conversion\nhappens in [`into_agent_input`] / [`build_workflow_starts`].",
+      "description": "`agents[].mandate:` — the standing instruction. Distinct from\n`coral_node::mandate::Mandate` (the runtime/wire shape); conversion\nhappens in [`into_agent_input`] / [`build_workflow_starts`].",
       "type": "object",
       "properties": {
         "idle_period": {
@@ -222,7 +222,7 @@
           "type": "string"
         },
         "external": {
-          "description": "External-signal payload. Mirror of\n`jarvis_node::trigger::Trigger::External`.",
+          "description": "External-signal payload. Mirror of\n`coral_node::trigger::Trigger::External`.",
           "$ref": "#/$defs/ExternalEnvelope"
         }
       },

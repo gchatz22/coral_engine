@@ -28,7 +28,7 @@ ps:
 
 # Open a `psql` shell against the structural-DB database.
 psql:
-	docker compose exec postgres psql -U jarvis -d jarvis_structural
+	docker compose exec postgres psql -U coral -d coral_structural
 
 # Build the worker image without starting it. Exercises the multi-stage
 # Dockerfile; useful in CI and before pushing to verify build health.

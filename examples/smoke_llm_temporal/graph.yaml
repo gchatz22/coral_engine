@@ -1,7 +1,7 @@
 # Single-file fixture for the workflow-driven smoke. Encodes one agent
 # with a mandate that asks the model to call `echo` once, then emit an
 # Output citing the resulting evidence id, then retire.
-apiVersion: jarvis.engine/v1alpha1
+apiVersion: coral.engine/v1alpha1
 kind: Graph
 metadata:
   name: smoke-llm-temporal
