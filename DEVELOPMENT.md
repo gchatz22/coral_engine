@@ -68,49 +68,65 @@ When the maintainer is **ideating, planning, or designing** (anything before tic
 - One file per topic: `scratch/<topic>.md` (e.g. `scratch/backend-architecture.md`, `scratch/scheduler-design.md`).
 - Use it as the working surface for proposals, tradeoffs, open questions, and decisions.
 - Update the file as the conversation evolves. Do not lose context to chat scrollback.
-- `scratch/` is for thinking, not deliverables. Once a plan crystallizes into Linear tickets, the tickets become the source of truth and the scratch file can be archived or deleted.
+- `scratch/` is for thinking, not deliverables. Once a plan crystallizes into GitHub issues, the issues become the source of truth and the scratch file can be archived or deleted.
 - Do not put scratch files anywhere else in the repo. Do not commit ideation noise into top-level docs.
-- **Attach the relevant plan to the Linear tickets it produced.** When tickets are filed, every ticket (project, parent, or sub-issue) must carry the slice of the scratch plan that motivates it — paste the relevant section into the ticket description, or attach/link the `scratch/<topic>.md` file. A reviewer reading only the ticket should see the reasoning, not just the acceptance criteria. For Projects, attach the full plan to the project page; for sub-issues, include the section specific to that unit of work.
+- **Attach the relevant plan to the GitHub issues it produced.** When issues are filed, every issue (project-tracked, parent, or sub-issue) must carry the slice of the scratch plan that motivates it — paste the relevant section into the issue body, or link the `scratch/<topic>.md` file. A reviewer reading only the issue should see the reasoning, not just the acceptance criteria. For a Project, attach the full plan to a tracking issue or the project description; for sub-issues, include the section specific to that unit of work.
 
-## 6. Feature Workflow: Linear-Driven, Staged Execution
+## 6. Feature Workflow: GitHub-Issues-Driven, Staged Execution
 
 When the maintainer asks for a **feature** (anything larger than a trivial one-shot edit), the agent's first job is **planning, not coding**.
 
-### Step 1 — Decompose into Linear tickets
+All tracking lives in **GitHub issues** in the `gchatz22/jarvis_engine` repo. Issues are filed and edited with the **`gh` CLI** — `gh issue create`, `gh issue edit`, `gh issue list`. There is no separate tracker to keep in sync; the issue, its linked branch, and its PR all live in the same repo.
 
-All work lives under team **"Jarvis Engine"**. Pick the right grouping primitive based on the size of the request:
+### Step 1 — Decompose into GitHub issues
 
-- **Large feature (~10+ sub-tickets, big effort)** → create a **Linear Project**. The project page holds the spec, target date, and the progress bar across all child issues. Every sub-ticket is created as an issue inside that project.
-- **Medium feature (~3–10 sub-tickets, lighter effort, a session)** → create a **parent issue with sub-issues**. The parent issue holds the spec; sub-issues show as a checklist with live progress on the parent. No project needed.
-- **Single task (one-shot, fits in one reviewable diff)** → create a **single issue**. No project, no parent. Just the ticket.
+Pick the right grouping primitive based on the size of the request:
 
-If a sub-ticket inside a Project is itself multi-step, make it a parent issue with its own sub-issues underneath it — Projects and parent/sub-issues compose.
+- **Large feature (~10+ sub-issues, big effort)** → create a **GitHub Project (v2) board**. The board holds the spec (in a tracking issue) and a Status column for every child issue. Every sub-issue is created as a normal issue and added to the board.
+- **Medium feature (~3–10 sub-issues, lighter effort, a session)** → create a **parent issue with native sub-issues**. The parent holds the spec; GitHub renders the sub-issues with a live progress bar on the parent. No board needed.
+- **Single task (one-shot, fits in one reviewable diff)** → create a **single issue**. No project, no parent. Just the issue.
 
-Break work into the smallest meaningful, **independently reviewable** units. Each ticket (project, parent, sub-issue, or standalone) must include:
+If a sub-issue inside a Project is itself multi-step, make it a parent issue with its own sub-issues nested underneath — Projects and parent/sub-issues compose.
+
+`gh` covers issue creation, editing, labelling, and linked branches (`gh issue develop`). It does **not** yet expose sub-issue nesting or Project-board membership as first-class subcommands — wire a sub-issue to its parent and add a card to a board through the GitHub web UI, or via `gh api graphql` (`addSubIssue` / `addProjectV2ItemById` mutations). Note in the breakdown which step you used so the maintainer can audit it.
+
+Break work into the smallest meaningful, **independently reviewable** units. Each issue (project-tracked, parent, sub-issue, or standalone) must include:
 
 - A clear, specific title.
-- A description with: goal, acceptance criteria, in-scope items, explicitly out-of-scope items, and dependencies on other tickets.
-- A reasonable effort estimate.
+- A body with: goal, acceptance criteria, in-scope items, explicitly out-of-scope items, and dependencies on other issues (reference them by `#number`).
+- A reasonable effort estimate (as a label or a body line).
 
-Order tickets so that dependencies come first. Note ticket-to-ticket dependencies in the descriptions. After creating the tickets, post a summary back to the maintainer: the project (if any), then each ticket with its ID, title, and one-line scope.
+Order issues so that dependencies come first. Note issue-to-issue dependencies in the bodies. After creating the issues, post a summary back to the maintainer: the project (if any), then each issue with its number, title, and one-line scope.
 
 ### Step 2 — Stop and wait
 
-Do **not** start implementing any ticket until the maintainer explicitly says so. The maintainer reviews the ticket breakdown, may revise it, and then prompts the agent to attack a specific ticket.
+Do **not** start implementing any issue until the maintainer explicitly says so. The maintainer reviews the issue breakdown, may revise it, and then prompts the agent to attack a specific issue.
 
-### Step 3 — Execute one ticket at a time
+### Step 3 — Execute one issue at a time
 
-When prompted to work a ticket:
+When prompted to work an issue:
 
-- Re-read the ticket. Confirm the scope.
+- Re-read the issue. Confirm the scope.
 - Apply rules 1–4 above (Rust, minimal diff, tests first, comprehensive summary).
-- Work on a dedicated branch named after the ticket (e.g. `jar-123-short-slug`). Never commit ticket work directly to `main`.
-- Update the ticket status as work progresses (in progress → in review → done).
-- **Every ticket ends as a Pull Request.** When the change is ready, push the branch and open a PR whose description links the Linear ticket, restates the acceptance criteria, and includes the structured summary from rule 4. One ticket = one branch = one PR. No ticket is "done" until its PR is open and linked back to the ticket; merge happens only after maintainer review.
-- **Dependent tickets ship as stacked PRs, managed with Graphite.** See *Stacked PRs — use Graphite* below. When a ticket depends on another ticket still in review, the new branch goes on top of the dependency via `gt create`, not branched manually off `main`. Each PR in the stack stays small and reviewable on its own; the description must call out the stack order and the parent PR. Do not bundle dependent tickets into one mega-PR to avoid stacking.
-- Deliver the change, open the PR (or `gt submit` for a stack), and then **stop**. Do not roll on to the next ticket. Wait for the maintainer's approval and the next prompt.
+- Work on a dedicated branch linked to the issue. Use `gh issue develop <number> --checkout` to create and check out a branch GitHub links back to the issue (named `<number>-short-slug`). Never commit issue work directly to `main`.
+- Move the issue across the status board as work progresses (Todo → In Progress → In Review → Done — see *Status board* below).
+- **Every issue ends as a Pull Request.** When the change is ready, push the branch and open a PR whose description closes the issue (`Closes #<number>`), restates the acceptance criteria, and includes the structured summary from rule 4. One issue = one branch = one PR. No issue is "done" until its PR is open and linked back to the issue; merge happens only after maintainer review.
+- **Dependent issues ship as stacked PRs, managed with Graphite.** See *Stacked PRs — use Graphite* below. When an issue depends on another issue still in review, the new branch goes on top of the dependency via `gt create`, not branched manually off `main`. Each PR in the stack stays small and reviewable on its own; the description must call out the stack order and the parent PR. Do not bundle dependent issues into one mega-PR to avoid stacking.
+- Deliver the change, open the PR (or `gt submit` for a stack), and then **stop**. Do not roll on to the next issue. Wait for the maintainer's approval and the next prompt.
 
-This staged loop — *plan → approve → one ticket → branch → PR → review → next ticket* — is the default. Skip it only when the maintainer explicitly says "just do it."
+This staged loop — *plan → approve → one issue → branch → PR → review → next issue* — is the default. Skip it only when the maintainer explicitly says "just do it."
+
+### Status board
+
+GitHub issues are only open/closed, so work status lives on a **GitHub Project (v2) board** with a single `Status` field. The columns are:
+
+`Backlog` → `Todo` → `In Progress` → `In Review` → `Done`
+
+- Newly filed issues land in `Backlog` (or `Todo` once the maintainer approves the breakdown).
+- Moving a branch from work to review moves the card `In Progress` → `In Review`; opening the PR is the trigger.
+- Merging the PR (which `Closes #<number>`) moves the card to `Done` and closes the issue.
+- A linked **draft** PR signals `In Progress`; marking it **ready for review** signals `In Review`. Keep the board column and the PR draft state consistent.
+- Move cards via the board UI, or `gh api graphql` (`updateProjectV2ItemFieldValue`) when scripting. `gh project item-edit` also works once you have the project and item IDs.
 
 ### Stacked PRs — use Graphite
 
@@ -195,9 +211,9 @@ When multiple agents are working tickets concurrently, use **git worktrees** wit
 
 **Audit at any time:** `git worktree list`, `git branch -vv | grep <prefix>`, `gt log long`. If you see a branch whose PR is closed/merged but whose worktree is still around, clean it.
 
-### Linear setup note
+### GitHub CLI setup note
 
-The Linear MCP server must be configured for an agent to create tickets. If it is not, the agent should ask the maintainer to configure it (or post the proposed ticket breakdown as text for the maintainer to file) rather than skip the planning step.
+The `gh` CLI must be authenticated for an agent to create issues (`gh auth status` to check; `gh auth login` to fix). If it is not, the agent should ask the maintainer to authenticate it (or post the proposed issue breakdown as text for the maintainer to file) rather than skip the planning step. No external tracker or MCP server is involved — issues, branches, and PRs all live in the GitHub repo.
 
 ---
 
@@ -209,4 +225,4 @@ The Linear MCP server must be configured for an agent to create tickets. If it i
 3. Tests with the change, runnable in one command.
 4. Summary at the end the maintainer can trust.
 5. Ideation/planning → `scratch/<topic>.md`.
-6. Features → Linear tickets under "Jarvis Engine" → wait → one ticket at a time → one PR per ticket → Graphite (`gt`) for stacks.
+6. Features → GitHub issues (`gh`) → wait → one issue at a time → one PR per issue (`Closes #N`) → Graphite (`gt`) for stacks.

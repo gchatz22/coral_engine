@@ -103,8 +103,8 @@ These do not depend on each other or on any architectural decision still open. P
 
 ---
 
-## Decision needed before filing tickets
+## Decision needed before filing issues
 
-1. **Linear shape.** Single ticket vs. parent issue with sub-issues vs. Project. My read: A3 is a single ticket; A1 and A2 are parent issues (each has 5+ sub-tickets identified in the Sizing sections).
+1. **Issue shape.** Single issue vs. parent issue with sub-issues vs. Project board. My read: A3 is a single issue; A1 and A2 are parent issues (each has 5+ sub-issues identified in the Sizing sections).
 2. **Order within Group A.** Any order is defensible since all three are independent. A3 is the cheapest unblock and prevents fixture rot, so a natural sequence is A3 → A1 / A2 in parallel (they share the agent-health module, so coordinate or land that piece first under whichever ships first).
 3. **Crate boundaries.** Do A1 and A2 ship in the same `jarvis_node` crate, or do they motivate the workspace split we discussed earlier (`jarvis_node` core + `jarvis_decide_llm` + `jarvis_mcp` extensions)? My read: defer the workspace until A1 lands and we feel actual compile-time pain or a real second consumer.

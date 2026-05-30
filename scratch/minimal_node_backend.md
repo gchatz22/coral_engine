@@ -199,9 +199,9 @@ Mapping to `agent_runtime.md` § 11:
 
 ---
 
-### 8. Proposed Linear breakdown (after this doc is approved)
+### 8. Proposed GitHub-issue breakdown (after this doc is approved)
 
-Medium feature → parent issue with sub-issues, no Project. Ordered by dependency:
+Medium feature → parent issue with sub-issues, no Project board. Ordered by dependency:
 
 1. **Bootstrap crate** — `Cargo.toml`, lib + bin, CI lint job. (Trivial; no logic.)
 2. **Core types** — `Mandate`, `Trigger`, `Decision`, `Evidence`, `Output`. Serde + tests.

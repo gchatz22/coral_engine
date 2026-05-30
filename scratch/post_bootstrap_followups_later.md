@@ -78,7 +78,7 @@ These are big enough that filing tickets without a design round would lock in an
 
 **Dependencies.** **Hard dependency on C1** — child handles must survive parent restart.
 
-**Sizing.** Multi-month. Almost certainly a Linear Project, not a parent issue.
+**Sizing.** Multi-month. Almost certainly a GitHub Project board, not a parent issue.
 
 ---
 
@@ -105,5 +105,5 @@ These are big enough that filing tickets without a design round would lock in an
 ## Decision needed before filing tickets
 
 For each item above, you'll want to decide:
-1. **Linear shape.** Single ticket vs. parent issue with sub-issues vs. Project. My read: B1 is a parent issue; C1, C2, C3 are Projects (each preceded by its own scratch doc).
+1. **Issue shape.** Single issue vs. parent issue with sub-issues vs. Project board. My read: B1 is a parent issue; C1, C2, C3 are Project boards (each preceded by its own scratch doc).
 2. **Order.** Group B before any real-scale demo. Group C requires C1 first, then C2, then C3.

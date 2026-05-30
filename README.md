@@ -103,4 +103,4 @@ The dev-environment work doesn't add Rust deps; if either command starts failing
 
 Pre-production. See `scratch/temporal_staged_plan.md` for the staged plan. Today's `jarvis_node` is a single in-process agent loop with provenance-enforced FS state.
 
-See `DEVELOPMENT.md` for contribution rules: smallest correct diff, tests with the change, Linear-driven planning, Graphite-managed stacked PRs.
+See `DEVELOPMENT.md` for contribution rules: smallest correct diff, tests with the change, GitHub-Issues-driven planning, Graphite-managed stacked PRs.
