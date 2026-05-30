@@ -234,7 +234,7 @@
       ]
     },
     "Tool": {
-      "description": "A tool registration. `kind` is the discriminant; `Builtin` is the\nonly variant accepted at validate-time. `Mcp` is parseable so it can\nbe rejected with a targeted error rather than serde's generic\n\"unknown variant\" message.",
+      "description": "A tool registration. `kind` is the discriminant selecting one of the\n[`ToolKind`] variants.",
       "type": "object",
       "properties": {
         "id": {
@@ -262,7 +262,7 @@
           ]
         },
         {
-          "description": "MCP server. Parseable so [`validate`] can emit a targeted error;\nnot allowed in v1.",
+          "description": "MCP server spawned as a stdio subprocess.",
           "type": "object",
           "properties": {
             "args": {
@@ -273,8 +273,19 @@
               }
             },
             "command": {
-              "description": "Command to spawn for the MCP server.",
+              "description": "Command to spawn for the MCP server. Must be non-empty.",
               "type": "string"
+            },
+            "env": {
+              "description": "Environment passed to the spawned server, as literal\n`NAME: value` pairs. Values are stored verbatim; do not put\nsecrets here that should not live in the graph definition.",
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": null
             },
             "kind": {
               "type": "string",

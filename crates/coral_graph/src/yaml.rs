@@ -56,10 +56,8 @@ pub struct Metadata {
     pub description: Option<String>,
 }
 
-/// A tool registration. `kind` is the discriminant; `Builtin` is the
-/// only variant accepted at validate-time. `Mcp` is parseable so it can
-/// be rejected with a targeted error rather than serde's generic
-/// "unknown variant" message.
+/// A tool registration. `kind` is the discriminant selecting one of the
+/// [`ToolKind`] variants.
 //
 // No `deny_unknown_fields` on this outer struct: it is incompatible
 // with `#[serde(flatten)]`. The inner `ToolKind` enum carries the
@@ -72,8 +70,7 @@ pub struct Tool {
     pub kind: ToolKind,
 }
 
-/// Discriminated `kind:` for [`Tool`]. `Mcp` is rejected at validate
-/// time; only `Builtin` is accepted in v1.
+/// Discriminated `kind:` for [`Tool`].
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolKind {
@@ -82,13 +79,17 @@ pub enum ToolKind {
         /// Identifier of the in-process tool to register (`"echo"` etc).
         builtin: String,
     },
-    /// MCP server. Parseable so [`validate`] can emit a targeted error;
-    /// not allowed in v1.
+    /// MCP server spawned as a stdio subprocess.
     Mcp {
-        /// Command to spawn for the MCP server.
+        /// Command to spawn for the MCP server. Must be non-empty.
         command: String,
         #[serde(default)]
         args: Vec<String>,
+        /// Environment passed to the spawned server, as literal
+        /// `NAME: value` pairs. Values are stored verbatim; do not put
+        /// secrets here that should not live in the graph definition.
+        #[serde(default)]
+        env: Option<HashMap<String, String>>,
     },
 }
 
@@ -290,11 +291,10 @@ pub enum GraphYamlError {
     )]
     MissingMandateIdlePeriod { agent_id: String },
 
-    /// A `tools[]` entry was `kind: mcp`, which v1 does not support.
-    #[error(
-        "tool {tool_id:?} has `kind: mcp`, which is not supported in v1 (mcp-tool support is a planned follow-up; remove the tool or wait for that work)"
-    )]
-    McpToolRejected { tool_id: String },
+    /// A `kind: mcp` tool had an empty `command`; there is nothing to
+    /// spawn for the server.
+    #[error("tool {tool_id:?} has `kind: mcp` with an empty `command` (set the executable to spawn for the MCP server)")]
+    EmptyMcpCommand { tool_id: String },
 
     /// `metadata.name` or `agents[].id` did not match the URL-path-safe
     /// regex `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`.
@@ -416,12 +416,12 @@ pub fn validate(g: &GraphYaml) -> Result<(), GraphYamlError> {
             });
         }
         match &tool.kind {
-            ToolKind::Mcp { .. } => {
-                return Err(GraphYamlError::McpToolRejected {
+            ToolKind::Mcp { command, .. } if command.trim().is_empty() => {
+                return Err(GraphYamlError::EmptyMcpCommand {
                     tool_id: tool.id.clone(),
                 });
             }
-            ToolKind::Builtin { .. } => {}
+            ToolKind::Mcp { .. } | ToolKind::Builtin { .. } => {}
         }
     }
 
@@ -943,24 +943,56 @@ seed:
     // --- Validator rejections ------------------------------------------
 
     #[test]
-    fn rejects_mcp_tool_with_unsupported_hint() {
+    fn accepts_mcp_tool() {
         let yaml = HAPPY_YAML
             .replace(
                 "  - id: echo\n    kind: builtin\n    builtin: echo\n",
-                "  - id: web\n    kind: mcp\n    command: mcp-web-search\n",
+                "  - id: web\n    kind: mcp\n    command: mcp-web-search\n    args: [--verbose]\n",
             )
-            // Drop the agent's tool reference so the validator reaches
-            // the MCP check before the unknown-tool-ref check.
+            .replace("    tools: [echo]\n", "    tools: [web]\n");
+        let g = parse_and_validate(&yaml).expect("valid mcp graph");
+        let web = g.tools.iter().find(|t| t.id == "web").expect("web tool");
+        assert!(matches!(
+            &web.kind,
+            ToolKind::Mcp { command, args, env }
+                if command == "mcp-web-search"
+                    && args == &vec!["--verbose".to_string()]
+                    && env.is_none()
+        ));
+    }
+
+    #[test]
+    fn mcp_env_round_trips() {
+        let yaml = HAPPY_YAML
+            .replace(
+                "  - id: echo\n    kind: builtin\n    builtin: echo\n",
+                "  - id: web\n    kind: mcp\n    command: mcp-web-search\n    env:\n      API_KEY: secret\n      LOG: debug\n",
+            )
+            .replace("    tools: [echo]\n", "    tools: [web]\n");
+        let g = parse_and_validate(&yaml).expect("valid mcp graph with env");
+        let web = g.tools.iter().find(|t| t.id == "web").expect("web tool");
+        match &web.kind {
+            ToolKind::Mcp { env, .. } => {
+                let env = env.as_ref().expect("env present");
+                assert_eq!(env.get("API_KEY").map(String::as_str), Some("secret"));
+                assert_eq!(env.get("LOG").map(String::as_str), Some("debug"));
+            }
+            other => panic!("expected mcp tool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_mcp_tool_with_empty_command() {
+        let yaml = HAPPY_YAML
+            .replace(
+                "  - id: echo\n    kind: builtin\n    builtin: echo\n",
+                "  - id: web\n    kind: mcp\n    command: \"\"\n",
+            )
             .replace("    tools: [echo]\n", "    tools: []\n");
         let err = validate_err(&yaml);
-        let msg = format!("{err}");
         assert!(
-            matches!(err, GraphYamlError::McpToolRejected { ref tool_id } if tool_id == "web"),
+            matches!(err, GraphYamlError::EmptyMcpCommand { ref tool_id } if tool_id == "web"),
             "got {err:?}",
-        );
-        assert!(
-            msg.contains("not supported in v1"),
-            "expected mcp-not-supported hint, got: {msg}",
         );
     }
 

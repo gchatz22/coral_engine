@@ -278,14 +278,27 @@ impl GraphStore {
         let mut tool_uuid_by_id: HashMap<&str, Uuid> = HashMap::with_capacity(graph.tools.len());
         for tool in &graph.tools {
             let tool_uuid = Uuid::new_v4();
-            let (kind_text, command_text): (&str, Option<&str>) = match &tool.kind {
-                ToolKind::Builtin { builtin } => ("builtin", Some(builtin.as_str())),
-                ToolKind::Mcp { .. } => {
-                    return Err(GraphStoreError::Sqlx(sqlx::Error::Protocol(format!(
-                        "internal: create_from_yaml saw kind: mcp for tool {:?}; \
-                             validator should have rejected it",
-                        tool.id,
-                    ))));
+            let (kind_text, command_text, args_json, env_json): (
+                &str,
+                Option<&str>,
+                serde_json::Value,
+                serde_json::Value,
+            ) = match &tool.kind {
+                ToolKind::Builtin { builtin } => (
+                    "builtin",
+                    Some(builtin.as_str()),
+                    serde_json::json!([]),
+                    serde_json::json!([]),
+                ),
+                ToolKind::Mcp { command, args, env } => {
+                    let env_obj = serde_json::to_value(env.clone().unwrap_or_default())
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    (
+                        "mcp",
+                        Some(command.as_str()),
+                        serde_json::json!(args),
+                        env_obj,
+                    )
                 }
             };
             sqlx::query_as!(
@@ -298,8 +311,8 @@ impl GraphStore {
                 tool_uuid,
                 kind_text,
                 command_text,
-                serde_json::json!([]),
-                serde_json::json!([]),
+                args_json,
+                env_json,
             )
             .fetch_one(&mut *tx)
             .await?;
@@ -898,6 +911,55 @@ seed:
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].kind, "builtin");
         assert_eq!(tools[0].command.as_deref(), Some("echo"));
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn create_from_yaml_persists_mcp_tool_row(pool: PgPool) -> sqlx::Result<()> {
+        const MCP_YAML: &str = r#"
+apiVersion: coral.engine/v1alpha1
+kind: Graph
+metadata:
+  name: mcp-smoke
+tools:
+  - id: web
+    kind: mcp
+    command: mcp-web-search
+    args: [--verbose, --json]
+    env:
+      API_KEY: secret
+      LOG: debug
+agents:
+  - id: root
+    mandate:
+      text: do the thing
+      idle_period: 1s
+      max_ticks: 4
+    tools: [web]
+seed:
+  triggers:
+    - agent: root
+      at: start
+      external:
+        kind: kickoff
+        payload: {}
+"#;
+        let store = GraphStore::new(pool);
+        let g = crate::yaml::parse_and_validate(MCP_YAML).expect("validator green on mcp fixture");
+        let applied = store.create_from_yaml(&g).await.expect("create_from_yaml");
+
+        let agents = store
+            .list_agents_in_graph(applied.graph_id.into_uuid())
+            .await?;
+        let tools = store.list_tools_for_agent(agents[0].id).await?;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].kind, "mcp");
+        assert_eq!(tools[0].command.as_deref(), Some("mcp-web-search"));
+        assert_eq!(tools[0].args, serde_json::json!(["--verbose", "--json"]));
+        assert_eq!(
+            tools[0].env_refs,
+            serde_json::json!({"API_KEY": "secret", "LOG": "debug"}),
+        );
         Ok(())
     }
 
