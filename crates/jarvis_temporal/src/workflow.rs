@@ -8,6 +8,24 @@
 //! body does no I/O and consults no clocks — wall-clock arrives via
 //! `ctx.timer(...)` and FS reads/writes live in activities, so the loop is
 //! fully replayable against workflow history.
+//!
+//! Cross-workflow signaling uses a two-step SDK chain
+//! `ctx.external_workflow(workflow_id, None).signal(SignalDef, payload).await`
+//! — there is no single `signal_external_workflow(..)` method in this SDK
+//! version. Signal failures are logged and swallowed (best-effort): the
+//! sender's data is durable on its own FS regardless of whether the
+//! recipient observed the signal. [`ParentRef::signal`] is informational
+//! at this version — the dispatch site uses the compile-time
+//! [`AgentWorkflow::external_signal`] marker regardless of the field's
+//! value.
+//!
+//! Synthetic evidence: the parent's `reconcile_children` activity reads each
+//! cited child output cross-agent and writes one synthetic
+//! [`EvidenceRecord`](jarvis_node::evidence::EvidenceRecord) (`tool =
+//! "reconcile"`) into the parent's `evidence/`. This preserves
+//! [`AgentFs::persist_output`](jarvis_node::fs::AgentFs::persist_output)'s
+//! provenance check unchanged — cross-agent provenance becomes a normal
+//! evidence trail.
 
 use std::time::Duration;
 

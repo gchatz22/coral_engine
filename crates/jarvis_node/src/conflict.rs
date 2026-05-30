@@ -5,6 +5,22 @@
 //! `(alternatives, resolution)` so a retried activity PUTs byte-identical
 //! bytes under the same key and `put_if_absent` dedupes cleanly.
 //!
+//! ## `HeldOpen` vs. `Resolved`
+//!
+//! A conflict is *resolved* when the parent picked a winning alternative
+//! and recorded its reasoning; it is *held open* when the parent
+//! recognized the disagreement but did not pick a winner. The
+//! distinction is observable in the file as [`ConflictKind`] (one of
+//! `HeldOpen` or `Resolved`), but the kind is **derived**, not
+//! authored: [`ConflictRecord::new`] sets
+//! `kind = ConflictKind::from_resolution(&resolution)` — `Resolved` iff
+//! `resolution.is_some()`. The LLM only emits a
+//! [`crate::decision::ConflictRecordIntent`] whose `resolution` is
+//! `Option<ConflictResolution>`; the kind is a reader-side convenience
+//! so audit tools don't have to inspect `resolution.is_some()` to
+//! colour the row. It is not on the wire of the intent and not part of
+//! the content-address hash.
+//!
 //! ## Field layout
 //!
 //! ```text
@@ -19,10 +35,10 @@
 //!
 //! `timestamp` is excluded from the id for the same reason `Output`'s
 //! `created_at` is: a retry on a different wall-clock minute must still
-//! collapse to the same content-addressed file. `kind` is reader
-//! convenience (so an audit tool doesn't have to inspect
-//! `resolution.is_some()` to colour the row); it's not on the wire of
-//! the `ConflictRecordIntent` the LLM emits and not part of the hash.
+//! collapse to the same content-addressed file (retry idempotency under
+//! the activity's `put_if_absent` contract). Two conflicts that disagree
+//! only in their `timestamp` field hash to the same [`ConflictId`] and
+//! occupy the same on-disk slot.
 //!
 //! ## Canonical form
 //!

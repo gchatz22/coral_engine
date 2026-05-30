@@ -6,6 +6,49 @@
 //! Also hosts the per-tick surface the run loop uses: `ContextBundle` (the
 //! read-only snapshot handed to `Decide` each tick), the `Decide` trait,
 //! `MockDecide`, and `assemble_context`.
+//!
+//! # Parent-child variants
+//!
+//! Four variants describe parent-driven topology changes the LLM may
+//! propose: [`Decision::SpawnChild`], [`Decision::ReconcileChildren`],
+//! [`Decision::RetireChild`], and [`Decision::ReplaceChild`]. Each
+//! variant captures the LLM's *intent*; the runtime arm that executes
+//! it lives in `jarvis_temporal::workflow` and routes the variant to
+//! either a Temporal activity or an SDK workflow command. The variants
+//! carry only kernel-visible data (mandates, agent references, output
+//! ids, claim summaries) — no host-side workflow handles leak through.
+//!
+//! Cross-host stable identity travels as [`AgentRef`] (workflow id +
+//! structural [`AgentId`](crate::agent_ref::AgentId)). Every variant
+//! that names another agent uses [`AgentRef`] rather than a bare id so
+//! the same value can address an SDK signal *and* index the structural
+//! DB without a resolve step.
+//!
+//! ## `ReconcileChildren` shape
+//!
+//! The LLM is the only thing in the loop with enough context to
+//! summarize what a child claimed, so [`Decision::ReconcileChildren`]
+//! carries those summaries inline rather than asking the runtime to
+//! introspect arbitrary child output bodies. Shape:
+//!
+//! ```text
+//! ReconcileChildren {
+//!     sources:  Vec<ReconcileSource>,         // 1+ child outputs to fold in
+//!     conflict: Option<ConflictRecordIntent>, // Some iff the LLM observed disagreement
+//! }
+//! ```
+//!
+//! The reconcile activity persists the decision verbatim: one synthetic
+//! evidence record per [`ReconcileSource`] in the parent's `evidence/`
+//! directory (so the parent's next `EmitOutput` can cite the children
+//! through the existing evidence contract) and — only when `conflict`
+//! is `Some` — one [`ConflictRecordIntent`] written as a
+//! [`crate::conflict::ConflictRecord`] under the parent's `conflicts/`.
+//! The activity never edits claim text or chosen-alternative indices;
+//! the LLM owns those. `Some` with fewer than two alternatives is
+//! structurally not a conflict and the activity rejects it; `None` is
+//! the concordance fold-in case (synthetic evidence only, no conflict
+//! file written).
 
 use crate::agent_ref::AgentRef;
 use crate::evidence::{EvidenceId, EvidenceRecord};

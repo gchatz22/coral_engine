@@ -165,16 +165,80 @@ Tool calls are individual activities. We adopt the dynamic-activity dispatch pat
 
 VISION § 3: parent receives children outputs, reconciles, emits its own output upward. Children spawn grandchildren as needed. The graph fans out to whatever depth and width the work requires.
 
-**Children are detached child workflows + signal channels, not awaited child workflows.**
+Stage 5 (Linear Project — `scratch/temporal_staged_plan.md` § 5; sub-tickets JAR2-78..JAR2-87) shipped this. The original sketch in this section is replaced by the section below; the canonical references for what's on disk are the module docs of `crates/jarvis_node/src/{decision,trigger,conflict}.rs` and `crates/jarvis_temporal/src/workflow.rs`, plus the Stage 5 Project page in Linear (16 baked-in decisions).
 
-- Parent spawns child via `start_child_workflow(AgentWorkflow, child_cfg, parent_close_policy=ABANDON)`.
-- Parent does **not** block on child. Parent's loop continues; it sees child output as a `ChildOutput` trigger when the child signals it.
-- Child's `cfg.parent` carries a typed `AgentRef` it uses to `signal_external_workflow` when it has output to deliver.
-- Parent's reconciliation is a `Decision` variant (`ReconcileChildren`) the LLM emits when its triggers indicate enough children have spoken.
+### 7.1 Detached children + the SDK two-step signal chain
 
-Why detached over awaited: an awaited model would force the parent to block until the child completes, which is wrong shape for "continuous, never-ending" agents that may run for months. Detached + signals matches VISION's mental model: agents don't end, they idle.
+Children are detached child workflows + cross-workflow signals; the parent does **not** await child completion. Concretely:
 
-Lifecycle ops on children (retire, fork, replace) are kernel-level operations the parent agent can request via dedicated activities (`retire_child(ref)`, etc.). Temporal's parent-close semantics aren't doing this work for us.
+- The parent's `Decision::SpawnChild { agent_name, mandate }` arm (JAR2-78) routes to the `register_child_in_structural_db` activity (JAR2-80, Stage 5.3 — writes the `agents` + `edges` rows, mints the child's `AgentId`), then to the SDK workflow command `ctx.child_workflow(AgentWorkflow::run, child_input, opts)` with `ParentClosePolicy::Abandon` (per Stage 5 Project decision 5). The started child handle is dropped without `.result().await`. Per Stage 5 Project decision 6 the child workflow id is the flat `graphs/<parent_gid>/agents/<child_aid>` form (topology lives in the structural DB's `edges` table, not in the id string).
+- The child's `Decision::EmitOutput` arm runs the existing `persist_output` activity (writes the child's own `outputs/<id>.json`), then — if `input.parent_handle.is_some()` — fires a `Trigger::ChildOutput { child_ref, agent_name, output_id }` at the parent via the SDK's two-step external-workflow signal chain (JAR2-81, Stage 5.4):
+  ```rust
+  ctx.external_workflow(parent.workflow_id.clone(), None)
+     .signal(AgentWorkflow::external_signal, trigger)
+     .await
+  ```
+  There is no single `ctx.signal_external_workflow(workflow_id, signal_name, payload)` method in the Rust SDK at v0.4.0 — see `scratch/temporal_rust_sdk_smoke.md` § 3.10 for the API divergence finding. The signal name is bound at compile time via the `#[signal]`-macro-generated marker, so `ParentRef.signal` is informational at v1; the dispatch target is always `AgentWorkflow::external_signal` because the only signal recipient is another `AgentWorkflow` instance.
+- Per Stage 5 Project decision 10, signal failures (parent retired, transient server error) are **logged and swallowed**. The child's data is durable on its own FS regardless; the child does not block on parent acknowledgment, and there is no `Trigger::ParentUnreachable` correction path at v1.
+
+### 7.2 Parent ingest path — same handler as everything else
+
+The parent receives `Trigger::ChildOutput` and `Trigger::ChildRetired` through the existing `AgentWorkflow::external_signal` handler (the same one that takes operator-driven `Trigger::External` payloads). There is no dedicated cross-agent signal arm. The handler pushes the typed `Trigger` onto `pending_triggers`; the loop drains it on the next wake and `assemble_context` surfaces it in the `ContextBundle`.
+
+The trigger taxonomy tightened with Stage 5: `TriggerQueue::drain_ordered` enforces `Human > External > ChildOutput/ChildRetired > Scheduled`, FIFO within each class (JAR2-79, Stage 5.2). `ChildOutput` and `ChildRetired` share a priority class because both represent "a child told the parent something actionable"; operator-driven signals (`Human`, `External`) always preempt cross-agent traffic; cross-agent traffic always preempts idle timers.
+
+### 7.3 Reconciliation = synthetic evidence (the load-bearing move)
+
+When the parent's LLM decides to fold N child outputs back into its own context, it emits
+
+```rust
+Decision::ReconcileChildren {
+    sources:  Vec<ReconcileSource>,         // 1+ child outputs to fold in
+    conflict: Option<ConflictRecordIntent>, // Some iff the LLM observed disagreement
+}
+```
+
+The `reconcile_children` activity (JAR2-82, Stage 5.5) does three things:
+
+1. For each source, open the child's per-agent FS read-only via `AgentFs::open_for_agent(storage, parent_graph_id, child_agent_id)` (a thin `attach` wrapper — no mandate read, no tail reconcile — appropriate for point lookups across agent roots) and `read_output(output_id)` the cited `Output`.
+2. Write one **synthetic** `EvidenceRecord` per source into the **parent's** `evidence/` directory. The synthetic record's `tool` discriminator is the fixed string `"reconcile"`; its `args` capture the child's `AgentRef` + cited `OutputId`; its `result` carries the child output verbatim. The record gets a normal content-addressed `EvidenceId` like any other piece of evidence on the parent's FS.
+3. If `conflict.is_some()`, write one `ConflictRecord` to the parent's `<agent_root>/conflicts/<id>.json` (per § 7.4 below).
+
+This is the conceptual move the original § 7 sketch did not capture. The parent's next tick picks the synthetic evidence records up through the existing `list_recent_evidence` window in `assemble_context`. The LLM cites them on its next `Decision::EmitOutput { content, evidence }` exactly like any other evidence id. **The existing provenance check in `AgentFs::persist_output` — every cited evidence id must resolve to a file under `<agent_root>/evidence/` — keeps working unchanged.** Cross-agent provenance becomes a normal evidence trail; no new contract, no new workflow-state slot (`staged_reconciliation` or similar), no special-case branch in the prompt renderer. A reviewer reading the parent's emitted output can follow `output → evidence → "this came from <child_agent_id>'s output_id X" → open the child's FS → output → leaf tool call` without ambiguity across two agent FS roots.
+
+Stage 5 Project decision 4 baked in why the variant carries claim summaries inline: the LLM is the only thing with enough context to summarize what a child claimed, so the activity persists what's in the decision (claim text, chosen-alternative index, reasoning) verbatim rather than asking the activity to introspect arbitrary JSON output bodies.
+
+### 7.4 Conflict log primitive
+
+`<agent_root>/conflicts/<id>.json`. Written by the `reconcile_children` activity when `Decision::ReconcileChildren.conflict.is_some()` (JAR2-83, Stage 5.6). Shape on disk:
+
+```text
+ConflictRecord {
+    id,              // ConflictId — sha256 hex over (alternatives, resolution)
+    timestamp,       // when minted; NOT part of the id
+    kind,            // HeldOpen | Resolved — derived from resolution.is_some()
+    alternatives,    // >= 2 — validated by AgentFs::write_conflict
+    resolution,      // None iff HeldOpen
+}
+```
+
+Content-addressed over `(alternatives, resolution)` only — `timestamp` is excluded for retry idempotency (a retried activity PUTs byte-identical bytes under the same key; `put_if_absent` dedupes cleanly). `kind` is derived from `resolution.is_some()` (single source of truth — the LLM doesn't author it on `ConflictRecordIntent`; the writer derives it). `HeldOpen` is the recorded-disagreement-without-a-winner case (audit primitive for Stage 6's human-as-reconciler override); `Resolved` carries the parent's chosen alternative index + reasoning.
+
+Per Stage 5 Project decision 14, no append-only index: `conflicts/` is bounded (dozens per agent over its lifetime, vs. the millions `outputs/` will see) and `AgentFs::list_conflicts` walks the directory; the cost is fine at v1 scale.
+
+### 7.5 `RetireChild` / `ReplaceChild`
+
+`Decision::RetireChild { child_ref, reason }` (JAR2-78, executed JAR2-84 Stage 5.7) fires `AgentWorkflow::retire` at the child via the same SDK two-step external-workflow chain JAR2-81 uses in reverse. Same best-effort failure semantics (log + continue); the parent drops the child from its `child_handles` workflow-state field regardless of signal outcome (the intent — "this child is gone from the parent's model" — is the load-bearing state mutation).
+
+`Decision::ReplaceChild { child_ref, new_mandate }` is **retire + fresh spawn**, not an in-place mandate swap. The replacement gets a fresh `AgentId` + workflow id + `edges` row; the old `edges` row stays (audit trail; no `retired_at` column at v1). Per Stage 5 Project decision 6, the flat workflow-id scheme means "replace" is structurally retire + spawn from the kernel's point of view — ids do not encode topology so there is nothing to rename. The replacement's deterministic name is `replacement-of-<old_agent_id>` (no DB lookup needed inside the workflow body; the kernel doesn't promise human-meaningful names for runtime spawns).
+
+### 7.6 `ParentClosePolicy::Abandon` matches VISION's framing
+
+Per Stage 5 Project decision 5, every child is spawned with `ParentClosePolicy::Abandon`. Children survive every parent boundary: continue-as-new, worker restart, **parent retirement**. The only kill path is `Decision::RetireChild`. This matches VISION's "continuous, never-ending agents" framing — a parent CAN or restart is not a lifecycle event children should observe; if a parent wants a child gone it has to say so explicitly.
+
+### 7.7 Hermetic-in-process limitation
+
+Per Stage 5 Project decision 11, `AgentCore::dispatch`'s in-process behavior for the 4 new `Decision` variants is `unimplemented!()`. The in-process loop stays single-agent forever; `Agent::run` is the hermetic single-agent test driver and Stage 5 does NOT aim to make it parent-aware. Every multi-agent test in the Stage 5 sub-tickets (5.5, 5.6, 5.7, 5.9) is `TEMPORAL_LIVE_TEST=1` gated against a real Temporal dev server. There is no hermetic in-process multi-agent path. Hermetic-mode coverage of single-agent semantics (`AgentCore` + `MockDecide` + `MemoryStorage`) is unaffected and remains the fast-feedback test loop.
 
 ---
 
@@ -228,13 +292,13 @@ This is the next thing to drill on. See § 11.
 
 These ripple back into the runtime and need their own design rounds:
 
-1. **Trigger taxonomy and ordering.** What types of triggers exist (external event, child output, human override, mandate update, scheduled wake, sibling batch invitation, ...), what are the priority/ordering rules, what happens if a mandate-update arrives mid-tick?
-2. **Continue-as-new carryover schema.** Exact bytes carried, exact threshold logic, behavior when continue-as-new fires mid-decision.
-3. **Provenance contract.** What `evidence_ids` look like, where evidence records live (FS layout), what the auditor's reconstruction path is, how disputes propagate.
+1. ~~**Trigger taxonomy and ordering.**~~ **LOCKED for the parent-child cross-agent variants** (Stage 5 — JAR2-79, Stage 5.2). The variants are `Scheduled` / `External { kind, payload }` / `HumanOverride { op }` / `ChildOutput { child_ref, agent_name, output_id }` / `ChildRetired { child_ref, agent_name, reason }`. Drain order: `Human > External > ChildOutput/ChildRetired > Scheduled` (FIFO within each class). `ChildOutput` and `ChildRetired` share a priority class. Sibling-batch / dispute-specific trigger types remain open for their respective stages; the mandate-update mid-tick question is still open and lives under Stage 6.
+2. **Continue-as-new carryover schema.** Exact bytes carried, exact threshold logic, behavior when continue-as-new fires mid-decision. (Stage 3.11 / JAR2-67 shipped the v1 schema — load-bearing closure of this question for the single-agent path is on disk in `crates/jarvis_temporal/src/workflow.rs::Carryover`; the threshold logic uses `ctx.continue_as_new_suggested()` per the SDK gotcha called out there. The "mid-decision CAN" sub-question remains open for the long-running smoke that has the wall-clock budget to observe it.)
+3. **Provenance contract.** What `evidence_ids` look like, where evidence records live (FS layout), what the auditor's reconstruction path is, how disputes propagate. (Single-agent provenance shipped via `AgentFs::persist_output`'s evidence-presence check; **cross-agent provenance** is now also closed by Stage 5's synthetic-evidence pattern — see § 7.3 above. Disputes specifically remain Stage 6 territory.)
 4. **Per-agent filesystem schema.** Out of scope for the runtime layer per se, but the runtime's activity contracts depend on it. Needs a sibling design doc.
 5. **Scheduler at scale.** "Millions of subagents continuously" (VISION § 7) is not solved by Temporal timers alone. The scheduler is a separate kernel concern that decides which workflows wake when. Needs its own doc.
 6. **MCP traffic multiplexing.** Sibling batching of MCP calls is cross-workflow and lives outside the agent runtime — but the `execute_tool` activity contract has to be shaped so multiplexing can be added without rewriting agents.
-7. **Conflict log.** When a parent reconciles disagreeing children and "holds the disagreement open" (VISION § 4), where does that record live and how is it structured?
+7. ~~**Conflict log.**~~ **LOCKED at the v1 shape** (Stage 5 — JAR2-83, Stage 5.6). `<agent_root>/conflicts/<id>.json` where `id` is `sha256_hex((alternatives, resolution))`. `kind` ∈ `{HeldOpen, Resolved}` is derived from `resolution.is_some()`; `timestamp` is excluded from the content-address hash for retry idempotency. One file per disagreement, no append-only index at v1 (`conflicts/` is bounded; the `AgentFs::list_conflicts` directory scan is the only reader). See § 7.4 for the rationale. **Human-as-reconciler override** — the surface that *reads* this log to let a human break ties or revisit a held-open conflict — stays open and is Stage 6 territory; the conflict-log records *are* the primitive Stage 6 will build that override against.
 8. **Cost accounting.** Per-agent, per-graph, per-tenant. Where are the hooks?
 
 ---

@@ -343,6 +343,53 @@ Filing as a **GitHub Project board** (Project size, multi-month, multi-cross-cra
 
 **Acceptance.** A multi-agent smoke runs end-to-end. Reviewer can read provenance from a parent's output all the way back to a leaf tool call across 2 levels.
 
+**What shipped (Stage 5 closeout — JAR2-87, parallel to the JAR2-73 "v1 expedient" note in § 2.6).** The Stage 5 Project closed with all 10 sub-tickets merged (JAR2-78..JAR2-87 → PRs #85..#94). This note captures divergences from the plan above so the on-disk truth is one click away from the plan that led to it.
+
+**Landed verbatim from the plan:**
+
+- The 4 new `Decision` variants in `jarvis_node::decision` (JAR2-78, Stage 5.1) — `SpawnChild`, `ReconcileChildren`, `RetireChild`, `ReplaceChild` — match the plan's names and load-bearing fields.
+- The 2 new `Trigger` variants in `jarvis_node::trigger` (JAR2-79, Stage 5.2) — `ChildOutput`, `ChildRetired` — landed as separate variants (not folded into `External`), with the `Human > External > ChildOutput > Scheduled` ordering enforced by `TriggerQueue::drain_ordered` and exercised in `trigger_queue.rs`'s tests.
+- `register_child_in_structural_db` activity + `ctx.child_workflow(..)` with `ParentClosePolicy::Abandon` for `Decision::SpawnChild` (JAR2-80, Stage 5.3) — verbatim against the plan, including the flat workflow-id scheme `graphs/<gid>/agents/<aid>`.
+- Child → parent signal via `signal_external_workflow` (JAR2-81, Stage 5.4) — first live exercise of the SDK primitive `temporal_rust_sdk_smoke.md` § 2 row 8 had marked WORKED-on-paper. The happy path + parent-unreachable failure-mode test both live at `crates/jarvis_temporal/tests/child_parent_signal.rs`.
+- Synthetic-evidence pattern (JAR2-82, Stage 5.5) — reads each cited child output via `AgentFs::open_for_agent`, writes one synthetic `EvidenceRecord` per source into the parent's `evidence/`, returns the `EvidenceId`s. Stage 5 Project decision 3 baked in.
+- Content-addressed conflict log (JAR2-83, Stage 5.6) — `<agent_root>/conflicts/<id>.json` per Stage 5 Project decision 14, content-addressed over `(alternatives, resolution)` only, `kind` derived from `resolution.is_some()`.
+- `RetireChild` / `ReplaceChild` activity paths (JAR2-84, Stage 5.7) — same SDK two-step external-workflow chain, reverse direction; replacement is fresh-id-not-in-place per the plan.
+- Multi-agent YAML extension to `jarvis apply` (JAR2-85, Stage 5.8) — hierarchical `children:` form walked, shared `build_child_input` helper between the apply walker and the workflow's `Decision::SpawnChild` arm so the two surfaces cannot drift on `parent_handle` shape.
+- End-to-end multi-agent integration test (JAR2-86, Stage 5.9) — parent + 2 children, deliberately conflicting outputs, parent reconciles via scripted `MockDecide` disagreement, parent's output cites child outputs through synthetic evidence, conflict log has exactly one entry.
+
+**Landed differently — call out:**
+
+- **`Decision::ReconcileChildren` payload grew** from the plan's `Vec<OutputId>` to `{sources: Vec<ReconcileSource>, conflict: Option<ConflictRecordIntent>}` (Stage 5 Project decision 4 baked this in pre-execution). The rationale: the LLM is the only thing in the loop with enough context to summarize what a child claimed, so the variant carries the claim summaries inline rather than asking the activity to introspect arbitrary JSON output bodies. The activity persists what's in the decision verbatim.
+- **`AgentInput` grew identity fields.** Stage 5.3 added `graph_id: GraphId`, `agent_id: AgentId`, and `agent_name: String` to `AgentInput` per Stage 5 Project decision 8 (so the `SpawnChild` workflow arm can address the structural DB without parsing `ctx.workflow_id()`'s string format). The `Default` impl was dropped at the same time — an agent without identity is meaningless, and a zero-UUID `agent_id` would silently route every spawn to the same edge row. Every test surface now constructs `AgentInput` explicitly via `AgentInput::new_for_test` (test) or `into_agent_input` / `build_child_input` / `build_root_input` (production).
+- **`ParentRef.signal` is informational at v1.** The plan assumed a single `ctx.signal_external_workflow(workflow_id, signal_name, payload).await` method (cf. the plan's `signal_parent` pseudocode); the JAR2-81 live exercise discovered the SDK has no such method — the real shape is the two-step `ctx.external_workflow(..).signal(SignalDef, payload).await` chain where the signal is bound at compile time via the `#[signal]`-macro-generated `SignalDefinition` marker. `ParentRef.signal: String` stays on the wire for future targets that may diverge from `external_signal`, but at v1 it's ignored at the dispatch site. See `scratch/temporal_rust_sdk_smoke.md` § 3.10 for the SDK divergence finding (no upstream issue filed — the divergence is doc-only).
+- **JAR2-89 was subsumed into JAR2-85.** JAR2-89 was queued as the standalone "synthetic-UUID `into_agent_input` cleanup" follow-up; PR #93 (JAR2-85, Stage 5.8) landed both changes atomically because the multi-agent walker would have re-introduced the synthetic UUID right after JAR2-89 retired it. Net diff is smaller as a single PR than as two stacked ones.
+- **JAR2-86 (Stage 5.9) chose Pattern A.** The end-to-end integration test bypasses `jarvis apply` and constructs the multi-agent topology in the test fixture directly (Pattern A in the JAR2-86 advisor discussion). Apply-path coverage is delivered by JAR2-74's single-agent smoke (`examples/smoke_llm_temporal/graph.yaml` round-trip) plus JAR2-85's hermetic walker test (`crates/jarvis_graph/src/yaml.rs::walker_tests` asserts the YAML → AgentInput tree shape end-to-end). The "apply walker drives multi-agent live workflow" path is left to a future Pattern B follow-up (env-gated `MockDecide` install or a `--decide=mock` flag on `jarvis apply` so the walker can drive a hermetic multi-agent live workflow without a real LLM).
+- **CI extension shipped as a follow-up commit on PR #94.** The integration test (JAR2-86) added 5 new `TEMPORAL_LIVE_TEST=1`-gated tests that the existing `.github/workflows/live.yml` job did not enumerate. Rather than file a separate ticket, the CI workflow file was extended in the same PR with the 5 new test ids so the live job exercises them. Not a divergence from the plan per se — the plan's "Mixed CI" decision (§ 8 decision 5) implies this — but worth recording so a future audit doesn't think the live tests are dead code.
+
+**New follow-ups surfaced during execution** (beyond the "Queued follow-ups" already in the Stage 5 Project description):
+
+- **JAR2-88 — worker daemon `StructuralDbStore` install.** `Decision::SpawnChild`'s `register_child_in_structural_db` activity reads from a process-wide `OnceLock<Arc<dyn GraphStore>>` that the worker binary does not install at boot. The hermetic + live tests install it via the test fixture; the production `crates/jarvis_temporal/src/bin/worker.rs` does not. **`Decision::SpawnChild` does not work in the production worker yet.** JAR2-88 (file separately) is the ticket that adds the boot-time install — small follow-up, but a real production gap.
+- *(optional)* **Pattern B follow-up for apply-path coverage.** Either an env-gated `MockDecide` install or a `--decide=mock` flag on `jarvis apply` so the walker can drive a hermetic multi-agent live workflow without a real LLM. JAR2-86 deliberately deferred this; if Stage 6's operator-CLI work surfaces a need for an "apply + observe end-to-end with no LLM" loop, file it then.
+- *(optional)* **`MockDecide` callback variant.** The `reconcile_children_live` and `multi_agent` test fixtures plant a sentinel `Idle` decision after the script exhausts because `MockDecide` returns an error on exhaustion and the live workflow can't gracefully exit on that path. A callback-driven `Decide` (e.g. `MockDecide::with_default(|| Decision::Idle { .. })`) would retire the sentinel-`Idle` hack. Cosmetic; file if a fourth fixture needs it.
+- *(optional)* **Doc the `persist_output` empty-evidence contract explicitly.** The JAR2-86 subagent had to plant a harness "echo" evidence record per child output because `AgentFs::persist_output` rejects empty `evidence: Vec<EvidenceId>`. The contract is correct (per-claim provenance enforcement is the whole point of `persist_output`), but the rejection mode wasn't loud in the rustdoc; a future test author hit the same surprise. One-paragraph addition to `AgentFs::persist_output`'s rustdoc would close it.
+
+**JAR2 ticket cross-references for traceability:**
+
+| Stage | Ticket  | PR     | Scope                                                                |
+| ----- | ------- | ------ | -------------------------------------------------------------------- |
+| 5.1   | JAR2-78 | #87    | `Decision` enum extensions (4 parent-child variants + `AgentRef`)    |
+| 5.2   | JAR2-79 | #86    | `Trigger` enum extensions + drain ordering invariant                 |
+| 5.3   | JAR2-80 | #89    | `spawn_child` workflow path + `register_child_in_structural_db`      |
+| 5.4   | JAR2-81 | #88    | Child → parent signal (first live `signal_external_workflow`)        |
+| 5.5   | JAR2-82 | #90    | `reconcile_children` activity + synthetic-evidence pattern           |
+| 5.6   | JAR2-83 | #91    | Conflict log FS schema + content-addressed writer                    |
+| 5.7   | JAR2-84 | #92    | `retire_child` / `replace_child` workflow paths                      |
+| 5.8   | JAR2-85 | #93    | Multi-agent YAML extension to `jarvis apply` (subsumes JAR2-89)      |
+| 5.9   | JAR2-86 | #94    | End-to-end integration test + CI extension                           |
+| 5.10  | JAR2-87 | *this* | Documentation pass (this note + module docs + § 7 rewrite)           |
+
+(Stage 5 → 5.x ticket numbering: the JAR2-78..JAR2-87 sequence maps 1:1 to Stage 5.1..5.10. PR numbers were drawn from the merge order on `main`; if a future audit finds them inconsistent because of an unrelated PR in the sequence, treat the JAR2-NN ticket id as the source of truth and the PR number as a convenience reference.)
+
 ---
 
 ### Stage 6 — Human-in-kernel surfaces
