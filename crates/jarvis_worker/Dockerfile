@@ -1,9 +1,9 @@
-# Worker container for `jarvis_temporal`.
+# Worker container for `jarvis_worker`.
 #
 # Build from the repo root so the workspace is in context:
 #   docker compose build worker
 # or:
-#   docker build -t jarvis-worker:dev -f crates/jarvis_temporal/Dockerfile .
+#   docker build -t jarvis-worker:dev -f crates/jarvis_worker/Dockerfile .
 
 # ---- Build stage --------------------------------------------------------
 # Pin Rust to the same version as `rust-toolchain.toml`. Bookworm
@@ -15,7 +15,12 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml ./
 COPY crates ./crates
 
-RUN cargo build --release -p jarvis_temporal --bin worker
+# Compile both LLM vendors in so the container can install a `Decide`
+# backend at runtime; the active vendor is picked from `JARVIS_MODEL_VENDOR`
+# / whichever API key is set (see
+# `jarvis_temporal::worker::build_decide_from_env`). A no-vendor build still
+# compiles but exits at boot when it tries to install a `Decide` impl.
+RUN cargo build --release -p jarvis_worker --bin worker --features llm-anthropic,llm-cohere
 
 # ---- Runtime stage ------------------------------------------------------
 FROM debian:bookworm-slim AS runtime

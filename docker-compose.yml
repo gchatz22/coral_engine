@@ -2,7 +2,7 @@
 #
 # Scope: bring up backing services (Temporal Server + UI, Postgres) and
 # build (but do not run) a worker container scaffold. The recommended dev
-# loop runs the worker natively (`cargo run -p jarvis_temporal --bin
+# loop runs the worker natively (`cargo run -p jarvis_worker --bin
 # worker`) against these containerized services — see README "Dev
 # environment" section.
 #
@@ -96,7 +96,7 @@ services:
     container_name: jarvis-worker
     build:
       context: .
-      dockerfile: crates/jarvis_temporal/Dockerfile
+      dockerfile: crates/jarvis_worker/Dockerfile
     profiles: ["container-worker"]
     restart: unless-stopped
     depends_on:
@@ -109,10 +109,15 @@ services:
       # localhost. `.env.example` has the host-network equivalents for
       # the recommended native-worker dev loop.
       DATABASE_URL: postgres://jarvis:jarvis@postgres:5432/jarvis_structural
-      TEMPORAL_HOST: temporal:7233
+      TEMPORAL_ADDRESS: http://temporal:7233
       TEMPORAL_NAMESPACE: default
       AGENT_FS_ROOT: /agent-fs
       RUST_LOG: info
+      # The image compiles both LLM vendors; pick one at runtime by supplying
+      # its API key (and optionally JARVIS_MODEL_VENDOR). Without a key the
+      # worker exits at boot on Decide setup.
+      # JARVIS_MODEL_VENDOR: anthropic
+      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     volumes:
       - ./agent-fs:/agent-fs
     networks:

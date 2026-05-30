@@ -14,7 +14,7 @@ dispatches the workflow onto the daemon's canonical task queue
 exits. **Execution lives on a separately-running worker daemon** — see
 the [top-level README's Dev Environment
 section](../../README.md#dev-environment) for the recommended dev loop
-(`cargo run -p jarvis_temporal --bin worker` in a separate terminal,
+(`cargo run -p jarvis_worker --bin worker` in a separate terminal,
 or the `worker` compose service).
 
 ## Files

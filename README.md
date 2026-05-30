@@ -7,16 +7,18 @@ The Jarvis Engine is an OS for autonomous research: a runtime for graphs of long
 ## Repo layout
 
 - `crates/jarvis_node` — runtime types and agent core (`Agent::run`, `AgentFs`, `Mandate`, `Trigger`, `Decision`, ...). Today's library; foundation for the workspace.
-- `crates/jarvis_temporal` — Temporal-hosted agent workflow runtime.
+- `crates/jarvis_temporal` — Temporal-hosted agent workflow runtime (library + `temporal-smoke` bin).
+- `crates/jarvis_graph` — structural DB (graphs, agents, edges, tools) + the `jarvis-apply` operator CLI.
+- `crates/jarvis_worker` — the long-lived worker daemon binary; composition root that wires the runtime to the structural-DB store.
 - `scratch/` — design notes. `scratch/temporal_staged_plan.md` is the current execution plan; read it before non-trivial work.
 - `examples/` — runnable smokes (FS, MCP, LLM-driven).
-- `docker-compose.yml` + `crates/jarvis_temporal/Dockerfile` — local dev environment, documented below.
+- `docker-compose.yml` + `crates/jarvis_worker/Dockerfile` — local dev environment, documented below.
 
 ## Dev environment
 
 The day-to-day dev loop runs **backing services in Docker** and the **worker natively** via `cargo run`. Native worker = fast incremental builds, native debugger, no Docker rebuild between iterations. The container-shape worker exists in `docker-compose.yml` (profile `container-worker`) so the production path stays exercised — but it's not the default.
 
-**Operator CLIs dispatch to the daemon.** Per `scratch/temporal_staged_plan.md` § 2.6, operator-facing CLIs (`jarvis apply`, future `jarvis signal` / `inspect` / `retire`) are thin Temporal clients — they connect to Temporal, dispatch onto the canonical task queue `jarvis-agents` (exported as `jarvis_temporal::worker::DEFAULT_TASK_QUEUE`), and exit. The long-lived worker daemon — the binary at `crates/jarvis_temporal/src/bin/worker.rs`, either run natively or as the `worker` compose service — is what executes the workflows.
+**Operator CLIs dispatch to the daemon.** Per `scratch/temporal_staged_plan.md` § 2.6, operator-facing CLIs (`jarvis apply`, future `jarvis signal` / `inspect` / `retire`) are thin Temporal clients — they connect to Temporal, dispatch onto the canonical task queue `jarvis-agents` (exported as `jarvis_temporal::worker::DEFAULT_TASK_QUEUE`), and exit. The long-lived worker daemon — the binary at `crates/jarvis_worker/src/bin/worker.rs`, either run natively or as the `worker` compose service — is what executes the workflows.
 
 ### Prerequisites
 
@@ -45,10 +47,10 @@ What this starts:
 ```sh
 # Backing services already up from `make up`. The worker uses values from
 # `.env` (host-network endpoints).
-cargo run -p jarvis_temporal --bin worker
+cargo run -p jarvis_worker --bin worker
 ```
 
-The worker connects to the Temporal frontend at `TEMPORAL_ADDRESS`, registers `AgentWorkflow` + the activity bundle, and listens on the canonical task queue **`jarvis-agents`** (overrideable via `TEMPORAL_TASK_QUEUE` — see `.env.example`). Once the log line `jarvis worker starting; registered: AgentWorkflow + AgentActivities` shows up with `task_queue="jarvis-agents"`, operator CLIs (and `temporal workflow start --task-queue jarvis-agents ...`) can dispatch to it.
+The worker connects to the Temporal frontend at `TEMPORAL_ADDRESS`, registers `AgentWorkflow` + the activity bundle, and listens on the canonical task queue **`jarvis-agents`** (overrideable via `TEMPORAL_TASK_QUEUE` — see `.env.example`). It also installs the structural-DB store from **`DATABASE_URL`** (required — the daemon exits at boot without it) so `Decision::SpawnChild` can register child agents; it does not run migrations, so apply the schema via `jarvis apply` first. Once the log lines `installed StructuralDbStore backend ...` and `jarvis worker starting; registered: AgentWorkflow + AgentActivities` show up with `task_queue="jarvis-agents"`, operator CLIs (and `temporal workflow start --task-queue jarvis-agents ...`) can dispatch to it.
 
 ### Dispatch a workflow against the running daemon
 
