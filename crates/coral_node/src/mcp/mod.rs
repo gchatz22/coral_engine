@@ -101,9 +101,28 @@ impl McpClient {
     /// Spawn `command` with `args`, connect over stdio, and complete the
     /// MCP handshake. Returns once the server's `initialize` response has
     /// been received and the `initialized` notification has been sent.
+    ///
+    /// The subprocess inherits the worker's full environment. Use
+    /// [`Self::connect_stdio_with_env`] to scope per-server variables.
     pub async fn connect_stdio(command: &str, args: &[&str]) -> Result<Self, McpError> {
-        let mut cmd = Command::new(command);
-        cmd.args(args);
+        Self::connect_stdio_with_env(command, args, &[]).await
+    }
+
+    /// Like [`Self::connect_stdio`], but sets the given `env` variables on
+    /// the spawned subprocess.
+    ///
+    /// `env` *extends* the inherited environment: each `(name, value)` is
+    /// added or overrides an inherited key, but the worker's own
+    /// environment is **not** cleared. This is deliberate — the worker's
+    /// runtime config (e.g. `PATH`, proxy settings) must still reach the
+    /// server — and it means a caller cannot use this to hide an inherited
+    /// variable from the subprocess, only to add or shadow named ones.
+    pub async fn connect_stdio_with_env(
+        command: &str,
+        args: &[&str],
+        env: &[(String, String)],
+    ) -> Result<Self, McpError> {
+        let cmd = stdio_command(command, args, env);
         let transport = TokioChildProcess::new(cmd)
             .map_err(|e| McpError::Transport(format!("spawn {command:?}: {e}")))?;
         let inner = ().serve(transport).await?;
@@ -161,6 +180,15 @@ impl McpClient {
             .map_err(|e| McpError::Transport(format!("join error during shutdown: {e}")))?;
         Ok(())
     }
+}
+
+/// Build the subprocess [`Command`] for a stdio MCP server, applying
+/// `env` on top of the inherited environment.
+fn stdio_command(command: &str, args: &[&str], env: &[(String, String)]) -> Command {
+    let mut cmd = Command::new(command);
+    cmd.args(args);
+    cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    cmd
 }
 
 /// MCP-aware extension methods on `ToolRegistry`. Lives in the `mcp` module
@@ -250,6 +278,27 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use tokio::io::{duplex, AsyncWriteExt};
+
+    /// `stdio_command` must pass the named env to the child *and* leave the
+    /// inherited environment intact. Spawns `/bin/sh` (no MCP handshake) and
+    /// reads back the passed var plus the inherited `PATH`.
+    #[tokio::test]
+    async fn stdio_command_extends_env_without_clearing_inherited() {
+        let mut cmd = stdio_command(
+            "/bin/sh",
+            &["-c", "printf '%s|%s' \"$CORAL_MCP_TEST_VAR\" \"$PATH\""],
+            &[("CORAL_MCP_TEST_VAR".to_string(), "from-config".to_string())],
+        );
+        let output = cmd.output().await.expect("spawn /bin/sh");
+        assert!(output.status.success(), "sh exited non-zero: {output:?}");
+        let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+        let (passed, inherited_path) = stdout.split_once('|').expect("delimited output");
+        assert_eq!(passed, "from-config", "passed env var did not reach child");
+        assert!(
+            !inherited_path.is_empty(),
+            "inherited PATH was cleared from the child env",
+        );
+    }
 
     /// Hand-built fake MCP server. Advertises one tool, `repeat`, that
     /// echoes its `text` argument back; can be configured to return a
