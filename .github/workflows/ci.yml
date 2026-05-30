@@ -375,6 +375,20 @@ jobs:
           cargo test --locked -p jarvis_graph --test multi_agent -- --nocapture \
             2>&1 | tee ci-logs/multi-agent-live.log
 
+      # Exercises the production worker wiring: the real `GraphStore` installed
+      # as the `StructuralDbStore`, driven through `Decision::SpawnChild`, with
+      # the child `agents` + `edges` rows read back from the service Postgres.
+      - name: Run spawn_child DB live
+        env:
+          TEMPORAL_LIVE_TEST: "1"
+          # `jarvis_worker` pulls `jarvis_graph` (compile-time `sqlx::query!`);
+          # route the build through the `.sqlx/` cache, runtime hits the service.
+          SQLX_OFFLINE: "true"
+        run: |
+          set -o pipefail
+          cargo test --locked -p jarvis_worker --test spawn_child_db_live -- --nocapture \
+            2>&1 | tee ci-logs/spawn-child-db-live.log
+
       - name: Upload workflow smoke logs on failure
         if: failure()
         uses: actions/upload-artifact@v4

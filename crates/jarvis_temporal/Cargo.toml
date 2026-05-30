@@ -11,10 +11,6 @@ license.workspace = true
 publish = false
 
 [[bin]]
-name = "worker"
-path = "src/bin/worker.rs"
-
-[[bin]]
 name = "temporal-smoke"
 path = "src/bin/temporal_smoke.rs"
 
@@ -49,7 +45,7 @@ async-trait = "0.1"
 # `thiserror`-derived errors hit `ApplicationFailure::non_retryable` via
 # `anyhow::Error::new`, which requires `StdError + Send + Sync`.
 thiserror = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
 url = "2"

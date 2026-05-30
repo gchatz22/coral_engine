@@ -3,6 +3,7 @@ members = [
     "crates/jarvis_node",
     "crates/jarvis_temporal",
     "crates/jarvis_graph",
+    "crates/jarvis_worker",
 ]
 # Workspace roots silently fall back to resolver 1 unless pinned; pin keeps
 # feature unification consistent across crates.

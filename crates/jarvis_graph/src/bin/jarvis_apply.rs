@@ -7,7 +7,7 @@
 //! the workflow IDs + a Temporal CLI describe hint per agent, and
 //! exits. **Does not host a Temporal worker.** Execution happens on
 //! the separately-deployed daemon at
-//! `crates/jarvis_temporal/src/bin/worker.rs`.
+//! `crates/jarvis_worker/src/bin/worker.rs`.
 //!
 //! Workflow IDs are the UUID-shaped flat form
 //! `graphs/<graph_uuid>/agents/<agent_uuid>` — cross-agent FS reads
@@ -64,7 +64,7 @@ Thin Temporal client: writes the structural DB, dispatches every
 AgentWorkflow in the graph (parents-first DFS) onto the worker
 daemon's task queue, signals seed triggers, prints the workflow IDs,
 and exits. Workflow execution happens on the long-lived worker daemon
-(run `cargo run -p jarvis_temporal --bin worker` in a separate
+(run `cargo run -p jarvis_worker --bin worker` in a separate
 terminal, or via the `worker` compose service — see top-level
 README's Dev Environment section).
 

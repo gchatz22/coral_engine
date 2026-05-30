@@ -1,22 +1,33 @@
-//! Long-lived Jarvis Temporal worker daemon. Connects to a Temporal
-//! Server, registers [`jarvis_temporal::workflow::AgentWorkflow`] and
-//! [`jarvis_temporal::activities::AgentActivities`] against the
+//! Long-lived Jarvis worker daemon. Connects to a Temporal Server,
+//! installs the process-wide backends every activity body reaches for
+//! (agent storage, the `Decide` impl, the tool registry, and the
+//! structural-DB store), registers [`jarvis_temporal::workflow::AgentWorkflow`]
+//! and [`jarvis_temporal::activities::AgentActivities`] against the
 //! canonical task queue, and runs until SIGINT.
 //!
-//! Configuration env vars: `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`,
+//! Required env: `DATABASE_URL` — Postgres URL for the structural DB. The
+//! daemon installs a `GraphStore`-backed [`StructuralDbStore`] so
+//! `Decision::SpawnChild`'s `register_child_in_structural_db` activity can
+//! write child `agents` + `edges` rows. The worker does **not** run
+//! migrations; apply the schema via `jarvis apply` first.
+//!
+//! Optional env: `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`,
 //! `TEMPORAL_TASK_QUEUE`, `AGENT_FS_ROOT`, `JARVIS_MODEL_VENDOR`,
 //! `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`, `COHERE_API_KEY` /
-//! `COHERE_MODEL`. The library half is feature-agnostic; vendor-specific
-//! constructors are `#[cfg]`-gated here. A build with no vendor still
-//! compiles but errors at boot when no `Decide` impl can be installed.
+//! `COHERE_MODEL`. Vendor-specific `Decide` construction is `#[cfg]`-gated
+//! behind this crate's `llm-anthropic` / `llm-cohere` features; a build with
+//! no vendor compiles but errors at boot when no `Decide` impl can be
+//! installed.
 
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use jarvis_graph::GraphStore;
 use jarvis_node::storage::LocalStorage;
 use jarvis_node::tools::{EchoTool, ToolRegistry};
+use sqlx::postgres::PgPoolOptions;
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
@@ -24,12 +35,28 @@ use tracing::info;
 
 use jarvis_temporal::worker::{
     build_decide_from_env, build_worker, install_agent_storage, install_decide,
-    install_tool_registry, DEFAULT_TASK_QUEUE,
+    install_structural_db_store, install_tool_registry, StructuralDbStore, DEFAULT_TASK_QUEUE,
 };
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
 const DEFAULT_NAMESPACE: &str = "default";
 const DEFAULT_FS_ROOT: &str = "./agent-fs";
+const DATABASE_URL_ENV: &str = "DATABASE_URL";
+const DB_POOL_MAX_CONNECTIONS: u32 = 8;
+
+/// Resolve the structural-DB connection string from the raw env value.
+/// Required: without it the daemon has no `StructuralDbStore` and the first
+/// `Decision::SpawnChild` fails mid-workflow. Failing here turns that
+/// deferred panic into a clean boot-time error.
+fn require_database_url(value: Option<String>) -> Result<String> {
+    match value {
+        Some(url) if !url.is_empty() => Ok(url),
+        _ => Err(anyhow!(
+            "{DATABASE_URL_ENV} must be set; the worker installs the structural-DB store at boot \
+             so Decision::SpawnChild can register child agents (see crates/jarvis_worker/README.md)"
+        )),
+    }
+}
 
 async fn build_client() -> Result<Client> {
     let address = env::var("TEMPORAL_ADDRESS").unwrap_or_else(|_| DEFAULT_ADDRESS.into());
@@ -76,12 +103,18 @@ async fn main() -> Result<()> {
     install_tool_registry(Arc::new(registry));
     info!("installed ToolRegistry with tools: echo");
 
-    // `register_child_in_structural_db` reaches for
-    // `worker::structural_db_store()`; wiring a real `GraphStore` here
-    // requires resolving the `jarvis_graph` <-> `jarvis_temporal`
-    // dependency direction, so multi-agent workflows
-    // (`Decision::SpawnChild`) still panic on first spawn from this
-    // daemon. Single-agent + signal / retire paths are unaffected.
+    // Structural-DB store: installed before the worker serves any task so
+    // `register_child_in_structural_db` always finds a real `GraphStore`.
+    // The URL is kept out of the logs because it carries the DB password.
+    let database_url = require_database_url(env::var(DATABASE_URL_ENV).ok())?;
+    let pool = PgPoolOptions::new()
+        .max_connections(DB_POOL_MAX_CONNECTIONS)
+        .connect(&database_url)
+        .await
+        .with_context(|| format!("connecting to structural DB at {DATABASE_URL_ENV}"))?;
+    let store: Arc<dyn StructuralDbStore> = Arc::new(GraphStore::new(pool));
+    install_structural_db_store(store);
+    info!("installed StructuralDbStore backend (GraphStore over DATABASE_URL)");
 
     let telemetry_options = TelemetryOptions::builder().build();
     let runtime = CoreRuntime::new_assume_tokio(
@@ -114,4 +147,34 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("worker.run() exited with error: {e}"))?;
     info!("jarvis worker exited cleanly");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn require_database_url_returns_value_when_set() {
+        let got = require_database_url(Some("postgres://jarvis@localhost/db".to_string()))
+            .expect("set url accepted");
+        assert_eq!(got, "postgres://jarvis@localhost/db");
+    }
+
+    #[test]
+    fn require_database_url_errors_when_unset() {
+        let err = require_database_url(None).expect_err("missing url rejected");
+        assert!(
+            format!("{err}").contains(DATABASE_URL_ENV),
+            "error should name the env var; got: {err}"
+        );
+    }
+
+    #[test]
+    fn require_database_url_errors_when_empty() {
+        let err = require_database_url(Some(String::new())).expect_err("empty url rejected");
+        assert!(
+            format!("{err}").contains(DATABASE_URL_ENV),
+            "error should name the env var; got: {err}"
+        );
+    }
 }
