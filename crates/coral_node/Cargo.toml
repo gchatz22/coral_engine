@@ -1,0 +1,80 @@
+[package]
+name = "coral_node"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Single-node runtime for the Coral Engine."
+license.workspace = true
+publish = false
+
+[lib]
+name = "coral_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "node-run"
+path = "src/bin/node_run.rs"
+
+[[bin]]
+name = "compute-evidence-id"
+path = "src/bin/compute_evidence_id.rs"
+
+[[bin]]
+name = "model-call"
+path = "src/bin/model_call.rs"
+
+[[bin]]
+name = "node-run-mcp"
+path = "src/bin/node_run_mcp.rs"
+required-features = ["mcp"]
+
+[[bin]]
+name = "node-run-llm"
+path = "src/bin/node_run_llm.rs"
+# `required-features` would pin a single conjunction; cargo does not support OR.
+# Vendor + `mcp` are gated at runtime inside the binary instead.
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+rmcp = { version = "1.6.0", optional = true, features = ["client", "server", "transport-child-process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+tracing = "0.1"
+ulid = { version = "1", features = ["serde"] }
+# `v4` is opt-out: the kernel never generates `AgentId`s itself — they come from
+# the structural DB — so only `serde` is needed here.
+uuid = { version = "1", default-features = false, features = ["serde", "std"] }
+
+[features]
+# Default build is network-free: no `reqwest`, no live model adapters, so
+# `cargo test` stays hermetic.
+default = []
+llm-anthropic = ["dep:reqwest"]
+llm-cohere = ["dep:reqwest"]
+mcp = ["dep:rmcp"]
+# Opt-in to the in-memory `MemoryStorage` impl from non-test code. Tests in any
+# workspace crate always have access via `#[cfg(test)]`; production binaries
+# must enable this feature explicitly to avoid shipping in-memory storage.
+memory-storage = []
+
+# Clippy 1.88 promoted a handful of style lints (notably `uninlined_format_args`)
+# that fire on patterns the 1.84 toolchain accepted. Allow them until there's a
+# reason to broadly modernize formatting.
+[lints.clippy]
+uninlined_format_args = "allow"
+
+[dev-dependencies]
+tempfile = "3"
+# `test-util` enables `tokio::time::pause`/`advance` and the `start_paused`
+# attribute on `#[tokio::test]`, used by the scheduler's deterministic
+# time-travel tests.
+tokio = { version = "1", features = ["test-util"] }

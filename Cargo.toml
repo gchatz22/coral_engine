@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "crates/jarvis_node",
-    "crates/jarvis_temporal",
-    "crates/jarvis_graph",
-    "crates/jarvis_worker",
+    "crates/coral_node",
+    "crates/coral_temporal",
+    "crates/coral_graph",
+    "crates/coral_worker",
 ]
 # Workspace roots silently fall back to resolver 1 unless pinned; pin keeps
 # feature unification consistent across crates.

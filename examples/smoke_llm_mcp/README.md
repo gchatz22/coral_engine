@@ -42,7 +42,7 @@ cargo run --features "mcp llm-anthropic" --bin node-run-llm -- \
     --vendor anthropic \
     examples/smoke_llm_mcp/config.json \
     examples/smoke_llm_mcp/triggers.jsonl \
-    /tmp/jarvis-smoke-llm-mcp-fs \
+    /tmp/coral-smoke-llm-mcp-fs \
     -- npx -y @modelcontextprotocol/server-everything
 ```
 
@@ -54,7 +54,7 @@ cargo run --features "mcp llm-cohere" --bin node-run-llm -- \
     --vendor cohere \
     examples/smoke_llm_mcp/config.json \
     examples/smoke_llm_mcp/triggers.jsonl \
-    /tmp/jarvis-smoke-llm-mcp-fs \
+    /tmp/coral-smoke-llm-mcp-fs \
     -- npx -y @modelcontextprotocol/server-everything
 ```
 
@@ -104,12 +104,12 @@ comparing prompt/mandate tweaks across runs is trivial.
 On success, stdout includes:
 
 ```
-node-run-llm: fs_root=/tmp/jarvis-smoke-llm-mcp-fs/2026-05-20T04-30-07-123Z
+node-run-llm: fs_root=/tmp/coral-smoke-llm-mcp-fs/2026-05-20T04-30-07-123Z
 node-run-llm: registered 13 MCP tool(s): echo, get-annotated-message, get-env, ...
 node-run-llm: vendor=anthropic model=claude-haiku-4-5
 node-run-llm: agent retired: <model's reason or max_ticks (8) reached>
-node-run-llm: fs tree at /tmp/jarvis-smoke-llm-mcp-fs/2026-05-20T04-30-07-123Z:
-/tmp/jarvis-smoke-llm-mcp-fs/2026-05-20T04-30-07-123Z
+node-run-llm: fs tree at /tmp/coral-smoke-llm-mcp-fs/2026-05-20T04-30-07-123Z:
+/tmp/coral-smoke-llm-mcp-fs/2026-05-20T04-30-07-123Z
 ├── claims
 ├── evidence
 │   └── <hex>.json
@@ -142,7 +142,7 @@ will drift if the server's release bumps its tool surface.
 ## Cleanup
 
 ```bash
-rm -rf /tmp/jarvis-smoke-llm-mcp-fs
+rm -rf /tmp/coral-smoke-llm-mcp-fs
 ```
 
 This nukes the *parent* directory and every accumulated
@@ -163,19 +163,19 @@ on the npm-installed MCP server *or* on a live model key — the default
 suite stays offline. The two optional integration tests are gated
 independently:
 
-* `tests/smoke_llm_mcp_anthropic.rs` — needs both `JARVIS_SMOKE_LLM_MCP=1`
+* `tests/smoke_llm_mcp_anthropic.rs` — needs both `CORAL_SMOKE_LLM_MCP=1`
   and `ANTHROPIC_API_KEY`; compiled only with `mcp` + `llm-anthropic`.
-* `tests/smoke_llm_mcp_cohere.rs` — needs both `JARVIS_SMOKE_LLM_MCP=1`
+* `tests/smoke_llm_mcp_cohere.rs` — needs both `CORAL_SMOKE_LLM_MCP=1`
   and `COHERE_API_KEY`; compiled only with `mcp` + `llm-cohere`.
 
 Run them explicitly:
 
 ```bash
-JARVIS_SMOKE_LLM_MCP=1 ANTHROPIC_API_KEY=sk-ant-... \
+CORAL_SMOKE_LLM_MCP=1 ANTHROPIC_API_KEY=sk-ant-... \
 cargo test --features "mcp llm-anthropic" \
     --test smoke_llm_mcp_anthropic -- --nocapture
 
-JARVIS_SMOKE_LLM_MCP=1 COHERE_API_KEY=... \
+CORAL_SMOKE_LLM_MCP=1 COHERE_API_KEY=... \
 cargo test --features "mcp llm-cohere" \
     --test smoke_llm_mcp_cohere -- --nocapture
 ```

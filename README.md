@@ -1,24 +1,24 @@
-# Jarvis Engine
+# Coral Engine
 
 *An open, forkable substrate for continuously running autonomous research — a graph of subagents that read the world, reason about it, and keep a current model of any topic alive forever after.*
 
-The Jarvis Engine is an OS for autonomous research: a runtime for graphs of long-lived agents that wake on signal, do narrow work, and feed outputs to their parents. The graph — not the request — is the unit of computation. See `VISION.md` for the full product/architecture vision and `DEVELOPMENT.md` for the rules every contributor (human or agent) follows.
+The Coral Engine is an OS for autonomous research: a runtime for graphs of long-lived agents that wake on signal, do narrow work, and feed outputs to their parents. The graph — not the request — is the unit of computation. See `VISION.md` for the full product/architecture vision and `DEVELOPMENT.md` for the rules every contributor (human or agent) follows.
 
 ## Repo layout
 
-- `crates/jarvis_node` — runtime types and agent core (`Agent::run`, `AgentFs`, `Mandate`, `Trigger`, `Decision`, ...). Today's library; foundation for the workspace.
-- `crates/jarvis_temporal` — Temporal-hosted agent workflow runtime (library + `temporal-smoke` bin).
-- `crates/jarvis_graph` — structural DB (graphs, agents, edges, tools) + the `jarvis-apply` operator CLI.
-- `crates/jarvis_worker` — the long-lived worker daemon binary; composition root that wires the runtime to the structural-DB store.
+- `crates/coral_node` — runtime types and agent core (`Agent::run`, `AgentFs`, `Mandate`, `Trigger`, `Decision`, ...). Today's library; foundation for the workspace.
+- `crates/coral_temporal` — Temporal-hosted agent workflow runtime (library + `temporal-smoke` bin).
+- `crates/coral_graph` — structural DB (graphs, agents, edges, tools) + the `coral-apply` operator CLI.
+- `crates/coral_worker` — the long-lived worker daemon binary; composition root that wires the runtime to the structural-DB store.
 - `scratch/` — design notes. `scratch/temporal_staged_plan.md` is the current execution plan; read it before non-trivial work.
 - `examples/` — runnable smokes (FS, MCP, LLM-driven).
-- `docker-compose.yml` + `crates/jarvis_worker/Dockerfile` — local dev environment, documented below.
+- `docker-compose.yml` + `crates/coral_worker/Dockerfile` — local dev environment, documented below.
 
 ## Dev environment
 
 The day-to-day dev loop runs **backing services in Docker** and the **worker natively** via `cargo run`. Native worker = fast incremental builds, native debugger, no Docker rebuild between iterations. The container-shape worker exists in `docker-compose.yml` (profile `container-worker`) so the production path stays exercised — but it's not the default.
 
-**Operator CLIs dispatch to the daemon.** Per `scratch/temporal_staged_plan.md` § 2.6, operator-facing CLIs (`jarvis apply`, future `jarvis signal` / `inspect` / `retire`) are thin Temporal clients — they connect to Temporal, dispatch onto the canonical task queue `jarvis-agents` (exported as `jarvis_temporal::worker::DEFAULT_TASK_QUEUE`), and exit. The long-lived worker daemon — the binary at `crates/jarvis_worker/src/bin/worker.rs`, either run natively or as the `worker` compose service — is what executes the workflows.
+**Operator CLIs dispatch to the daemon.** Per `scratch/temporal_staged_plan.md` § 2.6, operator-facing CLIs (`coral apply`, future `coral signal` / `inspect` / `retire`) are thin Temporal clients — they connect to Temporal, dispatch onto the canonical task queue `coral-agents` (exported as `coral_temporal::worker::DEFAULT_TASK_QUEUE`), and exit. The long-lived worker daemon — the binary at `crates/coral_worker/src/bin/worker.rs`, either run natively or as the `worker` compose service — is what executes the workflows.
 
 ### Prerequisites
 
@@ -37,20 +37,20 @@ What this starts:
 
 | Service | Image | Host port | Purpose |
 |---|---|---|---|
-| `postgres` | `postgres:16-alpine3.23` | `5432` | Backs both Temporal (its own DBs) and the structural DB (`jarvis_structural`). |
+| `postgres` | `postgres:16-alpine3.23` | `5432` | Backs both Temporal (its own DBs) and the structural DB (`coral_structural`). |
 | `temporal` | `temporalio/auto-setup:1.29.6` | `7233` | Temporal frontend (gRPC). Single-container "all services in one" dev image; production-shape splits these. |
 | `temporal-ui` | `temporalio/ui:2.50.0` | `8233` | Temporal Web UI. Reachable at <http://localhost:8233>. |
-| `worker` | built locally (`jarvis-worker:dev`) | — | Worker container scaffold. Built on demand; not started by default (profile `container-worker`). |
+| `worker` | built locally (`coral-worker:dev`) | — | Worker container scaffold. Built on demand; not started by default (profile `container-worker`). |
 
 ### Run the worker natively (recommended)
 
 ```sh
 # Backing services already up from `make up`. The worker uses values from
 # `.env` (host-network endpoints).
-cargo run -p jarvis_worker --bin worker
+cargo run -p coral_worker --bin worker
 ```
 
-The worker connects to the Temporal frontend at `TEMPORAL_ADDRESS`, registers `AgentWorkflow` + the activity bundle, and listens on the canonical task queue **`jarvis-agents`** (overrideable via `TEMPORAL_TASK_QUEUE` — see `.env.example`). It also installs the structural-DB store from **`DATABASE_URL`** (required — the daemon exits at boot without it) so `Decision::SpawnChild` can register child agents; it does not run migrations, so apply the schema via `jarvis apply` first. Once the log lines `installed StructuralDbStore backend ...` and `jarvis worker starting; registered: AgentWorkflow + AgentActivities` show up with `task_queue="jarvis-agents"`, operator CLIs (and `temporal workflow start --task-queue jarvis-agents ...`) can dispatch to it.
+The worker connects to the Temporal frontend at `TEMPORAL_ADDRESS`, registers `AgentWorkflow` + the activity bundle, and listens on the canonical task queue **`coral-agents`** (overrideable via `TEMPORAL_TASK_QUEUE` — see `.env.example`). It also installs the structural-DB store from **`DATABASE_URL`** (required — the daemon exits at boot without it) so `Decision::SpawnChild` can register child agents; it does not run migrations, so apply the schema via `coral apply` first. Once the log lines `installed StructuralDbStore backend ...` and `coral worker starting; registered: AgentWorkflow + AgentActivities` show up with `task_queue="coral-agents"`, operator CLIs (and `temporal workflow start --task-queue coral-agents ...`) can dispatch to it.
 
 ### Dispatch a workflow against the running daemon
 
@@ -58,7 +58,7 @@ The worker connects to the Temporal frontend at `TEMPORAL_ADDRESS`, registers `A
 # In a separate terminal, with the dev stack + native worker both up:
 temporal workflow start \
     --address localhost:7233 --namespace default \
-    --task-queue jarvis-agents \
+    --task-queue coral-agents \
     --type AgentWorkflow \
     --workflow-id 'graphs/<graph_id>/agents/<agent_id>' \
     --input '{ ... AgentInput JSON ... }'
@@ -73,12 +73,12 @@ make worker-build                # build only
 make worker                      # build + run, attached
 ```
 
-Or directly: `docker compose --profile container-worker up worker`. The container listens on the same `jarvis-agents` queue, so operator CLIs don't care which path is running.  Worker reads service-name endpoints (`postgres:5432`, `temporal:7233`) inside the compose network — no `.env` changes needed.
+Or directly: `docker compose --profile container-worker up worker`. The container listens on the same `coral-agents` queue, so operator CLIs don't care which path is running.  Worker reads service-name endpoints (`postgres:5432`, `temporal:7233`) inside the compose network — no `.env` changes needed.
 
 ### Inspect state
 
 - **Temporal UI:** <http://localhost:8233> — workflow histories, signals, task queues.
-- **Postgres:** `make psql` opens a `psql` shell against the `jarvis_structural` database. From the host: `psql postgres://jarvis:jarvis@localhost:5432/jarvis_structural`.
+- **Postgres:** `make psql` opens a `psql` shell against the `coral_structural` database. From the host: `psql postgres://coral:coral@localhost:5432/coral_structural`.
 - **Per-agent FS:** the host directory `./agent-fs/` is bind-mounted to `/agent-fs` inside the worker container. Inspect it with the usual shell tools.
 
 ### Reset
@@ -103,7 +103,7 @@ The dev-environment work doesn't add Rust deps; if either command starts failing
 
 ## Status
 
-Pre-production. See `scratch/temporal_staged_plan.md` for the staged plan. Today's `jarvis_node` is a single in-process agent loop with provenance-enforced FS state.
+Pre-production. See `scratch/temporal_staged_plan.md` for the staged plan. Today's `coral_node` is a single in-process agent loop with provenance-enforced FS state.
 
 See `DEVELOPMENT.md` for contribution rules: smallest correct diff, tests with the change, GitHub-Issues-driven planning, Graphite-managed stacked PRs.
 

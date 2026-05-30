@@ -8,11 +8,11 @@
 
 Research today is treated as a query: someone asks a question, a process runs, an answer comes back, the process exits. This was the right shape when the constraint was retrieval — when the work was finding the relevant document, the relevant data point, the relevant precedent. **Retrieval is no longer the constraint.** Reasoning at scale is the constraint, and reasoning at scale doesn't fit inside a query.
 
-The Jarvis Engine reframes research as a **continuously running process**: a graph of autonomous subagents, each with its own narrow mandate, its own tools, and its own state, that wake up when reality changes, do their work, hand their outputs to their parents, and contribute to a model of the topic that is never finished. The graph is the program. The graph is the state of the research. The graph is always live.
+The Coral Engine reframes research as a **continuously running process**: a graph of autonomous subagents, each with its own narrow mandate, its own tools, and its own state, that wake up when reality changes, do their work, hand their outputs to their parents, and contribute to a model of the topic that is never finished. The graph is the program. The graph is the state of the research. The graph is always live.
 
 The engine is **domain-agnostic infrastructure**. A graph can be a public-equity thesis, a clinical trial pipeline, a piece of contested geopolitics, a piece of code under continuous review, a watch on a port nobody reads. The substrate is the same. Each subagent's mandate is narrow; stack enough of them and you have a model of any slice of the world that updates in real time and traces every claim to its evidence.
 
-The Jarvis Engine is **open source by default and forkable by design**. We are not building a vertical product with a single hosted UI — we are building **the OS for autonomous research, in the spirit of Ubuntu**: a small, well-defined kernel; an opinionated default distribution; a connector and tool ecosystem deep enough to be useful; and a clean contract that a thousand applications can be built against. The substrate is the commons. The applications are where value reaches users.
+The Coral Engine is **open source by default and forkable by design**. We are not building a vertical product with a single hosted UI — we are building **the OS for autonomous research, in the spirit of Ubuntu**: a small, well-defined kernel; an opinionated default distribution; a connector and tool ecosystem deep enough to be useful; and a clean contract that a thousand applications can be built against. The substrate is the commons. The applications are where value reaches users.
 
 ---
 
@@ -28,7 +28,7 @@ Every team that has tried to build serious autonomous-research tooling has hit t
 
 **Built for chat, not research.** The dominant UX of the agent era is the chat box. Real research is not a conversation — it is a long, branching, contradictory, self-correcting process whose unit of work is closer to a paper trail than a turn-taking dialogue. Tooling shaped like chat will lose to tooling shaped like the work.
 
-The Jarvis Engine treats these four walls as design constraints. The substrate has to be continuous, collaborative, infrastructural, and shaped like research.
+The Coral Engine treats these four walls as design constraints. The substrate has to be continuous, collaborative, infrastructural, and shaped like research.
 
 ---
 
@@ -110,7 +110,7 @@ These are not separate products. They are dialects of one substrate. Each choose
 
 ## 7. The Performance Frontier
 
-A platform that runs ten subagents per graph is a demo. A platform that runs ten thousand is a research tool. **A platform that runs millions, continuously, durably, at controllable cost — that is infrastructure.** The engineering ambition of the Jarvis Engine is to operate at that frontier and drag the rest of the field forward.
+A platform that runs ten subagents per graph is a demo. A platform that runs ten thousand is a research tool. **A platform that runs millions, continuously, durably, at controllable cost — that is infrastructure.** The engineering ambition of the Coral Engine is to operate at that frontier and drag the rest of the field forward.
 
 The hard problems are not novel in isolation; they are novel in combination at this scale.
 
@@ -118,7 +118,7 @@ The hard problems are not novel in isolation; they are novel in combination at t
 - **Inference economics.** Inference is the dominant runtime cost. The engine caches aggressively, batches across siblings, distills hot paths, and routes each mandate to the cheapest model that meets the bar.
 - **State durability and traffic multiplexing.** Millions of agents with rich, versioned, time-scrubbable filesystems demand storage that is fast on the hot path and cheap on the cold path. MCP traffic must be deduplicated and routed so that thousands of agents reading the same source impose one fetch, not thousands.
 
-These problems do not get solved by stacking more frameworks on top of each other. They get solved by treating the engine as a serious systems project — written in languages that respect performance, with profiling and tracing baked in, with a kernel small enough to be optimized end-to-end. The Jarvis Engine is an invitation to performance engineers to do their best work on a workload that did not exist five years ago.
+These problems do not get solved by stacking more frameworks on top of each other. They get solved by treating the engine as a serious systems project — written in languages that respect performance, with profiling and tracing baked in, with a kernel small enough to be optimized end-to-end. The Coral Engine is an invitation to performance engineers to do their best work on a workload that did not exist five years ago.
 
 ---
 
@@ -174,7 +174,7 @@ The window to set the canonical substrate is narrow. Closed alternatives are rac
 
 ## 11. The Endgame
 
-In three years, the Jarvis Engine is the substrate for autonomous research the way Linux is the substrate for servers and Postgres is the substrate for serious data. Every serious research organization runs a fork — public, private, sovereign — against their own connectors and their own models, with their own people as architects of their own graphs.
+In three years, the Coral Engine is the substrate for autonomous research the way Linux is the substrate for servers and Postgres is the substrate for serious data. Every serious research organization runs a fork — public, private, sovereign — against their own connectors and their own models, with their own people as architects of their own graphs.
 
 In five years, every nontrivial question in the institutions that pay for being right — funds, agencies, ministries, labs, hospitals — has a graph behind it that has been running for months. The graphs are the institutional memory. The memos write themselves. The humans are the architects, the skeptics, and the editors.
 

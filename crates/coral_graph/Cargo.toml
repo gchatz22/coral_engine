@@ -1,0 +1,115 @@
+[package]
+name = "coral_graph"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Structural DB for the Coral Engine: graphs, agents, edges, tools, authored mandates."
+license.workspace = true
+publish = false
+
+[lib]
+name = "coral_graph"
+path = "src/lib.rs"
+
+# Operator-facing thin Temporal client. Reads `graph.yaml`, writes the
+# structural DB, and dispatches an `AgentWorkflow` onto the long-lived worker
+# daemon's canonical task queue. The CLI does not host a worker and does not
+# block on `get_result`.
+[[bin]]
+name = "coral-apply"
+path = "src/bin/coral_apply.rs"
+
+[dependencies]
+coral_node = { path = "../coral_node" }
+coral_temporal = { path = "../coral_temporal" }
+
+
+# `sqlx` pinned with `=` so a future `cargo update` doesn't silently shift the
+# DB driver under us.
+#
+# Features:
+# - `runtime-tokio-rustls`: same async runtime + TLS stack as the rest of the
+#   workspace.
+# - `postgres`: target DB.
+# - `macros`: enables `query!` / `query_as!` compile-time-checked queries;
+#   offline mode via `.sqlx/` makes them work in CI without a live DB.
+# - `migrate`: enables `sqlx::migrate!()` for programmatic schema application.
+# - `chrono`, `uuid`, `json`: column-type support (`TIMESTAMPTZ`, `uuid`,
+#   `jsonb`).
+sqlx = { version = "=0.8.6", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "macros",
+    "migrate",
+    "chrono",
+    "uuid",
+    "json",
+] }
+
+# Match `coral_node`'s `chrono` shape exactly so a future workspace-deps
+# consolidation is a one-line move and unification doesn't trip duplicates.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# `impl coral_temporal::worker::StructuralDbStore for GraphStore` in
+# `src/store.rs` uses `#[async_trait]` because the trait is itself
+# `#[async_trait]`-annotated.
+async-trait = "0.1"
+
+# `graph.yaml` parsing deps.
+#
+# All three pinned with `=` so the `examples/graph.schema.json` byte-equality
+# test (and humanized-duration parser surface) cannot silently drift.
+#
+# `serde_yaml` 0.9.x is marked `+deprecated` upstream but is still the
+# canonical Rust YAML driver — `serde_yml` is a recent fork without a
+# stability story yet.
+#
+# `humantime` parses `100ms` / `5m` / `1h`. No `humantime-serde` — we
+# deserialize via a custom adapter on `String` to keep the error surface
+# aligned with the rest of `GraphYamlError`.
+#
+# `schemars` 1.x `derive` gives us `JsonSchema` macros; the example schema
+# JSON is generated from these.
+serde_yaml = "=0.9.34"
+humantime = "=2.3.0"
+schemars = { version = "=1.2.1", features = ["derive"] }
+
+# Thin-client `coral-apply` only needs the Temporal client surface (`Client`,
+# signal/start workflow, `Url`); workflow execution lives on the worker daemon.
+# Pinned with `=` to match the rest of the Temporal SDK pins so the CLI's wire
+# shape can't drift from the daemon's.
+temporalio-client = "=0.4.0"
+temporalio-sdk-core = "=0.4.0"
+url = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+
+[features]
+default = []
+
+[dev-dependencies]
+tempfile = "3"
+
+# `memory-storage` feature pulls in `MemoryStorage` for the integration test
+# without dragging it into the production `coral-apply` binary. Mirrors the
+# analogous override in `coral_temporal/Cargo.toml`.
+coral_node = { path = "../coral_node", features = ["memory-storage"] }
+
+# Integration test hosts a worker inline as a test fixture (the thin-client CLI
+# no longer does), so the test build pulls in the worker-side Temporal SDK
+# surface (`Worker::new` lives in `temporalio-sdk` via
+# `coral_temporal::worker::build_worker`; `CoreRuntime` + `TelemetryOptions`
+# come from `temporalio-sdk-core` and `temporalio-common`). The production
+# `coral-apply` binary stays client-only.
+temporalio-sdk = "=0.4.0"
+temporalio-common = "=0.4.0"
+
+# Lint posture matches `coral_node`: clippy 1.88 promoted style lints; allow
+# until there's a reason to broadly modernize formatting.
+[lints.clippy]
+uninlined_format_args = "allow"

@@ -1,21 +1,21 @@
-# Local Docker dev environment for the Jarvis Engine.
+# Local Docker dev environment for the Coral Engine.
 #
 # Scope: bring up backing services (Temporal Server + UI, Postgres) and
 # build (but do not run) a worker container scaffold. The recommended dev
-# loop runs the worker natively (`cargo run -p jarvis_worker --bin
+# loop runs the worker natively (`cargo run -p coral_worker --bin
 # worker`) against these containerized services — see README "Dev
 # environment" section.
 #
 # Dev-only: `temporalio/auto-setup` bundles all Temporal services into
 # one container for simplicity. Postgres here hosts both Temporal's
 # persistence (databases `temporal` + `temporal_visibility`, created by
-# auto-setup) and the structural DB (`jarvis_structural`, created by an
+# auto-setup) and the structural DB (`coral_structural`, created by an
 # init script). One Postgres in dev keeps the stack light.
 
-name: jarvis
+name: coral
 
 networks:
-  jarvis:
+  coral:
     driver: bridge
 
 volumes:
@@ -24,29 +24,29 @@ volumes:
 services:
   postgres:
     image: postgres:16-alpine3.23
-    container_name: jarvis-postgres
+    container_name: coral-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: jarvis
-      POSTGRES_PASSWORD: jarvis
+      POSTGRES_USER: coral
+      POSTGRES_PASSWORD: coral
       # Default DB the structural-DB schema owns. Temporal creates its
       # own `temporal` + `temporal_visibility` DBs at startup.
-      POSTGRES_DB: jarvis_structural
+      POSTGRES_DB: coral_structural
     ports:
       - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     networks:
-      - jarvis
+      - coral
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U jarvis -d jarvis_structural"]
+      test: ["CMD-SHELL", "pg_isready -U coral -d coral_structural"]
       interval: 5s
       timeout: 3s
       retries: 20
 
   temporal:
     image: temporalio/auto-setup:1.29.6
-    container_name: jarvis-temporal
+    container_name: coral-temporal
     restart: unless-stopped
     depends_on:
       postgres:
@@ -54,15 +54,15 @@ services:
     environment:
       DB: postgres12
       DB_PORT: 5432
-      POSTGRES_USER: jarvis
-      POSTGRES_PWD: jarvis
+      POSTGRES_USER: coral
+      POSTGRES_PWD: coral
       POSTGRES_SEEDS: postgres
       # `default` namespace is created by auto-setup. Skip schema setup
       # only if already present (auto-setup handles this internally).
     ports:
       - "7233:7233"  # gRPC frontend (workers connect here)
     networks:
-      - jarvis
+      - coral
     healthcheck:
       # `temporal` CLI ships inside the auto-setup image. `operator
       # cluster health` exits non-zero until the frontend is accepting
@@ -75,7 +75,7 @@ services:
 
   temporal-ui:
     image: temporalio/ui:2.50.0
-    container_name: jarvis-temporal-ui
+    container_name: coral-temporal-ui
     restart: unless-stopped
     depends_on:
       temporal:
@@ -86,17 +86,17 @@ services:
     ports:
       - "8233:8080"  # UI on http://localhost:8233
     networks:
-      - jarvis
+      - coral
 
   worker:
     # Worker container scaffold. Built but not started by default — the
     # recommended dev loop runs the worker natively via `cargo run`.
     # Bring it up explicitly with `docker compose --profile container-worker up worker`.
-    image: jarvis-worker:dev
-    container_name: jarvis-worker
+    image: coral-worker:dev
+    container_name: coral-worker
     build:
       context: .
-      dockerfile: crates/jarvis_worker/Dockerfile
+      dockerfile: crates/coral_worker/Dockerfile
     profiles: ["container-worker"]
     restart: unless-stopped
     depends_on:
@@ -108,17 +108,17 @@ services:
       # In-container worker reaches services by their compose name, not
       # localhost. `.env.example` has the host-network equivalents for
       # the recommended native-worker dev loop.
-      DATABASE_URL: postgres://jarvis:jarvis@postgres:5432/jarvis_structural
+      DATABASE_URL: postgres://coral:coral@postgres:5432/coral_structural
       TEMPORAL_ADDRESS: http://temporal:7233
       TEMPORAL_NAMESPACE: default
       AGENT_FS_ROOT: /agent-fs
       RUST_LOG: info
       # The image compiles both LLM vendors; pick one at runtime by supplying
-      # its API key (and optionally JARVIS_MODEL_VENDOR). Without a key the
+      # its API key (and optionally CORAL_MODEL_VENDOR). Without a key the
       # worker exits at boot on Decide setup.
-      # JARVIS_MODEL_VENDOR: anthropic
+      # CORAL_MODEL_VENDOR: anthropic
       # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     volumes:
       - ./agent-fs:/agent-fs
     networks:
-      - jarvis
+      - coral

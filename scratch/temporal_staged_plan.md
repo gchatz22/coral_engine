@@ -55,7 +55,7 @@ Agent::run — in-process loop (existing), refactored to call AgentCore::dispatc
   - Source of truth for "how the loop behaves" until AgentWorkflow ships; then becomes the test driver.
 ```
 
-The seam that survives across hosts is **`Decision` (input, shared)** + **`DispatchOutcome`'s continuation variants (shared semantic intent: Continue / NeedsCorrection / ToolError / Retired)**. `AgentCore::dispatch` itself is the in-process loop's implementation of that semantic; the workflow host has its own implementation that maps `Decision` to activities directly and never calls `AgentCore::dispatch`. `drain_triggers` and `decide` are genuinely pure of FS/tool effects and are shared by both hosts; `dispatch` is host-specific code that happens to live in `jarvis_node` so the in-process loop can be a thin wrapper.
+The seam that survives across hosts is **`Decision` (input, shared)** + **`DispatchOutcome`'s continuation variants (shared semantic intent: Continue / NeedsCorrection / ToolError / Retired)**. `AgentCore::dispatch` itself is the in-process loop's implementation of that semantic; the workflow host has its own implementation that maps `Decision` to activities directly and never calls `AgentCore::dispatch`. `drain_triggers` and `decide` are genuinely pure of FS/tool effects and are shared by both hosts; `dispatch` is host-specific code that happens to live in `coral_node` so the in-process loop can be a thin wrapper.
 
 The async runtime concerns and the signal source are properties of the host (`AgentWorkflow` or `Agent::run`), not the core. This gives us a clean cutover when we're ready: route real traffic through `AgentWorkflow`, keep `Agent::run` only for `cargo test`.
 
@@ -110,37 +110,37 @@ This principle shapes how `AgentWorkflow` is structured — it matches on `Decis
 
 A second principle, lateral to § 2.5. Stated at the top because it dictates the deployment topology every stage from 4 onward inherits.
 
-**The principle.** Every operator-facing CLI — `jarvis apply`, `jarvis signal`, `jarvis inspect`, `jarvis retire`, and any future sibling — is a **thin Temporal client**. It connects to Temporal, calls `start_workflow` / `signal_workflow` / `query_workflow` / `describe_workflow`, and exits. It does **not** host its own Temporal worker. Workflows run on a **separately-deployed long-lived worker daemon** (the binary at `crates/jarvis_temporal/src/bin/worker.rs`, deployed as the worker container introduced in stage 0.3).
+**The principle.** Every operator-facing CLI — `coral apply`, `coral signal`, `coral inspect`, `coral retire`, and any future sibling — is a **thin Temporal client**. It connects to Temporal, calls `start_workflow` / `signal_workflow` / `query_workflow` / `describe_workflow`, and exits. It does **not** host its own Temporal worker. Workflows run on a **separately-deployed long-lived worker daemon** (the binary at `crates/coral_temporal/src/bin/worker.rs`, deployed as the worker container introduced in stage 0.3).
 
 **Why.** Same shape as `kubectl apply`, `helm install`, `temporal workflow start`, for the same reasons: the CLI is fast and local; the long-lived work runs centrally; the CLI's lifetime is decoupled from the workflow's. An operator launching a graph should not have to keep their terminal open while the agent retires hours or days later. Operators on multiple machines all dispatch to the same worker fleet. Restarting the CLI's host does not restart the workflows.
 
 **Concrete implications for stages 4 and 6.**
 
-- **`jarvis apply graph.yaml`** (stage 4): writes the structural DB → `start_workflow` → signals seed triggers → **exits**. Does **not** call `get_result`. Does **not** boot a worker. Assumes a worker daemon is already consuming from the right task queue.
-- **`jarvis signal / inspect / retire <agent_id>`** (stage 6): same thin-client shape. Each is one Temporal client call + exit.
+- **`coral apply graph.yaml`** (stage 4): writes the structural DB → `start_workflow` → signals seed triggers → **exits**. Does **not** call `get_result`. Does **not** boot a worker. Assumes a worker daemon is already consuming from the right task queue.
+- **`coral signal / inspect / retire <agent_id>`** (stage 6): same thin-client shape. Each is one Temporal client call + exit.
 - Integration tests in this lineage (stage 4.3 onward) start a worker as test fixture (or rely on the dev-stack worker daemon). They are **not** a license to put the worker inline inside the operator CLI.
 
-**Prerequisite: worker daemon deployment — shipped.** The thin-client CLI shape is only viable when there is a worker daemon to dispatch to. Stage 0.3 built the worker container scaffold; stage 3 filled it with the real workflow + activity code. **JAR2-75** made the daemon the canonical dev-loop target (canonical task queue const `DEFAULT_TASK_QUEUE = "jarvis-agents"`, the `worker` container kept opt-in behind the `container-worker` compose profile so `cargo run -p jarvis_temporal --bin worker` stays the day-to-day loop). **JAR2-76** then refactored `jarvis apply` off its inline-worker shape onto that queue (and deleted the redundant `jarvis_run_workflow` binary along with it).
+**Prerequisite: worker daemon deployment — shipped.** The thin-client CLI shape is only viable when there is a worker daemon to dispatch to. Stage 0.3 built the worker container scaffold; stage 3 filled it with the real workflow + activity code. **JAR2-75** made the daemon the canonical dev-loop target (canonical task queue const `DEFAULT_TASK_QUEUE = "coral-agents"`, the `worker` container kept opt-in behind the `container-worker` compose profile so `cargo run -p coral_temporal --bin worker` stays the day-to-day loop). **JAR2-76** then refactored `coral apply` off its inline-worker shape onto that queue (and deleted the redundant `coral_run_workflow` binary along with it).
 
-**v1 expedient (JAR2-73, Stage 4.2) — shipped in JAR2-76.** What JAR2-73 first delivered was the smoke-shape inline-worker binary — boots its own worker, starts the workflow, signals seed triggers, blocks on `get_result`, prints FS-tree artifacts, exits. That deviated from the principle above, chosen pragmatically because (1) no worker daemon was deployed yet, (2) JAR2-68's smoke binary was the only working call-shape reference, (3) JAR2-74's regression test wanted a synchronous byte-comparable end-state. **JAR2-76 paid that debt down:** with JAR2-75's worker daemon now the canonical dev-loop target, `jarvis apply` is now a thin Temporal client that writes the DB, dispatches the workflow onto `jarvis-agents`, signals seeds, prints the workflow ID, and exits — execution lives on the daemon. The sibling CLIs (`jarvis signal` / `inspect` / `retire`) ship in Stage 6 proper.
+**v1 expedient (JAR2-73, Stage 4.2) — shipped in JAR2-76.** What JAR2-73 first delivered was the smoke-shape inline-worker binary — boots its own worker, starts the workflow, signals seed triggers, blocks on `get_result`, prints FS-tree artifacts, exits. That deviated from the principle above, chosen pragmatically because (1) no worker daemon was deployed yet, (2) JAR2-68's smoke binary was the only working call-shape reference, (3) JAR2-74's regression test wanted a synchronous byte-comparable end-state. **JAR2-76 paid that debt down:** with JAR2-75's worker daemon now the canonical dev-loop target, `coral apply` is now a thin Temporal client that writes the DB, dispatches the workflow onto `coral-agents`, signals seeds, prints the workflow ID, and exits — execution lives on the daemon. The sibling CLIs (`coral signal` / `inspect` / `retire`) ship in Stage 6 proper.
 
 ---
 
 ## 3. Workspace shape
 
-Single crate today (`jarvis_node`); this plan grows the surface enough that splitting into a workspace becomes worth the cost. Proposed:
+Single crate today (`coral_node`); this plan grows the surface enough that splitting into a workspace becomes worth the cost. Proposed:
 
 ```
 crates/
-  jarvis_node       — types, AgentCore, AgentFs, Decide, Tool, Mandate, Trigger, Decision.
+  coral_node       — types, AgentCore, AgentFs, Decide, Tool, Mandate, Trigger, Decision.
                       No Temporal deps. No structural-DB deps. Library only.
-  jarvis_temporal   — AgentWorkflow, activities, Temporal worker binary, signal/update API.
-                      Depends on jarvis_node + temporalio-sdk.
-  jarvis_graph      — Structural DB (sqlite), graph.yaml parser, `jarvis apply` binary.
-                      Depends on jarvis_node (types) + sqlx + serde_yaml.
-  jarvis_tui        — TUI binary. Depends on jarvis_node (types), reads via FS today;
-                      later may depend on jarvis_temporal/jarvis_graph for live signals.
-  jarvis_cli        — Operator CLI (jarvis apply / jarvis run / jarvis tui as subcommands).
+  coral_temporal   — AgentWorkflow, activities, Temporal worker binary, signal/update API.
+                      Depends on coral_node + temporalio-sdk.
+  coral_graph      — Structural DB (sqlite), graph.yaml parser, `coral apply` binary.
+                      Depends on coral_node (types) + sqlx + serde_yaml.
+  coral_tui        — TUI binary. Depends on coral_node (types), reads via FS today;
+                      later may depend on coral_temporal/coral_graph for live signals.
+  coral_cli        — Operator CLI (coral apply / coral run / coral tui as subcommands).
                       Thin top-level binary aggregating the others. Optional; could
                       stay as separate binaries inside each crate until pressure justifies.
 ```
@@ -176,8 +176,8 @@ Stage 0 stages the workspace move. After that, each subsequent stage lands in th
 
 **Sub-tickets.**
 
-- **0.1 — Workspace split.** Move `jarvis_node` into `crates/jarvis_node`. Add `crates/jarvis_temporal` stub (just `lib.rs` + `Cargo.toml`). Workspace `Cargo.toml`. CI updates. No logic changes.
-- **0.2 — Temporal Rust SDK smoke.** In `jarvis_temporal`: pull `temporalio-sdk` at a pinned version. Write a trivial "hello workflow" that exercises: workflow definition, activity definition, signal handler, durable timer, continue-as-new, child workflow start (abandoned), `wait_condition`. Run against a local Temporal Server (docker-compose). Document **what works, what's missing, what's unexpected** in a sibling note `scratch/temporal_rust_sdk_smoke.md`. If anything is a blocker, this is the moment to know.
+- **0.1 — Workspace split.** Move `coral_node` into `crates/coral_node`. Add `crates/coral_temporal` stub (just `lib.rs` + `Cargo.toml`). Workspace `Cargo.toml`. CI updates. No logic changes.
+- **0.2 — Temporal Rust SDK smoke.** In `coral_temporal`: pull `temporalio-sdk` at a pinned version. Write a trivial "hello workflow" that exercises: workflow definition, activity definition, signal handler, durable timer, continue-as-new, child workflow start (abandoned), `wait_condition`. Run against a local Temporal Server (docker-compose). Document **what works, what's missing, what's unexpected** in a sibling note `scratch/temporal_rust_sdk_smoke.md`. If anything is a blocker, this is the moment to know.
 - **0.3 — Local Docker dev environment (Temporal + Postgres + worker scaffold).** A `docker-compose.yml` that brings up: Temporal Server + Temporal UI, Postgres for the structural DB (used by stage 1), and a worker container scaffold (Dockerfile for the Rust worker — built but doesn't yet host real workflow code). Volume mount for per-agent FS at `/agent-fs` in the worker container. README section: how to run the stack, how to reset, how to run the worker natively (`cargo run`) against the containerized services for dev iteration. The full architecture (everything-in-containers) is the production shape; the dev-shortcut shape (containers for backing services, worker native) is what we use day-to-day.
 - **0.4 — Operational doc draft.** One page: how production Temporal will be deployed (server topology, persistence backend, namespace — one per deployment per § 8.3, workflow-id scheme — `graphs/<graph_id>/agents/<agent_id>` per § 8.2). Postgres deployment story (single instance dev → managed prod). Per-agent FS volume topology (one volume per deployment containing `graphs/<graph_id>/agents/<agent_id>/...`). Not implementation; scoping for stage 3+.
 
@@ -197,7 +197,7 @@ Stage 0 stages the workspace move. After that, each subsequent stage lands in th
 
 **Sub-tickets.**
 
-- **1.1 — Crate stub + dep choice.** `crates/jarvis_graph` stub. Use `sqlx` with the Postgres feature for compile-time-checked queries and async-tokio fit. Pin version. `DATABASE_URL` env-var convention.
+- **1.1 — Crate stub + dep choice.** `crates/coral_graph` stub. Use `sqlx` with the Postgres feature for compile-time-checked queries and async-tokio fit. Pin version. `DATABASE_URL` env-var convention.
 - **1.2 — Schema + migrations.** Tables: `graphs`, `agents`, `edges` (parent→child), `tools` (id, kind, command, args, env-refs), `agent_tools` (many-to-many), `mandates_as_authored` (the YAML-authored mandate; agent's *current* mandate stays in `mandate.json` on disk). Use `sqlx::migrate!` against Postgres. Document the schema in a module doc.
 - **1.3 — Rust types + serde.** `Graph`, `AgentRecord`, `Edge`, `ToolRecord` structs with serde. Conversion to/from the existing `Mandate` / `Trigger` types where overlap exists.
 - **1.4 — CRUD API.** `GraphStore` trait or concrete struct: `create_graph`, `add_agent`, `add_edge`, `register_tool`, `list_agents_in_graph`, `get_agent`, etc. Async, returns `Result`. Tests use `sqlx::test` against an ephemeral test DB (Postgres in the dev stack — CI either runs Postgres as a service container or gates DB tests behind an env var, per § 8 question 5).
@@ -205,7 +205,7 @@ Stage 0 stages the workspace move. After that, each subsequent stage lands in th
 
 **Out of scope.** Reading/writing agent FS state from this DB. The DB has structural state only. Outputs/evidence/notes/claims/health stay on disk.
 
-**Acceptance.** `cargo test -p jarvis_graph` exercises create/read/update of all five entities. Schema migration runs cleanly on a fresh DB and on a DB with prior data.
+**Acceptance.** `cargo test -p coral_graph` exercises create/read/update of all five entities. Schema migration runs cleanly on a fresh DB and on a DB with prior data.
 
 ---
 
@@ -223,7 +223,7 @@ Stage 0 stages the workspace move. After that, each subsequent stage lands in th
 
 **Acceptance.** With 10k outputs + 10k evidence records, `list_recent_outputs(8)` returns in <1ms (microbench). Tests for crash recovery (truncated index file → verify regenerates from directory).
 
-**Why this is parallel-trackable.** Touches `jarvis_node` only; no Temporal, no DB. Could ship in the same week as stage 1.
+**Why this is parallel-trackable.** Touches `coral_node` only; no Temporal, no DB. Could ship in the same week as stage 1.
 
 ---
 
@@ -248,11 +248,11 @@ Detailed design lives in `scratch/agent_storage.md`. Headline: every `AgentFs` m
 - Per-worker read-through cache — follow-up stage 9 sub-ticket; not needed at single-host scale.
 - Object versioning support in the trait — defer to stage 8 when snapshot shape is concrete.
 - Streaming / chunked I/O — defer until an MCP tool returns multi-MB results.
-- The `jarvis fs` debug CLI — follow-up stage 9 sub-ticket.
+- The `coral fs` debug CLI — follow-up stage 9 sub-ticket.
 
 **Acceptance.**
 
-- `cargo test -p jarvis_node` passes — every existing FS test stays green.
+- `cargo test -p coral_node` passes — every existing FS test stays green.
 - New trait-level tests against `MemoryStorage` cover the full surface.
 - Adversarial test: pull `AgentFs` apart, mock storage to simulate transient failures, confirm correct error propagation.
 - A `recent_outputs` benchmark shows the tail-index path is O(1) regardless of total output count (assert in a microbench).
@@ -270,7 +270,7 @@ This is the load-bearing Project. Filing as a **GitHub Project board** (per CLAU
 **Sub-tickets (~12, ordered by dependency).**
 
 - **3.1 — Extract `AgentCore`.** Pull the pure logic out of `Agent::run` into functions on a new `AgentCore` type (or module). Functions are `pub` and take `&mut` references to the (now trait-backed via stage 2.5) `AgentFs`, tools, decide. Keep `Agent::run` alive — it now calls `AgentCore` instead of doing the work inline. *No behavior change.* Tests stay green. **This is the foundational refactor; review it carefully because every following ticket depends on the seam.** Stage 2.5 unblocks this — `AgentCore` takes the FS facade backed by `Arc<dyn AgentStorage>`, which means `MemoryStorage` covers hermetic tests cleanly.
-- **3.2 — `AgentWorkflow` skeleton.** In `jarvis_temporal`: define `AgentWorkflow` workflow type, `AgentInput` (cfg, fs_handle, parent_handle, carryover). Workflow IDs use the URL-shaped scheme `graphs/<graph_id>/agents/<agent_id>` per § 8.2. Empty body that just continues-as-new immediately. Worker binary that registers it. Live test: workflow starts, continues-as-new, terminates.
+- **3.2 — `AgentWorkflow` skeleton.** In `coral_temporal`: define `AgentWorkflow` workflow type, `AgentInput` (cfg, fs_handle, parent_handle, carryover). Workflow IDs use the URL-shaped scheme `graphs/<graph_id>/agents/<agent_id>` per § 8.2. Empty body that just continues-as-new immediately. Worker binary that registers it. Live test: workflow starts, continues-as-new, terminates.
 - **3.3 — Signal handlers.** `external_signal(Trigger)`, `human_override(HumanOp)`, `mandate_update(MandatePatch)`, `retire(String)`, `inspect_state()` (update). Signals push onto an in-workflow `Vec<Trigger>`; updates return a snapshot.
 - **3.4 — Workflow loop body.** Race `wait_condition(triggers_pending)` against `timer(next_wake)`; drain triggers via `AgentCore::drain_triggers`; call into activities for the actual work. The workflow code is the *orchestrator* — it sequences activities (assemble → decide → dispatch each step) and on a `CallTools` decision spawns one activity invocation per call in parallel via `tokio::join!` of N futures. No tool calls or LLM yet — just the loop shape, exercised against `MockDecide` via a hermetic test. Workflow code is deterministic (no clocks, no I/O, no randomness — per § 2.5); all side effects live in activities. **SDK constraint** (see [`temporal_rust_sdk_smoke.md`](./temporal_rust_sdk_smoke.md) § 2 row 4 and § 3): the "race" and "parallel join" constructs above must use the SDK's deterministic `temporalio_sdk::workflows::select!` (and equivalent join), not `tokio::select!` / `tokio::join!`, or replay determinism breaks silently.
 - **3.5 — `assemble_context` activity.** Wraps `AgentCore::assemble_context` (which already exists). Activity is deterministic given `(fs_snapshot_id, triggers, mandate, correction, policy)`. Hermetic-mode: reads FS directly.
@@ -287,7 +287,7 @@ This is the load-bearing Project. Filing as a **GitHub Project board** (per CLAU
 - **3.9 — `apply_fs_ops` activity.** For `RewriteFs` decisions. Writes under `notes/`. Same path validation as today.
 - **3.10 — `persist_retirement` + retirement path.** Writes `retirement.json`, workflow exits cleanly (no continue-as-new).
 - **3.11 — Continue-as-new.** History-driven (`workflow_info().history_length` or `history_size` threshold). Carryover struct per `agent_runtime.md` § 9 — explicitly *not* conversation history; just trigger queue + scheduler cursor + child handles + last output id + mid-tick evidence (if applicable).
-- **3.12 — Replace `node-run-llm` with workflow-driven smoke.** `jarvis run --workflow` (or a new bin in `jarvis_temporal`) spawns an `AgentWorkflow` against the existing `examples/smoke_llm_mcp/config.json` via the Temporal client. Asserts the same end-state (output emitted with provenance, retirement marker) the existing smoke does. The existing `node-run-llm` stays around against the in-process path until we're confident.
+- **3.12 — Replace `node-run-llm` with workflow-driven smoke.** `coral run --workflow` (or a new bin in `coral_temporal`) spawns an `AgentWorkflow` against the existing `examples/smoke_llm_mcp/config.json` via the Temporal client. Asserts the same end-state (output emitted with provenance, retirement marker) the existing smoke does. The existing `node-run-llm` stays around against the in-process path until we're confident.
 
 **Out of scope.** Parent–child topology (stage 5). External signal API for non-workflow callers — internal Temporal client calls only for stage 3 (stage 6 exposes the API). Snapshot / fork (stage 8).
 
@@ -297,7 +297,7 @@ This is the load-bearing Project. Filing as a **GitHub Project board** (per CLAU
 - A new integration test boots an `AgentWorkflow` against the smoke config, asserts a provenance-grounded output lands in the FS, asserts continue-as-new doesn't fire on a short run, asserts retirement exits cleanly.
 - One live-LLM smoke against Temporal end-to-end (vendor-gated behind env var, same shape as the existing `node-run-llm` live test).
 
-**Why this is a Project, not a parent issue.** 12+ sub-tickets, ~6–8 weeks of focused work, cross-crate (`jarvis_node` for the refactor, `jarvis_temporal` for everything else), review surface that benefits from a project-level progress bar.
+**Why this is a Project, not a parent issue.** 12+ sub-tickets, ~6–8 weeks of focused work, cross-crate (`coral_node` for the refactor, `coral_temporal` for everything else), review surface that benefits from a project-level progress bar.
 
 ---
 
@@ -309,9 +309,9 @@ Stage 4 ships **single-agent only** because parent–child topology (stage 5) ha
 
 **Sub-tickets.**
 
-- **4.1 — `schemars`-derived schema + parser.** `serde_yaml` parses into the Rust types from `jarvis_node` + `jarvis_graph`. JSON Schema is generated from `schemars` derive (per the graph-yaml-schema doc § 4.8). Ship `graph.schema.json` for editor autocomplete.
+- **4.1 — `schemars`-derived schema + parser.** `serde_yaml` parses into the Rust types from `coral_node` + `coral_graph`. JSON Schema is generated from `schemars` derive (per the graph-yaml-schema doc § 4.8). Ship `graph.schema.json` for editor autocomplete.
 - **4.2 — Validation pass.** Refs resolve (`tools: [echo]` refers to an existing tool id). Times parse (`100ms`). Required fields present. Validation errors carry source location (line:col) per `serde_yaml` capabilities.
-- **4.3 — `jarvis apply` binary.** `jarvis apply graph.yaml` writes the parsed structure to the structural DB. For single-agent graphs in stage 4: also starts the `AgentWorkflow` via Temporal client, **signals seed triggers, and exits (thin-client shape per § 2.6 — does NOT host an inline worker and does NOT block on `get_result`).** (Multi-agent topology lands in stage 5; this binary's behavior extends then, not now.) **Note:** first shipped in smoke-style (JAR2-73, v1 expedient — inline worker + `get_result` block), refactored to thin-client in JAR2-76. Sibling CLIs in Stage 6.
+- **4.3 — `coral apply` binary.** `coral apply graph.yaml` writes the parsed structure to the structural DB. For single-agent graphs in stage 4: also starts the `AgentWorkflow` via Temporal client, **signals seed triggers, and exits (thin-client shape per § 2.6 — does NOT host an inline worker and does NOT block on `get_result`).** (Multi-agent topology lands in stage 5; this binary's behavior extends then, not now.) **Note:** first shipped in smoke-style (JAR2-73, v1 expedient — inline worker + `get_result` block), refactored to thin-client in JAR2-76. Sibling CLIs in Stage 6.
 - **4.4 — Integration test.** Round-trip: apply a YAML fixture, assert the structural DB has the expected rows, assert the workflow is running, assert an output lands.
 
 **Out of scope.** Multi-agent topology (stage 5). The "missing from YAML → ?" reconciliation question from § 4.6 of the schema doc — lean "warn-and-leave" for v1, defer the `--prune` flag. Dynamic spawn / sidecar (§ 4.7) — defer to stage 5.
@@ -335,9 +335,9 @@ Filing as a **GitHub Project board** (Project size, multi-month, multi-cross-cra
 - **5.5 — Parent reconciliation.** When parent's `Decide` returns `ReconcileChildren`, run a `reconcile` activity: reads referenced child outputs from disk (FS access across agent roots — well-defined read-only), produces a typed `ReconciliationResult`, parent emits its own `EmitOutput` referencing the child output IDs as part of its evidence (provenance!).
 - **5.6 — Conflict log.** New FS schema: `<agent_root>/conflicts/<id>.json`. Written when parent reconciliation explicitly holds disagreement open or chooses a side over a recorded alternative. Captures the decision, the alternatives, and the timestamp. Inspectable.
 - **5.7 — Lifecycle ops.** `RetireChild` / `ReplaceChild` activities: signal child to retire (clean exit), or stop child + spawn replacement with new mandate.
-- **5.8 — Multi-agent YAML.** Extend `jarvis apply` to walk the hierarchical YAML and spawn the right shape. Tools-by-reference resolution. Defaults inheritance.
+- **5.8 — Multi-agent YAML.** Extend `coral apply` to walk the hierarchical YAML and spawn the right shape. Tools-by-reference resolution. Defaults inheritance.
 - **5.9 — End-to-end integration test.** A fixture with parent + 2 children. Children emit outputs at different times. Parent reconciles, emits its own output. All provenance trails resolve. Conflict log populated when children disagree (use scripted `MockDecide` to force the disagreement).
-- **5.10 — Documentation pass.** Module docs in `jarvis_node` and `jarvis_temporal` updated for multi-agent semantics. Update `agent_runtime.md` § 7 to reflect what shipped vs. what was sketched.
+- **5.10 — Documentation pass.** Module docs in `coral_node` and `coral_temporal` updated for multi-agent semantics. Update `agent_runtime.md` § 7 to reflect what shipped vs. what was sketched.
 
 **Out of scope.** Snapshot / fork (stage 8). Cross-graph references. Human-as-reconciler override (stage 6's territory once it lands, but the conflict log records mean stage 6 can build the override surface on top of stage 5's primitives).
 
@@ -347,14 +347,14 @@ Filing as a **GitHub Project board** (Project size, multi-month, multi-cross-cra
 
 **Landed verbatim from the plan:**
 
-- The 4 new `Decision` variants in `jarvis_node::decision` (JAR2-78, Stage 5.1) — `SpawnChild`, `ReconcileChildren`, `RetireChild`, `ReplaceChild` — match the plan's names and load-bearing fields.
-- The 2 new `Trigger` variants in `jarvis_node::trigger` (JAR2-79, Stage 5.2) — `ChildOutput`, `ChildRetired` — landed as separate variants (not folded into `External`), with the `Human > External > ChildOutput > Scheduled` ordering enforced by `TriggerQueue::drain_ordered` and exercised in `trigger_queue.rs`'s tests.
+- The 4 new `Decision` variants in `coral_node::decision` (JAR2-78, Stage 5.1) — `SpawnChild`, `ReconcileChildren`, `RetireChild`, `ReplaceChild` — match the plan's names and load-bearing fields.
+- The 2 new `Trigger` variants in `coral_node::trigger` (JAR2-79, Stage 5.2) — `ChildOutput`, `ChildRetired` — landed as separate variants (not folded into `External`), with the `Human > External > ChildOutput > Scheduled` ordering enforced by `TriggerQueue::drain_ordered` and exercised in `trigger_queue.rs`'s tests.
 - `register_child_in_structural_db` activity + `ctx.child_workflow(..)` with `ParentClosePolicy::Abandon` for `Decision::SpawnChild` (JAR2-80, Stage 5.3) — verbatim against the plan, including the flat workflow-id scheme `graphs/<gid>/agents/<aid>`.
-- Child → parent signal via `signal_external_workflow` (JAR2-81, Stage 5.4) — first live exercise of the SDK primitive `temporal_rust_sdk_smoke.md` § 2 row 8 had marked WORKED-on-paper. The happy path + parent-unreachable failure-mode test both live at `crates/jarvis_temporal/tests/child_parent_signal.rs`.
+- Child → parent signal via `signal_external_workflow` (JAR2-81, Stage 5.4) — first live exercise of the SDK primitive `temporal_rust_sdk_smoke.md` § 2 row 8 had marked WORKED-on-paper. The happy path + parent-unreachable failure-mode test both live at `crates/coral_temporal/tests/child_parent_signal.rs`.
 - Synthetic-evidence pattern (JAR2-82, Stage 5.5) — reads each cited child output via `AgentFs::open_for_agent`, writes one synthetic `EvidenceRecord` per source into the parent's `evidence/`, returns the `EvidenceId`s. Stage 5 Project decision 3 baked in.
 - Content-addressed conflict log (JAR2-83, Stage 5.6) — `<agent_root>/conflicts/<id>.json` per Stage 5 Project decision 14, content-addressed over `(alternatives, resolution)` only, `kind` derived from `resolution.is_some()`.
 - `RetireChild` / `ReplaceChild` activity paths (JAR2-84, Stage 5.7) — same SDK two-step external-workflow chain, reverse direction; replacement is fresh-id-not-in-place per the plan.
-- Multi-agent YAML extension to `jarvis apply` (JAR2-85, Stage 5.8) — hierarchical `children:` form walked, shared `build_child_input` helper between the apply walker and the workflow's `Decision::SpawnChild` arm so the two surfaces cannot drift on `parent_handle` shape.
+- Multi-agent YAML extension to `coral apply` (JAR2-85, Stage 5.8) — hierarchical `children:` form walked, shared `build_child_input` helper between the apply walker and the workflow's `Decision::SpawnChild` arm so the two surfaces cannot drift on `parent_handle` shape.
 - End-to-end multi-agent integration test (JAR2-86, Stage 5.9) — parent + 2 children, deliberately conflicting outputs, parent reconciles via scripted `MockDecide` disagreement, parent's output cites child outputs through synthetic evidence, conflict log has exactly one entry.
 
 **Landed differently — call out:**
@@ -363,13 +363,13 @@ Filing as a **GitHub Project board** (Project size, multi-month, multi-cross-cra
 - **`AgentInput` grew identity fields.** Stage 5.3 added `graph_id: GraphId`, `agent_id: AgentId`, and `agent_name: String` to `AgentInput` per Stage 5 Project decision 8 (so the `SpawnChild` workflow arm can address the structural DB without parsing `ctx.workflow_id()`'s string format). The `Default` impl was dropped at the same time — an agent without identity is meaningless, and a zero-UUID `agent_id` would silently route every spawn to the same edge row. Every test surface now constructs `AgentInput` explicitly via `AgentInput::new_for_test` (test) or `into_agent_input` / `build_child_input` / `build_root_input` (production).
 - **`ParentRef.signal` is informational at v1.** The plan assumed a single `ctx.signal_external_workflow(workflow_id, signal_name, payload).await` method (cf. the plan's `signal_parent` pseudocode); the JAR2-81 live exercise discovered the SDK has no such method — the real shape is the two-step `ctx.external_workflow(..).signal(SignalDef, payload).await` chain where the signal is bound at compile time via the `#[signal]`-macro-generated `SignalDefinition` marker. `ParentRef.signal: String` stays on the wire for future targets that may diverge from `external_signal`, but at v1 it's ignored at the dispatch site. See `scratch/temporal_rust_sdk_smoke.md` § 3.10 for the SDK divergence finding (no upstream issue filed — the divergence is doc-only).
 - **JAR2-89 was subsumed into JAR2-85.** JAR2-89 was queued as the standalone "synthetic-UUID `into_agent_input` cleanup" follow-up; PR #93 (JAR2-85, Stage 5.8) landed both changes atomically because the multi-agent walker would have re-introduced the synthetic UUID right after JAR2-89 retired it. Net diff is smaller as a single PR than as two stacked ones.
-- **JAR2-86 (Stage 5.9) chose Pattern A.** The end-to-end integration test bypasses `jarvis apply` and constructs the multi-agent topology in the test fixture directly (Pattern A in the JAR2-86 advisor discussion). Apply-path coverage is delivered by JAR2-74's single-agent smoke (`examples/smoke_llm_temporal/graph.yaml` round-trip) plus JAR2-85's hermetic walker test (`crates/jarvis_graph/src/yaml.rs::walker_tests` asserts the YAML → AgentInput tree shape end-to-end). The "apply walker drives multi-agent live workflow" path is left to a future Pattern B follow-up (env-gated `MockDecide` install or a `--decide=mock` flag on `jarvis apply` so the walker can drive a hermetic multi-agent live workflow without a real LLM).
+- **JAR2-86 (Stage 5.9) chose Pattern A.** The end-to-end integration test bypasses `coral apply` and constructs the multi-agent topology in the test fixture directly (Pattern A in the JAR2-86 advisor discussion). Apply-path coverage is delivered by JAR2-74's single-agent smoke (`examples/smoke_llm_temporal/graph.yaml` round-trip) plus JAR2-85's hermetic walker test (`crates/coral_graph/src/yaml.rs::walker_tests` asserts the YAML → AgentInput tree shape end-to-end). The "apply walker drives multi-agent live workflow" path is left to a future Pattern B follow-up (env-gated `MockDecide` install or a `--decide=mock` flag on `coral apply` so the walker can drive a hermetic multi-agent live workflow without a real LLM).
 - **CI extension shipped as a follow-up commit on PR #94.** The integration test (JAR2-86) added 5 new `TEMPORAL_LIVE_TEST=1`-gated tests that the existing `.github/workflows/live.yml` job did not enumerate. Rather than file a separate ticket, the CI workflow file was extended in the same PR with the 5 new test ids so the live job exercises them. Not a divergence from the plan per se — the plan's "Mixed CI" decision (§ 8 decision 5) implies this — but worth recording so a future audit doesn't think the live tests are dead code.
 
 **New follow-ups surfaced during execution** (beyond the "Queued follow-ups" already in the Stage 5 Project description):
 
-- **JAR2-88 — worker daemon `StructuralDbStore` install — resolved.** The boot-time install landed, but not in `crates/jarvis_temporal/src/bin/worker.rs` as the ticket assumed. Installing a real `GraphStore` there is a Cargo cycle: `jarvis_graph` already depends on `jarvis_temporal` (for the `StructuralDbStore` trait + `AgentWorkflow`), and Cargo has no per-`[[bin]]` dependency section — adding the reverse edge errors with `cyclic package dependency`. So the worker daemon moved to a new composition-root crate, `crates/jarvis_worker`, that depends on both. This revisits the ticket's "out of scope: relocate the worker" line — the relocation turned out to be the only cycle-free option. The daemon now reads `DATABASE_URL` (newly **required**: it exits at boot without it rather than panicking on first spawn), builds a `GraphStore`, and installs it before serving, so `Decision::SpawnChild` works in production.
-- *(optional)* **Pattern B follow-up for apply-path coverage.** Either an env-gated `MockDecide` install or a `--decide=mock` flag on `jarvis apply` so the walker can drive a hermetic multi-agent live workflow without a real LLM. JAR2-86 deliberately deferred this; if Stage 6's operator-CLI work surfaces a need for an "apply + observe end-to-end with no LLM" loop, file it then.
+- **JAR2-88 — worker daemon `StructuralDbStore` install — resolved.** The boot-time install landed, but not in `crates/coral_temporal/src/bin/worker.rs` as the ticket assumed. Installing a real `GraphStore` there is a Cargo cycle: `coral_graph` already depends on `coral_temporal` (for the `StructuralDbStore` trait + `AgentWorkflow`), and Cargo has no per-`[[bin]]` dependency section — adding the reverse edge errors with `cyclic package dependency`. So the worker daemon moved to a new composition-root crate, `crates/coral_worker`, that depends on both. This revisits the ticket's "out of scope: relocate the worker" line — the relocation turned out to be the only cycle-free option. The daemon now reads `DATABASE_URL` (newly **required**: it exits at boot without it rather than panicking on first spawn), builds a `GraphStore`, and installs it before serving, so `Decision::SpawnChild` works in production.
+- *(optional)* **Pattern B follow-up for apply-path coverage.** Either an env-gated `MockDecide` install or a `--decide=mock` flag on `coral apply` so the walker can drive a hermetic multi-agent live workflow without a real LLM. JAR2-86 deliberately deferred this; if Stage 6's operator-CLI work surfaces a need for an "apply + observe end-to-end with no LLM" loop, file it then.
 - *(optional)* **`MockDecide` callback variant.** The `reconcile_children_live` and `multi_agent` test fixtures plant a sentinel `Idle` decision after the script exhausts because `MockDecide` returns an error on exhaustion and the live workflow can't gracefully exit on that path. A callback-driven `Decide` (e.g. `MockDecide::with_default(|| Decision::Idle { .. })`) would retire the sentinel-`Idle` hack. Cosmetic; file if a fourth fixture needs it.
 - *(optional)* **Doc the `persist_output` empty-evidence contract explicitly.** The JAR2-86 subagent had to plant a harness "echo" evidence record per child output because `AgentFs::persist_output` rejects empty `evidence: Vec<EvidenceId>`. The contract is correct (per-claim provenance enforcement is the whole point of `persist_output`), but the rejection mode wasn't loud in the rustdoc; a future test author hit the same surprise. One-paragraph addition to `AgentFs::persist_output`'s rustdoc would close it.
 
@@ -384,7 +384,7 @@ Filing as a **GitHub Project board** (Project size, multi-month, multi-cross-cra
 | 5.5   | JAR2-82 | #90    | `reconcile_children` activity + synthetic-evidence pattern           |
 | 5.6   | JAR2-83 | #91    | Conflict log FS schema + content-addressed writer                    |
 | 5.7   | JAR2-84 | #92    | `retire_child` / `replace_child` workflow paths                      |
-| 5.8   | JAR2-85 | #93    | Multi-agent YAML extension to `jarvis apply` (subsumes JAR2-89)      |
+| 5.8   | JAR2-85 | #93    | Multi-agent YAML extension to `coral apply` (subsumes JAR2-89)      |
 | 5.9   | JAR2-86 | #94    | End-to-end integration test + CI extension                           |
 | 5.10  | JAR2-87 | *this* | Documentation pass (this note + module docs + § 7 rewrite)           |
 
@@ -394,19 +394,19 @@ Filing as a **GitHub Project board** (Project size, multi-month, multi-cross-cra
 
 ### Stage 6 — Human-in-kernel surfaces
 
-**Goal.** Wire `HumanOverride { op }` (and friends — mandate-update, dispute-output, inspect-state, retire) from outside the workflow. Today `HumanOverride` exists as a trigger variant with no caller. **All CLIs landed in this stage follow the thin-client shape from § 2.6 — Temporal client only, no inline worker.** (`jarvis apply`'s own thin-client refactor shipped earlier in JAR2-76; the sibling CLIs here pick up the same shape so `jarvis_{apply,signal,inspect,retire}` form a consistent operator surface.)
+**Goal.** Wire `HumanOverride { op }` (and friends — mandate-update, dispute-output, inspect-state, retire) from outside the workflow. Today `HumanOverride` exists as a trigger variant with no caller. **All CLIs landed in this stage follow the thin-client shape from § 2.6 — Temporal client only, no inline worker.** (`coral apply`'s own thin-client refactor shipped earlier in JAR2-76; the sibling CLIs here pick up the same shape so `coral_{apply,signal,inspect,retire}` form a consistent operator surface.)
 
 **Sub-tickets.**
 
 - **6.1 — External signal API design.** Short scratch sub-doc: HTTP/gRPC choice? Auth surface? Per-workflow addressability? Out of scope for the first cut: cross-tenant isolation, RBAC. Decide before code.
 - **6.2 — Signal/update wiring in `AgentWorkflow`.** Already partially in place from stage 3.3; complete the routing.
-- **6.3 — CLI commands.** `jarvis signal <agent_id> --human-override '<json>'`, `jarvis inspect <agent_id>`, `jarvis retire <agent_id> --reason '...'`. Use Temporal client directly (thin-client per § 2.6 — no inline worker), matching the shape `jarvis apply` adopted in JAR2-76 so `jarvis_{apply,signal,inspect,retire}` all behave identically vis-à-vis the worker daemon. Prerequisite: a worker daemon running (JAR2-75 made it the canonical dev-loop target; see § 2.6).
+- **6.3 — CLI commands.** `coral signal <agent_id> --human-override '<json>'`, `coral inspect <agent_id>`, `coral retire <agent_id> --reason '...'`. Use Temporal client directly (thin-client per § 2.6 — no inline worker), matching the shape `coral apply` adopted in JAR2-76 so `coral_{apply,signal,inspect,retire}` all behave identically vis-à-vis the worker daemon. Prerequisite: a worker daemon running (JAR2-75 made it the canonical dev-loop target; see § 2.6).
 - **6.4 — Dispute path.** `dispute_output(output_id, reason)` as a Temporal update (sync ack). Parent's workflow records dispute in conflict log; trigger queue gets a `Disputed` entry the next loop iteration reconciles.
 - **6.5 — Inspect-state read API.** `inspect_state()` returns a typed snapshot (mandate, last_decision, health, recent_output_ids, child_handles). The TUI's `KernelGraphSource` (stage 7 phase 3) will call this.
 
 **Out of scope.** Web UI. Auth beyond a shared-secret env var. Multi-tenant.
 
-**Acceptance.** `jarvis signal --human-override` against a running agent injects a trigger that the agent's next tick sees. `jarvis inspect` returns the snapshot.
+**Acceptance.** `coral signal --human-override` against a running agent injects a trigger that the agent's next tick sees. `coral inspect` returns the snapshot.
 
 ---
 
@@ -416,7 +416,7 @@ Filing as a **GitHub Project board** (Project size, multi-month, multi-cross-cra
 
 **Sub-tickets (~6).**
 
-- **7.1 — `jarvis_tui` crate scaffold.** Ratatui + crossterm + tokio + notify deps.
+- **7.1 — `coral_tui` crate scaffold.** Ratatui + crossterm + tokio + notify deps.
 - **7.2 — `GraphSource` trait + `FsGraphSource`.** Trait as designed in graph_tui.md § 4. FS impl reads under `<graph_root>/`.
 - **7.3 — `Agents` + `AgentDetail` screens.** Degenerate one-row tree against single-agent graphs today; ready for multi-agent post-stage-5.
 - **7.4 — Drill-down screens.** `Outputs`, `OutputDetail`, `Evidence`, `EvidenceDetail`, `Notes`, `Claims`, `Health`.
@@ -519,7 +519,7 @@ The seven questions raised during plan review have been resolved. Each decision 
 
 6. **Decision log artifact.** Piggyback onto stage 3.12. *Why:* the workflow is the natural single writer of decisions (in-process `Agent::run` doesn't survive long-term anyway). Writing `decisions/<tick>.jsonl` from `AgentCore::dispatch` means both the workflow and the test-driver `Agent::run` produce it consistently. Spec is small enough (one append per tick of a typed `DecisionLogEntry`) that it doesn't justify its own stage. TUI phase 1 (stage 7.6) reads it.
 
-7. **Stage 4 ordering.** Stage 4 starts after stage 1 with a degenerate `jarvis apply` mode that only writes the structural DB (and prints "would instantiate workflow X" without doing so). The "actually start the workflow via Temporal client" sub-ticket within stage 4 is gated on stage 3 landing. *Why:* the DB-writing part of stage 4 is independently useful (operators can author and validate graphs before the runtime is ready); coupling the whole stage to stage 3 wastes parallelism.
+7. **Stage 4 ordering.** Stage 4 starts after stage 1 with a degenerate `coral apply` mode that only writes the structural DB (and prints "would instantiate workflow X" without doing so). The "actually start the workflow via Temporal client" sub-ticket within stage 4 is gated on stage 3 landing. *Why:* the DB-writing part of stage 4 is independently useful (operators can author and validate graphs before the runtime is ready); coupling the whole stage to stage 3 wastes parallelism.
 
 ---
 

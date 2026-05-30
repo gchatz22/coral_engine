@@ -1,6 +1,6 @@
 # `smoke_llm_temporal` — live-vendor smoke fixture
 
-Single-file `graph.yaml` fixture consumed by `jarvis-apply` against a
+Single-file `graph.yaml` fixture consumed by `coral-apply` against a
 running worker daemon. The temporal worker only registers the
 bootstrap `EchoTool` (MCP-server wiring through env vars is a planned
 follow-up), so this fixture's mandate prompt is echo-only — diverging
@@ -8,21 +8,21 @@ from `smoke_llm_mcp/config.json`'s `get-sum` ask.
 
 ## Thin-client shape
 
-`jarvis apply` is a thin Temporal client: it writes the structural DB,
+`coral apply` is a thin Temporal client: it writes the structural DB,
 dispatches the workflow onto the daemon's canonical task queue
-(`jarvis-agents`), signals seed triggers, prints the workflow ID, and
+(`coral-agents`), signals seed triggers, prints the workflow ID, and
 exits. **Execution lives on a separately-running worker daemon** — see
 the [top-level README's Dev Environment
 section](../../README.md#dev-environment) for the recommended dev loop
-(`cargo run -p jarvis_worker --bin worker` in a separate terminal,
+(`cargo run -p coral_worker --bin worker` in a separate terminal,
 or the `worker` compose service).
 
 ## Files
 
 - `graph.yaml` — Single operator-authored fixture. Encodes the mandate
   (call `echo`, emit a cited output, retire) + the kickoff seed
-  trigger in the `apiVersion: jarvis.engine/v1alpha1` schema.
-  Consumed by `jarvis apply`.
+  trigger in the `apiVersion: coral.engine/v1alpha1` schema.
+  Consumed by `coral apply`.
 
 ## Run
 
@@ -30,8 +30,8 @@ Bring up the dev stack + the worker daemon (see the top-level README),
 then:
 
 ```sh
-DATABASE_URL=postgres://jarvis:jarvis@localhost:5432/jarvis_structural \
-cargo run -p jarvis_graph --bin jarvis-apply -- \
+DATABASE_URL=postgres://coral:coral@localhost:5432/coral_structural \
+cargo run -p coral_graph --bin coral-apply -- \
     examples/smoke_llm_temporal/graph.yaml
 ```
 

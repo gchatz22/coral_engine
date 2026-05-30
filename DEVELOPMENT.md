@@ -1,6 +1,6 @@
 # Development Rules
 
-These rules apply to **every agent** working on the Jarvis Engine. Read them before touching the repo. Re-read them before declaring work done.
+These rules apply to **every agent** working on the Coral Engine. Read them before touching the repo. Re-read them before declaring work done.
 
 ---
 
@@ -21,7 +21,7 @@ The goal is alignment, not deference. If you find yourself thinking *"I'd do thi
 
 ## 1. Language: Rust
 
-The Jarvis Engine is written in **Rust**. No exceptions without explicit approval from the maintainer.
+The Coral Engine is written in **Rust**. No exceptions without explicit approval from the maintainer.
 
 - Use stable Rust unless a feature has a documented, justified reason to require nightly.
 - Prefer the standard library and well-established crates over hand-rolled abstractions.
@@ -76,7 +76,7 @@ When the maintainer is **ideating, planning, or designing** (anything before tic
 
 When the maintainer asks for a **feature** (anything larger than a trivial one-shot edit), the agent's first job is **planning, not coding**.
 
-All tracking lives in **GitHub issues** in the `gchatz22/jarvis_engine` repo. Issues are filed and edited with the **`gh` CLI** — `gh issue create`, `gh issue edit`, `gh issue list`. There is no separate tracker to keep in sync; the issue, its linked branch, and its PR all live in the same repo.
+All tracking lives in **GitHub issues** in the `gchatz22/coral_engine` repo. Issues are filed and edited with the **`gh` CLI** — `gh issue create`, `gh issue edit`, `gh issue list`. There is no separate tracker to keep in sync; the issue, its linked branch, and its PR all live in the same repo.
 
 ### Step 1 — Decompose into GitHub issues
 
@@ -151,7 +151,7 @@ In a clean single-worktree setup `gt sync` does this end-to-end. When children l
 
 1. **Remove the merged worktree first**, before any sync. If gt sees the merged branch still checked out, it refuses to clean it up and the cascade stalls. Use `--force` if `target/` build artifacts block removal:
    ```
-   git worktree remove --force ../jarvis-<merged-slug>
+   git worktree remove --force ../coral-<merged-slug>
    git branch -D <merged-slug>
    ```
 2. **`gt sync`** from any worktree (the main repo is fine). This pulls trunk, untracks the merged branch, and re-parents children onto trunk in metadata. It will *attempt* to restack each child but will skip ones that are checked out elsewhere — that's expected.
@@ -197,15 +197,15 @@ gh api -X PATCH repos/<owner>/<repo>/pulls/<N> -f base=main
 When multiple agents are working tickets concurrently, use **git worktrees** without asking. One worktree per agent per ticket keeps branches, build artifacts, and uncommitted state fully isolated, and avoids agents stomping each other's working tree.
 
 **Spawn a worktree per ticket:**
-- For a ticket branched off `main`: `git worktree add ../jarvis-<ticket-slug> -b <ticket-slug> main`.
-- For a stacked ticket on top of an open PR's branch: `git worktree add ../jarvis-<ticket-slug> -b <ticket-slug> <parent-branch>`.
+- For a ticket branched off `main`: `git worktree add ../coral-<ticket-slug> -b <ticket-slug> main`.
+- For a stacked ticket on top of an open PR's branch: `git worktree add ../coral-<ticket-slug> -b <ticket-slug> <parent-branch>`.
 - Inside the new worktree, immediately register with Graphite: `gt track --parent <parent-branch>` (use `main` for unstacked).
 - Do all the ticket's work — edits, `cargo build`, `cargo test`, commits, `gt submit`/`gt submit --stack` — inside that worktree.
 - Worktrees are cheap. Prefer creating one over coordinating shared checkout state.
 
 **Clean up after a PR merges:**
 1. From the worktree: `gt sync` — pulls trunk, cascades the rest of the stack, and (if Graphite recognises the merge) drops the merged branch from the stack.
-2. Remove the worktree: `git worktree remove ../jarvis-<ticket-slug>`. Use `--force` only if there's intentional uncommitted state worth nuking.
+2. Remove the worktree: `git worktree remove ../coral-<ticket-slug>`. Use `--force` only if there's intentional uncommitted state worth nuking.
 3. Delete the local branch if it lingers: `git branch -D <ticket-slug>`. ("Branch already merged" is fine — `-D` skips the safety check, which is correct here because the on-main commit has a different SHA than your local branch tip.)
 4. Delete the origin branch if it lingers: `git push origin --delete <ticket-slug>`. **Better:** enable repo Settings → General → Pull Requests → "Automatically delete head branches" so GitHub does this for every merged PR. Then this step is unneeded.
 

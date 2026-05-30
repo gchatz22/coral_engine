@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repo state
 
-Cargo workspace at the root. Members live under `crates/` (currently `jarvis_node`, `jarvis_temporal`, `jarvis_graph`); confirm the current set by reading `Cargo.toml` and `crates/` before assuming a layout. `VISION.md` holds the product/architecture vision, `DEVELOPMENT.md` the binding workflow rules, `scratch/` the ideation surface.
+Cargo workspace at the root. Members live under `crates/` (currently `coral_node`, `coral_temporal`, `coral_graph`); confirm the current set by reading `Cargo.toml` and `crates/` before assuming a layout. `VISION.md` holds the product/architecture vision, `DEVELOPMENT.md` the binding workflow rules, `scratch/` the ideation surface.
 
 ## Non-negotiable workflow rules (from DEVELOPMENT.md)
 
@@ -31,7 +31,7 @@ If a comment seems necessary but you can rewrite the code (rename, extract, rest
 
 ## Feature workflow: GitHub-Issues-driven, planning before code
 
-For anything larger than a trivial one-shot edit, the **first job is planning, not coding**. All work is tracked as **GitHub issues** in the `gchatz22/jarvis_engine` repo.
+For anything larger than a trivial one-shot edit, the **first job is planning, not coding**. All work is tracked as **GitHub issues** in the `gchatz22/coral_engine` repo.
 
 1. **Decompose into GitHub issues** sized to the request, **writing issues in parallel** (or reusing existing ones if they already cover the work — check before filing):
    - Large (~10+ sub-issues) → a **GitHub Project (v2) board** holding the spec, with child issues tracked on it.

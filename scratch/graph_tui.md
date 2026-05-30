@@ -1,6 +1,6 @@
-# Graph TUI — K9s-style terminal inspector for a Jarvis graph
+# Graph TUI — K9s-style terminal inspector for a Coral graph
 
-*Status: ideation. Sketch of an inspector / navigator TUI for the Jarvis graph,
+*Status: ideation. Sketch of an inspector / navigator TUI for the Coral graph,
 modeled on K9s' navigation idiom. Read order: `VISION.md` §3–5,
 `scratch/agent_runtime.md`, `scratch/graph_yaml_schema.md`, then this. Not yet
 decomposed into GitHub issues.*
@@ -10,7 +10,7 @@ decomposed into GitHub issues.*
 ## 0. Goal
 
 Give an operator a fast, keyboard-driven terminal UI that **inspects a running
-(or retired) Jarvis graph** the way `k9s` inspects a Kubernetes cluster: list
+(or retired) Coral graph** the way `k9s` inspects a Kubernetes cluster: list
 the agents, drill into one, see its live state, scroll its filesystem, read
 the evidence behind any claim, replay decisions over time, watch health and
 cost. One process; one keyboard; everything an operator wants to know about a
@@ -80,13 +80,13 @@ subscription, not a single watch API).
 
 ---
 
-## 3. Mapping K9s primitives to Jarvis primitives
+## 3. Mapping K9s primitives to Coral primitives
 
-| K9s concept       | Jarvis equivalent                          | Notes |
+| K9s concept       | Coral equivalent                          | Notes |
 |-------------------|--------------------------------------------|-------|
 | Cluster           | Graph (root path on disk)                  | One graph per TUI session (v1) |
 | Namespace         | Subtree / parent agent                     | Filter scope inside one graph |
-| Pod               | Agent (a long-lived node)                  | Crate is `jarvis_node`; "node" already means "graph node = agent" — avoid the k8s "node = host" overload. We use "agent" consistently |
+| Pod               | Agent (a long-lived node)                  | Crate is `coral_node`; "node" already means "graph node = agent" — avoid the k8s "node = host" overload. We use "agent" consistently |
 | `describe pod`    | Agent detail view                          | Mandate, status, last tick, last decision, child handles |
 | `logs`            | Decision timeline + tick spans             | Once a per-tick log exists; bootstrap renders what's in `tracing` plus the FS-derived history |
 | `events`          | Trigger queue history                      | Per-agent, ordered |
@@ -238,7 +238,7 @@ log primitive (post-bootstrap follow-up).
 ### `Agents` (default landing screen)
 
 ```
-┌ jarvis · graph: fda-monitor · live ────────────────────────────────────┐
+┌ coral · graph: fda-monitor · live ────────────────────────────────────┐
 │ NAME                       STATE     LAST TICK  IDLE   OUTPUTS  CHLD   │
 │ ▾ root                     Healthy   2s ago     4h     12       3      │
 │   ▾ drug-alpha             Healthy   12s ago    1h     34       0      │
@@ -322,12 +322,12 @@ know the renderer maps onto types that already exist.
 - **`tokio`** for async I/O and the event loop. `tokio::select!` over
   (`crossterm::EventStream`, `notify` events, `GraphSource::subscribe`,
   periodic redraw timer).
-- **`serde_json`** + existing types from `jarvis_node`. The TUI links the
+- **`serde_json`** + existing types from `coral_node`. The TUI links the
   library crate; no duplicate schema.
 - **`tui-logger`** behind a flag for live `tracing` output, useful while
   developing.
 
-The TUI is a separate binary that depends on the `jarvis_node` library
+The TUI is a separate binary that depends on the `coral_node` library
 crate. No new public API beyond what `GraphSource` requires; everything
 else is already `pub` on the existing types.
 
@@ -392,7 +392,7 @@ Each is a real fork. Surface here so the build doesn't pick by accident.
 
 ```
 # Option A — subcommand on the existing CLI
-jarvis tui <graph-root>
+coral tui <graph-root>
 
 # Option B — separate binary (k9s-style)
 jr <graph-root>
@@ -476,7 +476,7 @@ zellij).
    the directory walk is not consistent. Acceptable for an inspector;
    noted so we don't claim more than we have.
 4. **Theming.** Defer until phase 0 stabilizes. Probably a TOML at
-   `~/.config/jarvis/tui.toml`; copy K9s' shape.
+   `~/.config/coral/tui.toml`; copy K9s' shape.
 5. **Remote graphs.** Phase 3's kernel source would let the TUI inspect
    graphs running on another machine. Auth / transport / TLS belong with
    the kernel API spec, not here.
@@ -484,7 +484,7 @@ zellij).
    `Agents` is enough until somebody actually wants to *see* the edges.
    That tool will be its own doc — likely a web UI rather than another
    TUI mode.
-7. **Naming.** "Jarvis TUI" / `jarvis tui` / `jr` — see § 12.1. Worth
+7. **Naming.** "Coral TUI" / `coral tui` / `jr` — see § 12.1. Worth
    picking before code lands, not after.
 
 ---

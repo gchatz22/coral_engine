@@ -1,0 +1,73 @@
+[package]
+name = "coral_temporal"
+version = "0.0.0"
+# `temporalio-sdk` is `edition = "2024"`; the workspace toolchain pin is 1.88
+# (see `rust-toolchain.toml`), so the SDK compiles. This crate stays on 2021 to
+# match `coral_node` — nothing here needs 2024.
+edition = "2021"
+rust-version = "1.88"
+description = "Temporal-hosted agent workflow runtime for the Coral Engine."
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "temporal-smoke"
+path = "src/bin/temporal_smoke.rs"
+
+[dependencies]
+# Signal handler payload types (`Trigger`, `HumanOp`, `MandatePatch`) live in
+# `coral_node`; this crate is the *host*, `coral_node` is the *type owner*.
+coral_node = { path = "../coral_node" }
+# `temporalio-sdk` is in Public Preview at v0.4.0; the SDK's `lib.rs` documents
+# its workflow API as "very unstable". Pinned with `=` so a future
+# `cargo update` doesn't silently shift the SDK under us.
+temporalio-sdk = "=0.4.0"
+temporalio-client = "=0.4.0"
+temporalio-common = "=0.4.0"
+temporalio-sdk-core = "=0.4.0"
+temporalio-macros = "=0.4.0"
+anyhow = "1"
+# The `#[activities]`, `#[workflow]`, `#[workflow_methods]` macros and
+# `temporalio_sdk::workflows::select!` expand to paths under `futures` /
+# `futures_util` (notably `FutureExt::boxed`), so both must be direct deps.
+futures = "0.3"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `clock` enables `Utc::now()` for the fallback when the SDK hasn't filled in
+# `scheduled_time` (test harnesses).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+bytes = "1"
+# `v4` is the runtime generator used by `register_child_in_structural_db` to
+# mint fresh child `Uuid`s at the activity-body call site.
+uuid = { version = "1", default-features = false, features = ["serde", "std", "v4"] }
+async-trait = "0.1"
+# `thiserror`-derived errors hit `ApplicationFailure::non_retryable` via
+# `anyhow::Error::new`, which requires `StdError + Send + Sync`.
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+url = "2"
+
+[features]
+# Pass-through to `coral_node`'s vendor features so the `worker` binary can be
+# built against one or both LLM vendors. The library itself is feature-agnostic;
+# only `bin/worker.rs` reaches for vendor-specific `ModelClient` constructors
+# and is `#[cfg]`-gated on these features.
+default = []
+llm-anthropic = ["coral_node/llm-anthropic"]
+llm-cohere = ["coral_node/llm-cohere"]
+
+[dev-dependencies]
+# `memory-storage` feature pulls in `MemoryStorage` for the unit tests in
+# `src/worker.rs` without dragging it into production worker binaries.
+coral_node = { path = "../coral_node", features = ["memory-storage"] }
+# Test-only concrete codec to prove `Serialize`/`Deserialize` derives are
+# present on every placeholder type; Temporal's wire-level payload codec
+# handles serialization at runtime.
+serde_json = "1"
+# Test-only dep so production worker binaries don't pull `chrono` into their
+# runtime graph; the hermetic tests plant `EvidenceRecord`s whose constructor
+# takes a `chrono::DateTime<Utc>`.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

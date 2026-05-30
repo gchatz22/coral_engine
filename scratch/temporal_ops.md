@@ -38,22 +38,22 @@ graphs/clinical-trials-2026Q1/agents/eligibility-screener-005
 
 **Supersession.** This replaces the `{graph_id}/{node_id}` sketch in `scratch/agent_runtime.md` § 3. The motivation for the simpler form (operator-readable, deterministic, no separate registry) survives unchanged in the URL form; the URL form additionally mirrors the eventual HTTP API (`GET /api/v1/graphs/<id>/agents/<id>/...`) and stays flat under reparenting (which doesn't happen — see edge cases).
 
-**Allowed characters.** `<graph_id>` and `<agent_id>` are constrained to `[a-zA-Z0-9_-]` (alphanumerics, underscore, hyphen). No slashes, no whitespace, no Unicode. This keeps IDs URL-safe, shell-safe, and Temporal-safe without escaping. Validation lives in `jarvis_graph` at `jarvis apply` time; the structural DB rejects writes that violate the constraint.
+**Allowed characters.** `<graph_id>` and `<agent_id>` are constrained to `[a-zA-Z0-9_-]` (alphanumerics, underscore, hyphen). No slashes, no whitespace, no Unicode. This keeps IDs URL-safe, shell-safe, and Temporal-safe without escaping. Validation lives in `coral_graph` at `coral apply` time; the structural DB rejects writes that violate the constraint.
 
-**Length budget.** Temporal limits Workflow IDs to **255 bytes** total ([docs](https://docs.temporal.io/workflows#workflow-id)). Our prefix `graphs//agents/` consumes 15 bytes; the remaining 240 bytes split across `<graph_id>` + `<agent_id>`. v1 caps each component at **64 bytes**, leaving ample headroom (15 + 64 + 64 = 143 bytes used, 112 free). The cap is enforced at `jarvis apply` validation; raising it later is non-breaking.
+**Length budget.** Temporal limits Workflow IDs to **255 bytes** total ([docs](https://docs.temporal.io/workflows#workflow-id)). Our prefix `graphs//agents/` consumes 15 bytes; the remaining 240 bytes split across `<graph_id>` + `<agent_id>`. v1 caps each component at **64 bytes**, leaving ample headroom (15 + 64 + 64 = 143 bytes used, 112 free). The cap is enforced at `coral apply` validation; raising it later is non-breaking.
 
 **Edge cases.**
 
 - **Reparenting an agent (changing its parent).** Does not happen. Workflow IDs are flat within a graph by design; parent–child is a logical relation in the `edges` table of the structural DB, mutated by ordinary DB writes. Reparenting an agent rewrites edges, not its workflow ID. This means a long-running agent keeps its workflow ID across topology changes — important for log continuity and human bookmarks.
-- **`<graph_id>` collision on `jarvis apply`.** Return a hard error and refuse the apply. Detection and validation live in `jarvis_graph` (stage 1.4 CRUD layer enforces the `graphs.id` uniqueness constraint; the `apply` binary in stage 4.3 surfaces the error to the operator). Operators rename or delete the existing graph explicitly — no silent overwrite.
-- **`<agent_id>` collision within a graph.** Same — `jarvis_graph` enforces a uniqueness constraint on `(graph_id, agent_id)` and `jarvis apply` rejects the YAML with a source-located error.
-- **Special characters in user-provided IDs.** Rejected at YAML parse / `jarvis apply` validation (stage 4.2). The error names the offending character and column.
+- **`<graph_id>` collision on `coral apply`.** Return a hard error and refuse the apply. Detection and validation live in `coral_graph` (stage 1.4 CRUD layer enforces the `graphs.id` uniqueness constraint; the `apply` binary in stage 4.3 surfaces the error to the operator). Operators rename or delete the existing graph explicitly — no silent overwrite.
+- **`<agent_id>` collision within a graph.** Same — `coral_graph` enforces a uniqueness constraint on `(graph_id, agent_id)` and `coral apply` rejects the YAML with a source-located error.
+- **Special characters in user-provided IDs.** Rejected at YAML parse / `coral apply` validation (stage 4.2). The error names the offending character and column.
 
 ---
 
 ## 4. Postgres deployment
 
-**Two logical databases on one instance** in v1: one for Temporal persistence, one for the structural DB (`jarvis_graph` per stage 1). They share a Postgres instance because their workloads are unrelated and they're cheap to colocate; if Temporal's write load eventually warrants isolation, the structural DB moves to its own instance — single-line DSN swap.
+**Two logical databases on one instance** in v1: one for Temporal persistence, one for the structural DB (`coral_graph` per stage 1). They share a Postgres instance because their workloads are unrelated and they're cheap to colocate; if Temporal's write load eventually warrants isolation, the structural DB moves to its own instance — single-line DSN swap.
 
 **Dev → prod migration path.**
 
@@ -62,16 +62,16 @@ graphs/clinical-trials-2026Q1/agents/eligibility-screener-005
 
 **Connection pooling.** Stateless workers hold short-lived connections per activity invocation. With N workers × M activities-in-flight, connection counts climb. v1 mitigation: per-worker connection pool capped at 8 (via `sqlx::PgPool`). If we cross ~200 concurrent workers, introduce `PgBouncer` in transaction-pooling mode as a sidecar. Not v1 work — flagged for stage 5 sizing.
 
-**Schema migrations.** `sqlx::migrate!` from the `jarvis_graph` crate. Migration files live at `crates/jarvis_graph/migrations/`. CI runs migrations against an ephemeral test DB on every PR (per `scratch/temporal_staged_plan.md` § 8 decision 5). Production migrations run from CD pipeline at deploy time against the managed DB — same `sqlx migrate run`, different DSN. Temporal's own schema is managed by the Temporal admin tools, not our migration system.
+**Schema migrations.** `sqlx::migrate!` from the `coral_graph` crate. Migration files live at `crates/coral_graph/migrations/`. CI runs migrations against an ephemeral test DB on every PR (per `scratch/temporal_staged_plan.md` § 8 decision 5). Production migrations run from CD pipeline at deploy time against the managed DB — same `sqlx migrate run`, different DSN. Temporal's own schema is managed by the Temporal admin tools, not our migration system.
 
 ---
 
 ## 5. Per-agent FS volume topology
 
-**Production shape.** Single S3 bucket per deployment. Bucket name: deployment-specific (`jarvis-prod`, `jarvis-staging`). Keys laid out to match the workflow ID structure:
+**Production shape.** Single S3 bucket per deployment. Bucket name: deployment-specific (`coral-prod`, `coral-staging`). Keys laid out to match the workflow ID structure:
 
 ```
-s3://jarvis-prod/graphs/<graph_id>/agents/<agent_id>/<file>
+s3://coral-prod/graphs/<graph_id>/agents/<agent_id>/<file>
                  graphs/macro-watch/agents/cpi-monitor/mandate.json
                  graphs/macro-watch/agents/cpi-monitor/outputs/<ulid>.json
                  graphs/macro-watch/agents/cpi-monitor/evidence/<sha256>.json
@@ -80,7 +80,7 @@ s3://jarvis-prod/graphs/<graph_id>/agents/<agent_id>/<file>
 
 The key prefix is literally the workflow ID. This is a load-bearing alignment: given a workflow, the worker knows its FS prefix without a lookup; given a key, the operator knows the workflow.
 
-**Single-host / dev shape.** Local mount at `<JARVIS_ROOT>/<graph_id>/<agent_id>/`. Same key layout, just on a POSIX filesystem. The `AgentStorage` trait (`scratch/agent_storage.md` § 5) abstracts the difference; `LocalStorage` impl lands in stage 2.5, `S3Storage` impl lands in stage 9 (unchanged from the staged plan).
+**Single-host / dev shape.** Local mount at `<CORAL_ROOT>/<graph_id>/<agent_id>/`. Same key layout, just on a POSIX filesystem. The `AgentStorage` trait (`scratch/agent_storage.md` § 5) abstracts the difference; `LocalStorage` impl lands in stage 2.5, `S3Storage` impl lands in stage 9 (unchanged from the staged plan).
 
 **Bucket configuration.** Versioning **off** in v1 — content-addressed evidence and ULID-keyed outputs make in-place mutation rare, and snapshot semantics (stage 8) are not yet specified. Lifecycle policies are a stage-9 concern. Encryption at rest uses SSE-S3 (bucket-level default). Cross-region replication is out of scope (§ 7).
 

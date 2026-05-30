@@ -27,7 +27,7 @@ From the repo root:
 cargo run --features mcp --bin node-run-mcp -- \
     examples/smoke_mcp/config.json \
     examples/smoke_mcp/triggers.jsonl \
-    /tmp/jarvis-smoke-mcp-fs \
+    /tmp/coral-smoke-mcp-fs \
     -- npx -y @modelcontextprotocol/server-everything
 ```
 
@@ -51,8 +51,8 @@ On success, stdout includes:
 ```
 node-run-mcp: registered 13 MCP tool(s): echo, get-annotated-message, get-env, ...
 node-run-mcp: agent retired: max_ticks (3) reached
-node-run-mcp: fs tree at /tmp/jarvis-smoke-mcp-fs:
-/tmp/jarvis-smoke-mcp-fs
+node-run-mcp: fs tree at /tmp/coral-smoke-mcp-fs:
+/tmp/coral-smoke-mcp-fs
 ├── claims
 ├── evidence
 │   └── 10c7854829677f9d39acaafa5aa5ae4e9fa59ae5cba2a1dafc941c4c9f4938de.json
@@ -101,7 +101,7 @@ Alternatively, capture the `(args, result)` triple and feed it to
 ## Cleanup
 
 ```bash
-rm -rf /tmp/jarvis-smoke-mcp-fs
+rm -rf /tmp/coral-smoke-mcp-fs
 ```
 
 The MCP server subprocess is shut down by the binary on retirement;
@@ -113,10 +113,10 @@ nothing leaks past the `cargo run` invocation.
 the npm-installed MCP server — the default suite stays offline. The
 optional integration test under
 `tests/smoke_mcp_server_everything.rs` is gated behind
-`JARVIS_SMOKE_MCP=1` and is skipped by default:
+`CORAL_SMOKE_MCP=1` and is skipped by default:
 
 ```bash
-JARVIS_SMOKE_MCP=1 cargo test --features mcp \
+CORAL_SMOKE_MCP=1 cargo test --features mcp \
     --test smoke_mcp_server_everything -- --nocapture
 ```
 
@@ -136,7 +136,7 @@ This is the gate the test prints when it is skipped.
   owned by `root` (a stray `sudo npm install` years ago), which makes
   `npx -y` fail with `EACCES`. Workaround: install once with a
   user-owned cache, e.g.
-  `npm install -g --cache /tmp/jarvis-npm-cache --prefix /tmp/jarvis-npm-prefix @modelcontextprotocol/server-everything`,
+  `npm install -g --cache /tmp/coral-npm-cache --prefix /tmp/coral-npm-prefix @modelcontextprotocol/server-everything`,
   then point the spawn command at
-  `/tmp/jarvis-npm-prefix/bin/mcp-server-everything`. Not a Jarvis
+  `/tmp/coral-npm-prefix/bin/mcp-server-everything`. Not a Coral
   issue; flagged here so anyone tripping on it knows the fix.

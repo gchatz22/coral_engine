@@ -10,7 +10,7 @@
 
 PRs #1–#11 deliver the entire spec from `scratch/minimal_node_backend.md`:
 
-- `jarvis_node` crate, single-crate, stable Rust 1.84.
+- `coral_node` crate, single-crate, stable Rust 1.84.
 - Typed core: `Mandate`, `Trigger`, `Decision`, `Output`, `Evidence{Id,Record}`, `FsOp`, `HumanOp`, `ClaimSeed`, `RetireReason`.
 - `AgentFs` with the load-bearing FS schema (`mandate.json`, `outputs/<ulid>.json`, `evidence/<sha256>.json`, `notes/`, `retirement.json`) and the provenance-by-construction invariant (`persist_output` rejects empty/unresolvable evidence).
 - `TriggerQueue` with `Human > External > Scheduled` ordering, `Scheduler` stub, `Decide` trait + `MockDecide`, `assemble_context`, `Tool` trait + `ToolRegistry` + `EchoTool`.
@@ -107,4 +107,4 @@ These do not depend on each other or on any architectural decision still open. P
 
 1. **Issue shape.** Single issue vs. parent issue with sub-issues vs. Project board. My read: A3 is a single issue; A1 and A2 are parent issues (each has 5+ sub-issues identified in the Sizing sections).
 2. **Order within Group A.** Any order is defensible since all three are independent. A3 is the cheapest unblock and prevents fixture rot, so a natural sequence is A3 → A1 / A2 in parallel (they share the agent-health module, so coordinate or land that piece first under whichever ships first).
-3. **Crate boundaries.** Do A1 and A2 ship in the same `jarvis_node` crate, or do they motivate the workspace split we discussed earlier (`jarvis_node` core + `jarvis_decide_llm` + `jarvis_mcp` extensions)? My read: defer the workspace until A1 lands and we feel actual compile-time pain or a real second consumer.
+3. **Crate boundaries.** Do A1 and A2 ship in the same `coral_node` crate, or do they motivate the workspace split we discussed earlier (`coral_node` core + `coral_decide_llm` + `coral_mcp` extensions)? My read: defer the workspace until A1 lands and we feel actual compile-time pain or a real second consumer.
