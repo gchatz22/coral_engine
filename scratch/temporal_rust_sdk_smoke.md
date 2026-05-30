@@ -198,5 +198,5 @@ Output: a verdict table on stdout, `MISSING:` lines on stderr for any gaps, exit
 - API docs: <https://docs.rs/temporalio-sdk/0.4.0/temporalio_sdk/>.
 - SDK README (in-repo): `temporalio/sdk-rust/crates/sdk/README.md` — has the "Workflow API still very unstable" disclaimer.
 - SDK examples: `temporalio/sdk-rust/crates/sdk/examples/{hello_world,message_passing,timer_examples,continue_as_new,child_workflows}` — the smoke's primitive demonstrations are mechanically derived from these.
-- Stage 0 ticket: Linear JAR2-41.
+- Stage 0 work: see `scratch/temporal_staged_plan.md` § 5 stage 0.
 - Related: `scratch/temporal_staged_plan.md` § 5 stage 0 (parent plan), `scratch/durability_substrate.md` § 4.1 + § 8 decision 3 (the caveats this smoke retires), `scratch/agent_runtime.md` § 4 (the primitive list the smoke had to cover).

@@ -1,6 +1,6 @@
 # Agent Runtime — High-Level Design (Temporal-based)
 
-*Status: ideation. Not yet decomposed into Linear tickets. Scope: the "Agent runtime" layer from VISION.md § 5 — the primitive that runs a single node in the graph. Adjacent layers (graph layer, per-agent FS, data layer, observability) are referenced where they constrain this layer but are out of scope for this doc.*
+*Status: ideation. Not yet decomposed into GitHub issues. Scope: the "Agent runtime" layer from VISION.md § 5 — the primitive that runs a single node in the graph. Adjacent layers (graph layer, per-agent FS, data layer, observability) are referenced where they constrain this layer but are out of scope for this doc.*
 
 ---
 

@@ -3,7 +3,7 @@
 *Status: ideation. Sketch of an inspector / navigator TUI for the Jarvis graph,
 modeled on K9s' navigation idiom. Read order: `VISION.md` §3–5,
 `scratch/agent_runtime.md`, `scratch/graph_yaml_schema.md`, then this. Not yet
-decomposed into Linear tickets.*
+decomposed into GitHub issues.*
 
 ---
 

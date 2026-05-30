@@ -1,6 +1,6 @@
 # Temporal-backed engine — staged execution plan
 
-*Status: ideation, ready for ticket-filing review. Captures the dependency-ordered breakdown of work to take the engine from "single in-process agent with real LLM + MCP" to "production-grade Temporal-backed graph runtime with parent–child topology, structural DB, snapshots, and operator surfaces." Each stage maps to a Linear shape (single issue / parent issue / Project) and carries enough detail to file tickets directly off the relevant section.*
+*Status: ideation, ready for issue-filing review. Captures the dependency-ordered breakdown of work to take the engine from "single in-process agent with real LLM + MCP" to "production-grade Temporal-backed graph runtime with parent–child topology, structural DB, snapshots, and operator surfaces." Each stage maps to a GitHub-issue shape (single issue / parent issue / Project board) and carries enough detail to file issues directly off the relevant section.*
 
 *Read order: `VISION.md` § 4–5, `scratch/agent_runtime.md` (the Temporal-shaped design — now ratified by the durability decision), `scratch/durability_substrate.md` (the substrate fork — Temporal won), `scratch/post_bootstrap_followups_later.md` (B/C groups — this plan supersedes their phasing), `scratch/graph_yaml_schema.md`, `scratch/graph_tui.md`, then this.*
 
@@ -151,7 +151,7 @@ Stage 0 stages the workspace move. After that, each subsequent stage lands in th
 
 ## 4. Stage table (high level)
 
-| # | Stage | Linear shape | Effort | Depends on | Critical path? |
+| # | Stage | Issue shape | Effort | Depends on | Critical path? |
 |---|---|---|---|---|---|
 | 0 | Temporal Rust SDK spike + workspace setup | Parent issue (≈4 sub) | ~3–5 days | — | **yes** |
 | 1 | Structural DB (Postgres) + topology model | Parent issue (≈5 sub) | ~1 week | 0 | yes |
@@ -265,7 +265,7 @@ Detailed design lives in `scratch/agent_storage.md`. Headline: every `AgentFs` m
 
 **Goal.** Refactor today's `Agent::run` into a reusable `AgentCore` and a new `AgentWorkflow` Temporal workflow that hosts it durably. End-state: every agent in production runs as a Temporal workflow; `Agent::run` survives as the in-process test driver.
 
-This is the load-bearing Project. Filing as a **Linear Project** (per CLAUDE.md large-feature shape), not a parent issue, because the sub-ticket count and review surface are both Project-scale.
+This is the load-bearing Project. Filing as a **GitHub Project board** (per CLAUDE.md large-feature shape), not a parent issue, because the sub-issue count and review surface are both Project-scale.
 
 **Sub-tickets (~12, ordered by dependency).**
 
@@ -324,7 +324,7 @@ Stage 4 ships **single-agent only** because parent–child topology (stage 5) ha
 
 **Goal.** Multi-agent graphs work end-to-end: parent spawns child via decision, child runs its own workflow, child outputs flow upward as triggers, parent reconciles.
 
-Filing as a **Linear Project** (Project size, multi-month, multi-cross-crate).
+Filing as a **GitHub Project board** (Project size, multi-month, multi-cross-crate).
 
 **Sub-tickets (~10).**
 
@@ -475,24 +475,24 @@ These are estimates with normal uncertainty. The critical path (0 → 1 → 3 �
 
 ---
 
-## 7. Linear shape per stage
+## 7. Issue shape per stage
 
 Per CLAUDE.md feature-workflow rules:
 
-| Stage | Linear primitive | Reason |
+| Stage | Issue primitive | Reason |
 |---|---|---|
-| 0 | Parent issue | 4 sub-tickets, one focused week |
-| 1 | Parent issue | 5 sub-tickets, one week |
-| 2 | Parent issue | 3 sub-tickets, days |
-| 2.5 | Parent issue | 4 sub-tickets, days; foundational for stage 3 |
-| 3 | **Project** | 12+ sub-tickets, 6–8 weeks, cross-crate |
-| 4 | Parent issue | 4 sub-tickets, 2 weeks |
-| 5 | **Project** | 10 sub-tickets, 6–8 weeks, cross-crate |
-| 6 | Parent issue | 5 sub-tickets, 3–4 weeks |
-| 7 | Parent issue | 6 sub-tickets, 3 weeks (phase 0+1) |
-| 8 | Parent issue | 6 sub-tickets, 3–4 weeks |
+| 0 | Parent issue | 4 sub-issues, one focused week |
+| 1 | Parent issue | 5 sub-issues, one week |
+| 2 | Parent issue | 3 sub-issues, days |
+| 2.5 | Parent issue | 4 sub-issues, days; foundational for stage 3 |
+| 3 | **Project board** | 12+ sub-issues, 6–8 weeks, cross-crate |
+| 4 | Parent issue | 4 sub-issues, 2 weeks |
+| 5 | **Project board** | 10 sub-issues, 6–8 weeks, cross-crate |
+| 6 | Parent issue | 5 sub-issues, 3–4 weeks |
+| 7 | Parent issue | 6 sub-issues, 3 weeks (phase 0+1) |
+| 8 | Parent issue | 6 sub-issues, 3–4 weeks |
 
-Sub-issues of Projects 3 and 5 that are themselves multi-step (e.g. 3.2 `AgentWorkflow` skeleton has ~3 implicit sub-steps) become parent issues *inside* the Project, per CLAUDE.md's "Projects and parent/sub-issues compose."
+Sub-issues of Project boards 3 and 5 that are themselves multi-step (e.g. 3.2 `AgentWorkflow` skeleton has ~3 implicit sub-steps) become parent issues *inside* the Project, per CLAUDE.md's "Projects and parent/sub-issues compose."
 
 ---
 
