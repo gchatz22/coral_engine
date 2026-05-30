@@ -7,3 +7,6 @@ members = [
 # Workspace roots silently fall back to resolver 1 unless pinned; pin keeps
 # feature unification consistent across crates.
 resolver = "2"
+
+[workspace.package]
+license = "Apache-2.0"

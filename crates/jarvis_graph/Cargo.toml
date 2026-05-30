@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Structural DB for the Jarvis Engine: graphs, agents, edges, tools, authored mandates."
-license = "Apache-2.0 OR MIT"
+license.workspace = true
 publish = false
 
 [lib]
