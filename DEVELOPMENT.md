@@ -157,10 +157,10 @@ Graphite composes with worktrees: when running parallel agents, each worktree ru
 
 The cascade-rebase pain `gt` is designed to absorb assumes the merge method preserves commit equivalence. **Squash-merge collapses N commits into 1**, so every child branch's history references orphan commits — GitHub flags the child as DIRTY/CONFLICTING and `gt restack` has to rewrite + force-push the child to recover. **Rebase-merge preserves commits 1:1**, so `git rebase origin/main` on each child cleanly detects "already applied" patches and skips them. Both methods are allowed by the repo's ruleset; pick per situation:
 
-- **Single non-stacked PR**: squash-merge. Matches the existing `feat(JAR2-XX): ... (#XX)` history on `main` and keeps the log compact.
+- **Single non-stacked PR**: squash-merge. Matches the existing commit history on `main` and keeps the log compact.
 - **Stacked PR**: **rebase-merge**. `gh pr merge $PR --rebase --delete-branch`, or "Rebase and merge" in the GitHub UI. The downstream cascade after each merge is then almost trivial: each child just needs a `gt sync` or `git rebase origin/main` to recognize the parent's commits already on trunk.
 
-**Pre-emptively retarget every child PR's base to `main` BEFORE merging the parent.** When `--delete-branch` removes the parent's head branch, GitHub *sometimes* auto-retargets the child PR's base to the repo default — but *sometimes* it auto-closes the child instead, especially if the child's CI was in flight or admin-bypass was in use. Recovery from an auto-closed PR is painful: GitHub refuses to reopen the PR once the base branch is gone, and the only path is to open a fresh PR from the same head branch to `main` (loses the review thread). We hit this on stage 2.5's PR #59. Pre-retargeting immunizes every child before the parent merge can trigger the race:
+**Pre-emptively retarget every child PR's base to `main` BEFORE merging the parent.** When `--delete-branch` removes the parent's head branch, GitHub *sometimes* auto-retargets the child PR's base to the repo default — but *sometimes* it auto-closes the child instead, especially if the child's CI was in flight or admin-bypass was in use. Recovery from an auto-closed PR is painful: GitHub refuses to reopen the PR once the base branch is gone, and the only path is to open a fresh PR from the same head branch to `main` (loses the review thread). Pre-retargeting immunizes every child before the parent merge can trigger the race:
 ```
 gh api -X PATCH repos/<owner>/<repo>/pulls/<N> -f base=main
 ```
@@ -175,8 +175,6 @@ gh api -X PATCH repos/<owner>/<repo>/pulls/<N> -f base=main
 3. **After each merge**: in the stack worktree, `git fetch origin --prune`. Then for each remaining child, in dependency order: `git checkout <child> && git rebase origin/main`. Rebase-merge means git skips the already-applied parent commits cleanly; no manual conflict resolution typically needed.
 4. **Force-push each rebased child**: `git push --force-with-lease origin <branch>`.
 5. **Move up one rung**: repeat from step 2 with the next PR in the stack.
-
-Lessons logged from the Stage 1 (JAR2-44) and Stage 2.5 (JAR2-45) merges where this recipe was discovered the hard way.
 
 ### Parallel agents — use worktrees freely
 

@@ -1,20 +1,15 @@
 //! Tool-use schema + parser for `Decision`.
 //!
-//! Design **#1** (one tool per `Decision` variant): the model sees five
-//! tools — `call_tool`, `emit_output`, `rewrite_fs`, `idle`, `retire` — one
-//! per `Decision` variant tag. The variant is fixed by the tool name, so
-//! the model can't confuse the discriminator with a payload field. This
-//! reads as more drift-resistant than a single `emit_decision` tool with a
-//! tagged-union argument because tool selection is the part of the
-//! tool-use contract providers fine-tune on hardest, and per-tool
-//! `input_schema`s give us provider-side validation per variant.
+//! One tool per `Decision` variant: the model sees a tool list whose
+//! names map one-to-one to the variant tags. Variant is fixed by the
+//! tool name, so the model can't confuse the discriminator with a
+//! payload field, and per-tool `input_schema`s give provider-side
+//! validation per variant.
 //!
 //! The parser leans on `Decision`'s existing
-//! `#[serde(tag = "type", rename_all = "snake_case")]` instead of
-//! reimplementing five field validators by hand: it injects the variant tag
-//! and feeds the resulting JSON object through `serde_json::from_value`.
-//! This also picks up the `duration_ms` / `transparent` helpers already on
-//! the relevant fields, so the schema can never silently drift from
+//! `#[serde(tag = "type", rename_all = "snake_case")]`: it injects the
+//! variant tag and feeds the resulting JSON object through
+//! `serde_json::from_value`. The schema cannot silently drift from
 //! `decision.rs` without a compile or test failure.
 
 use crate::decision::{ClaimSeed, Decision, ToolCall as DecisionToolCall};
@@ -24,8 +19,7 @@ use thiserror::Error;
 
 /// Tool name → matching `Decision` variant tag (`#[serde(tag = "type")]`
 /// value). Listed in the same order as the `Decision` enum so a reviewer
-/// can scan the two side by side. JAR2-78 (stage 5.1) appended the four
-/// parent-child topology tools.
+/// can scan the two side by side.
 const TOOL_NAMES: &[&str] = &[
     "call_tool",
     "emit_output",
@@ -141,15 +135,15 @@ pub fn decision_tools() -> Vec<ToolSpec> {
                 "required": ["reason"]
             }),
         },
-        // JAR2-78 (stage 5.1): parent-child topology decision tools. Each
-        // is a *terminal singleton* (same shape contract as `retire`):
-        // mixing with `call_tool` or another terminal in the same response
-        // fails parsing. The inner shapes (`mandate`, `sources`,
-        // `child_ref`, ...) are described as plain `object` and left to
-        // serde validation, mirroring the `rewrite_fs.ops` precedent —
-        // hand-rolling JSON Schema for `Mandate` / `AgentRef` / friends
-        // would duplicate `decision.rs` + `mandate.rs` + `agent_ref.rs`
-        // and drift on every kernel-shape change.
+        // Parent-child topology decision tools. Each is a terminal
+        // singleton (same shape contract as `retire`): mixing with
+        // `call_tool` or another terminal fails parsing. Inner shapes
+        // (`mandate`, `sources`, `child_ref`, ...) are described as plain
+        // `object` and left to serde validation, mirroring the
+        // `rewrite_fs.ops` precedent — hand-rolling JSON Schema for
+        // `Mandate` / `AgentRef` / friends would duplicate `decision.rs`
+        // + `mandate.rs` + `agent_ref.rs` and drift on every kernel-shape
+        // change.
         ToolSpec {
             name: "spawn_child".into(),
             description: "Express the decision to spawn a child agent. The runtime \
@@ -235,8 +229,8 @@ pub fn decision_tools() -> Vec<ToolSpec> {
 }
 
 /// Structured failure mode from `parse_decision`. Each variant carries
-/// enough context that a future correction loop (JAR2-19) can quote the
-/// failure back to the model in a corrective system message.
+/// enough context that the correction loop can quote the failure back to
+/// the model in a corrective system message.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DecisionParseError {
     /// The model returned no tool call where at least one was expected.
@@ -274,21 +268,19 @@ pub enum DecisionParseError {
 
 /// Convert a vendor-normalized list of tool calls into a `Decision`.
 ///
-/// The slice shape is the contract the parser cares about — `ToolCall` is
-/// already vendor-neutral (Anthropic and Cohere both reduce to
-/// `{ id, name, arguments }`). Vendor-specific normalization (e.g.
-/// Cohere's `parameters` field) is the responsibility of the relevant
-/// `ModelClient` impl, not this layer.
+/// `ToolCall` is already vendor-neutral (Anthropic and Cohere both reduce
+/// to `{ id, name, arguments }`); vendor-specific normalization is the
+/// responsibility of the `ModelClient` impl, not this layer.
 ///
-/// Multi-call shape: when every entry names the `call_tool` decision
-/// tool, the parser folds them into a single `Decision::CallTools(vec![...])`.
-/// The vendor `ToolCall.id` (the `tool_use.id` on the wire) propagates
-/// into each `decision::ToolCall.tool_use_id` so the run loop can stage
-/// the paired `tool_result` blocks for the next prompt bundle. Terminal
-/// decision tools (`emit_output`, `rewrite_fs`, `idle`, `retire`)
-/// remain singular: a response that includes any terminal tool alongside
-/// another call (terminal or `call_tool`) fails as `MixedDecisionTools`
-/// rather than silently discarding the extras.
+/// Multi-call shape: when every entry names `call_tool`, the parser
+/// folds them into a single `Decision::CallTools`. The vendor
+/// `ToolCall.id` (the `tool_use.id` on the wire) propagates into each
+/// `decision::ToolCall.tool_use_id` so the run loop can stage the paired
+/// `tool_result` blocks for the next prompt bundle. Terminal decision
+/// tools (`emit_output`, `rewrite_fs`, `idle`, `retire`) remain
+/// singular: a response that includes any terminal tool alongside
+/// another call fails as `MixedDecisionTools` rather than silently
+/// discarding the extras.
 pub fn parse_decision(calls: &[ToolCall]) -> Result<Decision, DecisionParseError> {
     if calls.is_empty() {
         return Err(DecisionParseError::NoCalls);
@@ -355,10 +347,9 @@ pub fn parse_decision(calls: &[ToolCall]) -> Result<Decision, DecisionParseError
         "rewrite_fs" => &["ops"],
         "idle" => &["next_after"],
         "retire" => &["reason"],
-        // JAR2-78 (stage 5.1): parent-child topology variants — terminal
-        // singletons (same shape contract as `retire`). Inner-shape
-        // validation (e.g. `mandate` field structure) falls through to
-        // serde via the `tagged.insert("type", ...)` re-tagging below.
+        // Parent-child topology variants — terminal singletons. Inner-
+        // shape validation (e.g. `mandate` field structure) falls through
+        // to serde via the `tagged.insert("type", ...)` re-tagging below.
         "spawn_child" => &["agent_name", "mandate"],
         "reconcile_children" => &["sources"],
         "retire_child" => &["child_ref", "reason"],
@@ -443,10 +434,10 @@ fn parse_call_tool_args(call: &ToolCall) -> Result<ParsedCallToolArgs, DecisionP
 /// Best-effort field name to attach to an `InvalidValue` error.
 ///
 /// `serde_json::Error` does not surface a structured path; the message
-/// usually reads `... at line L column C` or names the offending field via
-/// `invalid type: ... expected ...`. Without re-parsing the message we
-/// can't reliably extract the field, so we fall back to `<unknown>` and
-/// let `reason` carry the detail. The future correction loop only needs
+/// usually reads `... at line L column C` or names the offending field
+/// via `invalid type: ... expected ...`. Without re-parsing the message
+/// we can't reliably extract the field, so we fall back to `<unknown>`
+/// and let `reason` carry the detail. The correction loop only needs
 /// `reason` to be human-parseable.
 fn serde_path_or(_e: &serde_json::Error) -> String {
     "<unknown>".into()
@@ -525,7 +516,7 @@ mod tests {
 
     #[test]
     fn parse_k_call_tool_blocks_folds_into_one_call_tools_decision() {
-        // K=3 parallel call_tool blocks → single Decision::CallTools. The
+        // K parallel call_tool blocks → single Decision::CallTools. The
         // wire-side `id` on each becomes the per-call `tool_use_id`,
         // load-bearing for the next prompt's `tool_result` pairing.
         let calls = vec![
@@ -663,7 +654,6 @@ mod tests {
         // list and the parser's allowed-names table. `call_tool` folds into
         // the `call_tools` variant tag (the parallel-tool shape); every
         // other tool maps one-to-one with its own snake_case variant tag.
-        // JAR2-78: the four parent-child topology tools are appended.
         let agent_ref_minimal = json!({
             "workflow_id": "graphs/g1/agents/c1",
             "agent_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -720,7 +710,7 @@ mod tests {
         }
     }
 
-    // ---- JAR2-78 (stage 5.1): per-variant parse round-trips --------------
+    // ---- per-variant parse round-trips (parent-child topology) ----------
 
     #[test]
     fn parse_spawn_child_round_trips() {
@@ -889,8 +879,7 @@ mod tests {
     #[test]
     fn parse_reconcile_children_mixed_with_terminal_errors() {
         // `reconcile_children` is a terminal singleton — pairing it with
-        // another terminal in the same response is a mixed-shape error
-        // (same contract as `retire` + `idle`).
+        // another terminal in the same response is a mixed-shape error.
         let agent_ref = json!({
             "workflow_id": "graphs/g1/agents/c1",
             "agent_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -917,10 +906,9 @@ mod tests {
     #[test]
     fn parse_accepts_cohere_shaped_tool_call() {
         // Cohere's tool-call wire shape reduces to the same vendor-neutral
-        // `{id, name, arguments}` the trait surface (JAR2-14) uses; vendor
-        // adapters do any field-name normalization (e.g. Cohere's
-        // `parameters` → `arguments`) before this layer ever sees the
-        // call. We exercise that property here by constructing a fixture
+        // `{id, name, arguments}` the trait surface uses; vendor adapters
+        // do field-name normalization (e.g. Cohere's `parameters` →
+        // `arguments`) before this layer sees the call. The fixture is
         // shaped the way a Cohere `ModelClient` impl would emit it; the
         // parser stays vendor-agnostic because its input is already
         // normalized.

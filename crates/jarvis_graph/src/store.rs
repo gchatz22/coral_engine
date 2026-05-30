@@ -1,20 +1,8 @@
-//! `GraphStore` — CRUD API over the structural DB (stage 1.4, JAR2-49).
-//!
-//! Concrete struct over a `PgPool` rather than a trait. We're at the
-//! single-implementation stage; promoting to a trait now would be
-//! abstraction-for-its-own-sake (per `DEVELOPMENT.md` § 2). Mocking
-//! pressure will come from stage 3's `AgentCore` refactor — if a test
-//! wants to bypass the DB, the seam is `Arc<GraphStore>` swapped for a
-//! trait-object then, with the trait extracted at the moment of need.
-//!
-//! All queries use `sqlx::query!` / `sqlx::query_as!` so the schema is
-//! verified at compile time. The `.sqlx/` offline cache (committed via
-//! `cargo sqlx prepare --workspace`) lets `cargo build` succeed without
-//! a live DB; CI then runs the tests against a live Postgres.
-//!
-//! Method shapes match the union of the parent ticket (JAR2-44) and the
-//! sub-ticket (JAR2-49) — `list_children`, `list_edges_in_graph`, and
-//! `list_tools_for_agent` are all in scope.
+//! `GraphStore` — CRUD API over the structural DB. Concrete struct
+//! over a `PgPool` rather than a trait (no second implementation yet
+//! to motivate one). All queries use compile-time-checked `sqlx::query!`
+//! / `sqlx::query_as!` macros backed by the workspace `.sqlx/` offline
+//! cache, so `cargo build` succeeds without a live DB.
 
 use crate::types::{AgentRecord, Edge, Graph, ToolRecord};
 use crate::yaml::{AppliedGraph, GraphYaml, ResolvedAgent, ResolvedAgentWorkflow, ToolKind};
@@ -26,24 +14,17 @@ use sqlx::{PgPool, Postgres, Transaction};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Typed error surface for [`GraphStore::create_from_yaml`].
-///
-/// Stage 4.2 (JAR2-73) introduces a single domain-typed variant —
-/// `GraphAlreadyExists` — so the `jarvis-apply` binary can pattern-match
-/// the `metadata.name` collision and print a clean, operator-targeted
-/// error (rather than letting a generic `sqlx::Error` bubble through).
-/// Other failure paths stay opaque via `Sqlx`; the v1 CREATE-only
-/// semantics don't need finer-grained typing yet (see <JAR2-71> for the
-/// deferred reconciliation work that will).
+/// Typed error surface for [`GraphStore::create_from_yaml`]. The single
+/// domain-typed variant lets `jarvis-apply` pattern-match the
+/// `metadata.name` collision and print a clean operator-facing error;
+/// other failure paths stay opaque via `Sqlx`.
 #[derive(Debug, thiserror::Error)]
 pub enum GraphStoreError {
     /// A graph with this `metadata.name` already exists in the structural
-    /// DB. v1 is CREATE-only; reconciliation lives in Stage 5+.
-    /// See <JAR2-71>'s parent-ticket decision matrix.
+    /// DB. `jarvis apply` is CREATE-only.
     #[error(
-        "graph {name:?} already exists in the structural DB; v1 of `jarvis apply` is CREATE-only \
-         (reconciliation is deferred to Stage 5 — see <JAR2-71>). Drop the existing graph or use \
-         a different `metadata.name`."
+        "graph {name:?} already exists in the structural DB; `jarvis apply` is CREATE-only. \
+         Drop the existing graph or use a different `metadata.name`."
     )]
     GraphAlreadyExists { name: String },
 
@@ -56,8 +37,8 @@ pub enum GraphStoreError {
 }
 
 /// Thin wrapper over a `PgPool` exposing the structural-DB CRUD surface
-/// stage-4's `jarvis apply` will write into and downstream consumers
-/// will read from at startup.
+/// `jarvis apply` writes into and downstream consumers read from at
+/// startup.
 ///
 /// `Clone` is cheap — `PgPool` is `Arc`-shaped internally — so passing a
 /// `GraphStore` by value into per-request handlers is the intended
@@ -75,10 +56,9 @@ impl GraphStore {
     }
 
     /// Expose the underlying pool for callers that need to mix in their
-    /// own queries (e.g. stage-5 multi-graph tests). Intentionally
-    /// `pub` rather than `pub(crate)` because there's no realistic
-    /// kernel reason to hide it: `GraphStore` is a thin shell, and the
-    /// pool is what it shells.
+    /// own queries. Intentionally `pub` rather than `pub(crate)`:
+    /// `GraphStore` is a thin shell over the pool, with no realistic
+    /// kernel reason to hide it.
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -211,56 +191,45 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Stage 4.2 (JAR2-73) + 5.8 (JAR2-85 / JAR2-89) transactional
-    /// wrapper: in one DB transaction, CREATE the graph row, every
-    /// agent row (DFS parents-first across the whole forest), every
-    /// parent→child `edges` row, every tool row, and every
+    /// Transactional wrapper: in one DB transaction, CREATE the graph
+    /// row, every agent row (DFS parents-first across the whole forest),
+    /// every parent→child `edges` row, every tool row, and every
     /// `agent_tools` attachment.
     ///
     /// Returns [`AppliedGraph`] carrying the freshly-allocated
     /// `graph_id`, a parents-first list of [`ResolvedAgent`]s, and the
     /// `operator_id → (db_agent_id, workflow_id)` map the apply
-    /// binary's workflow-start phase consumes. **Single-agent YAML
-    /// (one root, no children) is the degenerate one-element case;
-    /// the JAR2-74 smoke test continues to work without changes on
-    /// the structural-DB side.**
+    /// binary's workflow-start phase consumes. Single-agent YAML is the
+    /// degenerate one-element case.
     ///
     /// Returns [`GraphStoreError::GraphAlreadyExists`] when a graph with
-    /// the same `metadata.name` already exists. v1 of `jarvis apply` is
-    /// CREATE-only; the reconciliation alternative (compare-and-update,
-    /// or `--prune`) is locked to Stage 5+ per the parent ticket
-    /// (<JAR2-71>). The collision is detected via a
-    /// `SELECT 1 FROM graphs WHERE name = $1` inside the transaction —
-    /// the fast path for the common, operator-driven case. As of JAR2-77
-    /// `graphs.name` also carries a DB-level UNIQUE constraint
-    /// (`graphs_name_unique`), and the INSERT below additionally catches
-    /// the resulting Postgres SQLSTATE 23505 and maps it to the same
-    /// `GraphAlreadyExists` variant — defense in depth for the two-
-    /// concurrent-applies race the SELECT-then-INSERT alone cannot
-    /// rule out.
+    /// the same `metadata.name` already exists. `jarvis apply` is
+    /// CREATE-only. Collision is detected via a `SELECT 1 FROM graphs
+    /// WHERE name = $1` inside the transaction. `graphs.name` also
+    /// carries a DB-level UNIQUE constraint (`graphs_name_unique`); the
+    /// INSERT below catches Postgres SQLSTATE 23505 and maps it to the
+    /// same variant — defense in depth for the two-concurrent-applies
+    /// race the SELECT-then-INSERT alone cannot rule out.
     ///
-    /// JAR2-85: `graph.policy` is preserved verbatim into the `graphs.metadata`
-    /// jsonb under a `"policy"` key (pass-through; not enforced).
-    /// `graphs.metadata` is `{}` when no policy is declared, matching
-    /// the pre-JAR2-85 shape.
+    /// `graph.policy` is preserved verbatim into `graphs.metadata` under
+    /// a `"policy"` key (pass-through; not enforced); metadata is `{}`
+    /// when no policy is declared.
     ///
     /// Caller invariant: `graph` must already have passed
     /// [`crate::yaml::validate`] (or [`crate::yaml::parse_and_validate`]).
     ///
-    /// Tool-row shape (mirror of the schema's free-form `kind` column):
-    /// `kind = "builtin"`, `command = Some(<builtin name>)`,
-    /// `args = []`, `env_refs = []`.
+    /// Tool-row shape: `kind = "builtin"`, `command = Some(<builtin
+    /// name>)`, `args = []`, `env_refs = []`.
     pub async fn create_from_yaml(
         &self,
         graph: &GraphYaml,
     ) -> Result<AppliedGraph, GraphStoreError> {
         let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
 
-        // Collision check inside the transaction. `FOR UPDATE` would be
-        // the textbook race-free shape, but `graphs.name` has no index
-        // and `jarvis apply` is operator-driven (not concurrent), so a
-        // plain SELECT is sufficient for v1 (with the SQLSTATE 23505
-        // catch on the INSERT below as the structural-race backstop).
+        // Collision check inside the transaction. A plain SELECT is
+        // sufficient for the operator-driven (non-concurrent) case; the
+        // SQLSTATE 23505 catch on the INSERT below is the structural-
+        // race backstop.
         let existing: Option<(Uuid,)> =
             sqlx::query_as("SELECT id FROM graphs WHERE name = $1 LIMIT 1")
                 .bind(&graph.metadata.name)
@@ -273,9 +242,8 @@ impl GraphStore {
         }
 
         // --- graph row -------------------------------------------------
-        // JAR2-85: `policy:` is pass-through. When declared, it lands
-        // verbatim under the `policy` key in `graphs.metadata`. When
-        // absent, metadata stays `{}` (pre-JAR2-85 shape).
+        // `policy:` is pass-through into `graphs.metadata` under the
+        // `policy` key; absent => `{}`.
         let graph_metadata: serde_json::Value = match &graph.policy {
             Some(p) => serde_json::json!({ "policy": p.0 }),
             None => serde_json::json!({}),
@@ -305,8 +273,8 @@ impl GraphStore {
         };
 
         // --- tool rows -------------------------------------------------
-        // Tools are graph-scoped (per JAR2-71). Index by operator id
-        // so each agent's `tools[]` reference can resolve to a UUID.
+        // Tools are graph-scoped. Indexed by operator id so each agent's
+        // `tools[]` reference can resolve to a UUID.
         let mut tool_uuid_by_id: HashMap<&str, Uuid> = HashMap::with_capacity(graph.tools.len());
         for tool in &graph.tools {
             let tool_uuid = Uuid::new_v4();
@@ -315,7 +283,7 @@ impl GraphStore {
                 ToolKind::Mcp { .. } => {
                     return Err(GraphStoreError::Sqlx(sqlx::Error::Protocol(format!(
                         "internal: create_from_yaml saw kind: mcp for tool {:?}; \
-                             validator should have rejected it (see <JAR2-71>)",
+                             validator should have rejected it",
                         tool.id,
                     ))));
                 }
@@ -373,9 +341,9 @@ impl GraphStore {
     // need explicit boxing on the recursive call site.)
 }
 
-/// JAR2-85: recursive DFS walker for `create_from_yaml`. Writes one
-/// `agents` row, optionally one `edges` row (when `parent_db_id` is
-/// `Some`), every `agent_tools` join, then recurses into children.
+/// Recursive DFS walker for `create_from_yaml`. Writes one `agents`
+/// row, optionally one `edges` row (when `parent_db_id` is `Some`),
+/// every `agent_tools` join, then recurses into children.
 ///
 /// Recursive `async fn` requires boxing on the recursive call (the
 /// future's size would otherwise be unbounded); the function returns a
@@ -402,9 +370,7 @@ fn walk_agent_tree<'a>(
             agent_uuid,
             graph_id,
             &yaml_agent.id,
-            // `mandate_ref` is the opaque text handle to the authored
-            // mandate. v1's mandate travels via `AgentInput.mandate`
-            // directly, so leave it `None`.
+            // Mandate travels via `AgentInput.mandate` directly today.
             None as Option<&str>,
         )
         .fetch_one(&mut **tx)
@@ -432,7 +398,7 @@ fn walk_agent_tree<'a>(
                 .ok_or_else(|| {
                     GraphStoreError::Sqlx(sqlx::Error::Protocol(format!(
                         "internal: create_from_yaml could not resolve tool ref {tool_ref:?}; \
-                     validator should have caught this (see <JAR2-71>)"
+                     validator should have caught this"
                     )))
                 })?;
             sqlx::query!(
@@ -444,10 +410,9 @@ fn walk_agent_tree<'a>(
             .await?;
         }
 
-        // Record this agent's id_map entry. The workflow id is the
-        // UUID-shaped flat form (per Stage 5 Project decision 6 + JAR2-89:
+        // The workflow id is the UUID-shaped flat form:
         // cross-agent FS reads look agents up by UUID, so the
-        // FsHandle::for_agent prefix must match the workflow id format).
+        // `FsHandle::for_agent` prefix must match the workflow id format.
         let workflow_id = agent_workflow_id(&graph_id.to_string(), &agent_uuid.to_string());
         id_map.insert(
             yaml_agent.id.clone(),
@@ -484,8 +449,8 @@ fn walk_agent_tree<'a>(
 
 impl GraphStore {
     /// Fetch a single agent by id. Returns `Ok(None)` if no row matches —
-    /// the call shape stage-3 startup code expects (lookup that may
-    /// legitimately miss).
+    /// the call shape startup code expects (lookup that may legitimately
+    /// miss).
     pub async fn get_agent(&self, agent_id: Uuid) -> sqlx::Result<Option<AgentRecord>> {
         let row = sqlx::query_as!(
             AgentRecord,
@@ -522,8 +487,7 @@ impl GraphStore {
     }
 
     /// All children of an agent, returned as the child's `AgentRecord`
-    /// (not the edge). The integration test in 1.5 uses this to assert
-    /// `list_children(parent_id) == [child_id]`.
+    /// (not the edge).
     pub async fn list_children(&self, parent_agent_id: Uuid) -> sqlx::Result<Vec<AgentRecord>> {
         let rows = sqlx::query_as!(
             AgentRecord,
@@ -542,11 +506,9 @@ impl GraphStore {
         Ok(rows)
     }
 
-    /// All edges whose parent or child belongs to a graph. Useful for
-    /// stage-4 `jarvis apply` round-trips that want to verify the full
-    /// edge set after a write. Same-graph invariant lives in
-    /// application code (see schema decision in
-    /// `migrations/0001_initial.sql`).
+    /// All edges whose parent or child belongs to a graph. The
+    /// same-graph invariant lives in application code (see schema
+    /// decision in `migrations/0001_initial.sql`).
     pub async fn list_edges_in_graph(&self, graph_id: Uuid) -> sqlx::Result<Vec<Edge>> {
         let rows = sqlx::query_as!(
             Edge,
@@ -565,9 +527,7 @@ impl GraphStore {
         Ok(rows)
     }
 
-    /// All tools attached to an agent via `agent_tools`. The integration
-    /// test in 1.5 uses this to assert
-    /// `list_tools_for_agent(child_id) == [tool_id]`.
+    /// All tools attached to an agent via `agent_tools`.
     pub async fn list_tools_for_agent(&self, agent_id: Uuid) -> sqlx::Result<Vec<ToolRecord>> {
         let rows = sqlx::query_as!(
             ToolRecord,
@@ -589,19 +549,11 @@ impl GraphStore {
     }
 }
 
-// JAR2-80 (stage 5.3) — bridge `GraphStore` to the worker-shared
-// `StructuralDbStore` trait `jarvis_temporal::worker` defines. The
-// trait lives in `jarvis_temporal` rather than `jarvis_graph` because
-// the `OnceLock<Arc<dyn ...>>` install is read from inside the
-// `register_child_in_structural_db` activity body (which can't depend
-// on `jarvis_graph` — the existing `jarvis_graph -> jarvis_temporal`
-// edge would cycle).
-//
-// The impl is a thin adapter: `GraphStore::add_agent` already returns
-// the full `AgentRecord` and takes a raw `Uuid`; the trait surface
-// hands back just the freshly-allocated `AgentId` and takes / returns
-// the kernel newtypes. `sqlx::Error` → `anyhow::Error` via `?` so the
-// activity layer can classify uniformly.
+// `StructuralDbStore` lives in `jarvis_temporal` because the
+// `OnceLock<Arc<dyn ...>>` install is read from inside an activity body
+// that can't depend on `jarvis_graph` without cycling the crate graph.
+// This adapter narrows `GraphStore`'s raw-`Uuid` / `AgentRecord` surface
+// to the trait's kernel-newtype shape.
 #[async_trait]
 impl StructuralDbStore for GraphStore {
     async fn add_agent(
@@ -634,12 +586,9 @@ mod tests {
     //! Per-method tests against an ephemeral per-test Postgres via
     //! `#[sqlx::test(migrator = "crate::MIGRATOR")]`. Each test gets
     //! its own freshly migrated DB, so tests are fully isolated and
-    //! can rely on row counts.
-    //!
-    //! Acceptance per JAR2-49: "happy path + one failure mode (e.g. FK
-    //! violation)" for each method. Failure modes that aren't reachable
-    //! via the public API (e.g. SQL parse errors) are skipped — those
-    //! are caught at compile time by `query!`.
+    //! can rely on row counts. Happy path + one failure mode (e.g. FK
+    //! violation) per method; SQL-parse-style failures are caught at
+    //! compile time by `query!` and not retested here.
     use super::*;
     use sqlx::PgPool;
 
@@ -886,12 +835,11 @@ mod tests {
         Ok(())
     }
 
-    // --- create_from_yaml (Stage 4.2, JAR2-73) -----------------------
+    // --- create_from_yaml --------------------------------------------
 
-    /// Canonical happy-path fixture for `create_from_yaml`. Mirror of
-    /// the validator-tests `HAPPY_YAML` (kept inline to avoid coupling
-    /// the store-test module's pass/fail to the yaml-test module's
-    /// shape).
+    /// Canonical happy-path fixture for `create_from_yaml`. Kept inline
+    /// (not shared with the validator tests) to avoid coupling this
+    /// module's pass/fail to the yaml-test module's shape.
     const HAPPY_YAML: &str = r#"
 apiVersion: jarvis.engine/v1alpha1
 kind: Graph
@@ -953,14 +901,14 @@ seed:
         Ok(())
     }
 
-    /// JAR2-85 multi-agent hermetic test — parent + 2 children fixture
-    /// against ephemeral Postgres. Verifies:
+    /// Multi-agent hermetic test — parent + 2 children fixture against
+    /// ephemeral Postgres. Verifies:
     ///   1. `agents` has 3 rows in the same graph
     ///   2. `edges` has 2 parent→child rows
     ///   3. `agent_tools` joins each agent to its declared tools
     ///   4. `AppliedGraph.id_map` contains all 3 operator ids mapped to
-    ///      matching UUIDs (the JAR2-89 fix in action — operator-authored
-    ///      ids resolve to the same UUIDs `agents.id` holds)
+    ///      matching UUIDs (operator-authored ids resolve to the same
+    ///      UUIDs `agents.id` holds)
     ///   5. `AppliedGraph.agents` is in DFS parents-first order
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn create_from_yaml_multi_agent_writes_tree_and_id_map_matches_agents_table(
@@ -1044,7 +992,7 @@ seed:
             .await?;
         assert_eq!(child_b_tools.len(), 0);
 
-        // JAR2-89 fix: id_map UUIDs match agents.id UUIDs verbatim.
+        // id_map UUIDs match agents.id UUIDs verbatim.
         for resolved in &applied.agents {
             let row = agents
                 .iter()
@@ -1055,7 +1003,7 @@ seed:
         Ok(())
     }
 
-    /// JAR2-85: `policy:` round-trips into `graphs.metadata` jsonb.
+    /// `policy:` round-trips into `graphs.metadata` jsonb.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn create_from_yaml_persists_policy_into_graph_metadata(
         pool: PgPool,
@@ -1120,8 +1068,8 @@ policy:
         store.create_from_yaml(&g).await.expect("first apply");
 
         // Second apply with the same `metadata.name` must surface the
-        // typed `GraphAlreadyExists` variant — the binary uses this to
-        // print the operator-facing v1-CREATE-only error.
+        // typed `GraphAlreadyExists` variant so the binary can print
+        // the operator-facing CREATE-only error.
         let err = store
             .create_from_yaml(&g)
             .await
@@ -1135,17 +1083,14 @@ policy:
         Ok(())
     }
 
-    /// JAR2-77 — concurrent-race regression: spawn N tasks that all try
-    /// to `create_from_yaml` the same graph against the same pool, and
+    /// Concurrent-race regression: spawn N tasks that all try to
+    /// `create_from_yaml` the same graph against the same pool, and
     /// assert exactly one wins.
     ///
-    /// Today's SELECT-then-INSERT fast path is sufficient for the
-    /// operator-driven case (single caller, no concurrency), but two
-    /// concurrent applies *could* both pass the SELECT before either
+    /// Two concurrent applies could both pass the SELECT before either
     /// INSERT lands. The DB-level UNIQUE constraint
-    /// (`graphs_name_unique`, migration `0002`) is what makes the
-    /// race structurally impossible; this test exercises it by racing
-    /// N=8 spawned tasks and verifying:
+    /// (`graphs_name_unique`) makes the race structurally impossible;
+    /// this test exercises it by racing N=8 spawned tasks and verifying:
     ///
     /// 1. Exactly one task returned `Ok`.
     /// 2. The remaining `N-1` tasks returned
@@ -1263,15 +1208,14 @@ policy:
         Ok(())
     }
 
-    // --- JAR2-80 (stage 5.3) — StructuralDbStore bridge --------------
+    // --- StructuralDbStore bridge ------------------------------------
 
     /// The `StructuralDbStore` impl is a thin shim over `add_agent` +
     /// `add_edge`; the load-bearing claim is that the freshly-allocated
     /// child id round-trips through the kernel newtype and the edge
-    /// row reads back via `list_children`. Mirrors the JAR2-49
-    /// `list_children_returns_child_records` shape, but routes through
-    /// the trait method (so a future trait-only refactor of the
-    /// activity body has coverage).
+    /// row reads back via `list_children`. Routes through the trait
+    /// method so a future trait-only refactor of the activity body has
+    /// coverage.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn structural_db_store_trait_adds_agent_and_edge(pool: PgPool) -> sqlx::Result<()> {
         let store = GraphStore::new(pool);

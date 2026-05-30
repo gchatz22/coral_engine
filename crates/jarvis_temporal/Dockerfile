@@ -1,9 +1,4 @@
-# Worker container scaffold for `jarvis_temporal`.
-#
-# Stage 0.3 (JAR2-42): this builds the stub `worker` binary that prints
-# and exits. Real workflow code lands in stage 3. The image exists today
-# so the production-shape compose path is wired end-to-end and the
-# Dockerfile is exercised in CI / by hand.
+# Worker container for `jarvis_temporal`.
 #
 # Build from the repo root so the workspace is in context:
 #   docker compose build worker
@@ -11,15 +6,12 @@
 #   docker build -t jarvis-worker:dev -f crates/jarvis_temporal/Dockerfile .
 
 # ---- Build stage --------------------------------------------------------
-# Pin Rust to the same version as `rust-toolchain.toml` (1.88). Bookworm
+# Pin Rust to the same version as `rust-toolchain.toml`. Bookworm
 # base keeps glibc compatible with the runtime image below.
 FROM rust:1.88-bookworm AS builder
 
 WORKDIR /build
 
-# Copy the workspace. The stub worker has no dependencies beyond std, so
-# we accept a single COPY + build (no cargo-chef dep-cache layer yet —
-# that becomes worthwhile in stage 3 when real deps land).
 COPY Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml ./
 COPY crates ./crates
 

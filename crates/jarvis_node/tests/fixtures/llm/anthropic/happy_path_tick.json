@@ -1,7 +1,7 @@
 {
   "synthesized": true,
   "vendor": "anthropic",
-  "note": "JAR2-21 happy-path tick: first response asks call_tool(echo), second emits an output citing a synthesized evidence id. Hand-written against the Anthropic Messages API wire shape documented in src/model_client/anthropic.rs (parse_response unit tests). Re-record with `JARVIS_LIVE_LLM=1 cargo test --features llm-anthropic` once a real ANTHROPIC_API_KEY is available.",
+  "note": "Happy-path tick: first response asks call_tool(echo), second emits an output citing a synthesized evidence id. Hand-written against the Anthropic Messages API wire shape documented in src/model_client/anthropic.rs (parse_response unit tests). Re-record with `JARVIS_LIVE_LLM=1 cargo test --features llm-anthropic` once a real ANTHROPIC_API_KEY is available.",
   "responses": [
     {
       "status": 200,

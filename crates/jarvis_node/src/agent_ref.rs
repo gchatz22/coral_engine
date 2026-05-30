@@ -1,20 +1,11 @@
 //! `AgentId` + `AgentRef` — the kernel's stable handles for naming agents.
 //!
-//! Lives in `jarvis_node` (not `jarvis_temporal`) because `Decision`
-//! references `AgentRef` for the parent-child topology variants
-//! (`RetireChild`, `ReplaceChild`, and — indirectly through
-//! `ReconcileSource`/`ConflictAlternative` — `ReconcileChildren`). The
-//! kernel needs to be able to talk about other agents without depending on
-//! a particular host's workflow plumbing.
-//!
-//! Own module rather than folded into `decision.rs` so that sibling
-//! crates / files (notably `trigger.rs`, which JAR2-79 extends with
-//! `ChildOutput { child_ref: AgentRef, .. }`) can `use crate::agent_ref::*`
-//! without the awkward semantics of "trigger imports from decision".
-//!
-//! `ParentRef` (in `jarvis_temporal::workflow`) stays distinct on purpose:
-//! it is the workflow-side delivery target and grows in 5.3 to carry
-//! `workflow_id` + `signal`. `AgentRef` is the kernel-native, persistable
+//! Lives in `jarvis_node` (not `jarvis_temporal`) so the kernel can talk
+//! about other agents — through `Decision`'s parent-child topology
+//! variants and `Trigger::ChildOutput` — without depending on a particular
+//! host's workflow plumbing. `ParentRef` (in `jarvis_temporal::workflow`)
+//! stays distinct: it is the workflow-side delivery target carrying
+//! `workflow_id` + `signal`; `AgentRef` is the kernel-native, persistable
 //! handle.
 
 use serde::{Deserialize, Serialize};
@@ -23,12 +14,12 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Newtype over the structural DB's `agents.id` column (a `Uuid`). The
-/// kernel never *generates* an `AgentId` — values originate either from
-/// the structural-DB `register_child_in_structural_db` activity (5.3) or
-/// from `jarvis apply`'s YAML walker (5.8). Both surfaces hand the id
-/// back to the kernel as an opaque token; this newtype keeps that
-/// opacity at the type level so a stray `Uuid` from somewhere else in
-/// the codebase can't be mistaken for an agent identifier.
+/// kernel never *generates* an `AgentId` — values originate from the
+/// `register_child_in_structural_db` activity or from `jarvis apply`'s
+/// YAML walker. Both surfaces hand the id back to the kernel as an
+/// opaque token; this newtype keeps that opacity at the type level so a
+/// stray `Uuid` from somewhere else in the codebase can't be mistaken
+/// for an agent identifier.
 ///
 /// Mirrors `OutputId` / `EvidenceId` in `mandate.rs` / `evidence.rs`:
 /// transparent serde so the on-disk and wire forms are the underlying
@@ -84,12 +75,10 @@ impl From<Uuid> for AgentId {
 /// so a `Uuid` from anywhere else in the codebase cannot be mistaken for a
 /// graph identifier.
 ///
-/// Added in JAR2-80 (stage 5.3): the `register_child_in_structural_db`
-/// activity needs the parent's `graph_id` to construct the child's workflow
-/// id (`graphs/<graph_id>/agents/<agent_id>`, per Stage 5 Project decision 6)
-/// and to call `GraphStore::add_agent` (which keys agents by `graph_id`).
-/// Threading the parent's `graph_id` through `AgentInput` keeps the activity
-/// hermetic — no DB lookup just to discover which graph the parent lives in.
+/// Threaded through child-registration activities so the workflow id
+/// (`graphs/<graph_id>/agents/<agent_id>`) can be constructed and
+/// `GraphStore::add_agent` (which keys agents by `graph_id`) can be called
+/// without a DB lookup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct GraphId(Uuid);
@@ -135,12 +124,11 @@ impl From<Uuid> for GraphId {
 /// topology decisions to name a sibling or child.
 ///
 /// Carries both the structural id and the workflow id so the workflow
-/// host (stage 5.3+) can route signals via
+/// host can route signals via
 /// `WorkflowContext::signal_external_workflow(workflow_id, ..)` without
 /// looking the id up against the DB on every send. The workflow-id
-/// scheme (`graphs/<graph_id>/agents/<agent_id>`, per Stage 5 Project
-/// decision 6) is flat — reparenting does not rewrite ids — so caching
-/// the string here is safe.
+/// scheme (`graphs/<graph_id>/agents/<agent_id>`) is flat — reparenting
+/// does not rewrite ids — so caching the string here is safe.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AgentRef {
     pub workflow_id: String,
@@ -230,10 +218,9 @@ mod tests {
         assert!(workflow_pos < agent_pos, "wire shape: {s}");
     }
 
-    // JAR2-80 (stage 5.3): GraphId mirror tests — keep the type-level
-    // shape of `GraphId` honest against `AgentId` so a future divergence
-    // (e.g. a non-transparent serde form on one but not the other) shows
-    // up here.
+    // GraphId mirror tests — keep its type-level shape honest against
+    // `AgentId` so a future divergence (e.g. a non-transparent serde form
+    // on one but not the other) shows up here.
 
     #[test]
     fn graph_id_transparent_serde_round_trip() {

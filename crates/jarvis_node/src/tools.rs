@@ -1,17 +1,7 @@
-//! Tool trait, registry, and built-in echo tool.
-//!
-//! The agent runtime dispatches side effects through `Tool` implementations
-//! looked up by name in a `ToolRegistry`. Calling a tool through the registry
-//! produces an `EvidenceRecord` whose id is the sha256 of the canonical JSON
-//! of `(name, args, result)` — see `evidence::EvidenceId::new`. That keeps
-//! provenance content-addressed: identical calls collapse to one record on
-//! disk.
-//!
-//! The trait surface is intentionally minimal and `name`-keyed so a future
-//! `call_batch` (sibling-batched MCP multiplexing, per
-//! `scratch/minimal_node_backend.md` § 6) can be added without breaking
-//! existing tools. MCP, sandboxing, and rate limiting are explicitly out of
-//! scope for this ticket (JAR2-7).
+//! Tool trait, registry, and built-in echo tool. Calling a tool through
+//! the registry produces an `EvidenceRecord` whose id is the sha256 of
+//! the canonical JSON of `(name, args, result)`, so identical calls
+//! collapse to one record on disk.
 
 use crate::evidence::EvidenceRecord;
 use anyhow::{anyhow, bail};
@@ -69,13 +59,10 @@ impl ToolRegistry {
 
     /// Predicate: is a tool registered under `name`?
     ///
-    /// Exposed so the agent run loop (JAR2-19) can discriminate "model
-    /// emitted `CallTool` for a tool that does not exist" — an apply-time
-    /// correction case the pending-correction loop handles — from "the tool
-    /// itself errored", which is a real call failure (JAR2-25 owns the
-    /// retry semantics for that path). The two cases share `tools.call`'s
-    /// error type today, and string-matching the message would be fragile;
-    /// a pre-check is the smaller, sturdier surface.
+    /// Lets the agent run loop discriminate "model emitted `CallTool` for
+    /// a tool that does not exist" (an apply-time correction case) from
+    /// "the tool itself errored" (a real call failure) without having to
+    /// string-match `tools.call`'s error message.
     pub fn contains(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }

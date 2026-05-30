@@ -1,80 +1,29 @@
-//! Stage 4.2 cleanup (JAR2-76) → Stage 5.8 (JAR2-85 / JAR2-89) —
-//! `jarvis apply` thin Temporal client with multi-agent YAML support.
+//! `jarvis apply` — thin Temporal client with multi-agent YAML support.
 //!
 //! Operator-facing CLI: reads a `graph.yaml`, validates it, writes the
-//! structural DB (CREATE-only — see <JAR2-71>), starts every
-//! `AgentWorkflow` in the graph (parents-before-children DFS) on the
-//! long-lived worker daemon's canonical task queue, signals the seed
-//! triggers, prints the workflow IDs + a Temporal CLI describe hint
-//! per agent, and exits. **Does not host a Temporal worker.** Execution
-//! happens on the separately-deployed daemon at
+//! structural DB (CREATE-only), starts every `AgentWorkflow` in the
+//! graph (parents-before-children DFS) on the long-lived worker
+//! daemon's canonical task queue, signals the seed triggers, prints
+//! the workflow IDs + a Temporal CLI describe hint per agent, and
+//! exits. **Does not host a Temporal worker.** Execution happens on
+//! the separately-deployed daemon at
 //! `crates/jarvis_temporal/src/bin/worker.rs`.
 //!
-//! See `scratch/temporal_staged_plan.md` § 2.6 (operator CLIs are thin
-//! Temporal clients) and `scratch/graph_yaml_schema.md` § 3 (multi-
-//! agent strawman this binary implements).
+//! Workflow IDs are the UUID-shaped flat form
+//! `graphs/<graph_uuid>/agents/<agent_uuid>` — cross-agent FS reads
+//! look agents up by `agent_id`, so the workflow id format must derive
+//! from the same UUID.
 //!
-//! # What it does
-//!
-//! 1. Parse `<graph.yaml>` from argv.
-//! 2. Read the YAML, run `jarvis_graph::yaml::parse_and_validate` —
-//!    source-located errors (`line:col: message`) print to stderr.
-//! 3. Connect to the structural DB via `DATABASE_URL`, run migrations
-//!    idempotently, and call `GraphStore::create_from_yaml`. The call
-//!    walks the agent forest DFS parents-first, writes every `graphs` /
-//!    `agents` / `edges` / `tools` / `agent_tools` row in one
-//!    transaction, and returns an [`AppliedGraph`] with the allocated
-//!    UUIDs + the `operator_id → (db_agent_id, workflow_id)` map.
-//!    The `metadata.name` collision is a typed
-//!    `GraphStoreError::GraphAlreadyExists`; print a clean error and
-//!    exit non-zero.
-//! 4. Build the per-agent `AgentInput`s + workflow IDs via
-//!    `jarvis_graph::yaml::build_workflow_starts` (uses the allocated
-//!    UUIDs — JAR2-89 fix; no synthetic UUIDs).
-//! 5. Connect a Temporal client.
-//! 6. For each `WorkflowStart` in DFS parents-first order, call
-//!    `start_workflow(AgentWorkflow, ..., task_queue)` against
-//!    [`DEFAULT_TASK_QUEUE`] (`jarvis-agents`, overrideable via
-//!    `TEMPORAL_TASK_QUEUE`). Each child workflow's
-//!    `AgentInput.parent_handle.workflow_id` references its parent's
-//!    workflow id (already issued earlier in the loop).
-//! 7. For each resolved seed trigger, signal the appropriate workflow
-//!    via `handle.signal(AgentWorkflow::external_signal, ...)`.
-//! 8. Print one `workflow_id=…` line per started agent (plus the
-//!    Temporal CLI describe hint), then exit. The agents retire
-//!    asynchronously on the daemon.
-//!
-//! # FS root ownership
-//!
-//! The CLI does **not** take a `<fs_root>` argument and does **not** stamp
-//! a per-invocation subdir. The worker daemon owns the FS root via
-//! `AGENT_FS_ROOT`. Operators inspecting on-disk artifacts read them
-//! under the daemon's root.
-//!
-//! # JAR2-89 (subsumed by JAR2-85): UUIDs from `GraphStore`
-//!
-//! Workflow IDs are now the UUID-shaped flat form
-//! `graphs/<graph_uuid>/agents/<agent_uuid>` — matches
-//! [`jarvis_temporal::workflow::FsHandle::for_agent`] and Stage 5.3's
-//! `spawn_child` path. Cross-agent FS reads (Stage 5.5) look agents up
-//! by `agent_id`, so the workflow id format must derive from the same
-//! UUID. (Pre-JAR2-89 the apply path minted synthetic UUIDs for
-//! `AgentInput.agent_id`, making the cross-agent lookup miss; that
-//! drift is closed here.)
-//!
-//! # v1 scope narrowings
+//! # Scope
 //!
 //! - **CREATE-only.** Re-applying a graph with the same `metadata.name`
-//!   errors out. No edit / prune / warn-and-leave today. Stage 6 owns
-//!   reconciliation.
-//! - **`kind: builtin` tools only.** MCP-in-worker is <JAR2-63>'s
-//!   flagged follow-up.
+//!   errors out.
+//! - **`kind: builtin` tools only.**
 //! - **Signaled, not stored.** `seed.triggers` are consumed at apply
 //!   time and signaled to the targeted agent; not persisted.
 //! - **`policy:` is pass-through.** Stored verbatim into
 //!   `graphs.metadata`; not enforced.
-//! - **Hierarchical YAML only** (Project decision 12). Flat
-//!   `parent:`-ref form deferred.
+//! - **Hierarchical YAML only.** Flat `parent:`-ref form not supported.
 //!
 //! # Env vars
 //!
@@ -128,20 +77,17 @@ ARGS:
                   `scratch/graph_yaml_schema.md` §§ 2-3 for the v1
                   single-agent and multi-agent shapes.
 
-V1 SCOPE NARROWINGS (locked in by JAR2-71 / JAR2-85):
+SCOPE:
     - Hierarchical multi-agent supported. `agents:` is a forest;
-      each agent may nest `children:`. Flat `parent:`-ref form is
-      deferred (Project decision 12).
+      each agent may nest `children:`. Flat `parent:`-ref form is not
+      supported.
     - CREATE-only. Re-applying a graph with the same `metadata.name`
-      errors out cleanly; reconciliation (edit / prune / warn-and-leave)
-      is Stage 6+.
-    - `kind: builtin` tools only. `kind: mcp` is rejected with a
-      pointer at JAR2-63's MCP-in-worker follow-up.
+      errors out cleanly.
+    - `kind: builtin` tools only. `kind: mcp` is rejected.
     - `seed.triggers:` are signaled to the targeted workflow at apply
       time, not persisted anywhere. Any agent in the tree can be a
       seed target (not just the root).
-    - `policy:` is pass-through into `graphs.metadata`; not enforced
-      (cost-budget and conflict-resolution enforcement is post-Stage-8).
+    - `policy:` is pass-through into `graphs.metadata`; not enforced.
 
 ENV:
     DATABASE_URL                           Postgres URL for the structural DB.
@@ -212,9 +158,8 @@ async fn run() -> Result<()> {
         Err(GraphStoreError::GraphAlreadyExists { name }) => {
             return Err(anyhow!(
                 "graph {name:?} already exists in the structural DB; \
-                 v1 of `jarvis apply` is CREATE-only (reconciliation is \
-                 deferred to Stage 6 — see JAR2-71). Drop the existing \
-                 graph or use a different `metadata.name`."
+                 `jarvis apply` is CREATE-only. Drop the existing graph \
+                 or use a different `metadata.name`."
             ));
         }
         Err(e) => return Err(e).context("create_from_yaml"),
@@ -231,8 +176,8 @@ async fn run() -> Result<()> {
     // allocated `AppliedGraph` and produces DFS parents-first
     // (workflow_id, AgentInput) pairs. Each child's
     // `parent_handle.workflow_id` is set to the parent's workflow id
-    // already issued earlier in this vector. The JAR2-89 fix is here:
-    // every `AgentInput.agent_id` is the real DB UUID.
+    // already issued earlier in this vector. Every
+    // `AgentInput.agent_id` is the real DB UUID.
     let task_queue = env::var("TEMPORAL_TASK_QUEUE").unwrap_or_else(|_| DEFAULT_TASK_QUEUE.into());
     let starts = build_workflow_starts(&graph, &applied);
     let triggers = yaml_seed_triggers(&graph, &applied)
@@ -326,9 +271,8 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-/// JAR2-85: count every agent in the YAML forest (top-level + all
-/// nested children). Used for the info-log line + the
-/// agent-count tracing field — purely informational.
+/// Count every agent in the YAML forest (top-level + all nested
+/// children). Used for the info-log line; purely informational.
 fn count_agents(graph: &GraphYaml) -> usize {
     fn rec(agent: &jarvis_graph::yaml::Agent, n: &mut usize) {
         *n += 1;
@@ -411,11 +355,8 @@ mod tests {
 
     #[test]
     fn usage_documents_v1_scope_narrowings() {
-        // The ticket (JAR2-71 / JAR2-85) calls out: `--help` must list
-        // the v1 scope narrowings (hierarchical multi-agent supported
-        // post-JAR2-85, CREATE-only, `kind: builtin` tools only,
-        // signals not stored). Pin those lines so the renderer doesn't
-        // silently drop them.
+        // `--help` must list the scope narrowings; pin those lines so
+        // the renderer doesn't silently drop them.
         assert!(
             USAGE.contains("Hierarchical multi-agent supported"),
             "USAGE: {USAGE}",
@@ -430,10 +371,10 @@ mod tests {
 
     #[test]
     fn usage_documents_thin_client_shape() {
-        // JAR2-76: the CLI is a thin Temporal client; the worker daemon
-        // executes the workflow. The help text must say so loudly enough
-        // that an operator who skips the README doesn't try to run the
-        // CLI without a daemon and get a confusing connect error.
+        // The CLI is a thin Temporal client; the worker daemon executes
+        // the workflow. The help text must say so loudly enough that an
+        // operator who skips the README doesn't try to run the CLI
+        // without a daemon and get a confusing connect error.
         assert!(USAGE.contains("Thin Temporal client"), "USAGE: {USAGE}");
         assert!(USAGE.contains("worker daemon"), "USAGE: {USAGE}");
         assert!(USAGE.contains("TEMPORAL_TASK_QUEUE"), "USAGE: {USAGE}");

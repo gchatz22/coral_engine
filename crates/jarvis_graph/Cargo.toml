@@ -3,7 +3,7 @@ name = "jarvis_graph"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Structural DB for the Jarvis Engine: graphs, agents, edges, tools, authored mandates (stage 1 stub)."
+description = "Structural DB for the Jarvis Engine: graphs, agents, edges, tools, authored mandates."
 license = "Apache-2.0 OR MIT"
 publish = false
 
@@ -11,44 +11,31 @@ publish = false
 name = "jarvis_graph"
 path = "src/lib.rs"
 
-# Stage 4.2 cleanup (JAR2-76) — operator-facing thin Temporal client. Reads
-# `graph.yaml`, writes the structural DB, and dispatches an `AgentWorkflow`
-# onto the long-lived worker daemon's canonical task queue. The CLI does
-# not host a worker and does not block on `get_result` — execution lives
-# on the daemon (`crates/jarvis_temporal/src/bin/worker.rs`).
+# Operator-facing thin Temporal client. Reads `graph.yaml`, writes the
+# structural DB, and dispatches an `AgentWorkflow` onto the long-lived worker
+# daemon's canonical task queue. The CLI does not host a worker and does not
+# block on `get_result`.
 [[bin]]
 name = "jarvis-apply"
 path = "src/bin/jarvis_apply.rs"
 
 [dependencies]
-# Stage 4.2 (JAR2-73) — `jarvis_graph` now owns the YAML → AgentInput
-# conversion (`yaml::into_agent_input`) and the `jarvis-apply` binary,
-# both of which materialize `jarvis_node` types (`Mandate`, `Trigger`)
-# and a `jarvis_temporal::workflow::AgentInput`. JAR2-72's `yaml.rs`
-# deliberately stayed `jarvis_node`-free; JAR2-73 is the explicit
-# handoff where the structural-DB crate grows the kernel-runtime
-# dependency.
 jarvis_node = { path = "../jarvis_node" }
 jarvis_temporal = { path = "../jarvis_temporal" }
 
 
-# `sqlx` is pinned with `=` to match the convention `jarvis_temporal` set
-# for stage-0 critical-path deps — a future `cargo update` should not
-# silently shift the DB driver under us. Bump deliberately when there's
-# a reason to.
+# `sqlx` pinned with `=` so a future `cargo update` doesn't silently shift the
+# DB driver under us.
 #
-# Features chosen for stage 1:
-# - `runtime-tokio-rustls`: stay on the same async runtime + TLS stack as
-#   the rest of the workspace (`jarvis_node` uses `reqwest` rustls; no
-#   reason to drag in `native-tls` here).
-# - `postgres`: target DB per `scratch/temporal_ops.md` § 4.
-# - `macros`: enables `query!` / `query_as!` compile-time-checked
-#   queries (stage 1.4 uses these; offline mode via `.sqlx/` makes them
-#   work in CI without a live DB at build time).
-# - `migrate`: enables `sqlx::migrate!()` so apps can apply the
-#   schema programmatically (stage 1.2 wires this).
-# - `chrono`, `uuid`, `json`: column-type support for the schema landing
-#   in stage 1.2 (`TIMESTAMPTZ`, `uuid`, `jsonb`).
+# Features:
+# - `runtime-tokio-rustls`: same async runtime + TLS stack as the rest of the
+#   workspace.
+# - `postgres`: target DB.
+# - `macros`: enables `query!` / `query_as!` compile-time-checked queries;
+#   offline mode via `.sqlx/` makes them work in CI without a live DB.
+# - `migrate`: enables `sqlx::migrate!()` for programmatic schema application.
+# - `chrono`, `uuid`, `json`: column-type support (`TIMESTAMPTZ`, `uuid`,
+#   `jsonb`).
 sqlx = { version = "=0.8.6", default-features = false, features = [
     "runtime-tokio-rustls",
     "postgres",
@@ -59,9 +46,8 @@ sqlx = { version = "=0.8.6", default-features = false, features = [
     "json",
 ] }
 
-# Match `jarvis_node`'s `chrono` shape exactly — `default-features = false`
-# + `clock` + `serde` — so a future workspace-deps consolidation is a
-# one-line move and we don't trip duplicate-version unification.
+# Match `jarvis_node`'s `chrono` shape exactly so a future workspace-deps
+# consolidation is a one-line move and unification doesn't trip duplicates.
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 serde = { version = "1", features = ["derive"] }
@@ -69,42 +55,34 @@ serde_json = "1"
 thiserror = "1"
 anyhow = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-# JAR2-80 — `impl jarvis_temporal::worker::StructuralDbStore for GraphStore`
-# in `src/store.rs` uses `#[async_trait]` because the trait is itself
-# `#[async_trait]`-annotated (Rust trait methods can't be `async` until
-# AFIT lands). Pre-JAR2-80 `async-trait` was a dev-only dep
-# (`jarvis_apply_smoke.rs`'s `EchoLike`); promoted here.
+# `impl jarvis_temporal::worker::StructuralDbStore for GraphStore` in
+# `src/store.rs` uses `#[async_trait]` because the trait is itself
+# `#[async_trait]`-annotated.
 async-trait = "0.1"
 
-# Stage 4.1 (JAR2-72) deps for `graph.yaml` parsing.
+# `graph.yaml` parsing deps.
 #
-# All three pinned with `=` so the `examples/graph.schema.json` byte-
-# equality test (and humanized-duration parser surface) cannot silently
-# drift under a `cargo update`. Same convention `sqlx` uses above.
+# All three pinned with `=` so the `examples/graph.schema.json` byte-equality
+# test (and humanized-duration parser surface) cannot silently drift.
 #
 # `serde_yaml` 0.9.x is marked `+deprecated` upstream but is still the
 # canonical Rust YAML driver — `serde_yml` is a recent fork without a
-# stability story yet. Documented as the v1 choice in
-# `scratch/graph_yaml_schema.md` § 5. Bump only when there's a reason.
+# stability story yet.
 #
-# `humantime` parses `100ms` / `5m` / `1h` per `scratch/graph_yaml_schema.md`
-# § 4.4. Stays a leaf dep — no `humantime-serde` (we deserialize via a
-# custom adapter on `String` to keep the error surface aligned with the
-# rest of `GraphYamlError`).
+# `humantime` parses `100ms` / `5m` / `1h`. No `humantime-serde` — we
+# deserialize via a custom adapter on `String` to keep the error surface
+# aligned with the rest of `GraphYamlError`.
 #
-# `schemars` 1.x is the current major; `derive` gives us
-# `JsonSchema` derive macros. `examples/graph.schema.json` is generated
-# from these.
+# `schemars` 1.x `derive` gives us `JsonSchema` macros; the example schema
+# JSON is generated from these.
 serde_yaml = "=0.9.34"
 humantime = "=2.3.0"
 schemars = { version = "=1.2.1", features = ["derive"] }
 
-# Stage 4.2 cleanup (JAR2-76) — the thin-client `jarvis-apply` binary only
-# needs the Temporal client surface (`Client`, signal/start workflow,
-# `Url`); workflow execution lives on the worker daemon and that binary
-# owns the SDK + activity runtime. Pinned with `=` to match the rest of
-# the Temporal SDK pins in `jarvis_temporal`'s Cargo.toml so a future
-# `cargo update` doesn't drift the CLI's wire shape from the daemon's.
+# Thin-client `jarvis-apply` only needs the Temporal client surface (`Client`,
+# signal/start workflow, `Url`); workflow execution lives on the worker daemon.
+# Pinned with `=` to match the rest of the Temporal SDK pins so the CLI's wire
+# shape can't drift from the daemon's.
 temporalio-client = "=0.4.0"
 temporalio-sdk-core = "=0.4.0"
 url = "2"
@@ -115,29 +93,23 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 default = []
 
 [dev-dependencies]
-# JAR2-73 — hermetic tests for `into_agent_input` need no DB; tempfile
-# powers the `load_graph` test cases against a synthesized YAML file.
 tempfile = "3"
 
-# JAR2-74 — the integration test uses `MemoryStorage` as the storage
-# backend, which is gated behind the `memory-storage` feature on
-# `jarvis_node`. Dev-only override turns the feature on for the test
-# build without dragging it into the production `jarvis-apply` binary.
-# Mirrors the analogous override in `jarvis_temporal/Cargo.toml`.
+# `memory-storage` feature pulls in `MemoryStorage` for the integration test
+# without dragging it into the production `jarvis-apply` binary. Mirrors the
+# analogous override in `jarvis_temporal/Cargo.toml`.
 jarvis_node = { path = "../jarvis_node", features = ["memory-storage"] }
 
-# JAR2-76 — the integration test hosts a worker inline as a test fixture
-# (the thin-client CLI no longer does), so the test build pulls in the
-# worker-side Temporal SDK surface (`Worker::new` lives in `temporalio-sdk`
-# via `jarvis_temporal::worker::build_worker`; `CoreRuntime` +
-# `TelemetryOptions` come from `temporalio-sdk-core` and
-# `temporalio-common`). The production `jarvis-apply` binary stays
-# client-only — these stay dev-only.
+# Integration test hosts a worker inline as a test fixture (the thin-client CLI
+# no longer does), so the test build pulls in the worker-side Temporal SDK
+# surface (`Worker::new` lives in `temporalio-sdk` via
+# `jarvis_temporal::worker::build_worker`; `CoreRuntime` + `TelemetryOptions`
+# come from `temporalio-sdk-core` and `temporalio-common`). The production
+# `jarvis-apply` binary stays client-only.
 temporalio-sdk = "=0.4.0"
 temporalio-common = "=0.4.0"
 
-# Stage-1 lint posture matches `jarvis_node` — see its `Cargo.toml` for
-# the rationale (clippy 1.88 promoted a handful of style lints; keep the
-# diff small until there's a reason to broadly modernize formatting).
+# Lint posture matches `jarvis_node`: clippy 1.88 promoted style lints; allow
+# until there's a reason to broadly modernize formatting.
 [lints.clippy]
 uninlined_format_args = "allow"

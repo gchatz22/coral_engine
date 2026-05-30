@@ -1,27 +1,7 @@
-//! In-memory [`AgentStorage`] backed by a `BTreeMap`.
-//!
-//! Gated behind `#[cfg(any(test, feature = "memory-storage"))]` (decision
-//! 6 in `scratch/agent_storage.md` § 13). Tests in any workspace crate
-//! get access for free via `#[cfg(test)]`; production binaries opt in
-//! via the `memory-storage` feature.
-//!
-//! # Why `BTreeMap`?
-//!
-//! The trait's `list` method returns keys in lex-ascending order. A
-//! `BTreeMap` iterator yields keys in that exact order natively, so
-//! `list` is a cheap range walk rather than "scan + sort". `HashMap`
-//! would force a sort on every list call for no benefit at the scale
-//! `MemoryStorage` is intended for (tests + dev spike-checks).
-//!
-//! # Concurrency
-//!
-//! Wrapped in `tokio::sync::RwLock` so concurrent readers don't block
-//! each other while the trait still presents an immutable `&self`
-//! surface. Single-writer-per-agent — promised by the wider engine
-//! architecture — means contention is bounded; we use the async-aware
-//! `tokio::sync::RwLock` rather than `std::sync::RwLock` so a `.lock()`
-//! call inside an `async fn` cannot deadlock the runtime when the lock
-//! is contended.
+//! In-memory [`AgentStorage`] backed by a `BTreeMap` wrapped in a
+//! `tokio::sync::RwLock`. `BTreeMap` yields keys in lex-ascending order
+//! natively, matching the `list` contract without a sort step. Gated
+//! behind `#[cfg(any(test, feature = "memory-storage"))]`.
 
 use super::{AgentStorage, ListPage, PutOutcome, StorageResult};
 use async_trait::async_trait;
@@ -29,8 +9,7 @@ use bytes::Bytes;
 use std::collections::BTreeMap;
 use tokio::sync::RwLock;
 
-/// In-memory storage backed by a `BTreeMap<String, Bytes>`. Cheap to
-/// clone via `Arc` (no need for `Clone` on the type itself).
+/// In-memory storage backed by a `BTreeMap<String, Bytes>`.
 #[derive(Debug, Default)]
 pub struct MemoryStorage {
     inner: RwLock<BTreeMap<String, Bytes>>,
@@ -62,15 +41,11 @@ impl AgentStorage for MemoryStorage {
 
     async fn get(&self, key: &str) -> StorageResult<Option<Bytes>> {
         let guard = self.inner.read().await;
-        // `Bytes::clone` is Arc-cheap.
         Ok(guard.get(key).cloned())
     }
 
     async fn get_many(&self, keys: &[&str]) -> StorageResult<Vec<Option<Bytes>>> {
-        // Single read-lock acquisition for the whole batch: the backing
-        // store is in-memory so there's no per-key parallelism to gain
-        // by spawning N tasks, and one lock keeps the snapshot
-        // consistent across the batch.
+        // One read-lock keeps the batch snapshot consistent.
         let guard = self.inner.read().await;
         let mut out = Vec::with_capacity(keys.len());
         for k in keys {
@@ -81,7 +56,7 @@ impl AgentStorage for MemoryStorage {
 
     async fn delete(&self, key: &str) -> StorageResult<()> {
         let mut guard = self.inner.write().await;
-        guard.remove(key); // idempotent: None when absent
+        guard.remove(key);
         Ok(())
     }
 
@@ -95,11 +70,8 @@ impl AgentStorage for MemoryStorage {
         let mut keys = Vec::with_capacity(limit.min(64));
         let mut overflow = false;
 
-        // `BTreeMap::range` over the whole map then filter; using the
-        // prefix as a lower bound would still need to stop at the upper
-        // bound, and computing the upper bound from an arbitrary UTF-8
-        // prefix (`prefix` + char::MAX) is more code than it's worth at
-        // MemoryStorage's scale.
+        // Filtering the full key iterator beats computing a UTF-8 upper
+        // bound at this scale.
         for k in guard.keys() {
             if !k.starts_with(prefix) {
                 continue;

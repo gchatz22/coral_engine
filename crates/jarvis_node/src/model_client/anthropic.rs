@@ -1,23 +1,14 @@
 //! Anthropic Messages API implementation of `ModelClient`.
 //!
 //! Endpoint: `POST https://api.anthropic.com/v1/messages`. Auth via the
-//! `x-api-key` header pulled from `ANTHROPIC_API_KEY`.
+//! `x-api-key` header pulled from `ANTHROPIC_API_KEY`. Wire-format work
+//! is split into pure `build_body` / `parse_response` / `map_status_error`
+//! helpers so tests exercise the seams without making live HTTP calls.
 //!
-//! The wire-format work is split into three pure functions —
-//! `build_body`, `parse_response`, `map_status_error` — that the async
-//! `complete` method composes around `reqwest`. Tests exercise the three
-//! seams directly so we never make a live HTTP call from `cargo test`.
-//!
-//! Role mapping (the trait's four roles are not all valid Anthropic
-//! `messages[].role` values):
-//!
-//! * `system` turns are concatenated into the top-level `system` field.
-//! * `user` and `assistant` turns are passed through with their content
-//!   blocks rewritten (`tool_use` keeps `id`, `name`, `input`).
-//! * `tool` turns become `user` messages whose `content` is a single
-//!   `tool_result` block. The trait says "this is a tool's reply"; the
-//!   wire format insists on `user` because Anthropic's role system has no
-//!   `tool` slot.
+//! Role mapping: `system` turns concatenate into the top-level `system`
+//! field; `user`/`assistant` pass through with content rewritten; `tool`
+//! turns become `user` messages with a `tool_result` block, since
+//! Anthropic's role system has no `tool` slot.
 
 use std::env;
 use std::time::Instant;
@@ -111,9 +102,7 @@ impl ModelClient for AnthropicClient {
             .map_err(|_| ModelError::Auth(format!("{API_KEY_ENV} not set in environment")))?;
 
         let body = build_body(&req, &self.model);
-        // Start the latency clock once we're committed to the HTTP call.
-        // We measure end-to-end wall time including body read so the
-        // number matches what an observer would see on the wire.
+        // End-to-end wall time including body read, matching wire observation.
         let started = Instant::now();
         let resp = self
             .http
@@ -186,10 +175,9 @@ pub fn build_body(req: &CompleteRequest, model: &str) -> Value {
                     if let ContentBlock::Text { text } = block {
                         system_chunks.push(text.clone());
                     }
-                    // Non-text blocks on a system turn are ignored: the
-                    // Anthropic system field is plain text. The prompt
-                    // renderer (JAR2-16) is the layer that's supposed to
-                    // produce well-formed system content.
+                    // Anthropic's system field is plain text; non-text blocks
+                    // on a system turn are dropped. Upstream renderer is
+                    // responsible for well-formed system content.
                 }
             }
             Role::User => {
@@ -236,12 +224,8 @@ pub fn build_body(req: &CompleteRequest, model: &str) -> Value {
             })
             .collect();
         body.insert("tools".into(), Value::Array(tools));
-        // JAR2-38 lifts the JAR2-37 `tool_choice.disable_parallel_tool_use`
-        // workaround: the parser now folds K parallel `tool_use` blocks
-        // into a single `Decision::CallTools` and the corrective-retry
-        // path emits matching `tool_result` blocks. Omitting `tool_choice`
-        // entirely keeps the API default (`auto`, parallel tools
-        // enabled).
+        // `tool_choice` is intentionally omitted so the API default
+        // (`auto`, parallel tools enabled) applies.
     }
     Value::Object(body)
 }
@@ -331,8 +315,7 @@ pub(crate) fn parse_response(body: &[u8]) -> Result<ParsedComplete, ModelError> 
                     arguments: input,
                 });
             }
-            // Tolerate forward-compat block types (`thinking`, future
-            // additions). Drop them rather than fail the parse.
+            // Tolerate forward-compat block types (e.g. `thinking`).
             _ => {}
         }
     }
@@ -467,9 +450,6 @@ mod tests {
                     "required": ["location"],
                 },
             }],
-            // JAR2-38: no `tool_choice` block; the API default keeps
-            // parallel tool use enabled, which the parser + agent loop
-            // now handle natively.
         });
         assert_eq!(body, expected);
     }
@@ -488,8 +468,6 @@ mod tests {
         assert!(body.get("temperature").is_none(), "no temperature field");
         assert!(body.get("system").is_none(), "no system field");
         assert!(body.get("tools").is_none(), "no tools field");
-        // JAR2-38: `tool_choice` is no longer set — at all. Default API
-        // behavior (parallel tools enabled) is what we want.
         assert!(
             body.get("tool_choice").is_none(),
             "no tool_choice when tools list is empty"
@@ -500,11 +478,8 @@ mod tests {
 
     #[test]
     fn build_body_does_not_set_tool_choice_when_tools_present() {
-        // JAR2-38: lifting the JAR2-37 workaround. Tool-bearing requests
-        // must omit `tool_choice` entirely so the Anthropic API default
-        // (parallel tools enabled) applies. The parser + agent loop now
-        // handle K `tool_use` blocks in a single response, so the
-        // workaround is no longer needed.
+        // Tool-bearing requests must omit `tool_choice` so the Anthropic API
+        // default (parallel tools enabled) applies.
         let req = CompleteRequest {
             messages: vec![Message::user("hi")],
             tools: vec![ToolSpec {
@@ -520,7 +495,7 @@ mod tests {
         let body = build_body(&req, "m");
         assert!(
             body.get("tool_choice").is_none(),
-            "tool_choice must be absent on tool-bearing requests (JAR2-38), got: {body}"
+            "tool_choice must be absent on tool-bearing requests, got: {body}"
         );
         assert!(body.get("tools").is_some(), "tools field should be present");
     }
@@ -683,10 +658,8 @@ mod tests {
 
     #[tokio::test]
     async fn complete_returns_auth_error_when_api_key_missing() {
-        // Use `remove_var` rather than relying on the ambient env. Wrapped
-        // in `unsafe` per Rust 2024 / 1.84 — `set_var`/`remove_var` are
-        // marked unsafe because they are not thread-safe with concurrent
-        // env reads. Single-threaded test, no readers, so this is fine.
+        // `remove_var` is unsafe because it isn't thread-safe with concurrent
+        // env reads; safe here because there are no concurrent readers.
         unsafe {
             std::env::remove_var(API_KEY_ENV);
         }
@@ -705,16 +678,10 @@ mod tests {
 
     #[test]
     fn new_reads_anthropic_model_env_for_unset_empty_and_value() {
-        // Was previously two tests (set-then-read, unset/empty-then-read)
-        // that mutated the process-global `ANTHROPIC_MODEL` env in parallel —
-        // Rust's default harness runs tests in the same binary concurrently,
-        // so the original "single-threaded" comment was wrong and the pair
-        // raced intermittently in CI. Merging the two into one sequential
-        // body removes the race without adding a serialization dep.
-        //
-        // Empty must behave like unset — `.envrc` defaults often ship as ""
-        // before someone fills them in, and we don't want that to send an
-        // empty string to the API.
+        // One sequential test body avoids racing on the process-global env
+        // when the harness runs tests concurrently. Empty must behave like
+        // unset — `.envrc` defaults often ship as "" and we don't want an
+        // empty string sent to the API.
         unsafe {
             std::env::remove_var(MODEL_ENV);
         }

@@ -1,24 +1,11 @@
-//! `Decision` — what the agent wants the runtime to do next.
-//!
-//! Pure data; the run loop (a later ticket) is what actually executes
-//! these. Every variant carries enough information that a Decision can be
+//! `Decision` — what the agent wants the runtime to do next. Pure data;
+//! every variant carries enough information that a Decision can be
 //! serialized, replayed, or audited without the original `Decide`
 //! implementation in hand.
 //!
-//! `ClaimSeed` and `FsOp` live here because they exist only as parameters
-//! to specific `Decision` variants; promoting them to their own modules
-//! would be premature.
-//!
-//! This module also hosts the JAR2-6 surface area:
-//!
-//! * `ContextBundle` — the read-only snapshot the loop hands to a `Decide`
-//!   implementation each tick.
-//! * `Decide` — the trait every model adapter (mock, real LLM, etc.)
-//!   implements; the run loop will only ever talk to this trait.
-//! * `MockDecide` — a scripted `Decide` for tests.
-//! * `assemble_context` — a plain async fn that reads the per-agent FS and
-//!   packages the bundle. Kept as a free function for the bootstrap; it
-//!   can graduate to its own trait once real LLM activities arrive.
+//! Also hosts the per-tick surface the run loop uses: `ContextBundle` (the
+//! read-only snapshot handed to `Decide` each tick), the `Decide` trait,
+//! `MockDecide`, and `assemble_context`.
 //!
 //! # Parent-child variants
 //!
@@ -108,30 +95,28 @@ pub enum Decision {
     },
     /// Stop running. The reason is persisted so retirement is auditable.
     Retire { reason: String },
-    /// JAR2-78 (stage 5.1): parent spawns a child agent at decision time.
-    /// The runtime activity (5.3 `register_child_in_structural_db`)
-    /// allocates the child's `AgentId` deterministically and instantiates
-    /// an `AgentWorkflow` under `graphs/<gid>/agents/<new_aid>`. This
-    /// variant carries only the agent's logical name + mandate; the
-    /// structural id is host-side state.
+    /// Parent spawns a child agent at decision time. The host-side
+    /// `register_child_in_structural_db` activity allocates the child's
+    /// `AgentId` deterministically and instantiates an `AgentWorkflow`
+    /// under `graphs/<gid>/agents/<new_aid>`. This variant carries only
+    /// the agent's logical name + mandate; the structural id is
+    /// host-side state.
     SpawnChild {
         agent_name: String,
         mandate: Mandate,
     },
-    /// JAR2-78 (stage 5.1): parent folds N child outputs into its own
-    /// context as synthetic evidence; optionally records a conflict if
-    /// the children disagree.
+    /// Parent folds N child outputs into its own context as synthetic
+    /// evidence; optionally records a conflict if the children disagree.
     ///
-    /// Per Stage 5 Project decision 4: the LLM is the only thing that
-    /// can summarize a child claim, so the variant carries the claim
-    /// summaries inline (via `ConflictAlternative.claim`) rather than
-    /// asking the activity to introspect arbitrary JSON outputs.
-    /// `conflict` is `Some` iff the children disagree; the activity
+    /// The variant carries the claim summaries inline (via
+    /// `ConflictAlternative.claim`) rather than asking the activity to
+    /// introspect arbitrary JSON outputs — summarization is the LLM's
+    /// job. `conflict` is `Some` iff the children disagree; the activity
     /// writes the conflict record only on `Some`.
     ReconcileChildren {
         /// 1+ child outputs to fold in. Each becomes one synthetic
         /// evidence record in the parent's `evidence/` directory at
-        /// activity-execution time (5.5).
+        /// activity-execution time.
         sources: Vec<ReconcileSource>,
         /// `Some` iff the parent observed disagreement among the
         /// `sources`. `None` reconciliations are concordance fold-ins
@@ -139,25 +124,25 @@ pub enum Decision {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conflict: Option<ConflictRecordIntent>,
     },
-    /// JAR2-78 (stage 5.1): parent terminates a child. The workflow host
-    /// (5.7) signals the child's existing retire arm via
+    /// Parent terminates a child. The workflow host signals the child's
+    /// existing retire arm via
     /// `WorkflowContext::signal_external_workflow(..)`. No replacement
     /// is spawned — for that, use `ReplaceChild`.
     RetireChild { child_ref: AgentRef, reason: String },
-    /// JAR2-78 (stage 5.1): parent retires a child and spawns a
-    /// replacement with a new mandate. The replacement gets a fresh
-    /// `AgentId` + workflow id — not an in-place mandate swap on the
-    /// existing child. Matches Stage 5 Project decision 6's flat
-    /// workflow-id scheme: ids do not encode topology, so a "replace"
-    /// is structurally a retire + spawn from the kernel's point of view.
+    /// Parent retires a child and spawns a replacement with a new
+    /// mandate. The replacement gets a fresh `AgentId` + workflow id —
+    /// not an in-place mandate swap on the existing child. The flat
+    /// workflow-id scheme means ids do not encode topology, so a
+    /// "replace" is structurally a retire + spawn from the kernel's
+    /// point of view.
     ReplaceChild {
         child_ref: AgentRef,
         new_mandate: Mandate,
     },
 }
 
-/// JAR2-78 (stage 5.1): one child output the parent wants folded into its
-/// own context. The 5.5 `reconcile_children` activity reads the child's
+/// One child output the parent wants folded into its own context. The
+/// `reconcile_children` activity reads the child's
 /// `outputs/<output_id>.json` and writes one synthetic evidence record
 /// per source into the parent's `evidence/` directory; the parent's
 /// subsequent `EmitOutput { evidence: [..] }` then cites those synthetic
@@ -168,11 +153,11 @@ pub struct ReconcileSource {
     pub output_id: OutputId,
 }
 
-/// JAR2-78 (stage 5.1): the parent's account of a disagreement among
-/// the cited child outputs. `alternatives.len() >= 2` is the load-bearing
-/// invariant (a single alternative is not a conflict); the 5.5 activity
-/// is responsible for validating that and writing the resulting
-/// `<agent_root>/conflicts/<id>.json` (5.6 schema).
+/// The parent's account of a disagreement among the cited child outputs.
+/// `alternatives.len() >= 2` is the load-bearing invariant (a single
+/// alternative is not a conflict); the `reconcile_children` activity
+/// validates that and writes the resulting
+/// `<agent_root>/conflicts/<id>.json`.
 ///
 /// `resolution` is `None` for "held open" — the parent records the
 /// disagreement but does not pick a winner. `Some` carries the chosen
@@ -180,7 +165,7 @@ pub struct ReconcileSource {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictRecordIntent {
     /// At least two alternatives; the type does not enforce the bound,
-    /// the 5.5 activity does (so a malformed `Decision` is a
+    /// the writing activity does (so a malformed `Decision` is a
     /// `NeedsCorrection` rather than a panic).
     pub alternatives: Vec<ConflictAlternative>,
     /// `None` = held open; `Some` = parent picked a winner.
@@ -188,11 +173,10 @@ pub struct ConflictRecordIntent {
     pub resolution: Option<ConflictResolution>,
 }
 
-/// JAR2-78 (stage 5.1): one side of a conflict. The `claim` text is the
-/// parent LLM's summary of what this source asserts — per Stage 5
-/// Project decision 4, this summarization happens at decision time
-/// because only the LLM has the context to do it well; the activity
-/// just persists what's in the decision.
+/// One side of a conflict. The `claim` text is the parent LLM's summary
+/// of what this source asserts — summarization happens at decision time
+/// because only the LLM has the context to do it well; the activity just
+/// persists what's in the decision.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictAlternative {
     pub source_child: AgentRef,
@@ -200,25 +184,20 @@ pub struct ConflictAlternative {
     pub claim: String,
 }
 
-/// JAR2-78 (stage 5.1): how the parent resolved a conflict. The chosen
-/// index points into the surrounding `ConflictRecordIntent.alternatives`
-/// vec; bounds-checking is the 5.5 activity's job. `reasoning` becomes
-/// part of the persisted conflict record so the resolution is auditable.
+/// How the parent resolved a conflict. The chosen index points into the
+/// surrounding `ConflictRecordIntent.alternatives` vec; bounds-checking
+/// is the writing activity's job. `reasoning` becomes part of the
+/// persisted conflict record so the resolution is auditable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictResolution {
     pub chosen_alternative_idx: usize,
     pub reasoning: String,
 }
 
-/// JAR2-82 (stage 5.5): content-addressed id of a persisted conflict
-/// record (`<agent_root>/conflicts/<id>.json`, schema lands in 5.6).
-///
-/// Carried on [`ReconcileChildrenOutput`](crate::decision) so the
-/// `reconcile_children` activity can return the id of the conflict
-/// record it just wrote. **This ticket (5.5) always returns `None`** —
-/// the actual writer + the canonical-form bytes the id hashes over land
-/// in JAR2-83 (5.6). The type is defined here today so 5.6 doesn't
-/// have to rev the activity's output shape on its way in.
+/// Content-addressed id of a persisted conflict record
+/// (`<agent_root>/conflicts/<id>.json`). Carried on the
+/// `reconcile_children` activity's output so the writer can return the
+/// id of the record it just wrote.
 ///
 /// Mirrors the [`OutputId`] / [`EvidenceId`] precedent: transparent
 /// serde so the on-disk filename and wire form are the underlying hex
@@ -229,10 +208,9 @@ pub struct ConflictResolution {
 pub struct ConflictId(String);
 
 impl ConflictId {
-    /// Wrap a pre-computed hex string. Trusts the caller; the actual
-    /// canonicalization-and-hash constructor (`ConflictId::new` over
-    /// the persisted conflict record) lands in JAR2-83 alongside the
-    /// writer.
+    /// Wrap a pre-computed hex string. Trusts the caller; the
+    /// canonicalize-and-hash constructor lives next to the writer in
+    /// `crate::conflict`.
     pub fn from_hex(hex: impl Into<String>) -> Self {
         ConflictId(hex.into())
     }
@@ -332,8 +310,8 @@ impl ClaimSeed {
 }
 
 /// A single mutation against the per-agent filesystem. Paths are relative
-/// to the agent's FS root; the FS layer (a later ticket) is responsible
-/// for sandboxing and validation.
+/// to the agent's FS root; the FS layer is responsible for sandboxing
+/// and validation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum FsOp {
@@ -348,9 +326,8 @@ pub enum FsOp {
 ///
 /// Owned data (not borrows) so an implementation can move the bundle into
 /// an async task, queue it, or serialize it for audit/replay without
-/// fighting lifetimes. The bootstrap shape mirrors the ticket spec
-/// verbatim: mandate + the triggers that woke us + a small slice of recent
-/// FS state. Trim fields here only when one is unambiguously dead.
+/// fighting lifetimes. Shape: mandate + the triggers that woke us + a
+/// small slice of recent FS state.
 ///
 /// `correction` is `Some` when this tick is a continuation of a prior
 /// attempt the runtime rejected (an unsatisfiable `Decision`). It carries
@@ -366,11 +343,10 @@ pub struct ContextBundle {
     pub recent_evidence: Vec<EvidenceRecord>,
     /// Open claims (`claims/<slug>.json` with `status == Open`), capped by
     /// `mandate.context_policy.open_claims_max`. Surfaced in the warm cache
-    /// so the seed-reuse convention (JAR2-28 / `scratch/claim_seed_persistence.md`)
-    /// works without a tool roundtrip every tick. Order is inherited from
-    /// `AgentFs::list_claims` (filename ascending) per
-    /// `scratch/context_assembly_v2.md` § 8. `#[serde(default)]` keeps the
-    /// wire format backward-compatible with pre-JAR2-36 bundles.
+    /// so the seed-reuse convention (see
+    /// `scratch/claim_seed_persistence.md`) works without a tool roundtrip
+    /// every tick. Order is inherited from `AgentFs::list_claims`
+    /// (filename ascending) per `scratch/context_assembly_v2.md` § 8.
     #[serde(default)]
     pub open_claims: Vec<Claim>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -403,9 +379,9 @@ impl CorrectionContext {
 }
 
 /// Trait every model adapter (mock, real LLM, deterministic policy)
-/// implements. The run loop (JAR2-8) talks to nothing else when it needs
-/// "what should the agent do next?" — that constraint is the whole point
-/// of this trait.
+/// implements. The run loop talks to nothing else when it needs "what
+/// should the agent do next?" — that constraint is the whole point of
+/// this trait.
 ///
 /// `Send + Sync` are required because the loop owns its `Decide`
 /// implementation behind shared state (typically `Arc<dyn Decide>`) and
@@ -457,17 +433,14 @@ impl Decide for MockDecide {
 /// Read FS state and package a `ContextBundle` for the given triggers.
 ///
 /// Window sizes are drawn from `cfg.context_policy`
-/// (`crate::mandate::ContextPolicy`): per-mandate tuning replaces the
-/// JAR2-6 hardcoded `RECENT_WINDOW = 8` constant retired in JAR2-36.
-/// Defaults reproduce the pre-JAR2-36 behavior so existing graphs are
-/// unaffected.
+/// (`crate::mandate::ContextPolicy`), so per-mandate tuning shapes the
+/// warm cache.
 ///
 /// Determinism: outputs and evidence are read via the FS helpers, which
 /// sort filenames lexically and return the last N entries — see
 /// `AgentFs::list_recent_outputs` / `AgentFs::list_recent_evidence`. Open
 /// claims are drawn from `AgentFs::list_claims` in its native filename
-/// order; phase 1 inherits that ordering per
-/// `scratch/context_assembly_v2.md` § 8.
+/// order per `scratch/context_assembly_v2.md` § 8.
 ///
 /// `correction` carries continuation state from the run loop when the
 /// previous tick produced an unsatisfiable `Decision`. When `Some`, the
@@ -488,9 +461,7 @@ pub async fn assemble_context(
         .filter(|c| c.status == ClaimStatus::Open)
         .take(policy.open_claims_max)
         .collect();
-    // Field counts feed the JAR2-36 measurement spike + ongoing
-    // observability — keeps the warm cache shape inspectable without
-    // dumping potentially large bodies into the log.
+    // Logs the warm-cache shape without dumping potentially large bodies.
     tracing::debug!(
         triggers = triggers.len(),
         recent_outputs = recent_outputs.len(),
@@ -644,14 +615,14 @@ mod tests {
         assert_eq!(d, back);
     }
 
-    // ---- JAR2-78 (stage 5.1): parent-child topology variants -------------
+    // ---- Parent-child topology variants ---------------------------------
 
     use crate::agent_ref::{AgentId, AgentRef};
     use crate::mandate::OutputId;
     use uuid::Uuid;
 
-    /// Hand-picked, valid UUID v4 reused across the stage 5.1 tests so
-    /// the wire-form assertions are exact.
+    /// Hand-picked, valid UUID v4 reused across these tests so the
+    /// wire-form assertions are exact.
     fn fixed_agent_id() -> AgentId {
         AgentId::new(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap())
     }
@@ -834,7 +805,7 @@ mod tests {
         assert!(s.contains("\"chosen_alternative_idx\":3"));
     }
 
-    // ---- JAR2-82 (stage 5.5): ConflictId surface ----
+    // ---- ConflictId surface ---------------------------------------------
 
     #[test]
     fn conflict_id_is_transparent_serde() {
@@ -877,7 +848,7 @@ mod tests {
         assert_eq!(del, back2);
     }
 
-    // ---- JAR2-6: Decide / MockDecide / assemble_context ---------------------
+    // ---- Decide / MockDecide / assemble_context -------------------------
 
     use crate::evidence::EvidenceRecord;
     use crate::mandate::Mandate;
@@ -1053,7 +1024,7 @@ mod tests {
         assert_eq!(original, ev_sorted, "evidence not in sorted order");
     }
 
-    // ---- JAR2-36: ContextPolicy plumbing -------------------------------
+    // ---- ContextPolicy plumbing ----------------------------------------
 
     use crate::fs::{Claim, ClaimStatus};
     use crate::mandate::ContextPolicy;
@@ -1205,8 +1176,8 @@ mod tests {
 
     #[tokio::test]
     async fn assemble_context_is_deterministic_across_repeat_calls_with_full_bundle() {
-        // Determinism is the load-bearing property — re-asserted under the
-        // JAR2-36 policy fields with every window populated.
+        // Determinism is the load-bearing property — re-asserted with
+        // every ContextPolicy window populated.
         let tmp = TempDir::new().unwrap();
         let mandate = dummy_mandate();
         let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)

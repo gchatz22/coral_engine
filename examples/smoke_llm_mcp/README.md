@@ -7,12 +7,11 @@ Cohere), the registry auto-registers every tool that
 chooses to call `get-sum`, observes the result as an evidence record, and
 emits an `Output` that cites that evidence id.
 
-It is the runbook companion to JAR2-37 and closes the parent acceptance
-of JAR2-12: *"Smoke fixture exercises a non-trivial decision path: model
-is asked, emits `CallTool`, runtime executes, model receives result,
-emits `EmitOutput` whose evidence resolves."* The mock-decide variant
-(`examples/smoke_mcp/`) still covers the deterministic MCP wiring; this
-one adds the live model.
+The runbook acceptance is: *smoke fixture exercises a non-trivial
+decision path: model is asked, emits `CallTool`, runtime executes,
+model receives result, emits `EmitOutput` whose evidence resolves.*
+The mock-decide variant (`examples/smoke_mcp/`) still covers the
+deterministic MCP wiring; this one adds the live model.
 
 ## Prerequisites
 

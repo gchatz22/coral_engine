@@ -91,10 +91,9 @@ fn read_json_dir(dir: &Path) -> Vec<Value> {
     out
 }
 
-/// JAR2-38 parallel-tool smoke for Cohere. Mirrors the Anthropic
-/// sibling: issues a K=3 parallel-call mandate and asserts the run
-/// completes Healthy within `max_ticks = 4` — pre-JAR2-38 the same
-/// mandate would need 5 sequential ticks and trip the cap.
+/// Parallel-tool smoke for Cohere. Mirrors the Anthropic sibling:
+/// issues a K=3 parallel-call mandate and asserts the run completes
+/// Healthy within `max_ticks = 4`.
 #[test]
 fn end_to_end_parallel_call_tools_against_server_everything() {
     if std::env::var("JARVIS_SMOKE_LLM_MCP").is_err() {
@@ -109,9 +108,8 @@ fn end_to_end_parallel_call_tools_against_server_everything() {
     let parent_dir = TempDir::new().expect("tempdir");
     let (cmd, args) = spawn_command();
     let bin = env!("CARGO_BIN_EXE_node-run-llm");
-    // Post-JAR2-40 workspace split: `CARGO_MANIFEST_DIR` is now
-    // `<root>/crates/jarvis_node`; the runbook `examples/` fixture
-    // dirs still live at the workspace root, so step out two levels.
+    // `CARGO_MANIFEST_DIR` is `<root>/crates/jarvis_node`; the runbook
+    // `examples/` dirs live at the workspace root, two levels up.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let config = format!("{manifest_dir}/../../examples/smoke_llm_mcp/config_parallel.json");
     let triggers = format!("{manifest_dir}/../../examples/smoke_llm_mcp/triggers.jsonl");
@@ -228,8 +226,7 @@ fn end_to_end_llm_decide_against_server_everything() {
     // overhead from inside the test.
     let bin = env!("CARGO_BIN_EXE_node-run-llm");
 
-    // See note in `parallel_smoke_llm_mcp_cohere`: examples/ lives at
-    // the workspace root, two levels up from this crate.
+    // `examples/` lives at the workspace root, two levels up from this crate.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let config = format!("{manifest_dir}/../../examples/smoke_llm_mcp/config.json");
     let triggers = format!("{manifest_dir}/../../examples/smoke_llm_mcp/triggers.jsonl");
@@ -301,8 +298,7 @@ fn end_to_end_llm_decide_against_server_everything() {
     );
 
     // Every evidence id in every Output must resolve to a file on disk
-    // under `evidence/<id>.json`. This is the JAR2-12 parent-acceptance
-    // assertion in test form.
+    // under `evidence/<id>.json` — the parent-acceptance contract.
     let evidence_dir = fs_root.join("evidence");
     for out in &outputs {
         let evidence = out["evidence"]

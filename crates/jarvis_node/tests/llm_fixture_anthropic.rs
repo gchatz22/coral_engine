@@ -1,24 +1,11 @@
-//! JAR2-21 recorded-fixture integration tests for the Anthropic adapter.
+//! Recorded-fixture integration tests for the Anthropic adapter.
 //!
-//! Drives `LlmDecide` and `Agent::run` against the real
-//! `AnthropicClient` HTTP path, with the client pointed at the
-//! hand-rolled mock HTTP server in `tests/llm_fixture/mod.rs`. The mock
-//! serves pre-recorded JSON responses from `tests/fixtures/llm/anthropic/`.
-//!
-//! Three hermetic scenarios per the JAR2-21 spec:
-//! (a) `happy_path_tick_drives_call_tool_then_emit_output`
-//! (b) `parse_retry_recovers_after_malformed_tool_use`
-//!     (the JAR2-19 LlmDecide-internal parse-retry path — distinct from
-//!     the agent-level apply-time correction path exercised by
-//!     `loop_smoke::invalid_call_tool_stages_correction_then_recovers`)
-//! (c) `unhealthy_then_recovery_cycle_via_agent_run`
-//!
-//! Plus one `JARVIS_LIVE_LLM=1`-gated smoke that exercises the same
-//! happy-path scenario against the real Anthropic API.
-//!
-//! Feature-gated: this whole file is a no-op unless built with
-//! `--features llm-anthropic`. The mock-server module under
-//! `llm_fixture/` is feature-agnostic and reused by the Cohere tests.
+//! Drives `LlmDecide` and `Agent::run` against the real `AnthropicClient`
+//! HTTP path, with the client pointed at the mock server in
+//! `tests/llm_fixture/mod.rs`. Fixtures live under
+//! `tests/fixtures/llm/anthropic/`. Plus one `JARVIS_LIVE_LLM=1`-gated
+//! smoke against the real Anthropic API. Feature-gated:
+//! `--features llm-anthropic`.
 
 #![cfg(feature = "llm-anthropic")]
 
@@ -69,7 +56,7 @@ fn ensure_dummy_api_key() {
 
 fn empty_bundle() -> ContextBundle {
     ContextBundle {
-        mandate: Mandate::new("jar2-21 fixture", Duration::from_secs(60), Some(8)),
+        mandate: Mandate::new("anthropic fixture", Duration::from_secs(60), Some(8)),
         triggers: vec![],
         recent_outputs: vec![],
         recent_evidence: vec![],
@@ -112,7 +99,6 @@ async fn happy_path_tick_drives_call_tool_then_emit_output() {
         other => panic!("expected CallTools, got {other:?}"),
     }
 
-    // CallStats assertions per JAR2-20 follow-up scope.
     let calls_1 = decide.last_tick_calls();
     assert_eq!(
         calls_1.len(),
@@ -233,7 +219,7 @@ async fn parse_retry_recovers_after_malformed_tool_use() {
     assert!(totals.latency_ms > 0);
 
     // The second request must echo the failing assistant turn and a
-    // corrective system message back to the model (per JAR2-19 contract).
+    // corrective system message back to the model.
     let captured = mock.captured();
     assert_eq!(captured.len(), 2);
     let retry_body: Value = captured[1].json();
@@ -250,19 +236,18 @@ async fn parse_retry_recovers_after_malformed_tool_use() {
         system_text.contains("could not be parsed"),
         "retry's system field must include the corrective phrase, got: {system_text}"
     );
-    // JAR2-38: the retry now interleaves a synthesized tool-result turn
-    // after the bad assistant echo so each `tool_use.id` has a matching
+    // The retry interleaves a synthesized tool-result turn after the
+    // bad assistant echo so each `tool_use.id` has a matching
     // `tool_result` (vendor API requirement). On Anthropic that
-    // rewraps as a `user` message carrying `tool_result` content. The
-    // assistant echo with the bad tool_use sits one slot before it.
-    // Walk back from the last message to confirm the shape:
+    // rewraps as a `user` message carrying `tool_result` content; the
+    // bad-tool_use assistant echo sits one slot before it.
     //   msgs[last]   = user (synthesized tool_result envelope)
     //   msgs[last-1] = assistant (bad tool_use echo)
     let last_msg = msgs.last().expect("retry has messages");
     assert_eq!(
         last_msg["role"],
         json!("user"),
-        "JAR2-38: synthesized tool-result envelope rewrapped as user on Anthropic"
+        "synthesized tool-result envelope rewrapped as user on Anthropic"
     );
     let tool_results = last_msg["content"].as_array().expect("content array");
     assert!(
@@ -286,7 +271,7 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
 
     let tmp = TempDir::new().expect("tempdir");
     let mandate = Mandate::new(
-        "jar2-21 unhealthy cycle",
+        "unhealthy recovery cycle",
         Duration::from_millis(50),
         Some(8),
     );
@@ -307,10 +292,10 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
 
     let agent = Agent::new(mandate, fs, decide, registry, health);
 
-    // JAR2-33: capture the stats handle *before* `Agent::run` consumes
-    // the agent. The handle survives the run and lets the test read
-    // post-run `CallStats` directly instead of inferring from captured
-    // HTTP traffic.
+    // Capture the stats handle *before* `Agent::run` consumes the
+    // agent. The handle survives the run and lets the test read post-run
+    // `CallStats` directly instead of inferring from captured HTTP
+    // traffic.
     let stats = agent.stats_handle();
 
     let handle = tokio::spawn(agent.run());
@@ -328,17 +313,14 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
     assert_eq!(mock.remaining(), 0);
     assert_eq!(mock.captured().len(), 4);
 
-    // JAR2-33: the final tick is the recovery `Retire("post-recovery")`
-    // — a single successful upstream call. The handle therefore reports
+    // The final tick is the recovery `Retire("post-recovery")` — a
+    // single successful upstream call. The handle therefore reports
     // exactly one call carrying Anthropic vendor + the configured model.
-    // Pre-JAR2-33 these properties were only checkable indirectly via
-    // the captured wire traffic above; the accessor now exposes them
-    // directly.
     //
-    // Latency is *not* asserted here even though tests (a)/(b) do —
-    // this test uses `start_paused = true`, which freezes tokio's
-    // clock; the mock's `tokio::time::sleep` returns instantly and the
-    // adapter's `std::time::Instant` delta may round to 0ms.
+    // Latency is *not* asserted here (unlike tests (a)/(b)): this test
+    // uses `start_paused = true`, which freezes tokio's clock; the
+    // mock's `tokio::time::sleep` returns instantly and the adapter's
+    // `std::time::Instant` delta may round to 0ms.
     let calls = stats.last_tick_calls();
     assert_eq!(
         calls.len(),
@@ -385,11 +367,11 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
     );
 }
 
-// ---------- (d) JAR2-38: parallel tool calls ----------
+// ---------- (d) parallel tool calls ----------
 
-/// JAR2-38: a single Anthropic response carrying K=3 `tool_use` blocks
-/// for `call_tool` parses into one `Decision::CallTools` with three
-/// entries. Pins the per-block `tool_use.id` propagation contract.
+/// A single Anthropic response carrying K=3 `tool_use` blocks for
+/// `call_tool` parses into one `Decision::CallTools` with three entries.
+/// Pins the per-block `tool_use.id` propagation contract.
 #[tokio::test]
 async fn parallel_tool_calls_k3_folds_into_single_call_tools_decision() {
     ensure_dummy_api_key();
@@ -421,14 +403,14 @@ async fn parallel_tool_calls_k3_folds_into_single_call_tools_decision() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].vendor, Vendor::Anthropic);
 
-    // JAR2-38 removed the `tool_choice.disable_parallel_tool_use`
-    // workaround; the request body must no longer carry that flag.
+    // The request body must not carry a `tool_choice` block — parallel
+    // tool calls require that field to be absent.
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
     let body: Value = captured[0].json();
     assert!(
         body.get("tool_choice").is_none(),
-        "JAR2-38: tool_choice block must be absent (workaround removed), got: {body}"
+        "tool_choice block must be absent, got: {body}"
     );
 }
 

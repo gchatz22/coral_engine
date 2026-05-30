@@ -1,12 +1,12 @@
 # `smoke_llm_temporal` — live-vendor smoke fixture
 
 Single-file `graph.yaml` fixture consumed by `jarvis-apply` against a
-running worker daemon. The temporal worker today only registers the
-bootstrap `EchoTool` (MCP-server wiring through env vars is JAR2-63's
-flagged follow-up), so this fixture's mandate prompt is echo-only —
-diverging from `smoke_llm_mcp/config.json`'s `get-sum` ask.
+running worker daemon. The temporal worker only registers the
+bootstrap `EchoTool` (MCP-server wiring through env vars is a planned
+follow-up), so this fixture's mandate prompt is echo-only — diverging
+from `smoke_llm_mcp/config.json`'s `get-sum` ask.
 
-## Thin-client shape (JAR2-76)
+## Thin-client shape
 
 `jarvis apply` is a thin Temporal client: it writes the structural DB,
 dispatches the workflow onto the daemon's canonical task queue
@@ -17,16 +17,12 @@ section](../../README.md#dev-environment) for the recommended dev loop
 (`cargo run -p jarvis_temporal --bin worker` in a separate terminal,
 or the `worker` compose service).
 
-The previous JAR2-68 fixture pair (`config.json` + `triggers.jsonl`)
-and the `jarvis-run-workflow` binary were removed in JAR2-76 — the
-single `graph.yaml` is now canonical.
-
 ## Files
 
 - `graph.yaml` — Single operator-authored fixture. Encodes the mandate
   (call `echo`, emit a cited output, retire) + the kickoff seed
-  trigger in the `apiVersion: jarvis.engine/v1alpha1` schema JAR2-72
-  defines. Consumed by `jarvis apply`.
+  trigger in the `apiVersion: jarvis.engine/v1alpha1` schema.
+  Consumed by `jarvis apply`.
 
 ## Run
 
@@ -52,5 +48,3 @@ The daemon writes artifacts under its configured `AGENT_FS_ROOT`:
 - `<root>/decisions/<tick>.jsonl`
 - `<root>/evidence/<sha>.json`
 - `<root>/mandate.json`
-
-See JAR2-68's PR body for the artifact-by-artifact contract.

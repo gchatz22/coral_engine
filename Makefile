@@ -26,8 +26,7 @@ logs:
 ps:
 	docker compose ps
 
-# Open a `psql` shell against the structural-DB database. Useful for
-# inspecting state once stage 1 lands a schema.
+# Open a `psql` shell against the structural-DB database.
 psql:
 	docker compose exec postgres psql -U jarvis -d jarvis_structural
 

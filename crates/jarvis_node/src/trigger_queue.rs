@@ -1,23 +1,12 @@
 //! `TriggerQueue` — the per-agent inbox for [`Trigger`]s.
 //!
-//! Sits behind a `tokio::sync::mpsc::unbounded_channel` (bootstrap choice;
-//! backpressure tuning is explicitly out of scope per JAR2-5). External
-//! producers hold a clonable [`SignalSink`] and call [`SignalSink::send`].
-//! The agent loop owns the [`TriggerQueue`] and uses two operations:
-//!
-//! * [`TriggerQueue::wait_nonempty`] — async, resolves once at least one
-//!   trigger is buffered. **Does not consume** the trigger; the next
-//!   [`TriggerQueue::drain_ordered`] returns it.
-//! * [`TriggerQueue::drain_ordered`] — synchronous, drains everything
-//!   currently buffered (both the internal staging buffer and any pending
-//!   items in the channel) and returns them sorted by the rule from
-//!   `scratch/minimal_node_backend.md` § 4, tightened in Stage 5
-//!   (`scratch/temporal_staged_plan.md` § 5 ticket 5.2 / JAR2-79):
-//!   **human > external > child_output > scheduled, FIFO within each
-//!   class**. Operator-driven signals always preempt cross-agent traffic;
-//!   cross-agent traffic preempts idle timers. `ChildRetired` is treated
-//!   as a `ChildOutput`-class signal for ordering purposes — both
-//!   represent a child telling the parent something actionable.
+//! Sits behind a `tokio::sync::mpsc::unbounded_channel`. External producers
+//! hold a clonable [`SignalSink`]; the agent loop owns the queue and uses
+//! [`TriggerQueue::wait_nonempty`] (async, peek-only) plus
+//! [`TriggerQueue::drain_ordered`] (sync, returns everything sorted by
+//! class: **human > external > child_output/child_retired > scheduled**,
+//! FIFO within each class). `ChildRetired` shares the `ChildOutput` class —
+//! both are a child telling the parent something actionable.
 //!
 //! [`TriggerQueue::push`] is a synchronous self-send used by the scheduler
 //! to inject `ScheduledWake` from inside the loop. It routes through the
@@ -154,12 +143,11 @@ impl TriggerQueue {
     }
 }
 
-/// Lower number = higher priority. Stable-sorting by this key yields the
-/// rule from `scratch/minimal_node_backend.md` § 4 tightened by Stage 5
-/// (JAR2-79): human > external > child_output/child_retired > scheduled,
-/// FIFO within each class. `ChildOutput` and `ChildRetired` share a
-/// priority class — both are cross-agent signals from a child, and the
-/// ordering between them is FIFO by arrival.
+/// Lower number = higher priority. Stable-sorting by this key yields
+/// human > external > child_output/child_retired > scheduled, FIFO within
+/// each class. `ChildOutput` and `ChildRetired` share a priority class —
+/// both are cross-agent signals from a child, and the ordering between
+/// them is FIFO by arrival.
 fn class_priority(t: &Trigger) -> u8 {
     match t {
         Trigger::HumanOverride { .. } => 0,
@@ -244,8 +232,8 @@ mod tests {
 
     #[tokio::test]
     async fn drain_returns_human_external_child_output_then_scheduled() {
-        // JAR2-79: Stage 5 ordering invariant — operator signals preempt
-        // cross-agent traffic preempts idle timers.
+        // Ordering invariant: operator signals preempt cross-agent
+        // traffic preempts idle timers.
         // `Human > External > ChildOutput > Scheduled`.
         let (mut q, sink) = TriggerQueue::new();
         // Push in the worst possible order for a naive FIFO drain — the

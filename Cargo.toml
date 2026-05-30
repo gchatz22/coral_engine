@@ -1,16 +1,9 @@
 [workspace]
-# Single-crate today (`jarvis_node`) became a two-member workspace at the
-# start of stage 0 (JAR2-40). `jarvis_temporal` is a stub reserving the
-# crate path for stage 0.2 onward (Temporal Rust SDK smoke); subsequent
-# stages add `jarvis_graph`, `jarvis_tui`, etc. per the workspace shape
-# in `scratch/temporal_staged_plan.md` § 3.
 members = [
     "crates/jarvis_node",
     "crates/jarvis_temporal",
     "crates/jarvis_graph",
 ]
-# Edition 2021 (and onward) defaults to resolver 2 only for single-crate
-# packages; workspace roots silently fall back to resolver 1 unless
-# pinned. Explicit pin keeps feature unification behavior matching what
-# the single-crate `jarvis_node` build did pre-split.
+# Workspace roots silently fall back to resolver 1 unless pinned; pin keeps
+# feature unification consistent across crates.
 resolver = "2"

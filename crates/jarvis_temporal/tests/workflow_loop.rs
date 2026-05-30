@@ -1,49 +1,10 @@
-//! Stage 3.4 (JAR2-60) — `AgentWorkflow` loop body live integration test.
-//! Stage 3.8 (JAR2-64) — extended with an `EmitOutput` arm so the real
-//! `persist_output` activity body lands a file via `AgentFs::persist_output`
-//! (provenance + tail-index inherited from JAR2-4 + JAR2-54).
+//! Live integration test for the `AgentWorkflow` loop body.
 //!
 //! Env-gated behind `TEMPORAL_LIVE_TEST=1`. Drives the workflow against a
 //! real Temporal Server with a scripted `decide_next_action` activity
-//! (via [`jarvis_temporal::activities::set_decision_script`]) and asserts
-//! the per-tick dispatch shape end-to-end:
-//!
-//! 1. `Decision::Idle` → loop continues to next tick (history shows the
-//!    `Decision::Idle`-producing `decide_next_action` invocation).
-//! 2. `Decision::CallTools { calls: [A, B, C] }` → 3 parallel
-//!    `execute_tool` activity invocations (asserted by counting
-//!    `ActivityTaskScheduled` events with the right activity type).
-//! 3. `Decision::EmitOutput { content, evidence }` → `persist_output`
-//!    activity body opens an `AgentFs` over the process-wide
-//!    `MemoryStorage`, writes the output under `outputs/<ulid>.json`,
-//!    updates `outputs/_tail.json` (JAR2-54). Asserted by reading back
-//!    via a fresh `AgentFs` view over the same storage.
-//! 4. `Decision::Retire { reason }` → `persist_retirement` activity
-//!    fires, workflow returns `AgentResult::Retired { reason }`.
-//!
-//! ## Why a scripted activity (and not a `MockDecide` injected via cfg)
-//!
-//! The SDK's `register_activities` takes a value-typed bundle (smoke
-//! § 3.4) and the workflow code is replayed by the worker; we cannot
-//! reach into the registered `AgentActivities` instance to swap in a
-//! `MockDecide`. The static `OnceLock<Mutex<VecDeque<Decision>>>` in
-//! `jarvis_temporal::activities` is the SDK-blessed workaround — the
-//! same one the smoke binary uses for its
-//! `ACTIVITY_INVOCATIONS: AtomicUsize`.
-//!
-//! ## History assertions
-//!
-//! After `get_result`, the test calls
-//! `Client::list_workflow_history(...)` (the SDK's iteration API) and
-//! counts:
-//!
-//! - `ActivityTaskScheduled` events with activity-type `execute_tool` —
-//!   asserted >= 3 (one per scripted `ToolCall`).
-//! - `ActivityTaskScheduled` events with activity-type
-//!   `persist_retirement` — asserted >= 1.
-//!
-//! Both invariants are necessary; together they prove the
-//! `CallTools` → `join_all` → `persist_retirement` path executed.
+//! and asserts the per-tick dispatch shape (Idle / CallTools / EmitOutput /
+//! RewriteFs / Retire) via the workflow's history events and the
+//! resulting FS artifacts.
 
 use std::env;
 use std::sync::{Arc, OnceLock};
@@ -75,38 +36,25 @@ use uuid::Uuid;
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
 const DEFAULT_NAMESPACE: &str = "default";
 
-/// JAR2-63: shared in-memory storage backend handed to both the
-/// `execute_tool` activity (via `agent_storage()`), the JAR2-66
-/// `persist_retirement` activity (same path), and the test's post-run
-/// evidence + retirement-file assertions. `OnceLock` because the
-/// install hooks panic on double-install — every test in this binary
-/// shares one storage + one tool registry.
+/// Shared in-memory storage handed to the activity bodies via
+/// `agent_storage()` and to the test's post-run assertions. The install
+/// hooks panic on double-install, so all tests in this binary share
+/// one storage + one tool registry.
 static SHARED_STORAGE: OnceLock<Arc<MemoryStorage>> = OnceLock::new();
 static INIT: std::sync::Once = std::sync::Once::new();
 
-/// Serializes the two live tests in this binary. Cargo's default test
-/// runner schedules tests in a binary in parallel; both live tests
-/// here mutate the process-wide [`set_decision_script`] queue and
-/// share one installed `AgentStorage` + `ToolRegistry`, so running
-/// them concurrently would have one test pop the other's scripted
-/// decisions and produce nonsense workflow histories. The mutex is
-/// held for the full duration of each test body, including the
-/// worker run + history fetch.
+/// Serializes the two live tests in this binary: both mutate the
+/// process-wide [`set_decision_script`] queue and share the installed
+/// `AgentStorage` + `ToolRegistry`. Held for the full test body,
+/// including the worker run + history fetch.
 static LIVE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// JAR2-63: per-test name for the `succeeding` and `failing` tools so
-/// the partial-failure test can route a single call to a tool that
-/// always errors while sibling calls succeed.
 const SUCCEEDING_TOOL_NAMES: &[&str] = &["tool_a", "tool_b", "tool_c"];
 const FAILING_TOOL_NAME: &str = "errbomb";
 
-/// Test double: `Tool` impl that wraps an arbitrary name and echoes its
-/// args under a fixed key. Mirror of `jarvis_node::tools::EchoTool` but
-/// with a configurable `name()` so the workflow_loop test can register
-/// three distinct names (`tool_a`/`tool_b`/`tool_c`) that all dispatch
-/// to the same in-memory body. Lives in the test crate (not promoted to
-/// `jarvis_node::tools` test surface) per the "smallest correct diff"
-/// rule — production code has no use for an alias-able echo.
+/// `Tool` impl with a configurable `name()` so the workflow_loop test
+/// can register three distinct names that all dispatch to the same
+/// in-memory body.
 struct AliasEchoTool {
     name: String,
 }
@@ -121,10 +69,9 @@ impl Tool for AliasEchoTool {
     }
 }
 
-/// Test double: `Tool` impl that always errors. Used by the partial-
-/// failure test to assert that a single failing call produces a
-/// `ToolCallOutcome::Failure` while the sibling calls' evidence
-/// persists.
+/// `Tool` impl that always errors. Used to assert that a single failing
+/// call produces a `ToolCallOutcome::Failure` while the sibling calls'
+/// evidence persists.
 struct FailingTool {
     name: String,
 }
@@ -140,10 +87,7 @@ impl Tool for FailingTool {
 }
 
 /// One-shot install of the process-wide `AgentStorage` + `ToolRegistry`
-/// the JAR2-63 activity body reaches for. Idempotent via `std::sync::Once`.
-/// Subsumes JAR2-66's `ensure_installed` (storage-only) by
-/// also installing a `ToolRegistry`; JAR2-66's retirement assertions
-/// reach for the same `SHARED_STORAGE` via the returned `Arc`.
+/// the activity bodies reach for. Idempotent via `std::sync::Once`.
 fn ensure_installed() -> Arc<MemoryStorage> {
     INIT.call_once(|| {
         let storage: Arc<MemoryStorage> = Arc::new(MemoryStorage::new());
@@ -225,16 +169,13 @@ async fn run_live_test() -> Result<()> {
     let agent_prefix = format!("graphs/g-loop-test/agents/a-loop-test-{suffix}");
     let driver_prefix = agent_prefix.clone();
 
-    // JAR2-63: install the AgentStorage + ToolRegistry the
-    // execute_tool activity body reaches for. Idempotent: the second
-    // test in this binary reuses the same install.
     let storage = ensure_installed();
 
-    // JAR2-64 — plant one evidence record under the workflow's FS prefix
-    // so the scripted `Decision::EmitOutput`'s provenance check resolves.
-    // The planting `AgentFs` shares the *same* `Arc<dyn AgentStorage>` the
-    // worker hands to activities — load-bearing for the in-process backend
-    // (a fresh `MemoryStorage` would not share state).
+    // Plant one evidence record under the workflow's FS prefix so the
+    // scripted `Decision::EmitOutput`'s provenance check resolves. The
+    // planting `AgentFs` must share the same `Arc<dyn AgentStorage>` the
+    // worker hands to activities — a fresh `MemoryStorage` would not
+    // share state.
     let plant_mandate = Mandate::new("plant", Duration::from_millis(0), None);
     let plant_storage: Arc<dyn AgentStorage> = storage.clone();
     let plant_fs = AgentFs::new_with_storage(plant_storage, &agent_prefix, &plant_mandate)
@@ -250,11 +191,8 @@ async fn run_live_test() -> Result<()> {
         .await
         .context("plant evidence for EmitOutput")?;
 
-    // Install the scripted decision sequence BEFORE the worker starts —
-    // by the time the first `decide_next_action` activity body fires,
-    // the script is in place. Sequence covers the four cases the
-    // ticket cluster cares about: Idle → CallTools(3 parallel) →
-    // EmitOutput (JAR2-64) → RewriteFs (JAR2-65) → Retire.
+    // Install the scripted decision sequence BEFORE the worker starts.
+    // Sequence: Idle → CallTools(3 parallel) → EmitOutput → RewriteFs → Retire.
     set_decision_script(vec![
         Decision::Idle {
             next_after: Duration::from_millis(50),
@@ -280,8 +218,6 @@ async fn run_live_test() -> Result<()> {
             reason: "workflow_loop test: scripted retire".into(),
         },
     ]);
-
-    // (Storage installed + evidence planted above, before the script.)
 
     let telemetry_options = TelemetryOptions::builder().build();
     let runtime = CoreRuntime::new_assume_tokio(
@@ -325,8 +261,8 @@ async fn run_live_test() -> Result<()> {
         .await
     });
 
-    // 60-second timeout matches JAR2-58's test ceiling; the workflow
-    // completes in <2s on a healthy local server.
+    // 60-second timeout catches stalls; the workflow completes in <2s
+    // on a healthy local server.
     let worker_result = tokio::time::timeout(Duration::from_secs(60), worker.run())
         .await
         .map_err(|_| anyhow::anyhow!("worker.run() timed out (60s)"))?
@@ -348,15 +284,9 @@ async fn drive(
 ) -> Result<()> {
     // Build an `AgentInput` that scopes the per-agent FS to a per-run
     // prefix — the workflow body passes it into every activity input,
-    // and JAR2-66's `persist_retirement` writes to
-    // `<prefix>/retirement.json`, JAR2-64's `persist_output` to
-    // `<prefix>/outputs/<ulid>.json`, and JAR2-65's `apply_fs_ops` to
-    // `<prefix>/notes/loop-test.md`.
-    // JAR2-80: `Default` was dropped; build via `new_for_test` (which
-    // supplies the JAR2-58..67 first-run defaults for non-identity
-    // fields) and then override `fs_handle` so the per-test prefix
-    // continues to scope storage writes the same way it did pre-
-    // JAR2-80.
+    // so `persist_retirement` writes to `<prefix>/retirement.json`,
+    // `persist_output` to `<prefix>/outputs/<ulid>.json`, and
+    // `apply_fs_ops` to `<prefix>/notes/loop-test.md`.
     let mut input = AgentInput::new_for_test(
         GraphId::new(Uuid::new_v4()),
         AgentId::new(Uuid::new_v4()),
@@ -391,24 +321,14 @@ async fn drive(
     // History assertions — count `ActivityTaskScheduled` events by
     // activity type. The scripted sequence guarantees:
     //
-    // - exactly 3 `execute_tool` schedules (one per `ToolCall` in the
-    //   CallTools batch);
-    // - exactly 1 `persist_output` schedule (from the `EmitOutput` arm,
-    //   JAR2-64);
-    // - exactly 1 `persist_retirement` schedule (from the `Retire` arm).
-    //
-    // (assemble_context + decide_next_action each fire once per tick;
-    // we don't assert on those because the loop semantics may schedule
-    // more if the SDK retries or replays — the *parallel-batch*,
-    // *emit-output*, and *retire* invariants are the load-bearing ones.)
-    // Use the SDK's `fetch_history` (paginates + returns flattened
-    // events) rather than calling the raw gRPC API by hand.
+    // - exactly 3 `execute_tool` schedules (one per `ToolCall`);
+    // - exactly 1 `persist_output` schedule (from `EmitOutput`);
+    // - exactly 1 `persist_retirement` schedule (from `Retire`).
     //
     // `WorkflowFetchHistoryOptions::default()` leaves `event_filter_type`
     // at the proto enum's zero value (Unspecified), which the server
-    // reads as "give me close events only". The builder default
-    // (`AllEvent`) is what we actually want for assertion purposes, so
-    // build the options explicitly.
+    // reads as "give me close events only". Build the options
+    // explicitly so we get the full event stream for assertions.
     let history = handle
         .fetch_history(WorkflowFetchHistoryOptions::builder().build())
         .await
@@ -418,20 +338,16 @@ async fn drive(
         history.events().len()
     );
     // Activity type names are namespaced by the `#[activities]` macro
-    // as `AgentActivities::<fn_name>`, observed via the SDK's
-    // registration shape. Match on the unqualified suffix so the
-    // assertion stays robust if the macro ever drops the prefix.
+    // as `AgentActivities::<fn_name>`. Match on the unqualified suffix
+    // so the assertion stays robust if the macro ever drops the prefix.
     let mut execute_tool_schedules = 0usize;
     let mut persist_output_schedules = 0usize;
     let mut persist_retirement_schedules = 0usize;
     let mut apply_fs_ops_schedules = 0usize;
-    // JAR2-67 regression: a workflow that retires via `Decision::Retire`
-    // (or the `retire` signal short-circuit) MUST NOT emit a
-    // `WorkflowExecutionContinuedAsNew` event. The CAN check lives
-    // structurally after the retirement-return arms in
-    // `AgentWorkflow::run`, so counting CAN events in this short
-    // Idle→CallTools→EmitOutput→RewriteFs→Retire script is the most
-    // direct end-to-end assertion of that guarantee.
+    // A retiring workflow must NOT emit a
+    // `WorkflowExecutionContinuedAsNew` event — counting CAN events is
+    // the most direct end-to-end assertion that the CAN check sits
+    // after the retirement-return arms in `AgentWorkflow::run`.
     let mut continued_as_new_events = 0usize;
     let mut all_activity_type_names: Vec<String> = Vec::new();
     for ev in history.events() {
@@ -480,12 +396,12 @@ async fn drive(
     );
     assert_eq!(
         continued_as_new_events, 0,
-        "JAR2-67: a retiring workflow must NOT emit a \
+        "a retiring workflow must NOT emit a \
          WorkflowExecutionContinuedAsNew event (the CAN check sits after \
          the retirement-return arms in run()), got {continued_as_new_events}"
     );
 
-    // JAR2-66: the real `persist_retirement` activity body wrote
+    // The `persist_retirement` activity body wrote
     // `<prefix>/retirement.json` via the shared MemoryStorage. Assert
     // the file lands with the scripted reason and a UTC-shaped
     // timestamp.
@@ -514,20 +430,16 @@ async fn drive(
         "retired_at not UTC-shaped: {retired_at:?}"
     );
 
-    // JAR2-63: each successful tool call's evidence record must land
-    // in the per-agent FS via `AgentFs::record_evidence`. With three
-    // succeeding tools (tool_a/tool_b/tool_c, all AliasEchoTool) the
-    // three sha256-keyed evidence files are distinct (each tool name
-    // is part of the canonical-JSON hash, see `EvidenceId::new`). Plus
-    // one planted evidence (tool_seed) from JAR2-64's plant step → 4
+    // Each successful tool call's evidence record must land in the
+    // per-agent FS via `AgentFs::record_evidence`. With three
+    // succeeding tools the three sha256-keyed evidence files are
+    // distinct (each tool name is part of the canonical-JSON hash,
+    // see `EvidenceId::new`). Plus one planted evidence (tool_seed) → 4
     // total. Read directly via the storage backend rather than
-    // constructing an `AgentFs` because `AgentFs::new_with_storage`
-    // would re-run tail reconciliation — pointless work that obscures
-    // the assertion.
-    // JAR2-68 fix: evidence keys live at `<agent_prefix>/evidence/<sha>.json`
-    // (see `AgentFs::evidence_key`). Listing the bare `"evidence/"` prefix
-    // matched zero keys against the agent-scoped storage layout; scope
-    // the list to the per-agent prefix.
+    // constructing an `AgentFs` to avoid re-running tail reconciliation.
+    // Evidence keys live at `<agent_prefix>/evidence/<sha>.json` (see
+    // `AgentFs::evidence_key`), so scope the list to the per-agent
+    // prefix.
     let evidence_prefix = format!("{agent_prefix}/evidence/");
     let page = storage
         .list(&evidence_prefix, None, usize::MAX)
@@ -545,13 +457,10 @@ async fn drive(
         "expected 4 evidence files (3 tool calls + 1 planted seed), got {evidence_records:?}"
     );
 
-    // JAR2-64 — FS assertions. Open a fresh `AgentFs` over the same
-    // process-wide storage the worker hands to activities and verify
-    // the scripted `EmitOutput` actually landed:
-    // - `outputs/<ulid>.json` present with the scripted content + the
-    //   planted evidence id (proves the real `persist_output` activity
-    //   body ran, not a stub).
-    // - tail-index inherited via JAR2-54.
+    // FS assertions: open a fresh `AgentFs` over the same process-wide
+    // storage the worker hands to activities and verify the scripted
+    // `EmitOutput` actually landed at `outputs/<ulid>.json` with the
+    // scripted content + the planted evidence id.
     let inspect_mandate = Mandate::new("inspect", Duration::from_millis(0), None);
     let inspect_storage: Arc<dyn AgentStorage> = storage.clone();
     let inspect_fs = AgentFs::new_with_storage(inspect_storage, agent_prefix, &inspect_mandate)
@@ -583,9 +492,9 @@ async fn drive(
         on_disk.evidence.len()
     );
 
-    // JAR2-65: the `RewriteFs` step of the script writes
-    // `<prefix>/notes/loop-test.md`. Pull it from the same shared
-    // `MemoryStorage` backend the activity wrote into.
+    // The `RewriteFs` step writes `<prefix>/notes/loop-test.md`. Pull
+    // it from the same shared `MemoryStorage` backend the activity
+    // wrote into.
     let notes_key = format!("{agent_prefix}/notes/loop-test.md");
     let blob = storage
         .get(&notes_key)
@@ -598,9 +507,8 @@ async fn drive(
     Ok(())
 }
 
-/// JAR2-63 partial-batch survival test (ticket § verification step 6).
-/// Scripts `Decision::CallTools` with one failing tool + two succeeding
-/// tools and asserts:
+/// Partial-batch survival test. Scripts `Decision::CallTools` with one
+/// failing tool + two succeeding tools and asserts:
 ///
 /// 1. All three `execute_tool` activities scheduled (parallel
 ///    `join_all` doesn't short-circuit on the first failure).
@@ -734,9 +642,6 @@ async fn run_partial_failure_test() -> Result<()> {
 }
 
 async fn drive_partial(client: Client, task_queue: &str, workflow_id: &str) -> Result<()> {
-    // JAR2-80: `Default` was dropped; partial-failure test uses
-    // synthetic identity (it asserts on tool dispatch history, not on
-    // the identity fields).
     let input = AgentInput::new_for_test(
         GraphId::new(Uuid::new_v4()),
         AgentId::new(Uuid::new_v4()),

@@ -1,62 +1,24 @@
-//! Stage 4.3 (JAR2-74) — graph.yaml-driven smoke, refreshed in JAR2-76
-//! after the `jarvis-apply` thin-client refactor.
-//!
-//! Drives an `AgentWorkflow` through the library surface the thin-client
-//! `jarvis-apply` CLI dispatches into (`parse_and_validate` →
+//! graph.yaml-driven smoke for the thin-client `jarvis-apply` library
+//! surface. Drives an `AgentWorkflow` through `parse_and_validate` →
 //! `into_agent_input` + `yaml_seed_triggers` → `start_workflow` +
-//! `external_signal`), with the worker hosted **inline as a test
-//! fixture** rather than out-of-process on the daemon. Asserts the
+//! `external_signal`, with the worker hosted inline as a test fixture
+//! (production runs it out-of-process on the daemon). Asserts the
 //! three durable artifacts the workflow body produces land on disk:
 //! an output, a retirement marker, and per-tick decision-log entries.
 //!
-//! ## What this test proves
+//! The hermetic test cannot rely on a daemon being up, so it builds a
+//! worker inline on a per-run randomized task queue and calls
+//! `get_result` directly to synchronize the FS-end-state assertions.
+//! Inline rather than a helper module — single test today.
 //!
-//! `jarvis apply graph.yaml` produces the expected workflow end-state
-//! (output + retirement + decision log) when dispatched onto a worker
-//! that's listening for the same task queue. The production CLI is the
-//! thin-client refactored in JAR2-76 — this test exercises the same
-//! library surface (`yaml::{parse_and_validate, into_agent_input,
-//! yaml_seed_triggers}` then `client.start_workflow` then
-//! `handle.signal(AgentWorkflow::external_signal, ...)`) with a worker
-//! spun up inline via `build_worker` for the lifetime of the test.
-//!
-//! ## Test-fixture shape (JAR2-76)
-//!
-//! Pre-JAR2-76 the binary itself hosted the worker on a randomized task
-//! queue and blocked on `get_result`; after JAR2-76 the binary returns
-//! once seed signals are sent and execution runs on the worker daemon.
-//! For hermeticity the test cannot rely on a daemon being up, so it
-//! builds a worker inline (`build_worker(...)` + `tokio::spawn`) on a
-//! per-run randomized task queue and calls `get_result` directly to
-//! synchronize the FS-end-state assertions. Inline rather than a
-//! helper module — single test today; promoting is a follow-up when a
-//! second caller appears.
-//!
-//! ## What this test deliberately does NOT exercise
-//!
-//! - **Structural-DB writes.** The binary's `GraphStore::create_from_yaml`
-//!   call is exercised by JAR2-73's unit tests against an ephemeral
-//!   `#[sqlx::test]` DB. Adding it here would force the CI
-//!   `temporal-workflow-smoke` job to spin up Postgres for end-state
-//!   value already covered upstream. The parent's acceptance bar is
-//!   workflow end-state, not DB rows.
-//! - **The binary's stdout contract.** "Prints `workflow_id=...`" is
-//!   unit-tested in `jarvis_apply.rs::tests`; this test goes through
-//!   the same call sites a level deeper.
-//! - **Real LLM Decide.** Hermetic — the `decide_next_action` activity
-//!   body checks the scripted `DECISION_SCRIPT` *before* reaching for
-//!   the installed `Decide` (`activities.rs::decide_next_action`).
-//!
-//! ## Why a scripted Decide
-//!
-//! Same rationale as `crates/jarvis_temporal/tests/workflow_smoke.rs`
-//! (the test this one mirrors): EvidenceId is content-addressed on
-//! `(tool, args, result)`, so a real-LLM citation against a synthetic
-//! id would fail the workflow's provenance check. We plant a real
-//! `EchoLike`-shaped evidence record under the workflow's FS prefix,
-//! then script EmitOutput to cite that planted id.
-//!
-//! ## Env-gated
+//! Structural-DB writes are covered by the `GraphStore::create_from_yaml`
+//! unit tests; this test does not spin up Postgres. The binary's stdout
+//! contract is exercised in `jarvis_apply.rs::tests`. `Decide` is
+//! scripted: EvidenceId is content-addressed on `(tool, args, result)`,
+//! so a real-LLM citation against a synthetic id would fail the
+//! workflow's provenance check; we plant a real `EchoLike`-shaped
+//! evidence record under the workflow's FS prefix, then script
+//! EmitOutput to cite that planted id.
 //!
 //! `TEMPORAL_LIVE_TEST=1` opts in — same env var `workflow_smoke.rs`
 //! uses, so a single CI gate covers both. Without it the test prints a
@@ -130,7 +92,7 @@ const TOOL_NAME: &str = "echo";
 /// Install the worker-shared storage + tool registry once per process.
 /// Matches `workflow_smoke.rs::ensure_installed` verbatim — separate
 /// test binary means a separate process means a separate set of
-/// `OnceLock`s, so this can't conflict with the JAR2-68 smoke.
+/// `OnceLock`s, so this can't conflict with that one.
 fn ensure_installed() -> Arc<MemoryStorage> {
     INIT.call_once(|| {
         let storage: Arc<MemoryStorage> = Arc::new(MemoryStorage::new());
@@ -177,11 +139,10 @@ fn load_graph_yaml() -> Result<String> {
         .with_context(|| format!("reading graph.yaml fixture from {}", path.display()))
 }
 
-/// JAR2-74 live test: drives a four-tick run (Idle → CallTools →
-/// EmitOutput → Retire) where the workflow input and seed triggers
-/// come from `examples/smoke_llm_temporal/graph.yaml`. Asserts the
-/// three node-run-llm-shaped artifacts land — same artifact contract
-/// JAR2-68 pins.
+/// Live test: drives a four-tick run (Idle → CallTools → EmitOutput
+/// → Retire) where the workflow input and seed triggers come from
+/// `examples/smoke_llm_temporal/graph.yaml`. Asserts the three durable
+/// artifacts land on disk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Lock-across-await: the scripted decision queue + installed storage /
 // registry are process-wide. Same rationale as `workflow_smoke.rs`.
@@ -202,10 +163,8 @@ async fn run_smoke() -> Result<()> {
     let yaml_text = load_graph_yaml()?;
     let graph = parse_and_validate(&yaml_text).context("parse_and_validate")?;
 
-    // The YAML's content is the test's promise: the fixture encodes the
-    // same Mandate the legacy JAR2-68 fixture pair does. Pinning these
-    // assertions here means a future YAML edit that drifts away from
-    // the legacy `config.json` shape fails the test, not the workflow.
+    // Pin the fixture contents so a YAML edit that drifts the mandate
+    // shape fails the test, not the workflow.
     assert_eq!(graph.metadata.name, "smoke-llm-temporal");
     assert_eq!(graph.agents.len(), 1);
     assert_eq!(graph.agents[0].id, "root");
@@ -218,20 +177,12 @@ async fn run_smoke() -> Result<()> {
     assert_eq!(graph.seed.triggers.len(), 1);
     assert_eq!(graph.seed.triggers[0].external.kind, "kickoff");
 
-    // Pin the mandate-derivation invariants in code now that the legacy
-    // `config.json` / `triggers.jsonl` fixtures (the JAR2-68 reference
-    // shapes) were deleted in JAR2-76 along with `jarvis_run_workflow`.
-    // The YAML is the canonical fixture going forward; these assertions
-    // bite if a future YAML edit drifts the mandate translation.
-    //
-    // JAR2-85 + JAR2-89: `into_agent_input` now requires the
-    // `(graph_id, agent_id)` allocated by `GraphStore::create_from_yaml`.
-    // The hermetic smoke fixture doesn't run against Postgres (the
-    // structural-DB write is exercised by JAR2-73's unit tests instead
-    // — see the module-doc note "What this test deliberately does NOT
-    // exercise"); we synthesize fresh UUIDs here so the workflow body
-    // still gets a real identity triple. Production `jarvis apply`
-    // gets these from the DB.
+    // Pin the mandate-derivation invariants: a YAML edit that drifts
+    // the mandate translation should bite here. `into_agent_input`
+    // requires the `(graph_id, agent_id)` allocated by
+    // `GraphStore::create_from_yaml`; this hermetic test doesn't run
+    // against Postgres, so we synthesize fresh UUIDs here. Production
+    // `jarvis apply` gets these from the DB.
     let synth_graph_id = GraphId::new(uuid::Uuid::new_v4());
     let synth_agent_id = AgentId::new(uuid::Uuid::new_v4());
     let agent_input = into_agent_input(&graph, synth_graph_id, synth_agent_id);
@@ -246,15 +197,12 @@ async fn run_smoke() -> Result<()> {
     // ---- Per-test setup ---------------------------------------------------
     let suffix = run_suffix();
     let task_queue = format!("jarvis-apply-smoke-{suffix}");
-    // Post-JAR2-76: `into_agent_input` returns the production-shape
-    // prefix `graphs/<metadata.name>/agents/<agents[0].id>` so the
-    // daemon's shared `LocalStorage` namespaces artifacts per agent.
-    // `MemoryStorage` here is process-wide via `OnceLock`, so any second
-    // test in this binary would still collide on that one prefix — we
-    // append a timestamp suffix to keep the per-test namespace hermetic.
-    // The suffix sits on top of the prod-shape prefix rather than
-    // replacing it, so this test exercises the same prefix derivation
-    // production uses (only with the extra suffix layer for isolation).
+    // `into_agent_input` returns the production-shape prefix
+    // `graphs/<metadata.name>/agents/<agents[0].id>`. `MemoryStorage`
+    // here is process-wide via `OnceLock`, so any second test in this
+    // binary would collide on that prefix; the timestamp suffix sits
+    // on top of the prod-shape prefix for per-test isolation while
+    // still exercising the production derivation.
     let agent_prefix = format!("{}-{suffix}", agent_input.fs_handle.prefix);
     let storage = ensure_installed();
 
@@ -263,7 +211,6 @@ async fn run_smoke() -> Result<()> {
     // evidence id. EvidenceId is content-addressed on
     // (tool, args, result), so we compute it by writing the same record
     // the planting AgentFs writes — `record_evidence` returns the id.
-    // Mirrors `workflow_smoke.rs` lines 168-182.
     let plant_mandate = Mandate::new("plant", Duration::from_millis(0), None);
     let plant_storage: Arc<dyn AgentStorage> = storage.clone();
     let plant_fs = AgentFs::new_with_storage(plant_storage, &agent_prefix, &plant_mandate)
@@ -280,8 +227,8 @@ async fn run_smoke() -> Result<()> {
         .context("plant evidence for EmitOutput")?;
 
     // Scripted sequence: Idle → CallTools(echo) → EmitOutput citing the
-    // planted id → Retire. Same shape as JAR2-68's smoke — proves the
-    // YAML-derived AgentInput drives the same agent-loop end-state.
+    // planted id → Retire. Proves the YAML-derived AgentInput drives
+    // the expected agent-loop end-state.
     set_decision_script(vec![
         Decision::Idle {
             next_after: Duration::from_millis(50),
@@ -315,19 +262,17 @@ async fn run_smoke() -> Result<()> {
     let shutdown = worker.shutdown_handle();
 
     // Build the AgentInput from the YAML — `into_agent_input` is the
-    // public conversion JAR2-73 calls. Override the FS prefix for the
-    // per-test namespacing (same shape as `workflow_smoke.rs`).
+    // public conversion the binary calls. Override the FS prefix for
+    // per-test namespacing.
     let mut input = agent_input;
     input.fs_handle = jarvis_temporal::workflow::FsHandle {
         prefix: agent_prefix.clone(),
     };
-    // JAR2-85: `yaml_seed_triggers` now takes an `AppliedGraph` so it
-    // can resolve each `seed.triggers[].agent` to a concrete
-    // workflow_id (multi-agent supports seeds targeting any node in
-    // the tree, not just the root). Synthesize a minimal AppliedGraph
-    // matching the synthetic UUIDs above; the test only uses the
-    // resolved `trigger` field (not `workflow_id`), so the synthesis
-    // is a thin shell.
+    // `yaml_seed_triggers` takes an `AppliedGraph` so it can resolve
+    // each `seed.triggers[].agent` to a concrete workflow_id (any node
+    // in the tree, not just the root). Synthesize a minimal
+    // AppliedGraph matching the synthetic UUIDs above; the test only
+    // uses the resolved `trigger` field (not `workflow_id`).
     let mut synth_id_map = std::collections::HashMap::new();
     synth_id_map.insert(
         graph.agents[0].id.clone(),
@@ -363,7 +308,7 @@ async fn run_smoke() -> Result<()> {
     let driver_graph_name = graph.metadata.name.clone();
     let driver_agent_id = graph.agents[0].id.clone();
     let driver = tokio::spawn(async move {
-        // Same URL-shaped workflow ID JAR2-73 derives from the YAML.
+        // URL-shaped workflow ID derived from the YAML.
         let workflow_id = format!(
             "{}-{suffix}",
             agent_workflow_id(&driver_graph_name, &driver_agent_id),
@@ -422,7 +367,7 @@ async fn drive(
         .await
         .context("start_workflow(AgentWorkflow)")?;
 
-    // Same signal pattern JAR2-73's binary uses post-`start_workflow`:
+    // Same signal pattern the binary uses post-`start_workflow`:
     // each YAML seed trigger → one `external_signal` in declared order.
     for (i, trigger) in triggers.into_iter().enumerate() {
         handle
@@ -464,9 +409,8 @@ async fn drive(
     );
 
     // ---- Artifact 2: `<prefix>/outputs/<sha>.json` ------------------------
-    // OutputId is content-addressed (JAR2-70 #1) — `sha256(content, evidence)`
-    // — so given the same scripted EmitOutput, the filename on disk is
-    // determined.
+    // OutputId is content-addressed (`sha256(content, evidence)`), so
+    // given the same scripted EmitOutput the filename on disk is fixed.
     let inspect_mandate = Mandate::new("inspect", Duration::from_millis(0), None);
     let inspect_storage: Arc<dyn AgentStorage> = storage.clone();
     let inspect_fs = AgentFs::new_with_storage(inspect_storage, agent_prefix, &inspect_mandate)
@@ -499,10 +443,10 @@ async fn drive(
     );
 
     // ---- Artifact 3: `<prefix>/decisions/<tick>.jsonl` --------------------
-    // Plan § 8 decision 6: one entry per tick. The scripted sequence
-    // produces four decisions (Idle, CallTools, EmitOutput, Retire); the
-    // workflow body bumps `tick` only on non-retire arms, so the four
-    // ticks land at `decisions/{0,1,2,3}.jsonl`.
+    // One entry per tick. The scripted sequence produces four decisions
+    // (Idle, CallTools, EmitOutput, Retire); the workflow body bumps
+    // `tick` only on non-retire arms, so the four ticks land at
+    // `decisions/{0,1,2,3}.jsonl`.
     let page = storage
         .list(&format!("{agent_prefix}/decisions/"), None, usize::MAX)
         .await

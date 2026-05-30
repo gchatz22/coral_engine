@@ -1,27 +1,12 @@
-//! Stage 3.2 (JAR2-58) — Jarvis worker registration helpers.
-//! Stage 3.4 (JAR2-60) — replaces `NoopActivities` with [`AgentActivities`].
-//! Stage 3.4.5 (JAR2-69) — process-wide `AgentStorage` install/access for
-//! activity bodies (the OnceLock pattern from
-//! `scratch/temporal_rust_sdk_smoke.md` § 3.4).
-//! Stage 3.6 (JAR2-62) — process-wide [`Decide`] install/access for the
-//! `decide_next_action` activity body. Mirrors the storage shape
-//! exactly: install once at worker boot, panic on double install, panic
-//! on access-before-install. The `Decide` trait is vendor-neutral and
-//! always available (un-gated in `jarvis_node::decision`), so this
-//! library compiles regardless of which vendor features are turned on.
-//! `bin/worker.rs` is the only place that picks the concrete
-//! [`LlmDecide`] vendor and is itself `#[cfg]`-gated.
-//! Stage 3.7 (JAR2-63) — process-wide [`ToolRegistry`] install/access for
-//! the `execute_tool` activity body. Mirrors the JAR2-69 storage pair.
+//! Worker registration helpers and process-wide handles for activity bodies.
 //!
-//! Lives in the library so both the `worker` binary and integration
-//! tests (in `tests/`) share the same registration call site.
-//!
-//! Stage 3.5–3.10 fills in real activity bodies inside
-//! [`crate::activities::AgentActivities`]; the registration call here is
-//! unchanged across those tickets. Those bodies will reach for the
-//! shared storage via [`agent_storage`] to build per-tick [`AgentFs`]
-//! instances.
+//! Lives in the library so both the `worker` binary and integration tests
+//! share one registration call site. Process-wide singletons
+//! ([`AgentStorage`], [`Decide`], [`ToolRegistry`], [`StructuralDbStore`])
+//! are installed once at worker boot and accessed from activity bodies via
+//! the matching getter. The `OnceLock` shape is required because the
+//! Temporal SDK's activity macro takes a value-typed bundle, so shared
+//! state cannot be threaded through the impl block.
 
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 use std::env;
@@ -47,7 +32,6 @@ use temporalio_client::Client;
 use temporalio_sdk::{Worker, WorkerOptions};
 use temporalio_sdk_core::CoreRuntime;
 
-/// JAR2-62 vendor selector env var. See [`build_decide_from_env`].
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 const VENDOR_ENV: &str = "JARVIS_MODEL_VENDOR";
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
@@ -59,36 +43,17 @@ use crate::activities::AgentActivities;
 use crate::workflow::AgentWorkflow;
 
 /// Canonical task queue the worker daemon listens on and operator CLIs
-/// dispatch to. Public so future thin-client CLIs (`jarvis apply`,
-/// `jarvis signal`, etc. — JAR2-76 and onward) import the same constant
-/// the daemon registers under, avoiding the "CLI and daemon target
-/// different queues" failure mode flagged in
-/// `scratch/temporal_staged_plan.md` § 2.6.
-///
-/// Both the `worker` binary and live integration tests under `tests/`
-/// override via `TEMPORAL_TASK_QUEUE` — the binary for fleet-shard /
-/// personal-queue isolation, the tests for per-run uniqueness so
-/// repeated runs don't share state.
+/// dispatch to. Overridden via `TEMPORAL_TASK_QUEUE` for fleet-shard
+/// isolation or per-test uniqueness.
 pub const DEFAULT_TASK_QUEUE: &str = "jarvis-agents";
 
-/// Process-wide [`AgentStorage`] backend. Installed once at worker boot
-/// (or test setup) via [`install_agent_storage`]; accessed from inside
-/// activity bodies via [`agent_storage`].
-///
-/// Per `scratch/temporal_rust_sdk_smoke.md` § 3.4 the activity macro
-/// owns the registered value, so shared state has to live behind a
-/// `static` rather than be threaded through the activity impl block.
+/// Process-wide [`AgentStorage`] backend installed via
+/// [`install_agent_storage`] and accessed via [`agent_storage`].
 static AGENT_STORAGE: OnceLock<Arc<dyn AgentStorage>> = OnceLock::new();
 
-/// Install the process-wide [`AgentStorage`] backend.
-///
-/// Worker binaries call this at boot (against a configured FS root, see
-/// `bin/worker.rs`); test harnesses call this with a `MemoryStorage`
-/// instance during their setup.
-///
-/// **Panics** on double install. This is loud-on-misuse rather than
-/// silent because two backends in one process would silently disagree
-/// about where evidence lives — better to crash early.
+/// Install the process-wide [`AgentStorage`] backend. Panics on double
+/// install — two backends in one process would silently disagree about
+/// where evidence lives.
 pub fn install_agent_storage(storage: Arc<dyn AgentStorage>) {
     AGENT_STORAGE
         .set(storage)
@@ -96,17 +61,8 @@ pub fn install_agent_storage(storage: Arc<dyn AgentStorage>) {
         .expect("install_agent_storage called twice; one process, one backend");
 }
 
-/// Access the installed [`AgentStorage`] backend.
-///
-/// Returns a cheap [`Arc`] clone — activity bodies hand the result to
-/// `AgentFs::new_with_storage(storage, &handle.prefix, &mandate).await`
-/// each tick, since `AgentFs` is per-prefix while the underlying
-/// storage is process-wide.
-///
-/// **Panics** if [`install_agent_storage`] hasn't been called.
-/// Activities only run after the worker has booted (which installs
-/// before `worker.run()`), so callers from activity bodies are
-/// structurally safe.
+/// Access the installed [`AgentStorage`] backend. Panics if
+/// [`install_agent_storage`] hasn't been called.
 pub fn agent_storage() -> Arc<dyn AgentStorage> {
     AGENT_STORAGE
         .get()
@@ -115,36 +71,16 @@ pub fn agent_storage() -> Arc<dyn AgentStorage> {
 }
 
 /// Process-wide [`Decide`] implementation used by the
-/// `decide_next_action` activity body (JAR2-62). Installed once at
-/// worker boot via [`install_decide`]; accessed from the activity body
-/// via [`decide_impl`].
+/// `decide_next_action` activity body. Installed via [`install_decide`]
+/// and accessed via [`decide_impl`].
 ///
-/// Same rationale as [`AGENT_STORAGE`]: the activity macro takes a
-/// value-typed bundle (smoke § 3.4), so shared state has to live behind
-/// a `static`. Vendor selection per `scratch/temporal_staged_plan.md`
-/// § 8 decision 4 happens at the worker-boot layer (env-driven today,
-/// structural DB later); the activity body itself doesn't relitigate
-/// vendor per tick.
-///
-/// The trait object is `Arc<dyn Decide>` rather than a concrete
-/// `LlmDecide` so:
-/// 1. Hermetic tests can install a `MockDecide` without dragging vendor
-///    features into the `jarvis_temporal` test build.
-/// 2. The library compiles with zero vendor features — only the
-///    worker binary needs to gate vendor-specific constructors.
+/// The trait object is `Arc<dyn Decide>` so hermetic tests can install a
+/// `MockDecide` without dragging vendor features into the test build,
+/// and the library compiles with zero vendor features.
 static DECIDE_IMPL: OnceLock<Arc<dyn Decide>> = OnceLock::new();
 
-/// Install the process-wide [`Decide`] implementation used by the
-/// `decide_next_action` activity body.
-///
-/// Worker binaries call this at boot after constructing an
-/// [`LlmDecide`] from env-driven vendor selection (see
-/// `bin/worker.rs`). Test harnesses install a `MockDecide` directly.
-///
-/// **Panics** on double install. Mirrors [`install_agent_storage`] —
-/// two implementations in one process would silently disagree about
-/// vendor / model routing and crashing loudly is friendlier than
-/// silently diverging.
+/// Install the process-wide [`Decide`] implementation. Panics on double
+/// install.
 pub fn install_decide(decide: Arc<dyn Decide>) {
     DECIDE_IMPL
         .set(decide)
@@ -152,19 +88,9 @@ pub fn install_decide(decide: Arc<dyn Decide>) {
         .expect("install_decide called twice; one process, one Decide impl");
 }
 
-/// Access the installed [`Decide`] implementation.
-///
-/// Returns a cheap [`Arc`] clone — the `decide_next_action` activity
-/// body holds the clone only for the duration of one
-/// `Decide::decide(...)` call. The trait method takes `&self`, so the
-/// clone is purely for ownership at the call site, not for
-/// concurrency.
-///
-/// **Panics** if [`install_decide`] hasn't been called. The
-/// `decide_next_action` activity body checks the test-injected
-/// `DECISION_SCRIPT` *before* reaching for the installed implementation
-/// (guardrail 5 of the ticket), so unit tests that script every
-/// decision don't need to install one.
+/// Access the installed [`Decide`] implementation. Panics if
+/// [`install_decide`] hasn't been called. Unit tests that script every
+/// decision via `DECISION_SCRIPT` don't reach this path.
 pub fn decide_impl() -> Arc<dyn Decide> {
     DECIDE_IMPL
         .get()
@@ -173,27 +99,11 @@ pub fn decide_impl() -> Arc<dyn Decide> {
 }
 
 /// Process-wide [`ToolRegistry`] consulted by the `execute_tool` activity
-/// body (JAR2-63). Installed once at worker boot via
-/// [`install_tool_registry`] and accessed via [`tool_registry`].
-///
-/// Same OnceLock pattern as [`AGENT_STORAGE`] above — the activity macro
-/// owns the registered activity value, so shared state has to live
-/// behind a `static` rather than be threaded through the activity impl
-/// block (`scratch/temporal_rust_sdk_smoke.md` § 3.4).
+/// body. Installed via [`install_tool_registry`] and accessed via
+/// [`tool_registry`].
 static TOOL_REGISTRY: OnceLock<Arc<ToolRegistry>> = OnceLock::new();
 
-/// Install the process-wide [`ToolRegistry`] used by the `execute_tool`
-/// activity.
-///
-/// The worker binary builds a registry at boot (registering the configured
-/// `EchoTool` + any MCP servers from env vars) and calls this before
-/// `worker.run()`. Test harnesses build a tiny in-memory registry
-/// (`EchoTool` plus per-test aliases) and call this in their setup.
-///
-/// **Panics** on double install. Same loud-on-misuse rationale as
-/// [`install_agent_storage`]: two registries in one process would
-/// disagree on which tool a given name routes to, and silent shadowing
-/// would be far worse than a crash.
+/// Install the process-wide [`ToolRegistry`]. Panics on double install.
 pub fn install_tool_registry(registry: Arc<ToolRegistry>) {
     TOOL_REGISTRY
         .set(registry)
@@ -201,18 +111,8 @@ pub fn install_tool_registry(registry: Arc<ToolRegistry>) {
         .expect("install_tool_registry called twice; one process, one registry");
 }
 
-/// Access the installed [`ToolRegistry`].
-///
-/// Returns a cheap [`Arc`] clone — the `execute_tool` activity body
-/// calls `registry.call(&input.call.name, input.call.args)` per
-/// invocation. The registry itself is `Send + Sync` (tools are
-/// `Arc<dyn Tool>`), so concurrent activity invocations share one
-/// instance.
-///
-/// **Panics** if [`install_tool_registry`] hasn't been called. Same
-/// structural-safety argument as [`agent_storage`]: activities only
-/// run after the worker has booted, which installs before
-/// `worker.run()`.
+/// Access the installed [`ToolRegistry`]. Panics if
+/// [`install_tool_registry`] hasn't been called.
 pub fn tool_registry() -> Arc<ToolRegistry> {
     TOOL_REGISTRY
         .get()
@@ -221,26 +121,15 @@ pub fn tool_registry() -> Arc<ToolRegistry> {
 }
 
 /// Structural-DB writer surface the `register_child_in_structural_db`
-/// activity (JAR2-80, stage 5.3) reaches for.
-///
-/// **Trait, not concrete type** — `jarvis_graph::GraphStore` already
-/// imports from `jarvis_temporal` (`yaml::into_agent_input` constructs
-/// an `AgentInput`), so depending on `jarvis_graph` from here would
-/// cycle. Defining the contract as a trait in `jarvis_temporal` and
-/// `impl`ing it on `GraphStore` from inside `jarvis_graph` resolves the
-/// dependency direction the same way [`AgentStorage`] does for the per-
-/// agent FS (JAR2-69).
-///
-/// The two methods mirror the `GraphStore` shape the activity's pseudo-
-/// code calls out — `add_agent` returns the freshly-minted `AgentId`,
-/// `add_edge` records the parent → child relationship.
+/// activity reaches for. Defined as a trait here (not a concrete type) to
+/// avoid a `jarvis_temporal` -> `jarvis_graph` dependency cycle, mirroring
+/// how [`AgentStorage`] handles per-agent FS.
 #[async_trait]
 pub trait StructuralDbStore: Send + Sync {
     /// Insert an agent row into a graph and return the freshly-allocated
-    /// `AgentId`. `mandate_ref` is the opaque text handle from
-    /// `migrations/0001_initial.sql`; the runtime spawn path passes
-    /// `None` (the child's mandate travels via `AgentInput.mandate`, per
-    /// Stage 5 Project decision 9).
+    /// `AgentId`. `mandate_ref` is the opaque text handle from the
+    /// initial schema; the runtime spawn path passes `None` (the child's
+    /// mandate travels via `AgentInput.mandate`).
     async fn add_agent(
         &self,
         graph_id: GraphId,
@@ -249,9 +138,8 @@ pub trait StructuralDbStore: Send + Sync {
     ) -> anyhow::Result<AgentId>;
 
     /// Insert a parent → child edge. Returns an error on UNIQUE
-    /// violation; the activity surfaces that as `ActivityError` so the
-    /// workflow body's retry / correction path takes over (rather than
-    /// silently swallowing a double-spawn).
+    /// violation so the workflow's retry / correction path takes over
+    /// rather than silently swallowing a double-spawn.
     async fn add_edge(
         &self,
         parent_agent_id: AgentId,
@@ -260,23 +148,11 @@ pub trait StructuralDbStore: Send + Sync {
 }
 
 /// Process-wide [`StructuralDbStore`] backend the
-/// `register_child_in_structural_db` activity (JAR2-80) reaches for.
-///
-/// Same OnceLock pattern as [`AGENT_STORAGE`] / [`TOOL_REGISTRY`] — the
-/// activity macro takes a value-typed bundle (smoke § 3.4), so shared
-/// state lives behind a `static`. The worker daemon installs a
-/// `GraphStore` (wrapped in `Arc<dyn StructuralDbStore>`) at boot; test
-/// harnesses install an in-memory fake.
+/// `register_child_in_structural_db` activity reaches for.
 static STRUCTURAL_DB: OnceLock<Arc<dyn StructuralDbStore>> = OnceLock::new();
 
-/// Install the process-wide [`StructuralDbStore`] backend.
-///
-/// Worker binaries call this at boot once they've connected to the
-/// structural DB (`DATABASE_URL`) and built a `GraphStore`. Test
-/// harnesses install a fake implementation.
-///
-/// **Panics** on double install. Same loud-on-misuse rationale as
-/// [`install_agent_storage`].
+/// Install the process-wide [`StructuralDbStore`] backend. Panics on
+/// double install.
 pub fn install_structural_db_store(store: Arc<dyn StructuralDbStore>) {
     STRUCTURAL_DB
         .set(store)
@@ -284,16 +160,8 @@ pub fn install_structural_db_store(store: Arc<dyn StructuralDbStore>) {
         .expect("install_structural_db_store called twice; one process, one structural DB");
 }
 
-/// Access the installed [`StructuralDbStore`] backend.
-///
-/// Returns a cheap [`Arc`] clone — the activity body holds it only for
-/// the duration of one add_agent + add_edge pair. `Arc<dyn ..>` is the
-/// trait-object form so callers can swap in `MemoryStructuralDbStore`
-/// (tests) or `GraphStore` (production) interchangeably.
-///
-/// **Panics** if [`install_structural_db_store`] hasn't been called.
-/// Activities only run after the worker has booted, so callers from
-/// activity bodies are structurally safe.
+/// Access the installed [`StructuralDbStore`] backend. Panics if
+/// [`install_structural_db_store`] hasn't been called.
 pub fn structural_db_store() -> Arc<dyn StructuralDbStore> {
     STRUCTURAL_DB
         .get()
@@ -303,14 +171,6 @@ pub fn structural_db_store() -> Arc<dyn StructuralDbStore> {
 
 /// Build a worker registering [`AgentWorkflow`] + [`AgentActivities`] on
 /// the given task queue.
-///
-/// `Worker::new` returns `Box<dyn Error>` (not `Send + Sync`); we wrap
-/// it via `anyhow::anyhow!("{e}")` so `?` works against `anyhow::Result`.
-/// See `scratch/temporal_rust_sdk_smoke.md` § 3.5.
-///
-/// `register_activities` takes the bare value, not `Arc<T>` — smoke
-/// § 3.4. The macro impls `ActivityImplementer for AgentActivities` and
-/// `register_activities` wraps in `Arc` internally.
 pub fn build_worker(runtime: &CoreRuntime, client: Client, task_queue: &str) -> Result<Worker> {
     let opts = WorkerOptions::new(task_queue)
         .register_workflow::<AgentWorkflow>()
@@ -319,42 +179,16 @@ pub fn build_worker(runtime: &CoreRuntime, client: Client, task_queue: &str) -> 
     Worker::new(runtime, client, opts).map_err(|e| anyhow::anyhow!("Worker::new failed: {e}"))
 }
 
-/// JAR2-62 — pick the LLM vendor from env and build the [`Decide`]
-/// implementation the `decide_next_action` activity body will call.
+/// Pick the LLM vendor from env and build the [`Decide`] implementation
+/// the `decide_next_action` activity body will call. Returns the vendor
+/// tag alongside the trait object so the caller can log it.
 ///
-/// Used by `bin/worker.rs` (the long-running worker daemon). Returns
-/// the vendor tag (`"anthropic"` / `"cohere"`) alongside the trait
-/// object so the caller can log it. Pre-JAR2-76 a second caller
-/// (`bin/jarvis_run_workflow.rs`) shared this helper; that binary was
-/// deleted with the thin-client refactor.
-///
-/// **Selection precedence (JAR2-70):**
-/// 1. `JARVIS_MODEL_VENDOR` env var set + that vendor is compiled in
-///    → use it.
-/// 2. `JARVIS_MODEL_VENDOR` env var set + that vendor is NOT compiled
-///    in → error pointing at the missing feature.
-/// 3. `JARVIS_MODEL_VENDOR` unset → walk the vendor preference order
-///    (`anthropic`, then `cohere` — matches `node-run-llm`'s documented
-///    order in `bin/node_run_llm.rs::USAGE`) and pick the **first
-///    compiled-in vendor whose API key is set**. A vendor that isn't
-///    compiled in is skipped even if its key is present; a compiled-
-///    in vendor with no key is skipped too.
-/// 4. None of the compiled-in vendors have keys → error with a
-///    "rebuild with --features" hint pointing at the union of the
-///    compiled-in vendors' key env vars.
-///
-/// Pre-JAR2-70 the env-key fallback (case 3) returned whichever
-/// vendor's key was set without checking compilation, so a binary
-/// built with `--features llm-cohere` and `ANTHROPIC_API_KEY` set in
-/// the env would resolve to `"anthropic"` and then fail at
-/// `build_anthropic_client` with the "not compiled in" error. Now
-/// `JARVIS_MODEL_VENDOR=anthropic` is the only path that surfaces
-/// that error; the auto-fallback transparently picks the compiled-in
-/// alternative.
-///
-/// **Feature gating.** The non-feature-gated body is itself `#[cfg]`-
-/// gated on at-least-one vendor, with a "no vendors built" stub for
-/// the zero-feature build (still compiles, errors at runtime).
+/// Selection precedence:
+/// 1. `JARVIS_MODEL_VENDOR` set + that vendor compiled in → use it.
+/// 2. `JARVIS_MODEL_VENDOR` set + vendor NOT compiled in → error.
+/// 3. `JARVIS_MODEL_VENDOR` unset → pick the first compiled-in vendor
+///    (in preference order `anthropic`, `cohere`) whose API key is set.
+/// 4. Nothing usable → error with a "rebuild with --features" hint.
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 pub fn build_decide_from_env() -> Result<(&'static str, Arc<dyn Decide>)> {
     let vendor = resolve_vendor()?;
@@ -368,9 +202,8 @@ pub fn build_decide_from_env() -> Result<(&'static str, Arc<dyn Decide>)> {
     Ok((vendor, decide))
 }
 
-/// Zero-vendor stub. Lib still compiles in a feature-less build (the
-/// workspace `cargo build` does this); callers get an early error when
-/// no vendor is compiled in.
+/// Zero-vendor stub so the library still compiles in a feature-less
+/// build; callers get an early error when no vendor is compiled in.
 #[cfg(not(any(feature = "llm-anthropic", feature = "llm-cohere")))]
 pub fn build_decide_from_env() -> Result<(&'static str, Arc<dyn Decide>)> {
     Err(anyhow!(
@@ -387,19 +220,15 @@ fn resolve_vendor() -> Result<&'static str> {
     )
 }
 
-/// Vendor + its required-key env var. The fallback walk in case 3
-/// iterates this list in preference order.
+/// Vendor + its required-key env var, in preference order.
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 const VENDOR_KEY_ENVS: &[(&str, &str)] = &[
     ("anthropic", ANTHROPIC_API_KEY_ENV),
     ("cohere", COHERE_API_KEY_ENV),
 ];
 
-/// Compile-time list of vendors built into this binary, in the
-/// preference order `VENDOR_KEY_ENVS` defines. Empty in the zero-
-/// vendor build (the outer `#[cfg]` guard means this function only
-/// exists when at least one vendor is compiled in, but the slice may
-/// still be inspected from the table-driven test below).
+/// Compile-time list of vendors built into this binary, in the same
+/// preference order `VENDOR_KEY_ENVS` defines.
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 fn compiled_vendors() -> &'static [&'static str] {
     #[cfg(all(feature = "llm-anthropic", feature = "llm-cohere"))]
@@ -417,20 +246,15 @@ fn compiled_vendors() -> &'static [&'static str] {
 }
 
 /// Pure, env-injected core of `resolve_vendor` — broken out so the
-/// table-driven test below can exercise the full matrix of
-/// (compiled-in vendors) × (which keys are set) × (`JARVIS_MODEL_VENDOR`
-/// set / unset) without mutating process env.
-///
-/// `compiled` is the list of vendors built into this binary, in
-/// preference order (`compiled_vendors()` at runtime; a test fixture
-/// in tests).
+/// table-driven test below can exercise the full matrix without
+/// mutating process env. `compiled` is the list of vendors built into
+/// this binary in preference order.
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 fn resolve_vendor_inner(
     vendor_env: Option<&str>,
     key_set: impl Fn(&str) -> bool,
     compiled: &[&'static str],
 ) -> Result<&'static str> {
-    // Case 1 + 2: explicit env vendor.
     if let Some(v) = vendor_env {
         return match v {
             "anthropic" => {
@@ -456,18 +280,11 @@ fn resolve_vendor_inner(
             )),
         };
     }
-    // Case 3: walk vendor preference order, pick first compiled-in
-    // vendor with key. Pre-JAR2-70 bug was returning a non-compiled
-    // vendor's name based on key presence alone, which then errored
-    // downstream at `build_*_client`.
     for (vendor, key_env) in VENDOR_KEY_ENVS {
         if compiled.contains(vendor) && key_set(key_env) {
             return Ok(*vendor);
         }
     }
-    // Case 4: nothing usable. The error message names only the
-    // compiled-in vendors' key env vars (no point telling the user to
-    // set `ANTHROPIC_API_KEY` on a cohere-only build).
     let usable_keys: Vec<&str> = VENDOR_KEY_ENVS
         .iter()
         .filter(|(v, _)| compiled.contains(v))
@@ -511,37 +328,19 @@ fn build_cohere_client() -> Result<Arc<dyn ModelClient>> {
 
 #[cfg(test)]
 mod tests {
-    //! Coverage for the install/access shape. The `OnceLock` is
-    //! process-wide, so these run under a single shared
-    //! `#[serial]`-style guard (the same pattern JAR2-60 used for
-    //! `DECISION_SCRIPT`).
-    //!
-    //! Note: a test that asserts `install_agent_storage` panics on
-    //! double-install can only run once per process — once the storage
-    //! is installed, any subsequent test that also wanted to install
-    //! would also panic. We resolve this by having a single test that
-    //! installs (succeeding), then re-installs (catching the panic),
-    //! then accesses (succeeding) — covering all three behaviors in
-    //! one shot.
-    //!
-    //! JAR2-62 extends this with the `install_decide` / `decide_impl`
-    //! pair, which has the same once-per-process constraint. The
-    //! storage and decide statics are independent `OnceLock`s, so we
-    //! cover both inside the same `#[test]` (which by virtue of being a
-    //! single test runs sequentially with itself; cargo's parallel
-    //! runner won't multiplex it). This keeps the file's one-test-per-
-    //! process invariant intact.
+    //! Coverage for the install/access shape. Each `OnceLock` can only
+    //! be set once per process, so each install + access + double-install
+    //! sequence lives inside a single test. Statics are independent, so
+    //! one test per static keeps them isolated.
     use super::*;
     use jarvis_node::decision::{Decide, Decision, MockDecide};
     use jarvis_node::storage::MemoryStorage;
     use jarvis_node::tools::{EchoTool, ToolRegistry};
     use std::time::Duration;
 
-    /// JAR2-80 — minimal `StructuralDbStore` impl whose methods panic
-    /// when called. The install/access test only exercises the
-    /// `OnceLock` plumbing; we never `add_agent` / `add_edge` through
-    /// it, so panicking on call is the cheapest way to flag any
-    /// accidental dispatch through this fake.
+    /// Minimal `StructuralDbStore` whose methods panic when called.
+    /// The install/access test only exercises the `OnceLock` plumbing;
+    /// panicking on call flags any accidental dispatch.
     mod structural_db_test_double {
         use super::*;
 
@@ -570,49 +369,30 @@ mod tests {
 
     #[test]
     fn install_then_access_then_double_install_panics() {
-        // ---- storage half ------------------------------------------------
-        // First install succeeds.
         install_agent_storage(Arc::new(MemoryStorage::new()));
 
-        // Access returns a usable Arc.
         let s = agent_storage();
-        // `Arc::strong_count >= 2` (the OnceLock holds one, we hold one).
         assert!(Arc::strong_count(&s) >= 2);
 
-        // Second install panics — caught with `catch_unwind` so the
-        // process stays alive for any other tests.
         let result = std::panic::catch_unwind(|| {
             install_agent_storage(Arc::new(MemoryStorage::new()));
         });
         assert!(result.is_err(), "double install_agent_storage should panic");
 
-        // ---- decide half (JAR2-62) --------------------------------------
-        // First install succeeds. `MockDecide` is the trait's
-        // test-only implementation in `jarvis_node::decision`; we use
-        // an empty script because we only assert the install/access
-        // wiring, not the trait's behavior (covered by JAR2-19).
         let decide: Arc<dyn Decide> = Arc::new(MockDecide::new(vec![Decision::Idle {
             next_after: Duration::from_millis(1),
         }]));
         install_decide(decide);
 
-        // Access returns a usable Arc.
         let d = decide_impl();
         assert!(Arc::strong_count(&d) >= 2);
 
-        // Second install panics.
         let result = std::panic::catch_unwind(|| {
             install_decide(Arc::new(MockDecide::new(vec![])));
         });
         assert!(result.is_err(), "double install_decide should panic");
     }
 
-    /// JAR2-63 mirror of `install_then_access_then_double_install_panics`
-    /// — the install/access/double-install invariants for the
-    /// process-wide `ToolRegistry` are exactly the same as for
-    /// `AgentStorage`. One process-scoped test covers all three
-    /// behaviours since the underlying `OnceLock` can only be set once
-    /// per process.
     #[test]
     fn install_tool_registry_then_access_then_double_install_panics() {
         let mut reg = ToolRegistry::new();
@@ -621,7 +401,6 @@ mod tests {
         install_tool_registry(Arc::new(reg));
 
         let r = tool_registry();
-        // OnceLock holds one strong ref, we hold one.
         assert!(Arc::strong_count(&r) >= 2);
 
         let result = std::panic::catch_unwind(|| {
@@ -630,13 +409,6 @@ mod tests {
         assert!(result.is_err(), "double install_tool_registry should panic");
     }
 
-    /// JAR2-80 mirror of the JAR2-69/JAR2-63 install/access pattern for
-    /// the [`StructuralDbStore`] OnceLock. Same one-test-per-process
-    /// constraint: the static can only be `set` once, so install +
-    /// access + double-install live in one test. Each install pair runs
-    /// against its own freshly-constructed `OnceLock` (the static here
-    /// is independent of `AGENT_STORAGE` / `DECIDE_IMPL` /
-    /// `TOOL_REGISTRY`), so this test can't conflict with the others.
     #[test]
     fn install_structural_db_store_then_access_then_double_install_panics() {
         let fake: Arc<dyn StructuralDbStore> =
@@ -656,18 +428,13 @@ mod tests {
         );
     }
 
-    /// JAR2-70 — `resolve_vendor_inner` precedence matrix.
+    /// `resolve_vendor_inner` precedence matrix.
     ///
-    /// Hermetic: env is injected via the function's `key_set` callback
-    /// and the explicit `vendor_env` argument, so no real env-var
-    /// mutation happens and no `serial_test` is needed. Covers the
-    /// full cross product:
-    ///   - `compiled`: anthropic-only, cohere-only, both.
-    ///   - `keys`: none, anthropic, cohere, both.
-    ///   - `vendor_env`: unset, anthropic, cohere, unknown.
-    ///
-    /// The matrix asserts the JAR2-70 precedence rule: `JARVIS_MODEL_VENDOR`
-    /// is honored only if compiled in (else feature-rebuild error);
+    /// Hermetic: env is injected via the `key_set` callback and the
+    /// explicit `vendor_env` argument, so no process env mutation
+    /// happens. Covers the cross product of `compiled` × `keys` ×
+    /// `vendor_env` against the precedence rule: `JARVIS_MODEL_VENDOR`
+    /// honored only if compiled in (else feature-rebuild error);
     /// otherwise pick the first compiled-in vendor whose key is set.
     #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
     #[test]
@@ -688,12 +455,12 @@ mod tests {
             Expected,
         );
         let cases: &[Case] = &[
-            // ---- explicit JARVIS_MODEL_VENDOR honored when compiled in ----
+            // explicit JARVIS_MODEL_VENDOR honored when compiled in
             (BOTH, Some("anthropic"), &[], Ok("anthropic")),
             (BOTH, Some("cohere"), &[], Ok("cohere")),
             (ANTHROPIC, Some("anthropic"), &[], Ok("anthropic")),
             (COHERE, Some("cohere"), &[], Ok("cohere")),
-            // ---- explicit but not compiled in -> error ----
+            // explicit but not compiled in -> error
             (
                 ANTHROPIC,
                 Some("cohere"),
@@ -706,46 +473,26 @@ mod tests {
                 &["ANTHROPIC_API_KEY"],
                 Err("anthropic"),
             ),
-            // ---- unknown vendor name -> error ----
+            // unknown vendor name -> error
             (BOTH, Some("openai"), &["ANTHROPIC_API_KEY"], Err("openai")),
-            // ---- env unset, fallback by key + compiled-in ----
-            // both compiled, anthropic key only -> anthropic.
+            // env unset, fallback by key + compiled-in
             (BOTH, None, &["ANTHROPIC_API_KEY"], Ok("anthropic")),
-            // both compiled, cohere key only -> cohere.
             (BOTH, None, &["COHERE_API_KEY"], Ok("cohere")),
-            // both compiled, both keys -> anthropic (preference order).
             (
                 BOTH,
                 None,
                 &["ANTHROPIC_API_KEY", "COHERE_API_KEY"],
                 Ok("anthropic"),
             ),
-            // anthropic-only build, only ANTHROPIC_API_KEY -> anthropic.
             (ANTHROPIC, None, &["ANTHROPIC_API_KEY"], Ok("anthropic")),
-            // anthropic-only build, only COHERE_API_KEY -> error (bug
-            // before JAR2-70 returned Ok("anthropic") then died at
-            // build_anthropic_client; OR Ok("cohere") then died at
-            // build_cohere_client. Post-JAR2-70 it's a clean "no
-            // vendor selected").
             (ANTHROPIC, None, &["COHERE_API_KEY"], Err("no vendor")),
-            // cohere-only build, only COHERE_API_KEY -> cohere (this
-            // is the bug case from the ticket: pre-JAR2-70 the
-            // env-key walk preferred anthropic even when not compiled
-            // in, so a cohere-only build with only the cohere key set
-            // and ANTHROPIC_API_KEY unset already worked; the actual
-            // breakage was when ANTHROPIC_API_KEY *was* also set,
-            // captured in the next case).
             (COHERE, None, &["COHERE_API_KEY"], Ok("cohere")),
-            // cohere-only build, both keys set -> cohere (the
-            // headline JAR2-70 fix: pre-fix returned anthropic and
-            // died downstream).
             (
                 COHERE,
                 None,
                 &["ANTHROPIC_API_KEY", "COHERE_API_KEY"],
                 Ok("cohere"),
             ),
-            // No keys, no env -> error.
             (BOTH, None, &[], Err("no vendor")),
             (ANTHROPIC, None, &[], Err("no vendor")),
             (COHERE, None, &[], Err("no vendor")),

@@ -1,30 +1,16 @@
 //! [`LocalStorage`] — on-disk backend for [`AgentStorage`].
 //!
-//! Reproduces the atomic semantics today's `AgentFs` (`src/fs.rs`)
-//! relies on, but routed through the [`AgentStorage`] trait so callers
-//! never have to care which backend they're on.
+//! Atomicity contract: `put` writes to `<key>.tmp.<uniq>` then renames
+//! into place (POSIX `rename` is atomic within a filesystem);
+//! `put_if_absent` opens with `O_CREAT | O_EXCL` (via
+//! `OpenOptions::create_new(true)`) so the kernel rejects an open against
+//! an existing file with `AlreadyExists`; `get` maps `ENOENT` to
+//! `Ok(None)`; `delete` swallows `ENOENT` for idempotency.
 //!
-//! See `scratch/agent_storage.md` § 6.1 for the design and § 8 for the
-//! atomicity contract this impl honors:
-//!
-//! - `put`: write-to-`<key>.tmp.<uniq>` then rename. POSIX `rename` is
-//!   atomic within a filesystem, so readers see either the prior value
-//!   or the new one — never a partial.
-//! - `put_if_absent`: `OpenOptions::create_new(true)`, which translates
-//!   to `O_CREAT | O_EXCL` on Unix — the kernel rejects the open with
-//!   `AlreadyExists` if the file is already there, no race.
-//! - `get`: read the file. `ENOENT` maps to `Ok(None)` (soft-not-found).
-//! - `delete`: unlink. `ENOENT` is `Ok(())` (idempotent contract).
-//! - `list`: `read_dir`, filter by prefix, lex-sort, paginate.
-//! - `get_many`: `futures::join_all` of N parallel `get` calls.
-//!
-//! Keys map to relative paths under the root. We deliberately accept
-//! keys that contain `/`: an agent's per-prefix layout
-//! (`outputs/<ulid>.json`, `evidence/<sha256>.json`) is exactly the
-//! kind of structure callers want. Parent directories are created on
-//! demand by `put`/`put_if_absent`. Traversal hardening
-//! (rejecting `..` etc.) is left to the `AgentFs` facade in JAR2-53 —
-//! `LocalStorage` is a thin storage primitive, not a sandbox.
+//! Keys map to relative paths under the root and may contain `/` —
+//! parent directories are created on demand. `LocalStorage` is a thin
+//! storage primitive, not a sandbox; traversal hardening is the caller's
+//! responsibility.
 
 use super::{AgentStorage, ListPage, PutOutcome, StorageError, StorageResult};
 use async_trait::async_trait;
@@ -59,8 +45,7 @@ impl LocalStorage {
         })
     }
 
-    /// Borrow the storage root for tests and the `AgentFs` facade that
-    /// needs the root path for ad-hoc legacy lookups.
+    /// Borrow the storage root.
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -78,9 +63,7 @@ impl LocalStorage {
         let pid = std::process::id();
         let name = match final_path.file_name() {
             Some(n) => n.to_owned(),
-            // `put` never builds a final_path without a file name (the
-            // key is non-empty after path-join validation); guard
-            // defensively rather than panic.
+            // Defensive guard: callers always pass a path with a file name.
             None => std::ffi::OsString::from(".put.tmp"),
         };
         let mut tmp = name;
@@ -98,23 +81,16 @@ impl AgentStorage for LocalStorage {
         let final_path = self.key_path(key);
         let tmp = self.tmp_path_for(&final_path);
 
-        // Ensure the parent directory exists. `outputs/`, `evidence/`,
-        // and nested `notes/<sub>/` are created lazily.
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent).map_err(StorageError::from_io)?;
         }
 
-        // Write to the tempfile, then atomically rename into place. On
-        // failure between `write_all` and `rename`, the partial tempfile
-        // is left behind — callers should not see it because the
-        // canonical key is unchanged. A best-effort cleanup is fine
-        // even when it fails (e.g. the rename succeeded after all).
+        // Write-to-tempfile + rename for atomic visibility under the
+        // canonical key. fsync before rename so a crash can't leave a
+        // zero-byte file under the final name.
         let mut f = fs::File::create(&tmp).map_err(StorageError::from_io)?;
         let write_res = f.write_all(value.as_ref());
         let sync_res = if write_res.is_ok() {
-            // Fsync the data and the file metadata before the rename so
-            // a crash between rename and the in-flight kernel flush
-            // doesn't leave a zero-byte file under the final name.
             f.sync_all()
         } else {
             Ok(())
@@ -142,10 +118,8 @@ impl AgentStorage for LocalStorage {
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent).map_err(StorageError::from_io)?;
         }
-        // `create_new(true)` → `O_CREAT | O_EXCL` on Unix: the kernel
-        // refuses the open with `AlreadyExists` if the file is there,
-        // so the conditional-write is atomic without any read-then-write
-        // race window.
+        // `create_new(true)` → `O_CREAT | O_EXCL` on Unix: atomic
+        // conditional-write with no read-then-write race window.
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -153,9 +127,8 @@ impl AgentStorage for LocalStorage {
         {
             Ok(mut f) => {
                 if let Err(e) = f.write_all(value.as_ref()) {
-                    // Partial bytes already written; best-effort cleanup
-                    // so a subsequent put_if_absent sees Created (not
-                    // Existed-with-garbage).
+                    // Best-effort cleanup so a retry sees Created, not
+                    // Existed-with-garbage.
                     drop(f);
                     let _ = fs::remove_file(&final_path);
                     return Err(StorageError::from_io(e));
@@ -182,13 +155,7 @@ impl AgentStorage for LocalStorage {
     }
 
     async fn get_many(&self, keys: &[&str]) -> StorageResult<Vec<Option<Bytes>>> {
-        // `join_all` over per-key futures preserves input order in the
-        // result vec — required by the trait contract. For the local
-        // backend the per-call work is a synchronous `fs::read` inside
-        // an `async fn`; there's no parallelism gain from spawning
-        // separate tasks (the work isn't I/O-bound in the sense
-        // `tokio` would want to interleave), so we just collect the
-        // futures and await them all.
+        // `join_all` preserves input order, which the trait contract requires.
         let futures = keys.iter().map(|k| self.get(k));
         let results = join_all(futures).await;
         results.into_iter().collect()
@@ -198,7 +165,7 @@ impl AgentStorage for LocalStorage {
         let path = self.key_path(key);
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()), // idempotent
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
             Err(e) => Err(StorageError::from_io(e)),
         }
     }
@@ -209,28 +176,10 @@ impl AgentStorage for LocalStorage {
         after: Option<&str>,
         limit: usize,
     ) -> StorageResult<ListPage> {
-        // The trait's key namespace is flat strings with `/` separators;
-        // on disk those separators become subdirectories. To honor
-        // `prefix` cleanly we walk the directory subtree rooted at the
-        // deepest existing parent of `prefix` and report keys relative
-        // to `self.root` so they round-trip through `get`/`delete`.
-        //
-        // Two split points matter:
-        //   * The longest leading path component sequence — say
-        //     `outputs/`. We start walking there to avoid scanning
-        //     unrelated subtrees (`evidence/`, `notes/`, ...).
-        //   * The trailing prefix-of-a-filename, if any
-        //     (`outputs/01` matching `outputs/01ABC.json`). The walk
-        //     emits every entry and the prefix filter does the
-        //     character match.
-
-        // Split `prefix` into (parent_dir_segment, name_filter).
-        // Examples:
-        //   ""                 → (root,               "")
-        //   "outputs/"         → (root/outputs,       "")
-        //   "outputs/01"       → (root/outputs,       "01")
-        //   "evidence/aa.json" → (root/evidence,      "aa.json")
-        //   "notes/sub/x"      → (root/notes/sub,     "x")
+        // Walk the directory subtree rooted at the deepest existing parent
+        // of `prefix` so unrelated sibling subtrees aren't scanned, then
+        // filter on the trailing name fragment for prefix-of-filename
+        // matches like `outputs/01` against `outputs/01ABC.json`.
         let (dir_segment, name_filter) = match prefix.rfind('/') {
             Some(i) => (&prefix[..=i], &prefix[i + 1..]),
             None => ("", prefix),
@@ -247,12 +196,8 @@ impl AgentStorage for LocalStorage {
             });
         }
 
-        // Collect every key (relative to root) under `scan_root` whose
-        // tail (path within scan_root) starts with `name_filter` —
-        // including any subdirectory crawl. This is intentionally
-        // simple: at `LocalStorage`'s expected scale (low thousands of
-        // entries per dir), `walk + sort` beats a heap-merge in code
-        // size and test surface.
+        // Simple walk + sort: at the expected scale (low thousands of
+        // entries per dir) it beats a heap-merge in code size and test surface.
         let mut keys: Vec<String> = Vec::new();
         let mut stack = vec![scan_root.clone()];
         while let Some(dir) = stack.pop() {
@@ -271,9 +216,7 @@ impl AgentStorage for LocalStorage {
                 if !file_type.is_file() {
                     continue;
                 }
-                // Key = path relative to `self.root`, with `/`
-                // separators (matches the agreed flat-string key
-                // namespace).
+                // Key = path relative to `self.root` with `/` separators.
                 let rel = match path.strip_prefix(&self.root) {
                     Ok(r) => r,
                     Err(_) => continue,
@@ -289,18 +232,15 @@ impl AgentStorage for LocalStorage {
                 if !key.starts_with(prefix) {
                     continue;
                 }
-                // Skip lingering tempfiles from in-flight `put`s — they
-                // are an implementation detail, not part of the
-                // storage's key namespace.
+                // Tempfiles from in-flight `put`s are implementation
+                // detail, not part of the key namespace.
                 if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
                     if name.contains(".tmp.") {
                         continue;
                     }
                 }
                 if !name_filter.is_empty() {
-                    // Already covered by the broader `starts_with(prefix)`
-                    // check above; the explicit `name_filter` variable
-                    // is kept for the doc comment's clarity.
+                    // Subsumed by the `starts_with(prefix)` check above.
                 }
                 keys.push(key);
             }
@@ -318,19 +258,12 @@ impl AgentStorage for LocalStorage {
         let mut overflow = false;
         for k in iter.by_ref() {
             if page.len() == limit {
-                // Already have `limit` entries and there's at least one
-                // more — set the cursor.
                 overflow = true;
                 break;
             }
             page.push(k);
         }
-        // Special-case limit == 0: we never pushed; iter may have more
-        // entries, in which case the cursor should still point at the
-        // last *would-have-been* boundary. The agreed contract treats
-        // `limit == 0` as "return no keys"; we surface no cursor so the
-        // caller's next call starts from the beginning if they keep
-        // limit == 0. That's degenerate but well-defined.
+        // `limit == 0`: degenerate but well-defined — empty page, no cursor.
         let next_cursor = if overflow { page.last().cloned() } else { None };
 
         Ok(ListPage {
@@ -342,12 +275,9 @@ impl AgentStorage for LocalStorage {
 
 #[cfg(test)]
 mod tests {
-    //! `LocalStorage` reuses the trait-level conformance suite from
-    //! `super::tests` to keep the "byte-identical behaviour across
-    //! backends" promise honest. Tests local to this module cover
-    //! crash-safety properties that only make sense for the on-disk
-    //! backend (atomic rename) and pinning of error-classification
-    //! through the typed `StorageError`.
+    //! Tests covering trait conformance plus on-disk-only crash-safety
+    //! properties (atomic rename, tempfile cleanup) and the typed
+    //! `StorageError` classification.
     use super::*;
     use crate::storage::AgentStorage;
     use std::sync::Arc;
@@ -359,9 +289,7 @@ mod tests {
         (tmp, storage)
     }
 
-    // ---- Trait conformance suite, duplicated as parameterized tests
-    //      against LocalStorage. Test bodies match the MemoryStorage
-    //      ones in `super::tests` exactly.
+    // ---- Trait conformance suite against LocalStorage. -----------------
 
     #[tokio::test]
     async fn local_put_get_round_trip() {
@@ -426,7 +354,6 @@ mod tests {
             .unwrap();
         storage.delete("doomed").await.unwrap();
         assert!(storage.get("doomed").await.unwrap().is_none());
-        // Idempotent on absent keys.
         storage.delete("doomed").await.unwrap();
         storage.delete("never-written").await.unwrap();
     }
@@ -494,10 +421,8 @@ mod tests {
 
     // ---- LocalStorage-specific tests ------------------------------------
 
-    /// Atomic-write under crash: a partial tempfile must not be
-    /// observable under the canonical key. We simulate the crash by
-    /// dropping a stray `.tmp.<pid>.<n>` file directly into the
-    /// directory, then asserting `get` and `list` ignore it.
+    /// A stray `.tmp.<pid>.<n>` file must not be observable under the
+    /// canonical key via `get` or `list`.
     #[tokio::test]
     async fn local_garbage_tempfile_does_not_corrupt_canonical_key() {
         let (tmp, storage) = fresh_local();
@@ -506,33 +431,27 @@ mod tests {
             .await
             .unwrap();
 
-        // Simulate a crash that left a tempfile behind.
         let stray = tmp.path().join("outputs").join("01.json.tmp.99999.42");
         fs::write(&stray, b"garbage-partial-write").unwrap();
 
-        // `get` returns the committed bytes; the canonical key wasn't
-        // replaced.
         let bytes = storage.get("outputs/01.json").await.unwrap().unwrap();
         assert_eq!(bytes.as_ref(), b"good");
 
-        // `list` filters tempfile artefacts out of the key namespace.
         let page = storage.list("outputs/", None, 100).await.unwrap();
         assert_eq!(page.keys, vec!["outputs/01.json".to_string()]);
     }
 
     /// Write-then-rename leaves the on-disk file exactly the bytes we
-    /// wrote (no off-by-one, no extra newline, no tempfile lingering).
+    /// wrote and removes the tempfile.
     #[tokio::test]
     async fn local_put_writes_byte_identical_payload_and_cleans_up_tempfile() {
         let (tmp, storage) = fresh_local();
         let payload = Bytes::from_static(b"\x00\x01\x02exact-bytes\xff");
         storage.put("blob", payload.clone()).await.unwrap();
 
-        // Disk read sees identical bytes.
         let from_disk = fs::read(tmp.path().join("blob")).unwrap();
         assert_eq!(from_disk, payload.as_ref());
 
-        // No tempfile lingering in the directory.
         let entries: Vec<_> = fs::read_dir(tmp.path())
             .unwrap()
             .filter_map(Result::ok)
@@ -545,8 +464,8 @@ mod tests {
         );
     }
 
-    /// `put` overwrites an existing key (last-write-wins). Sanity-check
-    /// the contract that distinguishes `put` from `put_if_absent`.
+    /// `put` overwrites an existing key (last-write-wins) — the contract
+    /// that distinguishes `put` from `put_if_absent`.
     #[tokio::test]
     async fn local_put_overwrites_existing_key() {
         let (_tmp, storage) = fresh_local();
@@ -555,9 +474,8 @@ mod tests {
         assert_eq!(storage.get("k").await.unwrap().unwrap().as_ref(), b"v2");
     }
 
-    /// Listing under a prefix that doesn't exist (no matching dir on
-    /// disk) returns an empty page rather than erroring. Matches the
-    /// `MemoryStorage` contract.
+    /// Listing under a prefix with no matching dir on disk returns an
+    /// empty page rather than erroring.
     #[tokio::test]
     async fn local_list_missing_prefix_returns_empty() {
         let (_tmp, storage) = fresh_local();
@@ -567,8 +485,7 @@ mod tests {
     }
 
     /// Keys with multiple `/` segments map to nested directories and
-    /// list correctly under their parent prefix. Mirrors the on-disk
-    /// `notes/sub/x.md` pattern used by the existing `AgentFs`.
+    /// list correctly under their parent prefix.
     #[tokio::test]
     async fn local_nested_keys_round_trip_through_list() {
         let (_tmp, storage) = fresh_local();
@@ -586,7 +503,6 @@ mod tests {
             .unwrap();
 
         let page = storage.list("notes/", None, 100).await.unwrap();
-        // Lex order across the recursive walk.
         assert_eq!(
             page.keys,
             vec![
@@ -598,9 +514,8 @@ mod tests {
     }
 
     /// `put_if_absent` against the same key from two concurrent tasks
-    /// must produce exactly one `Created` and one `Existed`. This is
-    /// the load-bearing race we rely on for content-addressed evidence
-    /// dedup, so pin it explicitly.
+    /// must produce exactly one `Created` and one `Existed` — the
+    /// race load-bearing for content-addressed evidence dedup.
     #[tokio::test]
     async fn local_put_if_absent_is_race_free_under_concurrency() {
         let (_tmp, storage) = fresh_local();
@@ -617,18 +532,10 @@ mod tests {
         assert_eq!(outcomes, vec![PutOutcome::Created, PutOutcome::Existed]);
     }
 
-    /// Sanity-check that `StorageError::from_io` is what `put_if_absent`
-    /// raises when the underlying `OpenOptions::create_new` returns
-    /// something other than `AlreadyExists` — the typed variants are
-    /// what the agent-loop uses to decide retry vs. fail-hard.
+    /// Soft-not-found: `get` on a missing nested key returns `Ok(None)`
+    /// rather than surfacing the kernel `NotFound` through the error channel.
     #[tokio::test]
     async fn local_io_error_propagation_uses_typed_variants() {
-        // A nonexistent root directory with no permission to create it
-        // is awkward to simulate portably; the simpler check is that a
-        // `NotFound` from the kernel — which we manufacture by trying
-        // to `get` a key whose parent dir doesn't exist via a path that
-        // pretends it does — surfaces `Ok(None)` (soft-not-found) on
-        // `get`, exactly as the trait contract promises.
         let (_tmp, storage) = fresh_local();
         let got = storage.get("does/not/exist.json").await.unwrap();
         assert!(got.is_none(), "expected None for missing nested key");
