@@ -13,19 +13,18 @@
 //!    correction is pending).
 //! 3. **If a correction is pending**, this iteration is a continuation of
 //!    the prior failed attempt: do **not** call [`HealthTracker::begin_tick`]
-//!    — the per-tick retry budget must accumulate across the correction so
-//!    exhaustion can mean what JAR2-19 says it means. Otherwise begin a
-//!    fresh tick.
+//!    — the per-tick retry budget must accumulate across the correction.
+//!    Otherwise begin a fresh tick.
 //! 4. Build a `ContextBundle` from the drained triggers, the recent FS
 //!    state, and the pending correction (if any), and ask `Decide::decide`
 //!    for a `Decision`.
 //! 5. Dispatch the decision.
-//! 6. **On [`ApplyOutcome::Continue`]**: clear `pending_correction` and
+//! 6. **On [`DispatchOutcome::Continue`]**: clear `pending_correction` and
 //!    mark the tick a success (`HealthTracker::mark_tick_success`) — this
 //!    archives any prior Unhealthy incident on recovery.
-//! 7. **On [`ApplyOutcome::Retire`]**: persist `retirement.json` and exit
-//!    the loop with the reason.
-//! 8. **On [`ApplyOutcome::NeedsCorrection`]**: the model emitted a
+//! 7. **On [`DispatchOutcome::Retired`]**: persist `retirement.json` and
+//!    exit the loop with the reason.
+//! 8. **On [`DispatchOutcome::NeedsCorrection`]**: the model emitted a
 //!    `Decision` the runtime cannot satisfy (an unregistered tool, an
 //!    unresolvable evidence id). We record the failure against the
 //!    inference budget; if there is still room we stash the failure
@@ -45,41 +44,24 @@
 //!
 //! # Why correction is agent-state, not a queue trigger
 //!
-//! An earlier draft expressed mid-correction continuation by self-injecting
-//! a `Trigger::External { kind: SYNTHETIC_CORRECTION_KIND, ... }` into the
-//! same queue external producers feed. That made "are we mid-correction?"
-//! a property *derived* from queue contents, with two failure modes:
+//! Expressing mid-correction continuation as a self-injected
+//! `Trigger::External { kind: SYNTHETIC_CORRECTION_KIND, ... }` makes
+//! "are we mid-correction?" derive from queue contents, which has two
+//! failure modes:
 //!
 //! * **External-producer race.** A trigger arriving between the inject and
-//!   the next drain made `is_correction_only` false, which reset the
-//!   per-tick budget and broke JAR2-19's accumulation contract.
+//!   the next drain makes `is_correction_only` false, which resets the
+//!   per-tick budget.
 //! * **Scheduler self-race.** If the prior tick took non-trivial time, the
-//!   `select!` arm racing `wait_nonempty` against `sleep_until` could see
+//!   `select!` arm racing `wait_nonempty` against `sleep_until` can see
 //!   both branches ready at once. Tokio picks pseudo-randomly; if the
-//!   deadline branch won, `ScheduledWake` was pushed alongside the
-//!   synthetic correction and the budget reset — even with zero external
-//!   producers in the picture.
+//!   deadline branch wins, `ScheduledWake` lands alongside the synthetic
+//!   correction and the budget resets — even with zero external producers.
 //!
 //! Storing `pending_correction: Option<CorrectionContext>` directly on the
 //! run loop makes the invariant a stored fact rather than a derived one.
 //! The trigger queue stays the boundary with the outside world; corrections
 //! stay agent-internal continuation state. See `decision::CorrectionContext`.
-//!
-//! # Type-parameter shape (deviation from the original ticket sketch)
-//!
-//! The bootstrap took `ToolRegistry` concretely (no `ToolDispatch` trait,
-//! no abstraction-for-future-needs). That decision still holds: there is
-//! still exactly one registry implementation, and `Decide` stays generic
-//! because there are several impls in tree.
-//!
-//! # Provenance keep-alive
-//!
-//! Provenance violations (`FsError::EmptyEvidence`,
-//! `FsError::EvidenceNotFound`) used to degrade to a `tracing::warn!` and
-//! `Continue`. JAR2-19 routes them through the correction loop instead, so
-//! the model gets a chance to self-correct on the next tick. The agent is
-//! still kept alive on the failure (the original property), just via a
-//! different mechanism.
 
 use anyhow::Result;
 use chrono::Utc;
@@ -254,13 +236,12 @@ impl<D: Decide> Agent<D> {
                 }
                 debug!(count = drained.len(), is_correction, "drained triggers");
 
-                // JAR2-57: per-tick logic now lives behind the
-                // `agent_core` seam. `drain_triggers` packages the
-                // already-drained vec into a `ContextBundle`; `decide`
-                // calls into the `Decide` impl; `dispatch` applies the
-                // resulting `Decision` and returns a typed
-                // `DispatchOutcome`. The in-process host below maps that
-                // outcome into budget / health / correction state.
+                // Per-tick logic lives behind the `agent_core` seam:
+                // `drain_triggers` packages the drained vec into a
+                // `ContextBundle`, `decide` calls into the `Decide` impl,
+                // `dispatch` applies the `Decision` and returns a typed
+                // `DispatchOutcome`. The host below maps that outcome
+                // into budget / health / correction state.
                 let bundle =
                     agent_core::drain_triggers(drained, &fs, &cfg, pending_correction.clone())
                         .await?;
@@ -349,48 +330,26 @@ impl<D: Decide> Agent<D> {
                         }
                     }
                     DispatchOutcome::ToolError { failures } => {
-                        // JAR2-25: the tool's internal retry policy
+                        // The tool's internal retry policy
                         // (`McpTool::call`) has already exhausted its
                         // `RetryPolicy::max_attempts` attempts before
-                        // surfacing this error. Each exhausted call counts
-                        // as one tick against `RetryBudget::max_tool`. The
-                        // two bounds are deliberately distinct: per-call
-                        // retries handle a single flaky tool invocation,
-                        // per-tick budget handles "many tools breaking on
-                        // one tick".
-                        //
-                        // JAR2-30: symmetric to the inference correction
-                        // loop in `NeedsCorrection` above, we stage a
-                        // `pending_correction` describing the failure
-                        // (tool name, args summary, last error). The next
-                        // tick threads it into the `ContextBundle` so the
-                        // model can self-correct (try different args, a
-                        // different tool, an `idle`, etc.). The shape of
-                        // the corrective signal is the same `CorrectionContext`
-                        // the inference path uses — reusing the existing
-                        // mechanism rather than introducing a parallel
-                        // trigger class, per the ticket's
-                        // "no public Trigger variant explosion" guidance.
-                        //
-                        // JAR2-38: a tick that issues K parallel calls
-                        // may surface K failures from one dispatch. Per
-                        // the ticket's "K against the budget" default,
-                        // each failed call consumes one
-                        // `FailureKind::ToolCall` slot — so one bad tick
-                        // can't burn an unbounded number of attempts
-                        // through the noise floor. The loop below
-                        // records every failure in order; if the budget
-                        // exhausts partway through, the remaining
+                        // surfacing this error. Each exhausted call
+                        // counts as one against `RetryBudget::max_tool`,
+                        // so K parallel failures consume K slots — one
+                        // bad tick can't burn an unbounded number of
+                        // attempts through the noise floor. If the
+                        // budget exhausts partway through, the remaining
                         // failures still join the retry trail (so the
                         // `HealthIncident` archive captures the full
-                        // batch) but stop spending budget slots that
-                        // are no longer there. Budget accumulation
-                        // across the correction continuation is
-                        // symmetric to JAR2-30: the next iteration skips
-                        // `begin_tick` while `pending_correction` is
-                        // `Some`, so K failures here plus M more on the
-                        // continuation count K+M against the same
-                        // window.
+                        // batch) but stop spending slots.
+                        //
+                        // The corrective signal reuses
+                        // `CorrectionContext` (same shape as the
+                        // inference path) rather than introducing a
+                        // parallel trigger class. Budget accumulates
+                        // across the correction continuation: the next
+                        // iteration skips `begin_tick` while
+                        // `pending_correction` is `Some`.
                         let desc = agent_core::tool_failure_correction_text(&failures);
                         let mut budget_exhausted: Option<FailureKind> = None;
                         let mut last_error = String::new();
@@ -484,14 +443,13 @@ enum TickOutcome {
     Retire(RetireReason),
 }
 
-// ---------- JAR2-33: post-run / between-tick CallStats accessor ----------
+// ---------- Post-run / between-tick CallStats accessor ----------
 //
 // The accessor and its supporting `StatsHandle` are scoped to
-// `Agent<LlmDecide>` — non-LLM `Decide` impls (test doubles, future
-// non-model decision sources) don't need a stats surface, and per
-// `JAR2-33` we kept the diff minimal by not extending the `Decide` trait
-// with a stats method. The whole section is feature-gated on the
-// `llm-*` features for the same reason `LlmDecide` itself is.
+// `Agent<LlmDecide>` — non-LLM `Decide` impls don't need a stats
+// surface, and the `Decide` trait deliberately doesn't carry a stats
+// method. Feature-gated on the `llm-*` features for the same reason
+// `LlmDecide` itself is.
 
 /// Cheap, clonable handle onto an `LlmDecide`'s per-tick `CallStats`
 /// accumulator. Surfaces the same data as `LlmDecide::last_tick_calls` /
@@ -534,11 +492,11 @@ impl StatsHandle {
 
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 impl Agent<LlmDecide> {
-    /// JAR2-33: capture a `StatsHandle` onto the inner `LlmDecide`'s
-    /// per-tick `CallStats` accumulator. Cheap (one `Arc::clone`). The
-    /// handle outlives the agent — `Agent::run` will consume `self` and
-    /// drop the `LlmDecide`, but the `Arc<Mutex<...>>` storage remains
-    /// reachable through any `StatsHandle` cloned out beforehand.
+    /// Capture a `StatsHandle` onto the inner `LlmDecide`'s per-tick
+    /// `CallStats` accumulator. Cheap (one `Arc::clone`). The handle
+    /// outlives the agent — `Agent::run` will consume `self` and drop the
+    /// `LlmDecide`, but the `Arc<Mutex<...>>` storage remains reachable
+    /// through any `StatsHandle` cloned out beforehand.
     ///
     /// Typical use in a test:
     /// ```ignore
@@ -570,26 +528,18 @@ impl Agent<LlmDecide> {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for `Agent::run`-scoped surfaces.
-    //!
-    //! JAR2-57: the JAR2-30 corrective-text helper (and its
-    //! `tool_failure_correction_text_*` deep tests) moved to
-    //! [`crate::agent_core::tests`] alongside the helper itself. The
-    //! stats-accessor tests below stay here because they test
-    //! `Agent<LlmDecide>` accessors that are still defined in this
-    //! module.
-    //!
-    //! Integration coverage for the end-to-end exhaustion → correction →
-    //! recovery flow lives in `tests/loop_smoke.rs`.
+    //! Unit tests for `Agent::run`-scoped surfaces. End-to-end coverage
+    //! of the exhaustion → correction → recovery flow lives in
+    //! `tests/loop_smoke.rs`.
 
-    // ---------- JAR2-33: stats accessor unit tests ----------
+    // ---------- Stats accessor unit tests ----------
 
     #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
     mod stats_handle_tests {
-        //! Unit tests for the JAR2-33 `StatsHandle` / `Agent<LlmDecide>`
+        //! Unit tests for the `StatsHandle` / `Agent<LlmDecide>`
         //! accessors. End-to-end coverage through `Agent::run` lives in
-        //! the JAR2-21 fixture suites (see
-        //! `tests/llm_fixture_anthropic.rs::unhealthy_then_recovery_cycle_via_agent_run`
+        //! the LLM fixture suites
+        //! (`tests/llm_fixture_anthropic.rs::unhealthy_then_recovery_cycle_via_agent_run`
         //! and the Cohere mirror).
         use crate::agent::*;
         use crate::fs::AgentFs;
@@ -708,9 +658,9 @@ mod tests {
 
         #[tokio::test]
         async fn stats_handle_survives_after_run_consumes_agent() {
-            // The core JAR2-33 promise: capture the handle pre-run, run
-            // the agent to retirement (consuming `self`), then read the
-            // most recent tick's stats off the handle.
+            // Core promise: capture the handle pre-run, run the agent to
+            // retirement (consuming `self`), then read the most recent
+            // tick's stats off the handle.
             let s = stats(11, 7, 42);
             let client: Arc<dyn ModelClient> = Arc::new(ScriptedClient {
                 script: StdMutex::new(vec![

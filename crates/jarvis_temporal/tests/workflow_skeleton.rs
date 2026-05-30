@@ -1,44 +1,11 @@
-//! Stage 3.2 (JAR2-58) — `AgentWorkflow` live integration test.
+//! `AgentWorkflow` live integration test.
 //!
-//! Env-gated behind `TEMPORAL_LIVE_TEST=1`. When the env var is absent
-//! the test no-ops cleanly so the default `cargo test` stays hermetic.
-//! When set, the test:
-//!
-//! 1. Connects to a Temporal Server at `TEMPORAL_ADDRESS` (default
-//!    `http://localhost:7233`).
-//! 2. Starts an in-process worker registering `AgentWorkflow` +
-//!    `AgentActivities` on a unique task queue (suffixed by epoch-ms so
-//!    parallel test runs don't collide).
-//! 3. Starts `AgentWorkflow` with an `AgentInput::new_for_test(..)`
-//!    (JAR2-80 dropped `Default` — see workflow.rs) under the
-//!    URL-shaped workflow ID `graphs/<graph_id>/agents/<agent_id>`.
-//! 4. Sends a `retire` signal after a short delay.
-//! 5. Awaits the workflow result. The new JAR2-60 loop body short-
-//!    circuits to the retirement path when the `retire` signal lands,
-//!    so a successful `get_result` is proof that the loop drained the
-//!    bucket and the `persist_retirement` activity completed.
-//!
-//! ## JAR2-60 adaptation (kept honest, not weakened)
-//!
-//! The JAR2-58 placeholder body terminated on its own (continue-as-new
-//! once, then time out). The JAR2-60 loop runs indefinitely against the
-//! stub `Decision::Idle { 1s }` fallback; it terminates only on a
-//! `Decision::Retire` (from `decide_next_action`) or the `retire`
-//! signal. The original test's intent ("wiring works end-to-end → the
-//! workflow exits cleanly") is preserved by sending `retire`; the path
-//! to exit shifts from "post-CAN timer ceiling" to "retire signal
-//! observed by the loop's `wait_condition` predicate". See JAR2-60 PR
-//! body for the conflict surfacing.
-//!
-//! ## SDK constraints (see `scratch/temporal_rust_sdk_smoke.md`)
-//!
-//! - The `Worker` is not `Send`, so it runs on the test's main task; the
-//!   workflow driver runs on a `tokio::spawn`-ed task and uses the
-//!   worker's `shutdown_handle()` to ask `worker.run()` to return after
-//!   the assertion. Same shape as `temporal_smoke.rs::run` (§ 3.1).
-//! - `Worker::new` returns `Box<dyn Error>` (not `Send + Sync`) — wrapped
-//!   via `anyhow::anyhow!("{e}")` inside
-//!   `jarvis_temporal::worker::build_worker` (§ 3.5).
+//! Env-gated behind `TEMPORAL_LIVE_TEST=1`; no-ops without it. Starts a
+//! worker registering `AgentWorkflow` + `AgentActivities`, starts the
+//! workflow, sends `retire`, awaits the result. The loop body short-
+//! circuits to the retirement path when the signal lands; a successful
+//! `get_result` is proof the loop drained the bucket and
+//! `persist_retirement` completed.
 
 use std::env;
 use std::sync::Arc;
@@ -65,8 +32,7 @@ const DEFAULT_ADDRESS: &str = "http://localhost:7233";
 const DEFAULT_NAMESPACE: &str = "default";
 
 /// Suffix derived from epoch-millis so iterative test runs don't collide
-/// on workflow IDs or task queues. Matches the smoke binary's pattern
-/// (`temporal_smoke.rs::run_suffix`).
+/// on workflow IDs or task queues.
 fn run_suffix() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -89,9 +55,8 @@ async fn build_client() -> Result<Client> {
 
 /// The live test. Runs an in-process worker + workflow client, sends a
 /// `retire` signal, and asserts the workflow runs to completion via the
-/// JAR2-60 loop's retirement-signal short-circuit. Multi-threaded
-/// runtime because the worker and the driver task need to run
-/// concurrently.
+/// loop's retirement-signal short-circuit. Multi-threaded runtime
+/// because the worker and the driver task need to run concurrently.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_skeleton_continues_as_new_and_exits() {
     if env::var("TEMPORAL_LIVE_TEST").ok().as_deref() != Some("1") {
@@ -105,10 +70,10 @@ async fn workflow_skeleton_continues_as_new_and_exits() {
     run_live_test().await.expect("live workflow_skeleton test");
 }
 
-/// JAR2-68: install a process-wide `AgentStorage` + `ToolRegistry` once
-/// per process. Required because JAR2-66's `persist_retirement` activity
-/// body (fired by the retire-signal short-circuit) reaches for
-/// `agent_storage()`. Pre-JAR2-66 the stub didn't need this.
+/// Install a process-wide `AgentStorage` + `ToolRegistry` once per
+/// process. Required because the `persist_retirement` activity body
+/// (fired by the retire-signal short-circuit) reaches for
+/// `agent_storage()`.
 fn ensure_installed_for_skeleton_test() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
@@ -122,9 +87,8 @@ fn ensure_installed_for_skeleton_test() {
 
 async fn run_live_test() -> Result<()> {
     ensure_installed_for_skeleton_test();
-    // JAR2-68: install a long-Idle script so `decide_next_action` returns
-    // without reaching for the (un-installed) live `Decide` impl. See
-    // the matching note in `tests/signal_handlers.rs::run_live_test`.
+    // Install a long-Idle script so `decide_next_action` returns
+    // without reaching for the (un-installed) live `Decide` impl.
     set_decision_script(vec![Decision::Idle {
         next_after: Duration::from_secs(60),
     }]);
@@ -173,9 +137,6 @@ async fn run_live_test() -> Result<()> {
 }
 
 async fn drive(client: Client, task_queue: &str, workflow_id: &str) -> Result<()> {
-    // JAR2-80: `AgentInput::Default` was dropped; use the explicit
-    // test constructor with synthetic identity. The skeleton smoke
-    // doesn't read these fields — it just exercises the retire path.
     let input = AgentInput::new_for_test(
         GraphId::new(Uuid::new_v4()),
         AgentId::new(Uuid::new_v4()),
@@ -190,14 +151,10 @@ async fn drive(client: Client, task_queue: &str, workflow_id: &str) -> Result<()
         .await
         .context("start_workflow(AgentWorkflow)")?;
 
-    // The JAR2-60 loop body runs until either `Decision::Retire` or the
-    // `retire` signal arrives. With the stubbed `decide_next_action`
-    // returning `Idle { 1s }` (no script installed for this test), the
-    // signal is what terminates the workflow. The short sleep gives
-    // the worker time to register and start the first iteration; the
-    // SDK queues signals that arrive before the workflow registers, so
-    // strictly speaking we don't need it — but it keeps the eprintln
-    // order legible during local debugging.
+    // The loop body runs until either `Decision::Retire` or the
+    // `retire` signal arrives. The signal terminates the workflow; the
+    // short sleep gives the worker time to register and start the first
+    // iteration so the eprintln order is legible during local debugging.
     tokio::time::sleep(Duration::from_millis(250)).await;
     handle
         .signal(

@@ -3,11 +3,6 @@
 //! Endpoint: `POST https://api.cohere.com/v2/chat`. Auth via the
 //! `Authorization: Bearer <token>` header pulled from `COHERE_API_KEY`.
 //!
-//! Mirrors the structure of `anthropic.rs`: three pure functions —
-//! `build_body`, `parse_response`, `map_status_error` — composed by an
-//! async `complete` method around `reqwest`. Tests exercise the seams
-//! directly so `cargo test` never makes a live HTTP call.
-//!
 //! # Wire-format quirks vs. the Anthropic adapter
 //!
 //! 1. Tool definitions are wrapped: `{type: "function", function: {name,
@@ -22,9 +17,8 @@
 //! 4. Usage lives at `usage.tokens.input_tokens` / `usage.tokens.output_tokens`
 //!    (nested under `tokens`, not flat).
 //! 5. `Role::Tool` maps to a real `tool` message with a top-level
-//!    `tool_call_id` field — Cohere has a native `tool` role, unlike
-//!    Anthropic. We emit one Cohere message per `ToolResult` block so the
-//!    `tool_use_id` correlation is preserved.
+//!    `tool_call_id` field — Cohere has a native `tool` role. One Cohere
+//!    message is emitted per `ToolResult` block to preserve correlation.
 //! 6. `stream: false` is sent explicitly per the docs.
 
 use std::env;
@@ -112,8 +106,8 @@ impl ModelClient for CohereClient {
             .map_err(|_| ModelError::Auth(format!("{API_KEY_ENV} not set in environment")))?;
 
         let body = build_body(&req, &self.model);
-        // Latency clock matches the Anthropic adapter: wall-clock around
-        // the full request + body read so the number is comparable.
+        // Wall-clock around full request + body read, matching the
+        // Anthropic adapter so the number is comparable.
         let started = Instant::now();
         let resp = self
             .http
@@ -221,15 +215,10 @@ pub fn build_body(req: &CompleteRequest, model: &str) -> Value {
                         }
                     }
                 }
-                // Cohere validates every assistant message as having
-                // either non-empty `content` OR a `tool_calls` array
-                // ("must have non-empty content or tool calls", HTTP 400).
-                // An empty-string `content` counts as empty by that rule,
-                // so when the assistant turn is tool-call-only we must
-                // *omit* the field entirely rather than send `""`. The
-                // `content` field is documented as optional on the
-                // `AssistantMessageResponse` schema, so dropping it is
-                // safe on the text-too path as well (no API change).
+                // Cohere requires non-empty `content` OR `tool_calls` on
+                // every assistant message (HTTP 400 otherwise). Empty-string
+                // `content` counts as empty, so when there's no text we
+                // omit the field entirely instead of sending `""`.
                 let joined = text_chunks.join("");
                 if !joined.is_empty() {
                     entry.insert("content".into(), json!(joined));
@@ -264,15 +253,10 @@ pub fn build_body(req: &CompleteRequest, model: &str) -> Value {
     if let Some(t) = req.options.temperature {
         body.insert("temperature".into(), json!(t));
     }
-    // Cohere V2 chat defaults `citation_options.mode` to `"ACCURATE"`,
-    // which makes the model wrap grounded spans in inline `<co>...</co: 0:[N]>`
-    // markers inside its text content whenever it thinks a span is
-    // supported by a tool result. That markup leaks straight into the
-    // text our `EmitOutput` decisions carry, polluting outputs end-to-end.
-    // `"OFF"` disables citation generation entirely (verified against
-    // the V2 chat API spec, 2026-05). Set unconditionally — the engine
-    // does its own provenance via the `evidence` array on `Output`, so
-    // vendor-side citation markup is pure noise for us.
+    // Cohere V2 defaults `citation_options.mode` to `"ACCURATE"`, which
+    // wraps grounded spans in inline `<co>...</co: 0:[N]>` markers inside
+    // assistant text. `"OFF"` disables that markup; the engine carries its
+    // own provenance via `Output.evidence`.
     body.insert("citation_options".into(), json!({ "mode": "OFF" }));
     body.insert("messages".into(), Value::Array(messages));
     if !req.tools.is_empty() {
@@ -543,13 +527,9 @@ mod tests {
 
     #[test]
     fn build_body_disables_cohere_citation_markup() {
-        // JAR2-37 Bug C regression. Cohere V2 chat defaults
-        // `citation_options.mode` to `"ACCURATE"`, which wraps grounded
-        // spans in `<co>...</co: 0:[N]>` markers inside the assistant
-        // text. That markup was leaking into our `EmitOutput` content
-        // verbatim. The adapter must set `citation_options.mode == "OFF"`
-        // on every request to suppress it. Asserted as a top-level field
-        // on the wire body; the exact value is part of the API contract.
+        // Cohere V2 defaults `citation_options.mode` to `"ACCURATE"`, which
+        // wraps grounded spans in `<co>...</co: 0:[N]>` markers. The adapter
+        // must set `mode == "OFF"` on every request to suppress that markup.
         let req = CompleteRequest {
             messages: vec![Message::user("hi")],
             tools: vec![],
@@ -568,11 +548,9 @@ mod tests {
 
     #[test]
     fn build_body_omits_content_on_assistant_turn_with_tool_calls_only() {
-        // Regression: Cohere rejects assistant messages whose `content`
-        // is an empty string and that carry tool_calls
-        // ("invalid request: ... must have non-empty content or tool calls",
-        // HTTP 400). The adapter must omit the `content` field entirely
-        // on a tool-call-only assistant turn rather than emit `""`.
+        // Cohere rejects assistant messages with an empty `content` string
+        // that also carry tool_calls (HTTP 400). The adapter must omit
+        // `content` entirely on a tool-call-only assistant turn.
         let req = CompleteRequest {
             messages: vec![
                 Message::user("go"),
@@ -616,11 +594,9 @@ mod tests {
 
     #[test]
     fn build_body_keeps_content_on_assistant_turn_with_text_and_tool_calls() {
-        // Mixed shape (some text + tool_calls) keeps `content` populated.
-        // The golden test covers the happy text-only-then-tool path; this
-        // test pins the "text and tool calls both present" boundary so a
-        // future refactor of the omission rule doesn't accidentally drop
-        // useful text content.
+        // Mixed shape (text + tool_calls) keeps `content` populated. Pins
+        // the boundary so a future refactor of the omission rule doesn't
+        // accidentally drop useful text content.
         let req = CompleteRequest {
             messages: vec![Message {
                 role: Role::Assistant,
@@ -649,14 +625,11 @@ mod tests {
 
     #[test]
     fn build_body_omits_content_on_assistant_turn_with_neither_text_nor_tool_calls() {
-        // Degenerate input: an assistant turn whose only content is a
-        // ToolResult block (which the assistant arm drops). The renderer
-        // is upstream's job to keep well-formed, but if we ever feed
-        // such a turn through, the result must still be valid Cohere
-        // wire format. Omitting `content` is the right call; the message
-        // will still fail Cohere's "non-empty content OR tool_calls"
-        // check, but the failure surfaces server-side rather than as a
-        // silent empty-string send.
+        // Degenerate input: an assistant turn whose only block is a
+        // ToolResult (dropped by the assistant arm). Result must still be
+        // valid Cohere wire format; omitting `content` lets the
+        // "non-empty content OR tool_calls" check surface server-side
+        // rather than as a silent empty-string send.
         let req = CompleteRequest {
             messages: vec![Message {
                 role: Role::Assistant,
@@ -893,9 +866,8 @@ mod tests {
 
     #[tokio::test]
     async fn complete_returns_auth_error_when_api_key_missing() {
-        // `set_var`/`remove_var` are unsafe in Rust 2024 / 1.84+ because they
-        // are not thread-safe with concurrent env reads. Single-threaded test
-        // with no readers, so this is fine.
+        // `remove_var` is unsafe because it isn't thread-safe with concurrent
+        // env reads; safe here because there are no concurrent readers.
         unsafe {
             std::env::remove_var(API_KEY_ENV);
         }
@@ -914,16 +886,10 @@ mod tests {
 
     #[test]
     fn new_reads_cohere_model_env_for_unset_empty_and_value() {
-        // Was previously two tests (set-then-read, unset/empty-then-read)
-        // that mutated the process-global `COHERE_MODEL` env in parallel —
-        // Rust's default harness runs tests in the same binary concurrently,
-        // so the pair raced intermittently in CI. Merging into one
-        // sequential body removes the race without adding a serialization dep.
-        // Same fix as `anthropic.rs` — kept symmetric.
-        //
-        // Empty must behave like unset — `.envrc` defaults often ship as ""
-        // before someone fills them in, and we don't want that to send an
-        // empty string to the API.
+        // One sequential test body avoids racing on the process-global env
+        // when the harness runs tests concurrently. Empty must behave like
+        // unset — `.envrc` defaults often ship as "" and we don't want an
+        // empty string sent to the API.
         unsafe {
             std::env::remove_var(MODEL_ENV);
         }

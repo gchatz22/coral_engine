@@ -1,168 +1,23 @@
-//! `AgentFs` — facade over the pluggable per-agent storage backend.
+//! `AgentFs` — facade over the pluggable per-agent [`crate::storage::AgentStorage`] backend.
 //!
-//! As of JAR2-53 (stage 2.5.3), `AgentFs` is a thin facade over
-//! [`crate::storage::AgentStorage`]: the on-disk representation of
-//! today's directory layout is one storage backend
-//! ([`crate::storage::LocalStorage`]); a forthcoming `S3Storage` lands
-//! at the future cloud-deployment stage. Callers continue to talk to
-//! `AgentFs` and never touch the backend directly. See
-//! `scratch/agent_storage.md` for the full design, especially:
-//!
-//! - § 2 — the method → object-op mapping table this module implements.
-//! - § 6.1 — `LocalStorage` semantics this facade still relies on
-//!   (atomic writes, `O_EXCL` for content-addressed evidence).
-//! - § 8 — atomicity contract (per-key, no cross-key transactions).
-//! - § 13 — load-bearing design decisions.
-//!
-//! # Schema
+//! Schema under `<prefix>` (empty for single-host bootstrap, otherwise
+//! `graphs/<graph_id>/agents/<agent_id>/`):
 //!
 //! ```text
-//! <prefix>mandate.json          — what the agent is told to do
-//! <prefix>outputs/<sha256>.json — produced artifacts; the agent's claims
-//! <prefix>evidence/<sha256>.json — raw record of every tool call
-//! <prefix>notes/                — private working memory
-//! <prefix>claims/<slug>.json    — claim_seed registry (JAR2-28)
-//! <prefix>retirement.json       — terminal marker
+//! mandate.json           — standing instruction
+//! outputs/<sha256>.json  — claims, content-addressed, immutable, require evidence
+//! evidence/<sha256>.json — raw tool-call record, content-addressed, dedup via put_if_absent
+//! notes/                 — mutable private working memory
+//! claims/<slug>.json     — claim_seed registry
+//! conflicts/<id>.json    — parent-reconciled disagreement record
+//! retirement.json        — terminal marker (presence ⇒ agent retired, not crashed)
 //! ```
 //!
-//! `<prefix>` is `""` for the single-host bootstrap. When multi-agent
-//! topology lands, the prefix becomes
-//! `graphs/<graph_id>/agents/<agent_id>/` so a single bucket /
-//! filesystem can hold every agent's state without collisions.
-//! [`AgentFs::new_with_storage`] is the constructor that exercises the
-//! prefix; the legacy `AgentFs::open` retains today's semantics for
-//! the bootstrap call sites.
-//!
-//! # `outputs/` vs `notes/` — claims vs thinking
-//!
-//! This is the core split.
-//!
-//! **`outputs/`** are the agent's *deliverables* — what a parent reads,
-//! what an audit tool indexes, what a human reviewer quotes. Each file is
-//! a *claim about the world*: "this drug is at risk of hold," "this code
-//! failed test X." Per `VISION.md` § 4 ("provenance by construction"),
-//! every output **must reference evidence**. [`AgentFs::persist_output`]
-//! enforces this by rejecting an empty or unresolvable evidence vector
-//! (see [`FsError::EmptyEvidence`] and [`FsError::EvidenceNotFound`]).
-//! There is no path through the system that produces a claim without a
-//! trail. Outputs are also **immutable** — once written, the file at
-//! `outputs/<sha256>.json` does not change. A reader can quote it; a parent
-//! can pin its id; a human auditor can dispute it. To revise a claim, an
-//! agent emits a *new* output that supersedes the old one.
-//!
-//! **`notes/`** are the agent's *private working memory*. Scratchpad.
-//! Intermediate distillations. Half-baked reasoning. A draft of an output
-//! that isn't ready to publish. Per `VISION.md` § 4, this is how the
-//! agent thinks across wakeups instead of relying on a hidden context
-//! window. [`AgentFs::apply_ops`] writes here in response to
-//! `RewriteFs` decisions and rejects any path that escapes
-//! `<root>/notes/` (see [`FsError::PathTraversal`] and
-//! [`FsError::PathOutsideNotes`]). Notes are **mutable** (the agent
-//! rewrites them freely), **private** (parents do not read them by
-//! default), and have **no provenance requirement** (you can scribble
-//! whatever helps you reason).
-//!
-//! Conflating these would muddle "what I'm telling my parent" with "my
-//! scratchpad." A parent reading "draft 3, unsure" alongside "the drug
-//! failed phase 2" is going to make bad calls. The directory split is
-//! the wall.
-//!
-//! # `evidence/` — content-addressed by design
-//!
-//! Each `evidence/<sha256>.json` is the **raw record** of a tool call:
-//! tool name, args, result, timestamp. The id is
-//! `sha256(canonical_json(tool, args, result))`, computed once in
-//! [`crate::evidence::EvidenceId::new`]. Three properties fall out:
-//!
-//! 1. **Dedup is automatic.** Two tool calls with the same `(tool, args,
-//!    result)` produce the same id, so [`AgentFs::record_evidence`]
-//!    uses [`crate::storage::AgentStorage::put_if_absent`] and is
-//!    idempotent — same bytes, same key, no duplicate.
-//! 2. **Outputs that cite the same evidence id are demonstrably
-//!    grounded in the same primary source.** An audit tool walks
-//!    `evidence_ids` from each output to its file with no joins.
-//! 3. **Provenance is verifiable without trust.** An auditor recomputes
-//!    the hash and confirms the file matches.
-//!
-//! Evidence is upstream of thinking, not part of it. You don't edit
-//! evidence; it's what the world told you. Notes are how you reasoned
-//! about it.
-//!
-//! # `claims/` — seed registry for claim-id stability across ticks
-//!
-//! `Decision::CallTool` carries a `ClaimSeed` the agent picks. The
-//! kernel uses that seed to derive a stable claim id, so multiple
-//! ticks supporting the same conceptual claim collapse into one. LLMs
-//! are non-deterministic, though — woken on tick 7 the agent may pick
-//! a different seed than it did on tick 3, and provenance fragments.
-//!
-//! `claims/` is the durable place the agent writes seeds it has
-//! already minted. Per `VISION.md` § 4, *state is files, not hidden
-//! context*: the agent doesn't have to *remember* a seed across ticks;
-//! it gets to *look it up*. The convention (slug rules, file shape,
-//! prompt addendum) lives in `scratch/claim_seed_persistence.md` and
-//! moves into the prompt-template module under JAR2-16. See
-//! [`AgentFs::write_claim`], [`AgentFs::read_claim`],
-//! [`AgentFs::list_claims`], and [`claim_slug`].
-//!
-//! # `mandate.json`
-//!
-//! The standing instruction (text + idle period + max ticks). Persisted
-//! to disk so an agent restart picks up the latest mandate, not a stale
-//! one from initial config. Mutable over time once `MandateUpdate`
-//! triggers and `HumanOverride { EditMandate }` ops are wired (see
-//! `scratch/agent_runtime.md` § 11). Today it's a single file; a
-//! `mandate_history/` sidecar will likely accompany it when mandate-edit
-//! semantics land, so audit can see what changed when. Out of scope for
-//! the bootstrap.
-//!
-//! # `retirement.json` — the terminal marker
-//!
-//! Per `VISION.md` § 3, agents *idle and wake* — they don't normally
-//! exit. `Retire` is the explicit, intentional shutdown decision (see
-//! [`crate::decision::Decision::Retire`]). When emitted,
-//! [`AgentFs::persist_retirement`] writes `retirement.json` with the
-//! reason and a UTC timestamp, then the loop exits cleanly. The file
-//! exists as a separate concept (rather than just "the loop returned")
-//! for three reasons:
-//!
-//! 1. **Restart safety.** Anything trying to start an agent at this root
-//!    again sees `retirement.json` as a hard "no — this agent's life is
-//!    over." Without it, a crash-recovery loop could resurrect a finished
-//!    agent and start re-emitting outputs. (With content-addressed
-//!    `OutputId`s as of JAR2-70, re-emitting an identical claim would
-//!    collapse to the same file rather than duplicate — but a retired
-//!    agent shouldn't be running at all, so the marker is still load-
-//!    bearing.)
-//! 2. **Audit.** Why did this agent stop? "Mandate satisfied," "parent
-//!    retired me," "user retired me," "max_ticks reached." Important
-//!    context when reconstructing what the graph did weeks later.
-//! 3. **Distinguishing retirement from crash.** Crashed agent: loop
-//!    exited but no `retirement.json`. Cleanly retired agent: file
-//!    present. The orchestrator (when we have one) treats those very
-//!    differently.
-//!
-//! # What this layout deliberately does not include yet
-//!
-//! Each item is punted in `scratch/minimal_node_backend.md` § 6 with a
-//! reason; surfaced here so a reader knows the gaps are intentional:
-//!
-//! - **No conflict log.** When parents reconcile disagreeing children
-//!   (`VISION.md` § 4), the resolution will need somewhere to live —
-//!   likely `conflicts/<id>.json`. Bootstrap is single-node.
-//! - **No child handles.** Likewise out of scope for single-node.
-//! - **No mandate history.** Lands with mandate-edit semantics.
-//! - **No versioning / snapshots / forks.** The graph layer is supposed
-//!   to be time-scrubbable (`VISION.md` § 5); that needs an FS-layer
-//!   hook (probably copy-on-write or a `snapshots/` dir). Deferred.
-//! - **No mid-tick state.** By design, state lives in `notes/` between
-//!   ticks. If mid-tick state has to survive a crash, that's a separate
-//!   concern.
-//! - **`health.json` is not on this facade.** [`crate::health::HealthTracker`]
-//!   writes `health.json` / `health/<ts>.json` directly via
-//!   `std::fs::write` against its own root. Moving the health tracker
-//!   over to `AgentStorage` is a follow-up — out of scope for stage
-//!   2.5.3 per the "smallest correct diff" rule.
+//! `outputs/` are deliverables a parent or auditor reads; every output
+//! must cite resolvable evidence ids ([`AgentFs::persist_output`] enforces
+//! via [`FsError::EmptyEvidence`] / [`FsError::EvidenceNotFound`]).
+//! `notes/` is private scratch that [`AgentFs::apply_ops`] writes to,
+//! rejecting anything that escapes `<root>/notes/`.
 
 use crate::agent_ref::{AgentId, GraphId};
 use crate::conflict::ConflictRecord;
@@ -179,43 +34,33 @@ use std::sync::Arc;
 use thiserror::Error;
 
 /// Cap on tail-object size (`<prefix>outputs/_tail.json`,
-/// `<prefix>evidence/_tail.json`). Per `scratch/agent_storage.md` § 13
-/// decision 3: 64 entries gives 8× headroom over the default
-/// `recent_outputs` / `recent_evidence` window of 8, keeps the tail
-/// object < ~8 KB even with verbose entries, and is configurable
-/// per-deployment if a workload needs more (out of scope today).
+/// `<prefix>evidence/_tail.json`). 64 entries gives 8× headroom over
+/// the default `recent_outputs` / `recent_evidence` window of 8 and
+/// keeps the tail object under ~8 KB.
 const TAIL_K: usize = 64;
 
 /// One entry in a `_tail.json` object — the filename relative to the
-/// indexed prefix (`outputs/` or `evidence/`) plus the wall-clock
-/// timestamp the entry was added. Public so a downstream snapshot /
-/// inspection tool can deserialize the tail object directly.
+/// indexed prefix plus the wall-clock timestamp the entry was added.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TailEntry {
-    /// Bare filename (e.g. `01HX2...json`, not `outputs/01HX2...json`).
-    /// Kept relative to the indexed prefix so the tail object survives
-    /// a prefix change at relocation time.
+    /// Bare filename, relative to the indexed prefix so the tail
+    /// survives a prefix change at relocation time.
     pub filename: String,
     /// When the entry was added to the tail. Distinct from the file's
-    /// own `created_at` on disk (which is also serialised inside the
-    /// object); on-disk timestamps may differ for replayed activities
-    /// — the tail entry records *when this writer recorded the index
-    /// update*.
+    /// own `created_at` so a replayed activity's index update is
+    /// distinguishable from the underlying record's timestamp.
     pub added_at: DateTime<Utc>,
 }
 
 /// The on-disk shape of `<prefix>outputs/_tail.json` and
 /// `<prefix>evidence/_tail.json`. `entries[0]` is the most recently
-/// written file; later entries are progressively older. The vector is
-/// truncated to [`TAIL_K`] on every update so the object size stays
-/// bounded.
+/// written file; the vector is truncated to [`TAIL_K`] on every update.
 ///
-/// **Completeness:** when `entries.len() < TAIL_K`, the tail is the
-/// authoritative list of *every* file ever written under the indexed
-/// prefix (modulo a torn-write that left a file without a tail
-/// update). When `entries.len() == TAIL_K`, older files may exist on
-/// disk that fell off the tail — readers that need the lex-greatest
-/// N across the *whole* history must fall back to the LIST path.
+/// When `entries.len() < TAIL_K` the tail is the authoritative list
+/// of every file ever written under the indexed prefix (modulo a
+/// torn-write). At capacity, older files may exist on disk that fell
+/// off the tail — readers needing the lex-greatest N across the whole
+/// history must fall back to the LIST path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TailObject {
     pub entries: Vec<TailEntry>,
@@ -238,23 +83,13 @@ pub enum FsError {
     #[error("output rejected: evidence {0} not found on disk")]
     EvidenceNotFound(EvidenceId),
     /// [`AgentFs::read_output`] could not resolve the requested
-    /// `OutputId` on disk. Surfaced as a typed error so the JAR2-82
-    /// `reconcile_children` activity can wrap it as
-    /// `ReconciliationError::ChildOutputNotFound` and the parent
-    /// workflow body's correction-context path can stage a satisfiable
-    /// failure description for the next tick (mirroring how
-    /// `EvidenceNotFound` propagates through `persist_output`).
+    /// `OutputId`. Typed so the reconcile path can fold it into a
+    /// correction context without losing the id.
     #[error("output {0} not found on disk")]
     OutputNotFound(OutputId),
-    /// JAR2-83 (stage 5.6): [`AgentFs::write_conflict`] was called with
-    /// fewer than two alternatives. A single-alternative "conflict" is
-    /// meaningless — there's nothing to disagree with — so the writer
-    /// rejects it as a structural error. The activity boundary maps this
-    /// to `ReconciliationError::ConflictAlternativesTooFew` and surfaces
-    /// it to the workflow body as a non-retryable
-    /// `CorrectionContext`-bearing failure (the LLM produced a bad
-    /// `Decision::ReconcileChildren`; re-running the activity won't fix
-    /// the shape).
+    /// [`AgentFs::write_conflict`] was called with fewer than two
+    /// alternatives — a single-alternative conflict carries no
+    /// information so the writer rejects it as a structural error.
     #[error("conflict rejected: only {count} alternatives (need >= 2)")]
     ConflictAlternativesTooFew { count: usize },
     /// An `FsOp` path contained `..`, an absolute root, or a Windows
@@ -287,8 +122,7 @@ impl FsError {
     }
 }
 
-/// On-disk record written to `retirement.json`. Kept private to this
-/// module — readers go through future audit tooling, not direct serde.
+/// On-disk record written to `retirement.json`.
 #[derive(Debug, Serialize, Deserialize)]
 struct RetirementRecord {
     reason: String,
@@ -296,9 +130,8 @@ struct RetirementRecord {
 }
 
 /// Lifecycle status the agent assigns to a claim. The kernel does not
-/// interpret these; they exist so the agent's future self can tell
-/// "still being investigated" from "already settled, don't gather more
-/// evidence under this seed."
+/// interpret these; they let the agent's future self distinguish a
+/// claim still under investigation from one already settled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimStatus {
@@ -308,13 +141,10 @@ pub enum ClaimStatus {
 }
 
 /// On-disk record written to `claims/<slug>.json`. The agent reads
-/// these back at the top of a tick to decide whether a new
-/// `claim_seed` is needed or an existing one should be reused.
-///
-/// `seed` is the canonical string the agent attached to
-/// `Decision::CallTool`; same string in the file as in the seed. The
-/// slug is derived from `seed` via [`claim_slug`] and is not stored on
-/// the record (it's the filename).
+/// these at the top of a tick to decide whether a new `claim_seed` is
+/// needed or an existing one should be reused. The slug is derived
+/// from `seed` via [`claim_slug`] and is not stored on the record
+/// (it's the filename).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
     pub seed: String,
@@ -323,10 +153,9 @@ pub struct Claim {
     pub created_at: DateTime<Utc>,
 }
 
-/// Maximum byte length of the kebab body in a slug (before the hash
-/// suffix). 80 keeps `claims/` listings readable on a terminal and
-/// leaves headroom under typical filesystem name limits once the
-/// `-<8 hex>` suffix and `.json` extension are added.
+/// Maximum byte length of the kebab body in a slug, before the hash
+/// suffix. Keeps `claims/` listings readable and leaves headroom under
+/// typical filesystem name limits.
 const SLUG_BODY_MAX: usize = 80;
 
 /// Derive the on-disk slug for a claim from its seed string.
@@ -334,23 +163,14 @@ const SLUG_BODY_MAX: usize = 80;
 /// Rules: lowercase, runs of non-`[a-z0-9]` collapse to `-`, leading
 /// and trailing `-` are trimmed, the body is truncated to
 /// [`SLUG_BODY_MAX`] bytes, and `-<first 8 hex chars of sha256(seed)>`
-/// is *always* appended.
-///
-/// The hash suffix is unconditional on purpose. Conditional suffixing
-/// (only on collision) makes the slug a function of prior writes
-/// rather than of the seed alone, which would silently break
-/// `read_claim` when the same seed maps to different filenames in
-/// different orders. With the always-on suffix, two distinct seeds
-/// that slugify to the same kebab body still get different filenames,
-/// and the same seed always resolves to the same file.
-///
-/// If the kebab body is empty after trimming (e.g. seed `"!!!"`), the
-/// slug is just the hash suffix. The 8-char prefix gives ~32 bits of
-/// collision resistance, which is far more than the agent population
-/// of one filesystem will ever contend with.
+/// is *always* appended. The hash suffix is unconditional so the slug
+/// is a function of the seed alone — same seed always resolves to the
+/// same file, and two seeds that slugify to the same body still get
+/// distinct filenames. If the body is empty after trimming, the slug
+/// is just the hash suffix.
 pub fn claim_slug(seed: &str) -> String {
     let mut body = String::with_capacity(seed.len());
-    let mut prev_dash = true; // leading dashes get trimmed by suppressing them
+    let mut prev_dash = true;
     for ch in seed.chars() {
         let lc = ch.to_ascii_lowercase();
         if lc.is_ascii_alphanumeric() {
@@ -366,14 +186,13 @@ pub fn claim_slug(seed: &str) -> String {
     }
     if body.len() > SLUG_BODY_MAX {
         body.truncate(SLUG_BODY_MAX);
-        // Truncation may have left a trailing `-`; clean it.
         while body.ends_with('-') {
             body.pop();
         }
     }
 
     let digest = Sha256::digest(seed.as_bytes());
-    let suffix = hex::encode(&digest[..4]); // 8 hex chars
+    let suffix = hex::encode(&digest[..4]);
 
     if body.is_empty() {
         suffix
@@ -386,24 +205,22 @@ pub fn claim_slug(seed: &str) -> String {
 /// backend. Cheap to clone — holds an `Arc` to the storage and a small
 /// key prefix.
 ///
-/// Construct via [`AgentFs::open`] for today's single-host bootstrap
-/// shape (`<root>` is one agent's directory, prefix is empty), or via
-/// [`AgentFs::new_with_storage`] when a test wants to drive `AgentFs`
-/// against `MemoryStorage` / a custom storage prefix.
+/// Construct via [`AgentFs::open`] for single-host use (`<root>` is
+/// one agent's directory, prefix is empty), or via
+/// [`AgentFs::new_with_storage`] to drive against another storage
+/// backend with a custom prefix.
 #[derive(Clone)]
 pub struct AgentFs {
     storage: Arc<dyn AgentStorage>,
-    /// Key prefix applied to every operation. Empty for the bootstrap;
-    /// non-empty (`graphs/<graph_id>/agents/<agent_id>/`) when
-    /// multi-agent topology lands. Always either empty or ends in `/`.
+    /// Key prefix applied to every operation. Empty for single-host;
+    /// `graphs/<graph_id>/agents/<agent_id>/` under multi-agent
+    /// topology. Always either empty or ends in `/`.
     prefix: String,
 }
 
 impl std::fmt::Debug for AgentFs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `dyn AgentStorage` doesn't carry a `Debug` bound (kept off
-        // the trait to leave backends free to choose), so we summarize
-        // the facade by its prefix instead.
+        // `dyn AgentStorage` carries no `Debug` bound, so summarise by prefix.
         f.debug_struct("AgentFs")
             .field("prefix", &self.prefix)
             .finish()
@@ -415,14 +232,8 @@ impl AgentFs {
     ///
     /// Wraps a [`LocalStorage`] backend with an empty prefix; equivalent
     /// to `new_with_storage(Arc::new(LocalStorage::new(root)?), "", mandate)`.
-    /// Kept as the primary entry point for the bootstrap call sites
-    /// (`bin/node_run*.rs`) and existing tests so this ticket's diff is
-    /// strictly "facade swap" rather than "rethread agent ids through
-    /// every caller". The `graphs/<graph_id>/agents/<agent_id>/` prefix
-    /// shape is exercised via [`AgentFs::new_with_storage`] and lands at
-    /// the call sites when multi-agent topology arrives.
     ///
-    /// Idempotent: calling `open` against an existing FS does not clobber
+    /// Idempotent: opening an existing FS does not clobber
     /// `mandate.json`, `outputs/`, `evidence/`, `notes/`, or
     /// `retirement.json` — the mandate file is only written when absent.
     pub async fn open(root: PathBuf, mandate: &Mandate) -> anyhow::Result<Self> {
@@ -434,11 +245,9 @@ impl AgentFs {
     /// prefix.
     ///
     /// `prefix` is normalized to either `""` or "`...something/`" — a
-    /// trailing slash is appended if missing so callers don't have to
-    /// remember the convention. Writing `mandate.json` is the only
-    /// state side effect; the trait's lazy-directory-creation
-    /// (`LocalStorage`) or implicit-namespace (`MemoryStorage`)
-    /// semantics handle the rest.
+    /// trailing slash is appended if missing. Writing `mandate.json`
+    /// (when absent) is the only state side effect; directory creation
+    /// is handled lazily by the backend.
     pub async fn new_with_storage(
         storage: Arc<dyn AgentStorage>,
         prefix: impl Into<String>,
@@ -450,9 +259,7 @@ impl AgentFs {
         }
         let me = Self { storage, prefix };
 
-        // Idempotent mandate write: read first, write only if absent so
-        // a re-open against an existing FS doesn't overwrite the
-        // current mandate (matches today's `open` semantics).
+        // Idempotent: re-open must not clobber an existing mandate.
         let mandate_key = me.key("mandate.json");
         let existing = me
             .storage
@@ -467,50 +274,25 @@ impl AgentFs {
                 .map_err(|e| FsError::storage(&mandate_key, e))?;
         }
 
-        // JAR2-54 tail-index reconciliation. A prior process may have
-        // crashed between an `outputs/<sha256>.json` PUT and the
-        // corresponding `_tail.json` PUT, leaving the tail lagging.
-        // `read_recent_window_with_tail` trusts a tail with
-        // `entries.len() < TAIL_K` as "complete" for O(1) reads — that
-        // trust would silently miss lag-orphans without this
-        // reconcile. Doing it once at open keeps the read path O(1)
-        // while honoring the `agent_storage.md` § 7.1 promise that the
-        // LIST fallback resolves lag. In-process single-writer-per-
-        // agent maintains the invariant for the lifetime of this
-        // `AgentFs`; cross-process inspectors (TUI, ad-hoc tools)
-        // wanting a fresh view can call `AgentFs::open` again.
-        //
-        // Cost: one LIST + at most one PUT per indexed prefix at open;
-        // subsequent `list_recent_*` calls stay O(1). When the on-disk
-        // filename set is already a subset of the tail (the common
-        // case) the PUT is skipped entirely.
+        // Reconcile any tail that lags on-disk reality after a crash
+        // mid-PUT, so the O(1) read path can trust a sub-capacity tail
+        // as complete. One LIST + at most one PUT per indexed prefix.
         me.reconcile_tail(OUTPUTS_TAIL_SUFFIX, "outputs/").await?;
         me.reconcile_tail(EVIDENCE_TAIL_SUFFIX, "evidence/").await?;
 
         Ok(me)
     }
 
-    /// Build an `AgentFs` over `storage` at `prefix` **without** the
-    /// mandate.json read/write or the tail-index reconciliation that
-    /// [`AgentFs::new_with_storage`] performs.
+    /// Build an `AgentFs` over `storage` at `prefix` without the
+    /// `mandate.json` read/write or the tail-index reconciliation
+    /// that [`AgentFs::new_with_storage`] performs. Makes no I/O calls.
     ///
-    /// Use when the caller needs the facade purely to write a known key
-    /// (e.g. `retirement.json` from the Temporal `persist_retirement`
-    /// activity) and either:
-    ///
-    /// - has no `Mandate` available in scope (the retirement-signal
-    ///   short-circuit fires before `assemble_context` runs, so no
-    ///   mandate is loaded into workflow state); **or**
-    /// - wants to skip the per-attach LIST that drives tail-index
-    ///   reconciliation when the operation doesn't touch
-    ///   `outputs/` / `evidence/`.
-    ///
-    /// `attach` is **strictly weaker** than `new_with_storage`: it makes
-    /// no I/O calls itself. Callers must not use it for paths that rely
-    /// on the tail-index invariants (`list_recent_outputs`,
-    /// `list_recent_evidence`) on a fresh per-call FS — those need
-    /// `new_with_storage`'s reconcile step. The retirement path writes
-    /// one key and exits, so the missing reconciliation is irrelevant.
+    /// Use when the caller has no `Mandate` in scope, or when the
+    /// operation does not touch `outputs/` / `evidence/` and the
+    /// per-attach LIST is wasted work. Callers must not use `attach`
+    /// for fresh-FS paths that rely on tail-index invariants
+    /// (`list_recent_outputs`, `list_recent_evidence`); those need
+    /// `new_with_storage`'s reconcile step.
     pub fn attach(storage: Arc<dyn AgentStorage>, prefix: impl Into<String>) -> Self {
         let mut prefix = prefix.into();
         if !prefix.is_empty() && !prefix.ends_with('/') {
@@ -519,24 +301,19 @@ impl AgentFs {
         Self { storage, prefix }
     }
 
-    /// JAR2-82 (stage 5.5): build an `AgentFs` scoped to an arbitrary
-    /// agent's `graphs/<graph_id>/agents/<agent_id>/` prefix on the
-    /// supplied storage backend. Cross-agent reads (the parent's
-    /// `reconcile_children` activity reading a child's
+    /// Build an `AgentFs` scoped to an arbitrary agent's
+    /// `graphs/<graph_id>/agents/<agent_id>/` prefix on the supplied
+    /// storage backend. Cross-agent reads (a parent reading a child's
     /// `outputs/<id>.json`) flow through this constructor.
     ///
-    /// **Strictly an `attach` wrapper** — no `mandate.json` read, no
-    /// tail-index reconcile. Both load-bearing for the cross-agent
-    /// case: the caller doesn't have the *other* agent's `Mandate` in
-    /// scope (it lives only on that agent's workflow input), and the
-    /// reconcile-target reads are point lookups (`storage.get` against
-    /// a known `OutputId`), not list/window reads that would care about
-    /// the tail's freshness.
+    /// An `attach` wrapper — no `mandate.json` read, no tail-index
+    /// reconcile. The caller does not have the other agent's `Mandate`
+    /// in scope, and reconcile-target reads are point lookups that do
+    /// not depend on the tail's freshness.
     ///
     /// Mirrors `crate::workflow::FsHandle::for_agent`'s prefix scheme
-    /// (Stage 5 Project decision 6 — flat `graphs/<gid>/agents/<aid>`
-    /// id form) so a future schema bump touches one call site rather
-    /// than every spawn / reconcile / retire helper.
+    /// so a future schema bump touches one call site rather than every
+    /// spawn / reconcile / retire helper.
     pub fn open_for_agent(
         storage: Arc<dyn AgentStorage>,
         graph_id: GraphId,
@@ -547,26 +324,15 @@ impl AgentFs {
     }
 
     /// Reconcile a tail object against the on-disk reality under its
-    /// indexed prefix. Called once per `new_with_storage` to recover
+    /// indexed prefix, called once per `new_with_storage` to recover
     /// from any prior crash that PUT an object without updating the
-    /// tail (`scratch/agent_storage.md` § 7.1).
+    /// tail.
     ///
-    /// Algorithm:
-    /// 1. LIST every key under the indexed prefix (skip the tail
-    ///    object itself and any non-record sidecar files).
-    /// 2. If every on-disk filename is in the tail (the common no-lag
-    ///    case), do nothing — no PUT, no churn.
-    /// 3. Otherwise, recompute the tail as the lex-greatest `TAIL_K`
-    ///    on-disk filenames in newest-first order, preserving any
-    ///    existing `added_at` timestamps from the prior tail (so a
-    ///    re-reconciliation produces byte-identical bytes), and PUT
-    ///    it back.
-    ///
-    /// Filenames-only comparison is correct for both `outputs/` and
-    /// `evidence/`: lex-greatest is what `list_recent_*` returns and
-    /// the tail's only role is to make that fetch O(1). Mis-ordered
-    /// `added_at` between recovered entries is cosmetic — no caller
-    /// uses the tail for chronology.
+    /// Algorithm: LIST under the prefix; if every on-disk filename is
+    /// already in the tail, no PUT. Otherwise rebuild the tail as the
+    /// lex-greatest `TAIL_K` filenames in newest-first order,
+    /// preserving any prior `added_at` so a no-op re-reconciliation
+    /// produces byte-identical bytes, and PUT it back.
     async fn reconcile_tail(&self, tail_suffix: &str, indexed_prefix: &str) -> anyhow::Result<()> {
         let full_prefix = self.key(indexed_prefix);
         let page = self
@@ -574,8 +340,7 @@ impl AgentFs {
             .list(&full_prefix, None, usize::MAX)
             .await
             .map_err(|e| FsError::storage(&full_prefix, e))?;
-        // Reduce keys to *record filenames* (strip the indexed prefix
-        // off, drop sidecars and tempfile artifacts).
+        // Reduce keys to record filenames (strip indexed prefix, drop sidecars).
         let mut on_disk: Vec<String> = page
             .keys
             .into_iter()
@@ -605,24 +370,22 @@ impl AgentFs {
             .map(|e| e.filename.as_str())
             .collect();
 
-        // Fast path: every on-disk filename is in the tail. Skip the
-        // PUT entirely. (The tail may carry stale entries pointing to
-        // out-of-band-deleted files — we don't garbage-collect them
-        // here; the read path silently drops absent keys.)
+        // Fast path: no PUT when every on-disk filename is in the
+        // tail. Stale tail entries pointing to deleted files are
+        // dropped silently by the read path, not GC'd here.
         if on_disk.iter().all(|f| tail_filenames.contains(f.as_str())) {
             return Ok(());
         }
 
-        // Preserve original `added_at` for already-known filenames so
-        // a no-op subsequent reconcile produces identical bytes.
+        // Preserve original `added_at` so a no-op subsequent reconcile
+        // produces byte-identical bytes.
         let existing_added_at: std::collections::HashMap<&str, DateTime<Utc>> = existing_tail
             .entries
             .iter()
             .map(|e| (e.filename.as_str(), e.added_at))
             .collect();
 
-        // Lex-greatest TAIL_K, in newest-first order (reverse-lex so
-        // entry 0 is the "most recent" in the tail's contract).
+        // Lex-greatest TAIL_K, reversed so entry 0 is the newest.
         let take_from = on_disk.len().saturating_sub(TAIL_K);
         let mut chosen: Vec<&str> = on_disk[take_from..].iter().map(String::as_str).collect();
         chosen.reverse();
@@ -645,17 +408,13 @@ impl AgentFs {
         Ok(())
     }
 
-    /// Borrow the underlying storage. Exposed for higher layers (tail
-    /// indices, snapshot scans) that need direct trait access without
-    /// going through every per-shape method.
+    /// Borrow the underlying storage. Exposed for higher layers that
+    /// need direct trait access without a per-shape method.
     pub fn storage(&self) -> &Arc<dyn AgentStorage> {
         &self.storage
     }
 
-    /// Borrow the agent's key prefix (always either empty or ending in
-    /// `/`). Exposed so the tail-index work (JAR2-54) can compute
-    /// `<prefix>outputs/_tail.json` keys without re-implementing the
-    /// prefixing logic.
+    /// Borrow the agent's key prefix (always either empty or ending in `/`).
     pub fn prefix(&self) -> &str {
         &self.prefix
     }
@@ -663,30 +422,22 @@ impl AgentFs {
     /// Persist an `EvidenceRecord` under `<prefix>evidence/<id>.json`.
     ///
     /// Writing the same record twice is a no-op: the file is content-
-    /// addressed by `record.id` (sha256 of `(tool, args, result)` —
-    /// see [`crate::evidence::EvidenceId::new`]), so a duplicate write
-    /// would produce identical bytes. We use
-    /// [`crate::storage::AgentStorage::put_if_absent`] which makes the
-    /// dedup atomic — race-free against a concurrent re-record from a
-    /// retried activity, matching the property the on-disk
-    /// `O_EXCL` give us today.
+    /// addressed by `record.id` (sha256 of `(tool, args, result)`), so
+    /// a duplicate write would produce identical bytes.
+    /// [`crate::storage::AgentStorage::put_if_absent`] makes the dedup
+    /// race-free against retried activities.
     pub async fn record_evidence(&self, record: EvidenceRecord) -> anyhow::Result<EvidenceId> {
         let id = record.id.clone();
         let key = self.evidence_key(&id);
         let bytes = serde_json::to_vec_pretty(&record)?;
-        // `put_if_absent` returns Created on first write, Existed on
-        // subsequent attempts; both paths are success for the
-        // content-addressed dedup contract.
         let outcome: PutOutcome = self
             .storage
             .put_if_absent(&key, Bytes::from(bytes))
             .await
             .map_err(|e| FsError::storage(&key, e))?;
-        // Update the tail-index only on first write — a replayed
-        // `record_evidence` for an already-seen sha256 would otherwise
-        // shuffle the existing entry to the front, polluting recency
-        // semantics with retry artefacts. `Existed` means we already
-        // counted this evidence id in a prior call.
+        // Tail update only on first write — a replayed record would
+        // otherwise shuffle the entry to the front, polluting recency
+        // with retry artefacts.
         if matches!(outcome, PutOutcome::Created) {
             let filename = format!("{}.json", id);
             self.append_to_tail(EVIDENCE_TAIL_SUFFIX, filename).await?;
@@ -714,19 +465,12 @@ impl AgentFs {
     /// enforcing the provenance contract: at least one evidence id,
     /// and every id must resolve to a record.
     ///
-    /// **Idempotent under retries (JAR2-70).** `OutputId::new` is
-    /// content-addressed over `(content, evidence)`, so two calls with
-    /// the same arguments target the same key. We use
-    /// [`crate::storage::AgentStorage::put_if_absent`] — a second call
-    /// returns `Existed` and skips the tail-index update, so the
-    /// `_tail.json` `added_at` for the entry stays at the first-write
-    /// timestamp and the `entries` list does not double-count.
-    ///
-    /// `created_at` is **not** part of the hash, so the bytes written
-    /// on the first call (`output.created_at = Utc::now()` at that
-    /// moment) are the bytes that stay on disk; a retry's freshly
-    /// minted `created_at` is silently discarded by `put_if_absent`.
-    /// This matches `record_evidence`'s dedup contract.
+    /// Idempotent under retries. `OutputId::new` is content-addressed
+    /// over `(content, evidence)`, so two calls with the same
+    /// arguments target the same key. `put_if_absent` skips the
+    /// tail-index update on a duplicate so `added_at` stays pinned at
+    /// the first write. `created_at` is not in the hash; the bytes
+    /// from the first call are the bytes that stay on disk.
     pub async fn persist_output(
         &self,
         content: &str,
@@ -735,10 +479,7 @@ impl AgentFs {
         if evidence.is_empty() {
             return Err(FsError::EmptyEvidence.into());
         }
-        // Verify presence of every cited evidence id before the write.
-        // A future optimization batches these via `get_many`; today's
-        // call counts are tiny (single-digit) so per-id `get` keeps
-        // the error message simple.
+        // Verify every cited evidence id before the write.
         for id in evidence {
             self.evidence_must_exist(id).await?;
         }
@@ -751,29 +492,22 @@ impl AgentFs {
             .put_if_absent(&key, Bytes::from(bytes))
             .await
             .map_err(|e| FsError::storage(&key, e))?;
-        // Update the outputs tail-index only on first write — a
-        // replayed `persist_output` for an already-seen id (a retry,
-        // or a second tick emitting the same `(content, evidence)`)
-        // would otherwise shuffle the entry to the front with a fresh
-        // `added_at`, polluting recency semantics with retry
-        // artefacts. Order matters: the file is PUT first, *then* the
-        // tail. If a crash happens between the two PUTs, the file is
-        // recoverable via the LIST-fallback in
-        // `read_recent_window_with_tail` — see § 7.1 of
-        // `scratch/agent_storage.md` for the recovery argument.
+        // Tail update only on first write — duplicates must not
+        // shuffle `added_at` forward. File is PUT before the tail; a
+        // crash between the two leaves the file recoverable via the
+        // LIST fallback in `read_recent_window_with_tail`.
         if matches!(outcome, PutOutcome::Created) {
             self.append_to_tail(OUTPUTS_TAIL_SUFFIX, filename).await?;
         }
         Ok(output)
     }
 
-    /// Apply a batch of filesystem ops. The bootstrap only supports
-    /// writes and deletes under `notes/`; any path that escapes
-    /// `<root>/notes/` is rejected before any write happens.
+    /// Apply a batch of filesystem ops. Only writes and deletes under
+    /// `notes/` are accepted; any path that escapes `<root>/notes/`
+    /// causes the entire batch to be rejected before any write
+    /// happens.
     pub async fn apply_ops(&self, ops: Vec<FsOp>) -> anyhow::Result<()> {
-        // Validate every op first so a partial batch with a bad path in
-        // the middle does not leave a half-applied state. The validated
-        // key carries the agent prefix already.
+        // Pre-validate so a bad path mid-batch leaves no partial state.
         let mut planned: Vec<(String, FsOp)> = Vec::with_capacity(ops.len());
         for op in ops {
             let raw = match &op {
@@ -792,7 +526,7 @@ impl AgentFs {
                         .map_err(|e| FsError::storage(&key, e))?;
                 }
                 FsOp::DeleteFile { .. } => {
-                    // Idempotent at the type level — missing key is fine.
+                    // Idempotent: missing key is fine.
                     self.storage
                         .delete(&key)
                         .await
@@ -803,51 +537,31 @@ impl AgentFs {
         Ok(())
     }
 
-    /// Return the most recent (up to) `n` `Output`s on disk.
+    /// Return the most recent (up to) `n` `Output`s on disk, in
+    /// ascending filename order.
     ///
-    /// Order is ascending filename. As of JAR2-70 output filenames are
-    /// sha256 digests (content-addressed over `(content, evidence)`),
-    /// which carry no temporal meaning — so the lex-greatest `n` across
-    /// the whole history is *not* the same set as the `n` most recently
-    /// written. The tail-fast-path therefore only kicks in when the
-    /// tail object is provably complete (i.e. the tail holds fewer
-    /// than `TAIL_K` entries, which means every output file ever
-    /// written under this agent is in the tail). For agents that
-    /// accumulate more than `TAIL_K` outputs the LIST fallback gives
-    /// the existing lex-window semantics.
+    /// Output filenames are sha256 digests, so the lex-greatest `n`
+    /// across the whole history is not the same set as the `n` most
+    /// recently written. The tail-fast-path is only used when the
+    /// tail is provably complete (under `TAIL_K`). Beyond `TAIL_K`,
+    /// the LIST fallback gives the lex-window semantics.
     ///
-    /// This matches the evidence path's behavior exactly — see
-    /// [`AgentFs::list_recent_evidence`] for the rationale. Pre-JAR2-70
-    /// outputs were ULID-named and the fast path stayed safe at
-    /// `TAIL_K` capacity; content-addressing trades that asymmetry for
-    /// `persist_output` idempotency under retries.
-    ///
-    /// Crash-recovery: if a previous `persist_output` PUT the file but
-    /// crashed before the tail update, the file isn't in the tail;
-    /// `read_recent_window_with_tail` detects the lag and falls back
-    /// to LIST automatically. See the `tail_lag_recovery_*` tests.
+    /// Crash recovery: if a previous write PUT the file but crashed
+    /// before the tail update, `read_recent_window_with_tail` detects
+    /// the lag and falls back to LIST automatically.
     pub async fn list_recent_outputs(&self, n: usize) -> anyhow::Result<Vec<Output>> {
         let prefix = self.key("outputs/");
         self.read_recent_window_with_tail::<Output>(&prefix, OUTPUTS_TAIL_SUFFIX, n, false)
             .await
     }
 
-    /// JAR2-82 (stage 5.5): point lookup of one persisted [`Output`] by
-    /// its content-addressed [`OutputId`].
+    /// Point lookup of one persisted [`Output`] by its content-
+    /// addressed [`OutputId`].
     ///
-    /// Returns `Err(FsError::OutputNotFound(id))` when the file is
-    /// absent — the typed-error variant lets the
-    /// `reconcile_children` activity wrap the miss as
-    /// `ReconciliationError::ChildOutputNotFound` (which the parent
-    /// workflow body folds into a `CorrectionContext` for the next
-    /// tick) without losing the original id.
-    ///
-    /// Read-only by construction: a `storage.get` against
-    /// `<prefix>outputs/<id>.json` plus a serde decode. No tail-index
-    /// update, no mandate write. Composes safely with
-    /// [`AgentFs::open_for_agent`] for the cross-agent reconcile path
-    /// where the caller never opens the *other* agent's FS via
-    /// `new_with_storage`.
+    /// Returns `Err(FsError::OutputNotFound(id))` when absent so
+    /// callers can fold the miss into a typed error without losing
+    /// the id. Read-only by construction; composes with
+    /// [`AgentFs::open_for_agent`] for cross-agent reads.
     pub async fn read_output(&self, id: &OutputId) -> anyhow::Result<Output> {
         let key = self.key(&format!("outputs/{}.json", id));
         let got = self
@@ -861,42 +575,27 @@ impl AgentFs {
         }
     }
 
-    /// Return the most recent (up to) `n` `EvidenceRecord`s on disk.
+    /// Return the most recent (up to) `n` `EvidenceRecord`s on disk,
+    /// in ascending filename order.
     ///
-    /// Order is ascending filename. Evidence filenames are sha256 hex
-    /// digests, which carry no temporal meaning — so the lex-greatest
-    /// `n` across the whole history is *not* the same set as the `n`
-    /// most recently written. The tail-fast-path therefore only kicks
-    /// in when the tail object is provably complete (i.e. the tail
-    /// holds fewer than `TAIL_K` entries, which means every evidence
-    /// file ever written under this agent is in the tail). For agents
-    /// that accumulate more than `TAIL_K` evidence records the LIST
-    /// fallback gives the existing lex-window semantics.
-    ///
-    /// This asymmetry vs. outputs is a deliberate design choice (see
-    /// `scratch/agent_storage.md` § 7.1 — the tail object is a single-
-    /// shape primitive across both; the *interpretation* differs by
-    /// content-addressing scheme of the indexed prefix). The common
-    /// case in deployed agents — well under `TAIL_K` evidence records
-    /// alive at once — stays O(1).
+    /// Evidence filenames are sha256 digests, so lex-greatest is not
+    /// the same set as most-recently-written. The tail-fast-path only
+    /// engages when the tail is provably complete (under `TAIL_K`);
+    /// beyond that the LIST fallback handles the lex window. The
+    /// common case — well under `TAIL_K` records alive — stays O(1).
     pub async fn list_recent_evidence(&self, n: usize) -> anyhow::Result<Vec<EvidenceRecord>> {
         let prefix = self.key("evidence/");
         self.read_recent_window_with_tail::<EvidenceRecord>(&prefix, EVIDENCE_TAIL_SUFFIX, n, false)
             .await
     }
 
-    /// Write `retirement.json` with the supplied reason and `retired_at`
-    /// timestamp. Overwrites any prior retirement record.
+    /// Write `retirement.json` with the supplied reason and
+    /// `retired_at` timestamp. Overwrites any prior retirement record.
     ///
-    /// **`retired_at` is supplied by the caller**, not stamped here. The
-    /// in-process agent loop (`agent_core::dispatch`) passes `Utc::now()`;
-    /// the Temporal workflow path (`jarvis_temporal::activities::persist_retirement`)
-    /// passes a deterministic timestamp sourced from the activity's
-    /// scheduled-time so replay produces byte-identical bytes — see
-    /// JAR2-66 for the rationale (`scratch/temporal_rust_sdk_smoke.md`
-    /// § 2 row 4: workflow-time must be deterministic from history,
-    /// `Utc::now()` inside an activity body is fine but on retry would
-    /// drift, so we anchor on the SDK's stored timestamp instead).
+    /// `retired_at` is supplied by the caller, not stamped here, so
+    /// the Temporal workflow path can source a deterministic timestamp
+    /// from activity-scheduled-time and replay produces byte-identical
+    /// bytes. The in-process loop passes `Utc::now()`.
     pub async fn persist_retirement(
         &self,
         reason: &str,
@@ -928,9 +627,9 @@ impl AgentFs {
         Ok(())
     }
 
-    /// Read the claim previously written for `seed`. Returns `Ok(None)`
-    /// when no record is present so callers can branch cleanly between
-    /// "first time minting this seed" and "I/O failed."
+    /// Read the claim written for `seed`. Returns `Ok(None)` when no
+    /// record is present so callers can distinguish "first time
+    /// minting this seed" from "I/O failed".
     pub async fn read_claim(&self, seed: &str) -> anyhow::Result<Option<Claim>> {
         let key = self.claim_key(seed);
         let got = self
@@ -953,29 +652,20 @@ impl AgentFs {
         self.read_recent_json::<Claim>(&prefix, usize::MAX).await
     }
 
-    /// JAR2-83 (stage 5.6): persist a [`ConflictRecord`] under
+    /// Persist a [`ConflictRecord`] under
     /// `<prefix>conflicts/<id>.json` and return its content-addressed
     /// [`ConflictId`].
     ///
     /// Validates `record.alternatives.len() >= 2` and returns
-    /// [`FsError::ConflictAlternativesTooFew`] otherwise — a single-
-    /// alternative "conflict" carries no information and is treated as a
-    /// malformed `Decision::ReconcileChildren` from the LLM.
+    /// [`FsError::ConflictAlternativesTooFew`] otherwise.
     ///
-    /// **Idempotent under retries.** `ConflictId` is content-addressed
-    /// over `(alternatives, resolution)`, so a retried `reconcile_children`
-    /// activity that re-PUTs the same record targets the same key. We
-    /// use [`AgentStorage::put_if_absent`] which makes the dedup atomic
-    /// — same shape as `record_evidence` / `persist_output`. `timestamp`
-    /// is not in the hash; the bytes written on the first call (carrying
-    /// the first attempt's `timestamp`) are the bytes that stay on disk,
-    /// matching `Output::created_at`'s contract.
+    /// Idempotent under retries: `ConflictId` is content-addressed
+    /// over `(alternatives, resolution)`, and `put_if_absent` makes
+    /// dedup atomic. `timestamp` is not in the hash; the bytes from
+    /// the first call are the bytes that stay on disk.
     ///
-    /// **No tail-index update.** `conflicts/` is bounded — dozens per
-    /// agent over its lifetime per Stage 5 Project decision 14 — so the
-    /// 2.5.4 tail-index pattern is unjustified overhead here. The
-    /// directory-scan path ([`AgentFs::list_conflicts`]) is the only
-    /// reader and it's O(M) over a small M.
+    /// No tail-index update — `conflicts/` is bounded to dozens per
+    /// agent so the tail-index pattern is unjustified overhead.
     pub async fn write_conflict(&self, record: &ConflictRecord) -> anyhow::Result<ConflictId> {
         if record.alternatives.len() < 2 {
             return Err(FsError::ConflictAlternativesTooFew {
@@ -986,9 +676,6 @@ impl AgentFs {
         let id = record.id.clone();
         let key = self.conflict_key(&id);
         let bytes = serde_json::to_vec_pretty(record)?;
-        // `put_if_absent` returns Created on first write, Existed on
-        // duplicate attempts — both paths are success for the
-        // content-addressed dedup contract.
         self.storage
             .put_if_absent(&key, Bytes::from(bytes))
             .await
@@ -996,15 +683,10 @@ impl AgentFs {
         Ok(id)
     }
 
-    /// JAR2-83 (stage 5.6): point lookup of one persisted
-    /// [`ConflictRecord`] by its content-addressed [`ConflictId`].
-    ///
-    /// Returns `Ok(None)` when the file is absent — the typed-error
-    /// shape (`OutputNotFound`/`EvidenceNotFound`) is reserved for read
-    /// paths where the caller needs to distinguish "the id doesn't
-    /// resolve" from "I/O failed". Conflict-record reads are audit /
-    /// inspection only and a missing id is not a contract violation, so
-    /// the simpler `Option`-returning shape mirrors `read_claim`.
+    /// Point lookup of one persisted [`ConflictRecord`] by its
+    /// content-addressed [`ConflictId`]. Returns `Ok(None)` when
+    /// absent — conflict reads are audit-only and a missing id is not
+    /// a contract violation, so the shape mirrors `read_claim`.
     pub async fn read_conflict(&self, id: &ConflictId) -> anyhow::Result<Option<ConflictRecord>> {
         let key = self.conflict_key(id);
         let got = self
@@ -1018,10 +700,9 @@ impl AgentFs {
         }
     }
 
-    /// JAR2-83 (stage 5.6): return every conflict record under
-    /// `<prefix>conflicts/` in ascending filename (== ascending hex-id)
-    /// order. Bounded by the projected count cited above; the LIST +
-    /// `get_many` shape is the same as [`AgentFs::list_claims`].
+    /// Return every conflict record under `<prefix>conflicts/` in
+    /// ascending filename order. LIST + `get_many` shape, same as
+    /// [`AgentFs::list_claims`].
     pub async fn list_conflicts(&self) -> anyhow::Result<Vec<ConflictRecord>> {
         let prefix = self.key("conflicts/");
         self.read_recent_json::<ConflictRecord>(&prefix, usize::MAX)
@@ -1053,14 +734,11 @@ impl AgentFs {
     /// Prepend `filename` to the tail object at `<prefix><tail_suffix>`
     /// and truncate to [`TAIL_K`].
     ///
-    /// Single-writer-per-agent is the wider engine contract, so we do
-    /// a plain GET-modify-PUT here without CAS — the loser of a race
-    /// would by definition be a violation of single-writer (the agent
-    /// loop drives all writes for a given agent). A failing tail-PUT
-    /// after a successful object-PUT leaves the tail lagging; the
-    /// reader's `read_recent_window_with_tail` detects this and falls
-    /// back to LIST. **No JSONL-append form ships** per decision 7 —
-    /// the tail object is the canonical artefact across backends.
+    /// Plain GET-modify-PUT without CAS: single-writer-per-agent is
+    /// the engine-wide contract. A failed tail-PUT after a successful
+    /// object-PUT leaves the tail lagging; the reader's
+    /// `read_recent_window_with_tail` detects this and falls back to
+    /// LIST.
     async fn append_to_tail(&self, tail_suffix: &str, filename: String) -> anyhow::Result<()> {
         let key = self.key(tail_suffix);
         let existing = self
@@ -1072,11 +750,8 @@ impl AgentFs {
             Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             None => TailObject::default(),
         };
-        // Defensive dedup: if the same filename is already in the tail
-        // (rare — would mean a non-content-addressed re-write that
-        // somehow reached this path), drop the old entry first so the
-        // newest position is the only one we keep. Avoids the tail
-        // double-counting under odd retry patterns.
+        // Defensive dedup: drop any prior entry for the same filename
+        // so the newest position is the only one we keep.
         tail.entries.retain(|e| e.filename != filename);
         tail.entries.insert(
             0,
@@ -1098,33 +773,21 @@ impl AgentFs {
 
     /// Tail-fast-path read for `outputs/` or `evidence/` recent windows.
     ///
-    /// `prefix` is the indexed prefix (e.g. `outputs/` or
-    /// `<agent_prefix>outputs/`). `tail_suffix` is the relative tail-
-    /// object key under that prefix's parent agent prefix (e.g.
-    /// `outputs/_tail.json`). `n` is the requested window. `lex_monotonic`
-    /// indicates whether "most recently written" is the same set as
-    /// "lex-greatest" for this indexed prefix — `false` for both
-    /// outputs and evidence post-JAR2-70 (both content-addressed),
-    /// kept as a parameter for backends or future prefixes that may
-    /// reintroduce a monotonic naming scheme.
+    /// `prefix` is the indexed prefix. `tail_suffix` is the tail
+    /// object's relative key. `lex_monotonic` indicates whether "most
+    /// recently written" coincides with "lex-greatest" under this
+    /// prefix's naming scheme — `false` for sha256-addressed prefixes,
+    /// kept as a parameter for future monotonic schemes.
     ///
     /// Decision matrix:
     ///
-    /// - `n == 0` → empty result, no I/O.
-    /// - Tail object missing → fall back to LIST.
-    /// - Tail length `< TAIL_K` → tail is complete; use it (no LIST
-    ///   needed regardless of `lex_monotonic`).
+    /// - `n == 0` → empty, no I/O.
+    /// - Tail missing → fall back to LIST.
+    /// - Tail length `< TAIL_K` → tail is complete; use it regardless
+    ///   of `lex_monotonic`.
     /// - Tail length `== TAIL_K` AND `lex_monotonic` AND `n <= TAIL_K`
-    ///   → use tail (outputs case; older entries that fell off the
-    ///   tail are lex-smaller than every tail entry).
+    ///   → use tail.
     /// - Otherwise → fall back to LIST.
-    ///
-    /// Falling back to LIST and the entire LIST + sort + get_many is
-    /// the pre-2.5.4 behavior, preserved as the slow path so the
-    /// answer stays correct even under the asymmetry above. The fast
-    /// path keeps `list_recent_outputs` O(1) regardless of total
-    /// output count (asserted by the `tail_index_outputs_is_o1_at_10k`
-    /// `#[ignore]`d microbench).
     async fn read_recent_window_with_tail<T>(
         &self,
         prefix: &str,
@@ -1145,10 +808,9 @@ impl AgentFs {
             .await
             .map_err(|e| FsError::storage(&tail_key, e))?;
         if let Some(bytes) = tail_bytes {
-            // A serde error on the tail is treated as "fall back to
-            // LIST" rather than fail loudly: a torn write or a
-            // forward-incompatible schema shouldn't break recent-N
-            // assembly, only slow it down.
+            // A serde error on the tail falls back to LIST — torn
+            // writes or schema drift should slow recent-N assembly,
+            // not break it.
             let parsed: Result<TailObject, _> = serde_json::from_slice(&bytes);
             if let Ok(tail) = parsed {
                 let tail_complete = tail.entries.len() < TAIL_K;
@@ -1158,24 +820,16 @@ impl AgentFs {
                 }
             }
         }
-        // LIST fallback — the pre-2.5.4 path. Covers:
-        //   * Tail missing (fresh FS, or never-written prefix).
-        //   * Tail at capacity with lex-non-monotonic filenames (the
-        //     evidence > TAIL_K case).
-        //   * `n > TAIL_K` with non-monotonic filenames.
-        //   * Recovery: a write whose tail update failed mid-flight
-        //     is still on disk; LIST picks it up. The single-writer
-        //     contract means we won't be racing the agent-loop here.
+        // LIST fallback covers: missing tail, capacity-bound tail
+        // with non-monotonic filenames, `n > TAIL_K`, and recovery
+        // when a tail update failed mid-flight.
         self.read_recent_json::<T>(prefix, n).await
     }
 
-    /// Materialise the trailing-`n` slice of `tail` (which is reverse-
-    /// chronological — newest entry at index 0) and return values in
-    /// ascending filename order. The ordering matches the pre-2.5.4
-    /// `read_recent_json` contract: callers (and tests) compare
-    /// against the lex-sorted last-n. Missing files in the window
-    /// (e.g. a tail entry whose object was deleted out-of-band) are
-    /// silently dropped — same forgiveness as the LIST path.
+    /// Materialise the trailing-`n` slice of `tail` (newest at index
+    /// 0) and return values in ascending filename order. Missing files
+    /// in the window are dropped silently, matching the LIST path's
+    /// forgiveness for out-of-band deletes.
     async fn read_keys_for_tail<T>(
         &self,
         prefix: &str,
@@ -1186,8 +840,8 @@ impl AgentFs {
         T: serde::de::DeserializeOwned,
     {
         // Tail is reverse-chronological; the first `n` entries are
-        // "the n most recent". Re-sort by filename ascending so the
-        // returned vector matches the lex-sort semantics tests pin.
+        // the most recent. Re-sort ascending so the returned vector
+        // matches the lex-sort semantics the caller expects.
         let take_n = tail.entries.len().min(n);
         let mut filenames: Vec<String> = tail.entries[..take_n]
             .iter()
@@ -1222,41 +876,24 @@ impl AgentFs {
     }
 
     /// Lex-sort every `.json` key under `prefix`, take the last `n`,
-    /// fetch and deserialize.
-    ///
-    /// Implementation mirrors the pre-2.5.3 `read_recent_json` but goes
-    /// through the storage trait: one `list` to enumerate keys, then a
-    /// single `get_many` for the trailing window so a remote backend
-    /// pays one round-trip instead of N. A missing prefix yields an
-    /// empty list (the backend returns an empty `ListPage`), preserving
-    /// the "safe to call right after `open`" property.
-    ///
-    /// Scaling note: still O(M) under the prefix because we ask for
-    /// every key and slice in memory. The O(1) tail-index path lands
-    /// in JAR2-54.
+    /// fetch and deserialise. One `list` plus a single `get_many` so
+    /// a remote backend pays one round-trip rather than N. O(M) under
+    /// the prefix; the tail-index fast path covers the common case.
     async fn read_recent_json<T>(&self, prefix: &str, n: usize) -> anyhow::Result<Vec<T>>
     where
         T: serde::de::DeserializeOwned,
     {
-        // `usize::MAX` as `limit` asks the backend for everything; both
-        // `MemoryStorage` and `LocalStorage` honor that without
-        // pagination. A future scale fix replaces this with a bounded
-        // page + heap-merge, but the tail-index work (JAR2-54)
-        // sidesteps it entirely for the common case.
+        // `usize::MAX` asks the backend for everything in one page;
+        // both `MemoryStorage` and `LocalStorage` honour that without
+        // pagination.
         let page = self
             .storage
             .list(prefix, None, usize::MAX)
             .await
             .map_err(|e| FsError::storage(prefix, e))?;
-        // Keep only `.json` keys — guards against any sidecar
-        // artifacts a backend might surface. Also exclude the
-        // tail-index file (`_tail.json`, JAR2-54) so the LIST
-        // fallback doesn't try to deserialise a `TailObject` as a
-        // `Output`/`EvidenceRecord`. The fallback path runs from
-        // `read_recent_window_with_tail`, which already routes around
-        // the tail object when it can; this filter handles the case
-        // where we ended up here because the tail was unparseable or
-        // capacity-exceeded.
+        // Keep only `.json` keys and drop the `_tail.json` sidecar so
+        // a fallback LIST does not try to deserialise a `TailObject`
+        // as the record type.
         let mut keys: Vec<String> = page
             .keys
             .into_iter()
@@ -1280,11 +917,7 @@ impl AgentFs {
         for (key, blob) in window.iter().zip(blobs.into_iter()) {
             let bytes = match blob {
                 Some(b) => b,
-                // Key disappeared between list and get_many — treat as
-                // absent rather than error. (Single-writer-per-agent
-                // makes this almost impossible in practice; pinning the
-                // behavior keeps races between concurrent test threads
-                // tame.)
+                // Key vanished between list and get_many; treat as absent.
                 None => {
                     tracing::debug!(key = key.as_str(), "key absent between list and get_many");
                     continue;
@@ -1296,17 +929,15 @@ impl AgentFs {
         Ok(out)
     }
 
-    /// Resolve `raw` to a storage key under `<prefix>notes/`. Paths must
-    /// be relative, start with a `notes/` segment, contain only normal
-    /// path components (no `..`, no root, no Windows prefix), and name
-    /// a file inside `notes/` (not `notes/` itself).
+    /// Resolve `raw` to a storage key under `<prefix>notes/`. Paths
+    /// must be relative, rooted at `notes/`, contain only normal
+    /// components (no `..`, no root, no Windows prefix), and name a
+    /// file inside `notes/` (not `notes/` itself).
     ///
-    /// We deliberately walk `Components` instead of using
-    /// `Path::canonicalize`: target files may not exist yet (write
-    /// targets), and canonicalize would error on those. The bootstrap
-    /// scope (single-process owner, no symlink farm) makes this
-    /// component check sufficient. Symlinks pointing out of `notes/` are
-    /// a known follow-up.
+    /// Walks `Components` rather than calling `Path::canonicalize`
+    /// because write targets may not exist yet, which canonicalize
+    /// treats as an error. Symlinks pointing out of `notes/` are a
+    /// known follow-up.
     fn resolve_notes_key(&self, raw: &str) -> anyhow::Result<String> {
         let candidate = Path::new(raw);
 
@@ -1315,7 +946,7 @@ impl AgentFs {
         for comp in candidate.components() {
             match comp {
                 Component::Normal(part) => cleaned.push(part),
-                Component::CurDir => {} // "." — harmless
+                Component::CurDir => {}
                 Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                     return Err(FsError::PathTraversal(raw.to_string()).into());
                 }
@@ -1332,10 +963,9 @@ impl AgentFs {
             Err(_) => return Err(FsError::PathOutsideNotes(raw.to_string()).into()),
         };
 
-        // Re-emit the tail as a `/`-separated key under
-        // `<prefix>notes/`. Components are guaranteed `Normal` by the
-        // first pass so `to_str` only fails on non-UTF-8, which we
-        // surface as a traversal error (no other reasonable mapping).
+        // Re-emit as a `/`-joined key under `<prefix>notes/`. The
+        // first pass already filtered to Normal components; non-UTF-8
+        // surfaces as PathTraversal (no other reasonable mapping).
         let mut parts = Vec::new();
         for comp in tail.components() {
             match comp {
@@ -1382,10 +1012,9 @@ mod tests {
         let root = tmp.path();
         // mandate.json present.
         assert!(root.join("mandate.json").is_file());
-        // Subdirectories are created lazily by `LocalStorage` on first
-        // write; they aren't materialised by `open` alone after the
-        // 2.5.3 facade swap. Verify the mandate write succeeded and
-        // round-trips instead.
+        // Subdirectories are created lazily by `LocalStorage` on
+        // first write, so `open` alone does not materialise them.
+        // Verify the mandate write round-trips instead.
         let bytes = std::fs::read(root.join("mandate.json")).unwrap();
         let back: Mandate = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, mandate);
@@ -1426,9 +1055,8 @@ mod tests {
         let id2 = fs.record_evidence(rec.clone()).await.unwrap();
         assert_eq!(id, id2);
 
-        // Count evidence record files only — `_tail.json` (JAR2-54)
-        // is a separate index artefact under `evidence/` and not
-        // itself an evidence record, so it doesn't violate dedup.
+        // Count evidence record files only — `_tail.json` is the
+        // tail-index sidecar, not an evidence record.
         let evidence_files: Vec<_> = std::fs::read_dir(tmp.path().join("evidence"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
@@ -1500,7 +1128,7 @@ mod tests {
         assert!(back.evidence.contains(&id));
     }
 
-    // ---- JAR2-82 (stage 5.5): read_output + open_for_agent ----
+    // ---- read_output + open_for_agent ----
 
     #[tokio::test]
     async fn read_output_returns_persisted_output_by_id() {
@@ -1549,8 +1177,8 @@ mod tests {
             "prefix must match the flat workflow-id scheme",
         );
 
-        // Sanity: writing evidence under this prefix and reading it
-        // back works (cross-agent reads in 5.5 use exactly this shape).
+        // Writing evidence under this prefix and reading it back
+        // works — cross-agent reads use exactly this shape.
         let rec = record("echo", json!({"x": 1}), json!({"y": 2}));
         let id = fs.record_evidence(rec.clone()).await.unwrap();
         let key = format!(
@@ -1565,9 +1193,9 @@ mod tests {
 
     #[tokio::test]
     async fn open_for_agent_supports_cross_agent_output_read() {
-        // Models the JAR2-82 reconcile path: a parent's FS scoped to
-        // its own prefix opens a child's FS over the *same* storage
-        // backend (different prefix) and reads the child's output.
+        // Models the reconcile path: a parent's FS scoped to its own
+        // prefix opens a child's FS over the same storage backend
+        // (different prefix) and reads the child's output.
         use crate::agent_ref::{AgentId, GraphId};
         use crate::storage::MemoryStorage;
         use uuid::Uuid;
@@ -1592,8 +1220,7 @@ mod tests {
             .unwrap();
 
         // Parent uses `open_for_agent` (no mandate) to read the
-        // child's output by id — exactly the surface the 5.5 activity
-        // exercises.
+        // child's output by id — the cross-agent reconcile surface.
         let parent_view = AgentFs::open_for_agent(storage, graph_id, child_agent_id);
         let read_back = parent_view.read_output(&child_out.id).await.unwrap();
         assert_eq!(read_back, child_out);
@@ -1733,10 +1360,9 @@ mod tests {
         let recent = fs.list_recent_outputs(8).await.unwrap();
         assert_eq!(recent.len(), 8);
 
-        // Returned outputs are in ascending filename (= sha256) order.
-        // Post-JAR2-70 the filename has no temporal meaning, so this is
-        // a lex-sort assertion only — recency semantics live on the
-        // tail object's `added_at`, not the filename.
+        // Returned outputs are in ascending filename (= sha256) order
+        // — a lex-sort assertion only. Recency lives on the tail
+        // object's `added_at`, not on the filename.
         let ids: Vec<_> = recent.iter().map(|o| o.id.clone()).collect();
         let mut sorted = ids.clone();
         sorted.sort();
@@ -1751,10 +1377,9 @@ mod tests {
         assert!(none.is_empty());
     }
 
-    /// JAR2-70 — `persist_output` is idempotent over `(content, evidence)`:
-    /// two calls with the same arguments produce one file and one
-    /// tail-index entry, with the tail's `added_at` pinned at the first
-    /// write (no shuffle on the retry).
+    /// `persist_output` is idempotent over `(content, evidence)`: two
+    /// calls with the same arguments produce one file and one tail
+    /// entry, with `added_at` pinned at the first write.
     #[tokio::test]
     async fn persist_output_is_idempotent_for_identical_content_and_evidence() {
         let (tmp, fs, _m) = fresh_fs().await;
@@ -1921,7 +1546,7 @@ mod tests {
         assert_eq!(empty.prefix(), "");
     }
 
-    // ---- JAR2-28: claim_seed persistence -------------------------------
+    // ---- claim_seed persistence -------------------------------
 
     use crate::decision::{
         ClaimSeed, ContextBundle, Decide, Decision, ToolCall as DecisionToolCall,
@@ -2162,7 +1787,7 @@ mod tests {
         assert_ne!(ClaimSeed::new("phase-2"), ClaimSeed::new("phase-3"));
     }
 
-    // ---- JAR2-53: facade-level adversarial tests -----------------------
+    // ---- facade-level adversarial tests -----------------------
 
     /// Mock `AgentStorage` that returns `Transient` for the next N
     /// `put` calls, then delegates to an inner `MemoryStorage`. Lets
@@ -2321,12 +1946,12 @@ mod tests {
         assert_eq!(recent[0].id, out.id);
     }
 
-    // ---- JAR2-54: tail-index integration -------------------------------
+    // ---- tail-index integration -------------------------------
 
     /// Round-trip a small workload through the tail-fast path. The
     /// `outputs/_tail.json` and `evidence/_tail.json` objects must be
     /// present after writes, and `list_recent_*` returns the same
-    /// answer as the pre-2.5.4 LIST path would have.
+    /// answer the LIST fallback would.
     #[tokio::test]
     async fn tail_index_outputs_and_evidence_are_written_on_each_put() {
         let (tmp, fs, _m) = fresh_fs().await;
@@ -2350,8 +1975,8 @@ mod tests {
 
     /// The tail trims to `TAIL_K`. Write `TAIL_K + 16` outputs and
     /// assert the on-disk tail has exactly `TAIL_K` entries with the
-    /// newest at index 0 (by `added_at`, not filename — sha256-named
-    /// post-JAR2-70 carries no temporal meaning).
+    /// newest at index 0 by `added_at` (filenames are sha256, so they
+    /// carry no temporal meaning).
     #[tokio::test]
     async fn tail_index_trims_to_tail_k() {
         let (tmp, fs, _m) = fresh_fs().await;
@@ -2378,11 +2003,10 @@ mod tests {
     }
 
     /// `list_recent_outputs(N)` returns the same lex-ascending
-    /// window as the pre-2.5.4 LIST path would have, even after the
-    /// tail has trimmed older entries. Under JAR2-70's sha256
-    /// filenames this asserts the LIST-fallback lex-window — the
-    /// tail-fast-path is bypassed because `lex_monotonic=false` and
-    /// the tail is at capacity (recency != lex ordering).
+    /// window the LIST path would, even after the tail has trimmed
+    /// older entries. Under sha256 filenames this asserts the
+    /// LIST-fallback lex-window — the tail-fast-path is bypassed
+    /// because `lex_monotonic=false` and the tail is at capacity.
     #[tokio::test]
     async fn list_recent_outputs_after_trim_matches_lex_window() {
         let (_tmp, fs, _m) = fresh_fs().await;
@@ -2461,13 +2085,11 @@ mod tests {
         assert_eq!(got.len(), 2);
     }
 
-    /// Crash recovery — tail lags on-disk reality (the real § 7.1
-    /// scenario). A previous process PUT `outputs/<sha256>.json` but
-    /// crashed before updating the tail. The tail has fewer entries
-    /// than disk; the in-process read path's `entries.len() < TAIL_K`
-    /// trust would silently drop the orphan. Open-time reconciliation
-    /// in `new_with_storage` rebuilds the tail from the LIST so the
-    /// in-process read path stays O(1) and correct.
+    /// Crash recovery: tail lags on-disk reality. A previous process
+    /// PUT `outputs/<sha256>.json` but crashed before updating the
+    /// tail. The in-process read path would trust the sub-capacity
+    /// tail and silently drop the orphan. Open-time reconciliation in
+    /// `new_with_storage` rebuilds the tail from the LIST.
     #[tokio::test]
     async fn open_time_reconcile_rebuilds_tail_when_lagging_behind_outputs() {
         let tmp = TempDir::new().unwrap();
@@ -2581,8 +2203,8 @@ mod tests {
     }
 
     /// `list_recent_*` returns an empty Vec when the prefix has no
-    /// writes yet (matches the pre-2.5.4 "safe to call right after
-    /// open" property). Verifies the no-tail-object path.
+    /// writes yet — "safe to call right after open". Verifies the
+    /// no-tail-object path.
     #[tokio::test]
     async fn list_recent_outputs_returns_empty_when_no_writes() {
         let (_tmp, fs, _m) = fresh_fs().await;
@@ -2609,18 +2231,13 @@ mod tests {
 
     /// Microbench: `list_recent_outputs(8)` over 10_000 outputs.
     ///
-    /// **JAR2-70 caveat.** Pre-JAR2-70, output filenames were ULIDs
-    /// (lex-monotonic with write time) and the tail-fast-path stayed
-    /// O(1) regardless of total output count. Post-JAR2-70, output
-    /// filenames are sha256 digests — non-monotonic — so once the
-    /// tail is at `TAIL_K` capacity, `list_recent_outputs` falls back
-    /// to the LIST path and the bench measures the LIST cost, not
-    /// the tail-fast-path. The bench is retained as a regression
-    /// guard against the LIST path silently degrading further; the
-    /// O(1) property the original bench asserted no longer holds at
-    /// the prefix level and would need a different naming scheme
-    /// (or a sidecar recency index) to restore. Bound relaxed so the
-    /// `#[ignore]`d bench still passes under the LIST path.
+    /// Output filenames are sha256 digests (non-monotonic), so once
+    /// the tail is at `TAIL_K` capacity `list_recent_outputs` falls
+    /// back to the LIST path and the bench measures LIST cost. The
+    /// bench is retained as a regression guard against the LIST path
+    /// degrading further; restoring an O(1) property at the prefix
+    /// level would need a different naming scheme or a sidecar
+    /// recency index.
     #[tokio::test]
     #[ignore = "microbench: long-running"]
     async fn tail_index_outputs_is_o1_at_10k() {
@@ -2638,18 +2255,15 @@ mod tests {
         let got = fs.list_recent_outputs(8).await.unwrap();
         let elapsed = start.elapsed();
         assert_eq!(got.len(), 8);
-        // Relaxed bound post-JAR2-70 — LIST fallback over 10 k
-        // sha256 filenames + sort + 8-entry get_many. Tuned to be
-        // unambiguous, not tight; primary purpose is a regression
-        // guard against the LIST path slipping into something
-        // outrageously slow.
+        // Loose bound — LIST fallback over 10 k sha256 filenames +
+        // sort + 8-entry get_many. Regression guard, not a tight cap.
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "list_recent_outputs(8) over 10k outputs took {elapsed:?}; bound exceeded"
         );
     }
 
-    // ---- JAR2-83 (stage 5.6): conflict-log FS writer ------------------
+    // ---- conflict-log FS writer ------------------
 
     use crate::agent_ref::AgentRef;
     use crate::conflict::{ConflictKind, ConflictRecord};

@@ -1,10 +1,10 @@
 //! `model-call` — one-shot DX CLI for exercising a `ModelClient` impl.
 //!
 //! Companion to `compute-evidence-id`: a hand-runnable binary for sanity-
-//! checking the JAR2-14 / JAR2-15 `ModelClient` adapters against a real
-//! vendor without writing a custom test or booting the agent loop. Useful
-//! for prompt iteration, vendor parity, and confirming auth + wire format
-//! end-to-end. Not part of the agent runtime.
+//! checking `ModelClient` adapters against a real vendor without writing a
+//! custom test or booting the agent loop. Useful for prompt iteration,
+//! vendor parity, and confirming auth + wire format end-to-end. Not part
+//! of the agent runtime.
 //!
 //! # Usage
 //!
@@ -29,11 +29,11 @@
 //!
 //! # Feature gating
 //!
-//! The `[[bin]]` entry no longer pins `required-features` because cargo
-//! does not support OR in that field. Instead, the per-vendor dispatch
-//! arms below are gated with `#[cfg(feature = "llm-...")]`; a build with
-//! neither feature still compiles the binary but every `--vendor` choice
-//! errors at runtime with a "rebuild with --features ..." hint.
+//! Cargo's `required-features` does not support OR, so the per-vendor
+//! dispatch arms below are gated with `#[cfg(feature = "llm-...")]`; a
+//! build with neither feature still compiles the binary but every
+//! `--vendor` choice errors at runtime with a "rebuild with --features
+//! ..." hint.
 //!
 //! # Output split
 //!
@@ -557,9 +557,8 @@ mod tests {
 
     #[test]
     fn build_request_cohere_succeeds() {
-        // JAR2-15 wiring: cohere now goes through the same vendor-agnostic
-        // request builder as anthropic. The previous "rejects with JAR2-15
-        // placeholder" behavior is gone.
+        // Cohere goes through the same vendor-agnostic request builder
+        // as anthropic.
         let p = ParsedArgs {
             vendor: Vendor::Cohere,
             model: None,
@@ -614,9 +613,8 @@ mod tests {
         assert!(format!("{err:#}").contains("empty"));
     }
 
-    /// Compile-time check that the request a JAR2-14 / JAR2-15 client can
-    /// consume is what `build_request` actually produces — `ModelClient::complete`
-    /// is the consumer.
+    /// Compile-time check that the request a `ModelClient` can consume is
+    /// what `build_request` actually produces.
     #[allow(dead_code)]
     fn _build_request_yields_modelclient_input(
         client: &dyn jarvis_node::model_client::ModelClient,

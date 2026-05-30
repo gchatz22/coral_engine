@@ -1,30 +1,7 @@
-//! `AgentStorage` — the storage abstraction backing the per-agent FS.
-//!
-//! Every method on today's `AgentFs` is object-shaped in disguise (put a
-//! named blob, get a named blob, list a prefix). This module extracts the
-//! minimum surface that supports every existing access pattern and maps
-//! cleanly to both the local-disk backend we ship today (JAR2-52) and the
-//! S3-compatible backend that lands in a future stage. See
-//! `scratch/agent_storage.md` for the full design, particularly:
-//!
-//! - § 2 mapping table (`AgentFs` method → object op).
-//! - § 5 trait surface (this module).
-//! - § 6 backend impl notes.
-//! - § 8 atomicity contract.
-//! - § 13 resolved decisions (load-bearing).
-//!
-//! # What ships in this ticket (JAR2-51)
-//!
-//! 1. The [`AgentStorage`] trait, [`PutOutcome`], [`ListPage`], and the
-//!    typed [`StorageError`] enum per decision 4. Trait-object-safe — no
-//!    generic methods, all bounds are `Send + Sync + 'static`.
-//! 2. [`MemoryStorage`], a `BTreeMap`-backed reference impl, gated behind
-//!    `#[cfg(any(test, feature = "memory-storage"))]` per decision 6.
-//!    Used in unit tests across the crate; production binaries that want
-//!    ephemeral behavior opt in via the `memory-storage` feature.
-//!
-//! `LocalStorage` (the on-disk backend) and the `AgentFs` facade refactor
-//! ship in JAR2-52 and JAR2-53 respectively.
+//! `AgentStorage` — the put/get/list storage abstraction backing the
+//! per-agent FS, with a `BTreeMap`-backed [`MemoryStorage`] reference impl
+//! (gated behind `#[cfg(any(test, feature = "memory-storage"))]`) and an
+//! on-disk [`LocalStorage`] backend in the `local` submodule.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -41,12 +18,8 @@ pub mod memory;
 pub use memory::MemoryStorage;
 
 /// Outcome of a [`AgentStorage::put_if_absent`] call. Distinguishes
-/// "wrote the bytes" from "key already existed, nothing changed."
-///
-/// The variant is load-bearing for the content-addressed evidence write
-/// path (`evidence/<sha256>.json` PUT-once-dedup-on-retry) and for any
-/// future "first writer wins" semantics; `AgentFs` uses it directly when
-/// the consumer needs to know whether a write happened.
+/// "wrote the bytes" from "key already existed, nothing changed" — used
+/// by content-addressed write paths to know whether a write happened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PutOutcome {
     /// The bytes were written and the key now resolves.
@@ -66,24 +39,17 @@ pub struct ListPage {
     pub next_cursor: Option<String>,
 }
 
-/// Typed errors raised by `AgentStorage` impls and surfaced through the
-/// `AgentFs` facade (JAR2-53). The taxonomy lets callers — the Temporal
-/// activity layer in particular — distinguish "key absent" (often
-/// expected) from "retry me" from "fail hard."
+/// Typed errors raised by `AgentStorage` impls. The taxonomy lets callers
+/// distinguish "key absent" (often expected) from "retry me" from "fail
+/// hard."
 ///
-/// Variants closely mirror `scratch/agent_storage.md` § 13 decision 4.
-/// `Other(anyhow::Error)` is the escape hatch for backend-specific errors
-/// that don't fit the taxonomy; impls should prefer mapping to a concrete
-/// variant when the underlying error is classifiable.
-///
-/// Implementations follow a "soft-not-found" convention for the common
-/// case: [`AgentStorage::get`] returns `Ok(None)` for an absent key
-/// instead of `Err(NotFound)` because the caller almost always wants to
-/// branch on presence rather than treat absence as an error. The
-/// `NotFound` variant exists for backends that surface it through the
-/// error channel for *other* operations (e.g. a non-idempotent delete on
-/// some object stores); impls are expected to swallow it into `Ok(())`
-/// for [`AgentStorage::delete`] (idempotent contract).
+/// Implementations follow a "soft-not-found" convention:
+/// [`AgentStorage::get`] returns `Ok(None)` for an absent key instead of
+/// `Err(NotFound)` because the caller almost always wants to branch on
+/// presence rather than treat absence as an error. The `NotFound` variant
+/// exists for backends that surface it through the error channel for
+/// *other* operations; impls are expected to swallow it into `Ok(())` for
+/// [`AgentStorage::delete`] (idempotent contract).
 #[derive(Debug, Error)]
 pub enum StorageError {
     /// A key was expected but does not resolve. `AgentStorage::get` does
@@ -115,8 +81,7 @@ pub enum StorageError {
 }
 
 impl StorageError {
-    /// Classify an `io::Error` from a local filesystem call. Used by
-    /// `LocalStorage` (JAR2-52) and the in-tree tests; exposed here so
+    /// Classify an `io::Error` from a local filesystem call. Exposed so
     /// every backend uses the same mapping for the I/O kinds it shares
     /// with the local impl.
     pub fn from_io(err: io::Error) -> Self {
@@ -140,9 +105,8 @@ pub type StorageResult<T> = Result<T, StorageError>;
 ///
 /// - [`MemoryStorage`] — in-process `BTreeMap`, gated behind a feature
 ///   flag, used by tests.
-/// - `LocalStorage` (JAR2-52) — on-disk POSIX directory; atomic semantics
-///   via tempfile + rename and `O_EXCL`.
-/// - `S3Storage` (future) — S3-compatible object store.
+/// - [`LocalStorage`] — on-disk POSIX directory; atomic semantics via
+///   tempfile + rename and `O_EXCL`.
 ///
 /// # Contract
 ///
@@ -183,10 +147,8 @@ pub trait AgentStorage: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-    //! Trait-level conformance suite. Lives in this module so it can be
-    //! shared with future backends — JAR2-52's `LocalStorage` tests reuse
-    //! the same `verify_*` helpers against a tempdir-backed impl, which
-    //! is how we keep "byte-identical behaviour across backends" honest.
+    //! Trait-level conformance suite shared by every backend so behaviour
+    //! stays byte-identical across impls.
     use super::*;
     use std::sync::Arc;
 
@@ -221,7 +183,6 @@ mod tests {
             .unwrap();
         assert_eq!(second, PutOutcome::Existed);
 
-        // Value is the original — second write was discarded.
         let got = storage.get(key).await.unwrap().unwrap();
         assert_eq!(got.as_ref(), b"v1");
     }
@@ -232,7 +193,6 @@ mod tests {
         storage.put("b", Bytes::from_static(b"B")).await.unwrap();
         storage.put("c", Bytes::from_static(b"C")).await.unwrap();
 
-        // Mixed present + absent + reordered.
         let keys: &[&str] = &["c", "missing", "a", "b"];
         let got = storage.get_many(keys).await.unwrap();
         assert_eq!(got.len(), 4);
@@ -251,7 +211,6 @@ mod tests {
         storage.delete("doomed").await.unwrap();
         assert!(storage.get("doomed").await.unwrap().is_none());
 
-        // Second delete is a no-op rather than NotFound.
         storage.delete("doomed").await.unwrap();
         storage.delete("never-written").await.unwrap();
     }
@@ -259,7 +218,6 @@ mod tests {
     /// `list` returns lex-sorted keys under `prefix`, honors `after`,
     /// and paginates through `limit` + `next_cursor`.
     async fn verify_list_prefix_and_pagination(storage: Arc<dyn AgentStorage>) {
-        // Seed several keys; some under our prefix, one outside it.
         for k in ["outputs/01", "outputs/02", "outputs/03", "outputs/04"] {
             storage.put(k, Bytes::from_static(b"x")).await.unwrap();
         }
@@ -268,7 +226,6 @@ mod tests {
             .await
             .unwrap();
 
-        // No cursor, generous limit: every matching key, lex-ascending.
         let page = storage.list("outputs/", None, 100).await.unwrap();
         assert_eq!(
             page.keys,
@@ -281,7 +238,6 @@ mod tests {
         );
         assert!(page.next_cursor.is_none());
 
-        // Paginate by 2.
         let page1 = storage.list("outputs/", None, 2).await.unwrap();
         assert_eq!(
             page1.keys,
@@ -297,10 +253,10 @@ mod tests {
             page2.keys,
             vec!["outputs/03".to_string(), "outputs/04".to_string()]
         );
-        // Page was exactly `limit` but no more keys exist → cursor None.
+        // Page exactly `limit` but no more keys exist → cursor None.
         assert!(page2.next_cursor.is_none());
 
-        // `after` is exclusive: passing an existing key skips it.
+        // `after` is exclusive: an existing key is skipped.
         let after_two = storage
             .list("outputs/", Some("outputs/02"), 100)
             .await
@@ -310,7 +266,6 @@ mod tests {
             vec!["outputs/03".to_string(), "outputs/04".to_string()]
         );
 
-        // Prefix isolation: `evidence/aa` is not returned.
         assert!(!page.keys.iter().any(|k| k.starts_with("evidence/")));
     }
 
@@ -371,9 +326,9 @@ mod tests {
         let _: Arc<dyn AgentStorage> = Arc::new(MemoryStorage::new());
     }
 
-    /// `StorageError::from_io` classifies the standard kinds the
-    /// `LocalStorage` impl (JAR2-52) cares about. Pinning here so the
-    /// taxonomy doesn't drift silently across the trait + impl boundary.
+    /// `StorageError::from_io` classifies the standard `io::ErrorKind`s
+    /// the local backend cares about. Pinned here so the taxonomy doesn't
+    /// drift silently across the trait + impl boundary.
     #[test]
     fn storage_error_from_io_classification() {
         let nf = StorageError::from_io(io::Error::new(io::ErrorKind::NotFound, "x"));

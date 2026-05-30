@@ -1,59 +1,18 @@
 //! Render a `ContextBundle` into a `Vec<Message>` the model can consume.
 //!
-//! The kernel's `Decide` trait sees a typed `ContextBundle` each tick (see
-//! `crate::decision`). The LLM-backed `Decide` adapter (JAR2-19) needs that
-//! bundle as a sequence of `Message`s the `ModelClient` understands. This
-//! module is the bridge.
+//! Layout: one `system` message (mandate text + standing invariants); an
+//! optional `user` correction message when the runtime rejected the
+//! previous tick's `Decision`; one `user` message per non-empty content
+//! window (triggers, recent outputs, recent evidence, open claims). Empty
+//! windows are dropped to keep the prompt budget tight.
 //!
-//! # v1 layout
-//!
-//! - One `system` message containing the mandate text and the standing
-//!   invariants the model must respect (provenance-by-construction,
-//!   one-decision-per-turn, the decision-tool taxonomy from JAR2-17).
-//! - When `bundle.correction` is `Some` (the runtime rejected the previous
-//!   tick's `Decision`), one `user` message that surfaces the failure
-//!   description so the model can self-correct. Rendered ahead of the
-//!   trigger window because it is the most actionable signal this tick.
-//! - One `user` message per non-empty content window (triggers, recent
-//!   outputs, recent evidence). Empty windows are dropped so the prompt
-//!   does not waste tokens on `(none)` placeholders.
-//!
-//! The decision-tool list itself is published separately via
-//! `CompleteRequest::tools` (see `crate::decide_llm::schema::decision_tools`);
-//! this module renders only the *prompt body*. The "now reply" cue is
-//! carried by the invariants block in the system message
-//! ("One decision per turn. Reply by calling exactly one decision tool…")
-//! rather than a trailing assistant-prompting message — adding such a
-//! message is a v2 prompt-engineering concern (JAR2-19 will iterate on
-//! prompt shape against real vendor behavior).
-//!
-//! # Determinism
-//!
-//! Output is **stable across runs**. The renderer:
-//!
-//! 1. Drops time-varying fields that carry no model-relevant signal
-//!    (`OutputId`, `Output::created_at`, `EvidenceRecord::created_at`).
-//! 2. Round-trips JSON values through `serde_json::to_string`, which uses
-//!    the default `BTreeMap`-backed `serde_json::Map` (no `preserve_order`
-//!    feature enabled in `Cargo.toml`) and therefore emits object keys in
-//!    sorted order.
-//! 3. Trusts caller-side ordering for the three windows. `assemble_context`
-//!    in `crate::decision` reads outputs and evidence via `AgentFs`'s
-//!    lex-sorted listings, so the slices arrive deterministic.
-//!
-//! That stability is what makes the snapshot tests below viable.
-//!
-//! # What is *not* in the rendered prompt
-//!
-//! - `OutputId` and timestamps. Outputs are recent context, not addressable
-//!   from prompts; surfacing the ULID adds noise without informing
-//!   decisions. If a future ticket needs the model to refer back to a
-//!   specific output, that is a v2 concern (JAR2-10).
-//! - Per-output / per-evidence created-at timestamps. The window itself
-//!   conveys "recent"; precise wall-clock times do not change what the
-//!   model should do this tick.
-//! - The decision-tool schemas. Those are published via
-//!   `CompleteRequest::tools`; duplicating them in prose risks drift.
+//! Output is deterministic across runs: time-varying fields (`OutputId`,
+//! `created_at`) are dropped; JSON values round-trip through
+//! `serde_json::to_string` with the default `BTreeMap`-backed
+//! `serde_json::Map`, emitting keys in sorted order; window ordering is
+//! the caller's responsibility (`assemble_context` reads via `AgentFs`'s
+//! lex-sorted listings). That stability is what makes the snapshot tests
+//! below viable.
 
 use crate::decision::{ContextBundle, CorrectionContext};
 use crate::evidence::EvidenceRecord;
@@ -67,21 +26,16 @@ use crate::trigger::Trigger;
 /// assert against the exact same string the renderer emits.
 ///
 /// The list is split into six short, single-purpose clauses rather than a
-/// few dense paragraphs. Empirically (JAR2-37, observed Cohere behavior)
-/// the model would re-emit Outputs across consecutive turns when the
-/// "do not re-emit" rule was buried as the last sentence of a long
-/// paragraph and worded conditionally ("if the most recent Output already
-/// satisfies the mandate, retire"). The model has attention to spend on
-/// the system prompt; we spend it by giving the no-re-emit rule its own
-/// numbered clause (invariant 5) with unconditional phrasing ("once you
-/// have emitted any Output on this run, your next decision must be
-/// `retire`") and by explicitly tagging the recent-outputs window as
-/// *yours* so the model treats those entries as work it already did
-/// rather than ambient context.
+/// few dense paragraphs: empirically, models would re-emit Outputs across
+/// consecutive turns when the "do not re-emit" rule was buried as the
+/// last sentence of a long paragraph and worded conditionally. Invariant
+/// 5 gets its own numbered clause with unconditional phrasing, and the
+/// recent-outputs window is explicitly tagged as *yours* so the model
+/// treats those entries as work it already did rather than ambient
+/// context.
 ///
-/// Invariant 3 now permits K parallel `call_tool` blocks in a single
-/// response — the JAR2-38 lift of the one-tool-per-tick limit. The
-/// runtime folds K `call_tool` `tool_use` blocks into a single
+/// Invariant 3 permits K parallel `call_tool` blocks in a single
+/// response — the runtime folds them into a single
 /// `Decision::CallTools` and dispatches them in the same tick, then
 /// stages K paired `tool_result` blocks on the next prompt bundle.
 /// Terminal decision tools (`emit_output`, `rewrite_fs`, `idle`,
@@ -164,13 +118,10 @@ fn render_correction(c: &CorrectionContext) -> String {
 /// shape the kernel uses on the wire — so the prompt cannot drift from
 /// the typed enum without a serde test failure elsewhere.
 ///
-/// Stage 5 (JAR2-79) cross-agent variants (`ChildOutput`, `ChildRetired`)
-/// render as human-readable prose instead: the model needs the child's
-/// name as a first-class signal ("which child should I reconcile?"), and
-/// an opaque `External`-shaped JSON blob buries that name behind a
-/// nested struct. Rendering distinct from `External` is part of the
-/// 5.2 acceptance — pinned by `snapshot_child_output_trigger_is_distinct_from_external`
-/// below.
+/// Cross-agent variants (`ChildOutput`, `ChildRetired`) render as
+/// human-readable prose instead: the model needs the child's name as a
+/// first-class signal ("which child should I reconcile?"), and an opaque
+/// `External`-shaped JSON blob buries that name behind a nested struct.
 fn render_triggers(triggers: &[Trigger]) -> String {
     // Header has no trailing newline; each bullet is `\n\n- BODY`, giving
     // a blank line between header-and-first-bullet and between every pair
@@ -244,12 +195,10 @@ fn render_evidence(evidence: &[EvidenceRecord]) -> String {
 /// Each entry shows the `seed` (the canonical claim id the agent attaches
 /// to `Decision::CallTool { claim_seed }`) and the human-readable
 /// `description` the agent stored when minting the seed. `status` is
-/// elided because the runtime pre-filters to `Open`. `created_at` is
+/// elided because the runtime pre-filters to `Open`; `created_at` is
 /// elided for the same reason recent-output / recent-evidence timestamps
-/// are: precise wall-clock time does not change what the model should do
-/// this tick. The window's purpose is the JAR2-28 seed-reuse convention —
-/// the model should consult this list before minting a fresh
-/// `ClaimSeed` for conceptual work it has already opened. See
+/// are. The window exists so the model consults this list before minting
+/// a fresh `ClaimSeed` for conceptual work it has already opened. See
 /// `scratch/claim_seed_persistence.md` for the convention and
 /// `scratch/context_assembly_v2.md` § 3 for the warm-cache rationale.
 fn render_open_claims(claims: &[Claim]) -> String {
@@ -530,7 +479,7 @@ mod tests {
         );
     }
 
-    // ---- JAR2-79: cross-agent trigger rendering ------------------------
+    // ---- cross-agent trigger rendering ---------------------------------
 
     fn child_ref() -> AgentRef {
         AgentRef::new(
@@ -540,8 +489,8 @@ mod tests {
     }
 
     /// Snapshot: a `ChildOutput` trigger renders as a human-readable
-    /// bullet that names the child and cites the `OutputId`. This is the
-    /// distinct-from-`External` shape the Stage 5.2 ticket pins.
+    /// bullet that names the child and cites the `OutputId`. Distinct from
+    /// the opaque `External` JSON shape.
     #[test]
     fn snapshot_child_output_trigger() {
         let output_id = OutputId::from_hex("ab".repeat(32));
@@ -633,10 +582,10 @@ mod tests {
     }
 
     /// Mixed-trigger snapshot covering every variant in priority order
-    /// after Stage 5.2 (human > external > child_output/child_retired >
-    /// scheduled). Locks both the per-variant rendering and the fact that
-    /// the renderer preserves whatever order the bundle hands it (the
-    /// queue is responsible for the priority sort upstream).
+    /// (human > external > child_output/child_retired > scheduled). Locks
+    /// both the per-variant rendering and the fact that the renderer
+    /// preserves whatever order the bundle hands it (the queue is
+    /// responsible for the priority sort upstream).
     #[test]
     fn snapshot_mixed_triggers_with_cross_agent_variants() {
         let output_id = OutputId::from_hex("cd".repeat(32));
@@ -835,7 +784,7 @@ mod tests {
         assert!(text(&msgs[4]).starts_with("# Recent evidence"));
     }
 
-    // ---- JAR2-36: open_claims rendering --------------------------------
+    // ---- open_claims rendering -----------------------------------------
 
     use crate::fs::{Claim, ClaimStatus};
 

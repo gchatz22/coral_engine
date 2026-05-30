@@ -1,21 +1,10 @@
-//! JAR2-21 recorded-fixture integration tests for the Cohere adapter.
+//! Recorded-fixture integration tests for the Cohere adapter.
 //!
 //! Mirror of `llm_fixture_anthropic.rs`. Drives `LlmDecide` and
 //! `Agent::run` against the real `CohereClient` HTTP path, pointed at
 //! the mock server in `tests/llm_fixture/mod.rs`. Fixtures live under
-//! `tests/fixtures/llm/cohere/`.
-//!
-//! Three hermetic scenarios per the JAR2-21 spec:
-//! (a) `happy_path_tick_drives_call_tool_then_emit_output`
-//! (b) `parse_retry_recovers_after_malformed_tool_use`
-//!     (the JAR2-19 LlmDecide-internal parse-retry path — distinct from
-//!     the agent-level apply-time correction path exercised by
-//!     `loop_smoke::invalid_call_tool_stages_correction_then_recovers`)
-//! (c) `unhealthy_then_recovery_cycle_via_agent_run`
-//!
-//! Plus one `JARVIS_LIVE_LLM=1`-gated smoke against the real Cohere API.
-//!
-//! Feature-gated: this whole file is a no-op unless built with
+//! `tests/fixtures/llm/cohere/`. Plus one `JARVIS_LIVE_LLM=1`-gated
+//! smoke against the real Cohere API. Feature-gated:
 //! `--features llm-cohere`.
 
 #![cfg(feature = "llm-cohere")]
@@ -60,7 +49,7 @@ fn ensure_dummy_api_key() {
 
 fn empty_bundle() -> ContextBundle {
     ContextBundle {
-        mandate: Mandate::new("jar2-21 fixture", Duration::from_secs(60), Some(8)),
+        mandate: Mandate::new("cohere fixture", Duration::from_secs(60), Some(8)),
         triggers: vec![],
         recent_outputs: vec![],
         recent_evidence: vec![],
@@ -228,7 +217,7 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
 
     let tmp = TempDir::new().expect("tempdir");
     let mandate = Mandate::new(
-        "jar2-21 unhealthy cycle",
+        "unhealthy recovery cycle",
         Duration::from_millis(50),
         Some(8),
     );
@@ -249,8 +238,7 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
 
     let agent = Agent::new(mandate, fs, decide, registry, health);
 
-    // JAR2-33: capture stats handle before `Agent::run` consumes the
-    // agent. Mirrors the Anthropic fixture's migration.
+    // Capture the stats handle before `Agent::run` consumes the agent.
     let stats = agent.stats_handle();
 
     let handle = tokio::spawn(agent.run());
@@ -266,11 +254,11 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
     assert_eq!(mock.remaining(), 0);
     assert_eq!(mock.captured().len(), 4);
 
-    // JAR2-33: post-run stats inspection. The recovery tick issues one
-    // successful upstream call; its CallStats must carry Cohere vendor +
-    // configured model. Latency is not asserted here — `start_paused`
-    // freezes tokio's clock and the millisecond-resolution adapter
-    // measurement can round to 0.
+    // Post-run stats inspection. The recovery tick issues one successful
+    // upstream call; its CallStats must carry Cohere vendor + configured
+    // model. Latency is not asserted here — `start_paused` freezes
+    // tokio's clock and the millisecond-resolution adapter measurement
+    // can round to 0.
     let calls = stats.last_tick_calls();
     assert_eq!(
         calls.len(),
@@ -314,17 +302,14 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
 
 // ---------- (d) Bug A regression: tool-call -> tool-result roundtrip ----------
 
-/// JAR2-37 Bug A regression. Pre-fix, an assistant turn carrying only
-/// `tool_use` blocks (no text) serialized as `{"role":"assistant",
-/// "content":"", "tool_calls":[...]}` and Cohere rejected the request
-/// with HTTP 400 `must have non-empty content or tool calls`. After the
-/// fix the `content` field is omitted on such turns and Cohere accepts.
+/// Cohere rejects HTTP requests where an assistant turn serializes as
+/// `{"role":"assistant","content":"","tool_calls":[...]}` with HTTP 400
+/// `must have non-empty content or tool calls`. The serializer must
+/// therefore omit `content` entirely on tool-call-only assistant turns.
 ///
-/// The mock isn't doing the validation Cohere does — it serves whatever
-/// the fixture says — so the test pins the *captured request body* to
-/// the post-fix shape rather than trying to coax the mock into rejecting
-/// the pre-fix shape. The pre-fix code path (an `entry.insert("content", "")`)
-/// would have failed this body-shape assertion deterministically.
+/// The mock doesn't replicate Cohere's validation, so the test pins the
+/// captured request body shape: `content` must be absent on the
+/// tool-call-only assistant message.
 #[tokio::test]
 async fn tool_call_roundtrip_assistant_turn_omits_empty_content() {
     ensure_dummy_api_key();
@@ -340,7 +325,7 @@ async fn tool_call_roundtrip_assistant_turn_omits_empty_content() {
     let req = CompleteRequest {
         messages: vec![
             Message::system("be terse"),
-            Message::user("Echo the message \"jar2-37 roundtrip\" via the echo tool."),
+            Message::user("Echo the message \"tool-call roundtrip\" via the echo tool."),
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
@@ -348,7 +333,7 @@ async fn tool_call_roundtrip_assistant_turn_omits_empty_content() {
                     name: "call_tool".into(),
                     input: json!({
                         "name": "echo",
-                        "args": {"msg": "jar2-37 roundtrip"},
+                        "args": {"msg": "tool-call roundtrip"},
                         "claim_seed": "roundtrip-seed",
                     }),
                 }],
@@ -357,7 +342,7 @@ async fn tool_call_roundtrip_assistant_turn_omits_empty_content() {
                 role: Role::Tool,
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: "tc_call_tool_42".into(),
-                    content: "echoed: jar2-37 roundtrip".into(),
+                    content: "echoed: tool-call roundtrip".into(),
                 }],
             },
         ],
@@ -415,13 +400,13 @@ async fn tool_call_roundtrip_assistant_turn_omits_empty_content() {
     assert_eq!(resp.stats.model, expected_model());
 }
 
-// ---------- (e) JAR2-38: parallel tool calls ----------
+// ---------- (e) parallel tool calls ----------
 
-/// JAR2-38: Cohere response carrying K=3 entries in `message.tool_calls`
-/// parses into one `Decision::CallTools` with three entries. The
-/// adapter synthesizes per-block `ContentBlock::ToolUse` from the wire
-/// shape; the parser keeps the per-call `tool_use_id` traceable through
-/// the propagation pipeline.
+/// A Cohere response carrying K=3 entries in `message.tool_calls` parses
+/// into one `Decision::CallTools` with three entries. The adapter
+/// synthesizes per-block `ContentBlock::ToolUse` from the wire shape;
+/// the parser keeps the per-call `tool_use_id` traceable through the
+/// propagation pipeline.
 #[tokio::test]
 async fn parallel_tool_calls_k3_folds_into_single_call_tools_decision() {
     ensure_dummy_api_key();

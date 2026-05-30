@@ -1,30 +1,7 @@
-//! `Scheduler` — per-agent idle-deadline stub.
-//!
-//! Per JAR2-5 (and `scratch/minimal_node_backend.md` § 6 row 5), this is
-//! deliberately a stub: it computes "when should the loop next wake up if
-//! no signal arrives?" for a *single* agent. Cross-agent / kernel-grade
-//! scheduling is out of scope and lives in a separate kernel ticket.
-//!
-//! Usage shape (from § 4 of the same scratch doc):
-//!
-//! ```ignore
-//! let next_wake = scheduler.next_deadline();
-//! tokio::select! {
-//!     _ = triggers.wait_nonempty() => {}
-//!     _ = tokio::time::sleep_until(next_wake) => {
-//!         triggers.push(Trigger::ScheduledWake);
-//!     }
-//! }
-//! // ... after handling the decision:
-//! if let Decision::Idle { next_after } = decision {
-//!     scheduler.set_next_after(next_after);
-//! }
-//! ```
-//!
-//! `next_deadline` is recomputed from `Instant::now()` on every call. That
-//! matches the loop above — the deadline is always "from now, wait
-//! `next_after`" — and means we don't need an internal anchor that could
-//! drift past wall time during long ticks.
+//! Per-agent idle-deadline stub. Computes "when should the loop next wake
+//! if no signal arrives?" for a single agent; `next_deadline` is always
+//! `Instant::now() + next_after` so it never drifts past wall time during
+//! long ticks.
 
 use std::time::Duration;
 
@@ -85,9 +62,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn next_deadline_advances_by_idle_period_after_set_next_after() {
-        // Mirror the ticket's acceptance test: the scheduler's deadline
-        // advances by `idle_period` once `set_next_after(idle_period)` is
-        // called.
+        // The scheduler's deadline advances by `idle_period` once
+        // `set_next_after(idle_period)` is called.
         let idle_period = Duration::from_secs(5);
         let mut s = Scheduler::new(Duration::from_millis(100));
 

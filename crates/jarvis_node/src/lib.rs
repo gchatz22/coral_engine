@@ -1,26 +1,8 @@
 //! `jarvis_node` — single-node runtime for the Jarvis Engine.
-//!
-//! This ticket (JAR2-3) lands the typed core: `Mandate`, `Trigger`,
-//! `Decision`, `Evidence`, `Output`. Pure data + serde, no behavior beyond
-//! constructors, validation, and ID generation. Persistence, the trigger
-//! queue, the `Decide` trait, tool dispatch, and the run loop arrive in
-//! later tickets (JAR2-4+).
 
 pub mod agent;
-// JAR2-57 (stage 3.1): pure per-tick logic — `drain_triggers`, `decide`,
-// `dispatch` + `DispatchOutcome`. Hosted by today's `Agent::run` and (in
-// stage 3.4+) by `AgentWorkflow`. See `agent_core.rs` module doc.
 pub mod agent_core;
-// JAR2-78 (stage 5.1): `AgentId` + `AgentRef`. Kernel-side stable handles
-// for naming other agents; referenced by `Decision`'s parent-child topology
-// variants and (in JAR2-79) by `Trigger::ChildOutput` / `ChildRetired`. See
-// `agent_ref.rs` module doc for the placement rationale.
 pub mod agent_ref;
-// JAR2-83 (stage 5.6): `ConflictRecord` + content-addressing constructor on
-// `ConflictId`. Re-exports `ConflictAlternative` / `ConflictResolution` /
-// `ConflictId` from `decision` for caller ergonomics. The FS writer
-// (`AgentFs::write_conflict` / `read_conflict` / `list_conflicts`) lives in
-// `fs.rs`.
 pub mod conflict;
 pub mod decide_llm;
 pub mod decision;
@@ -32,10 +14,6 @@ pub mod mandate;
 pub mod mcp;
 pub mod model_client;
 pub mod scheduler;
-// JAR2-51: pluggable per-agent storage abstraction. Today's `AgentFs`
-// (`src/fs.rs`) becomes a facade over `Arc<dyn AgentStorage>` in JAR2-53;
-// `LocalStorage` (the on-disk backend) lands in JAR2-52. See
-// `scratch/agent_storage.md` for the design.
 pub mod storage;
 pub mod tools;
 pub mod trigger;
@@ -54,9 +32,8 @@ pub(crate) mod duration_ms {
     where
         S: Serializer,
     {
-        // `as_millis` returns u128; durations large enough to overflow u64
-        // ms (~584M years) are not a real concern here, but saturate just
-        // in case rather than panic.
+        // Saturate rather than panic: u64-ms overflow would require a
+        // ~584M-year duration.
         let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
         s.serialize_u64(ms)
     }
@@ -70,8 +47,7 @@ pub(crate) mod duration_ms {
     }
 }
 
-/// Returns the crate name. Trivial helper from the bootstrap ticket; safe
-/// to remove once a richer public surface lands.
+/// Returns the crate name.
 pub fn crate_name() -> &'static str {
     "jarvis_node"
 }

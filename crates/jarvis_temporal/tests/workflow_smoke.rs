@@ -1,43 +1,13 @@
-//! Stage 3.12 (JAR2-68) — workflow-driven smoke. Closes the stage-3
-//! project by proving the full per-tick loop runs end-to-end against a
-//! real Temporal Server and lands the same three durable artifacts the
-//! in-process `node-run-llm` reference smoke produces:
+//! Workflow-driven smoke. Proves the full per-tick loop runs end-to-end
+//! against a real Temporal Server and lands the three durable artifacts:
 //!
 //! - `<prefix>/outputs/<ulid>.json` — a provenance-grounded `EmitOutput`.
 //! - `<prefix>/retirement.json` — the retirement marker.
-//! - `<prefix>/decisions/<tick>.jsonl` — one-line JSONL entry per tick
-//!   (plan § 8 decision 6).
+//! - `<prefix>/decisions/<tick>.jsonl` — one-line JSONL entry per tick.
 //!
-//! Env-gated behind `TEMPORAL_LIVE_TEST=1`. The CI hermetic shape spins
-//! up `temporal server start-dev` as a service step and runs this test
-//! under that env var; the `node-run-llm` binary stays alive as the
-//! in-process reference path (this smoke runs in parallel, not as a
-//! cutover — see ticket guardrail 1).
-//!
-//! ## Why a scripted Decide (and not the JAR2-21 LLM fixtures)
-//!
-//! `EvidenceId` is content-addressed: `sha256(tool, args, result)`. The
-//! JAR2-21 LLM fixtures cite a hand-synthesized id (`a1b2c3d4…`) that
-//! cannot match anything `execute_tool` actually produces. The
-//! workflow's `persist_output` activity surfaces `FsError::EvidenceNotFound`
-//! as an `ActivityError` (unlike the in-process `agent_core::dispatch`,
-//! which maps it to `NeedsCorrection`) — so an LLM-fixture-driven
-//! EmitOutput would fail the workflow instead of producing an output.
-//! Real-LLM coverage is manual via `jarvis-apply` against a worker
-//! daemon configured with vendor credentials (the `jarvis-run-workflow`
-//! live-vendor smoke binary was deleted in JAR2-76's thin-client
-//! cleanup; this hermetic harness is what CI runs). The pattern is the
-//! same scripted-decision shape `workflow_loop.rs` uses, with
-//! EmitOutput citing a *planted* evidence id that is, by construction,
-//! on disk.
-//!
-//! ## What this test proves over `workflow_loop.rs`
-//!
-//! `workflow_loop.rs` asserts the *history* shape (counts of scheduled
-//! activities, no spurious CAN). This test asserts the *FS artifacts*
-//! the agent produces end-to-end, plus that `decisions/<tick>.jsonl`
-//! lands in the workflow-host path (the artifact plan § 8 decision 6
-//! piggybacked onto this ticket).
+//! Env-gated behind `TEMPORAL_LIVE_TEST=1`. Uses a scripted `Decide` and
+//! a planted evidence id so `EmitOutput`'s content-addressed provenance
+//! check resolves against an on-disk record.
 
 use std::env;
 use std::sync::{Arc, OnceLock};
@@ -68,18 +38,15 @@ use uuid::Uuid;
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
 const DEFAULT_NAMESPACE: &str = "default";
 
-/// JAR2-68: shared in-memory storage backend. Process-wide so the
-/// activity bodies' `agent_storage()` lookup and the test driver's
-/// post-run assertions read the same bytes. `OnceLock` mirrors
-/// `workflow_loop.rs`'s pattern — the worker-shared install hooks panic
-/// on double-install, so all tests in this binary share one storage.
+/// Process-wide in-memory storage backend so the activity bodies'
+/// `agent_storage()` lookup and the test driver's post-run assertions
+/// read the same bytes. The worker-shared install hooks panic on
+/// double-install.
 static SHARED_STORAGE: OnceLock<Arc<MemoryStorage>> = OnceLock::new();
 static INIT: std::sync::Once = std::sync::Once::new();
 
-/// Test double — produces a deterministic `EvidenceRecord` we can plant
-/// against and assert on in the EmitOutput arm. The workflow_loop test's
-/// `AliasEchoTool` does the same thing; we replicate the type here
-/// (rather than promote to the test surface) per "smallest correct diff".
+/// Produces a deterministic `EvidenceRecord` we can plant against and
+/// assert on in the EmitOutput arm.
 struct EchoLike {
     name: String,
 }
@@ -96,10 +63,9 @@ impl Tool for EchoLike {
 
 const TOOL_NAME: &str = "echo";
 
-/// Install the worker-shared storage + tool registry once. Shared with
-/// `workflow_loop.rs`'s static-install pattern — the installs panic on
-/// double-install, and `INIT` keeps a multi-test binary from hitting
-/// that.
+/// Install the worker-shared storage + tool registry exactly once. The
+/// installs panic on double-install; `INIT` keeps a multi-test binary
+/// from hitting that.
 fn ensure_installed() -> Arc<MemoryStorage> {
     INIT.call_once(|| {
         let storage: Arc<MemoryStorage> = Arc::new(MemoryStorage::new());
@@ -139,13 +105,11 @@ async fn build_client() -> Result<Client> {
     Ok(client)
 }
 
-/// JAR2-68 live test: scripts a four-tick run (Idle → CallTools → EmitOutput
-/// → Retire), drives it via Temporal, and asserts the three node-run-llm-
-/// shaped artifacts land.
+/// Scripts a four-tick run (Idle → CallTools → EmitOutput → Retire),
+/// drives it via Temporal, and asserts the three durable artifacts land.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Lock is held across `await` because the scripted decision queue + the
-// installed storage / registry are process-wide. Same rationale as
-// `workflow_loop.rs::workflow_loop_runs_idle_then_calltools_then_retire`.
+// installed storage / registry are process-wide.
 #[allow(clippy::await_holding_lock)]
 async fn workflow_smoke_lands_output_retirement_and_decision_log() {
     if env::var("TEMPORAL_LIVE_TEST").ok().as_deref() != Some("1") {
@@ -187,9 +151,7 @@ async fn run_smoke() -> Result<()> {
 
     // Scripted sequence: Idle (tick 0) → CallTools(echo) (tick 1) →
     // EmitOutput citing the planted id (tick 2) → Retire (tick 3).
-    // Mirrors the in-process `node-run-llm` shape: the LLM is expected
-    // to call a tool, then emit an output citing the resulting
-    // evidence, then retire. Total: four ticks, four decision-log files.
+    // Total: four ticks, four decision-log files.
     set_decision_script(vec![
         Decision::Idle {
             next_after: Duration::from_millis(50),
@@ -246,8 +208,8 @@ async fn run_smoke() -> Result<()> {
         .await
     });
 
-    // 60-second budget mirrors `workflow_loop.rs` — the smoke completes
-    // in <2s on a healthy local server.
+    // 60-second budget catches stalls; the smoke completes in <2s on a
+    // healthy local server.
     let worker_result = tokio::time::timeout(Duration::from_secs(60), worker.run())
         .await
         .map_err(|_| anyhow::anyhow!("worker.run() timed out (60s)"))?
@@ -267,9 +229,7 @@ async fn drive(
     storage: Arc<MemoryStorage>,
     planted_id: jarvis_node::evidence::EvidenceId,
 ) -> Result<()> {
-    // JAR2-80: `Default` was dropped — use `new_for_test` for the
-    // identity defaults, then override `fs_handle` so the per-run
-    // prefix continues to namespace storage writes.
+    // Override `fs_handle` so the per-run prefix namespaces storage writes.
     let mut input = AgentInput::new_for_test(
         GraphId::new(Uuid::new_v4()),
         AgentId::new(Uuid::new_v4()),
@@ -317,8 +277,8 @@ async fn drive(
 
     // ---- Artifact 2: `<prefix>/outputs/<ulid>.json` -----------------------
     // Open a fresh `AgentFs` view over the same storage so the
-    // tail-index from JAR2-54 is exercised. The single scripted
-    // EmitOutput must land exactly one output.
+    // tail-index is exercised. The single scripted `EmitOutput` must
+    // land exactly one output.
     let inspect_mandate = Mandate::new("inspect", Duration::from_millis(0), None);
     let inspect_storage: Arc<dyn AgentStorage> = storage.clone();
     let inspect_fs = AgentFs::new_with_storage(inspect_storage, agent_prefix, &inspect_mandate)
@@ -351,10 +311,10 @@ async fn drive(
     );
 
     // ---- Artifact 3: `<prefix>/decisions/<tick>.jsonl` --------------------
-    // Plan § 8 decision 6: one entry per tick. The scripted sequence
-    // produces four decisions (Idle, CallTools, EmitOutput, Retire);
-    // the workflow body bumps `tick` only on non-retire arms, so the
-    // four ticks land at `decisions/{0,1,2,3}.jsonl`.
+    // One entry per tick. The scripted sequence produces four decisions
+    // (Idle, CallTools, EmitOutput, Retire); the workflow body bumps
+    // `tick` only on non-retire arms, so the four ticks land at
+    // `decisions/{0,1,2,3}.jsonl`.
     let page = storage
         .list(&format!("{agent_prefix}/decisions/"), None, usize::MAX)
         .await

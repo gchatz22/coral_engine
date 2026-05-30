@@ -1,53 +1,14 @@
-//! Stage 5.5 (JAR2-82) — live integration test for the
-//! `Decision::ReconcileChildren` workflow arm + `reconcile_children`
-//! activity.
+//! Live integration test for the `Decision::ReconcileChildren`
+//! workflow arm and the `reconcile_children` activity.
 //!
-//! Env-gated behind `TEMPORAL_LIVE_TEST=1`. Spawns two
-//! `AgentWorkflow` instances against a real Temporal Server:
-//!
-//! 1. A **parent** workflow whose scripted `Decide` waits for a
-//!    `Trigger::ChildOutput` signal from the child, then emits one
-//!    `Decision::ReconcileChildren { sources: [the child output],
-//!    conflict: None }`, then `Decision::Retire`.
-//! 2. A **child** workflow with `parent_handle: Some(..)` that emits
-//!    one `Decision::EmitOutput → Decision::Retire`. The
-//!    `Decision::EmitOutput` arm fires the `Trigger::ChildOutput`
-//!    signal at the parent (Stage 5.4 / JAR2-81 path).
-//!
-//! ## Happy-path assertions
-//!
-//! - After the parent retires, the parent's `evidence/` directory
-//!   contains at least one synthetic evidence record with
-//!   `tool == "reconcile"` and `args` carrying the
-//!   `(child_agent_id, child_workflow_id, source_output_id)` triple
-//!   that points back at the child's emitted output.
-//!
-//! ## Failure-mode assertions
-//!
-//! - The parent's `Decide` script emits a
-//!   `Decision::ReconcileChildren { sources: [bogus output id], .. }`
-//!   referencing an `OutputId` that doesn't resolve on the child's
-//!   FS. The activity returns `ReconciliationError::ChildOutputNotFound`
-//!   as a non-retryable `ApplicationFailure`; the parent's workflow
-//!   body catches the failure and stages a `CorrectionContext` for
-//!   the next tick. We confirm by observing the parent retires
-//!   normally (no panic / workflow failure) and that its next
-//!   scripted decision sees the correction surfaced (indirectly: the
-//!   workflow body's clear_correction is NOT invoked on the failing
-//!   arm, so the next tick's `assemble_context` input carries the
-//!   `prior_correction`).
-//!
-//! ## SDK / test-shape notes
-//!
-//! - Per Stage 5 Project decision 11, this entire test must run live
-//!   — there is no hermetic in-process multi-agent path.
-//! - Storage is `MemoryStorage` shared across both workflows so the
-//!   activity bodies see one consistent view; same shape JAR2-81 uses.
-//! - `(graph_id, agent_id)` is passed explicitly on `AgentInput`
-//!   (matching the `child_parent_signal.rs` pattern) rather than
-//!   routed through `into_agent_input`'s YAML adapter, which
-//!   sidesteps the JAR2-89 synthetic-UUID-mismatch concern flagged
-//!   in the JAR2-82 ticket.
+//! Env-gated behind `TEMPORAL_LIVE_TEST=1`. A scripted parent waits for
+//! a `Trigger::ChildOutput` from a child, emits one
+//! `Decision::ReconcileChildren { sources: [child output], conflict }`,
+//! then retires. Happy path asserts a synthetic `tool == "reconcile"`
+//! evidence record under the parent's prefix; the failure-mode path
+//! checks the parent stages a `CorrectionContext` and still retires
+//! cleanly when the source `OutputId` doesn't resolve; the conflict
+//! path checks the conflict-log writer lands a `HeldOpen` record.
 
 use std::collections::VecDeque;
 use std::env;
@@ -85,50 +46,40 @@ use jarvis_temporal::workflow::{AgentInput, AgentResult, AgentWorkflow, FsHandle
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
 const DEFAULT_NAMESPACE: &str = "default";
 
-const PARENT_MANDATE_TEXT: &str = "JAR2-82-parent";
-const CHILD_MANDATE_TEXT: &str = "JAR2-82-child";
+const PARENT_MANDATE_TEXT: &str = "reconcile-parent";
+const CHILD_MANDATE_TEXT: &str = "reconcile-child";
 
-/// Shared in-memory storage backend: parent + child both run their
-/// activities against this. The test driver also opens views over it
-/// to inspect what landed on disk.
+/// Shared in-memory storage so both workflows and the driver's
+/// inspection views see one consistent state.
 static SHARED_STORAGE: OnceLock<Arc<MemoryStorage>> = OnceLock::new();
 
-/// Captured trigger payloads the parent's `Decide` observed. The
-/// parent's reconcile script reads this to discover the child's
-/// `OutputId` at the moment it needs to construct
-/// `Decision::ReconcileChildren`.
+/// Captured trigger payloads the parent's `Decide` observed. Used to
+/// discover the child's `OutputId` at the moment the parent needs to
+/// construct `Decision::ReconcileChildren`.
 static PARENT_OBSERVED_TRIGGERS: OnceLock<Arc<Mutex<Vec<Trigger>>>> = OnceLock::new();
 
-/// Per-role scripts the `ReconcileRoutingDecide` consumes.
 static CHILD_SCRIPT: OnceLock<Mutex<VecDeque<Decision>>> = OnceLock::new();
 static PARENT_SCRIPT: OnceLock<Mutex<VecDeque<Decision>>> = OnceLock::new();
 
-/// Per-role pending-source plumbing the *parent's* script uses to
-/// build a `Decision::ReconcileChildren` at decision time using the
-/// child output id discovered from a previously-observed
-/// `Trigger::ChildOutput`. `(child_workflow_id, child_agent_id,
-/// output_id_override)` — when `output_id_override.is_some()` the
-/// reconcile decision uses that id (the failure-mode test plants a
-/// bogus id here); when `None`, the decision pulls the id from the
-/// first ChildOutput observed.
+/// `(child_workflow_id, child_agent_id, output_id_override)` the
+/// parent's script uses to build a `Decision::ReconcileChildren` at
+/// decision time. When `output_id_override.is_some()` the reconcile
+/// decision uses that id (the failure-mode test plants a bogus id);
+/// otherwise the id is pulled from the first observed `ChildOutput`.
 type PendingReconcile = (Option<String>, Option<AgentId>, Option<OutputId>);
 static PARENT_PENDING_RECONCILE: OnceLock<Mutex<Option<PendingReconcile>>> = OnceLock::new();
 
-/// JAR2-83: optional `ConflictRecordIntent` the parent's reconcile
-/// synthesizer attaches to the `Decision::ReconcileChildren` it builds.
-/// `None` (default) reproduces JAR2-82's `conflict: None` behaviour;
-/// `Some` exercises 5.6's conflict-log writer.
+/// Optional `ConflictRecordIntent` the parent's reconcile synthesizer
+/// attaches to the `Decision::ReconcileChildren` it builds. `None`
+/// (default) means `conflict: None`; `Some` exercises the conflict-log
+/// writer.
 static PARENT_PENDING_CONFLICT: OnceLock<Mutex<Option<ConflictRecordIntent>>> = OnceLock::new();
 
-/// Serializes the two live tests in this binary so they don't
-/// share `PARENT_OBSERVED_TRIGGERS` or the per-role scripts.
+/// Serializes the live tests so they don't share per-role state.
 static LIVE_TEST_GUARD: Mutex<()> = Mutex::new(());
 
 static INIT: std::sync::Once = std::sync::Once::new();
 
-/// One-shot install of the shared storage + empty tool registry +
-/// `ReconcileRoutingDecide`. Subsequent calls are no-ops — the
-/// underlying install hooks panic on double-install.
 fn ensure_installed() -> Arc<MemoryStorage> {
     INIT.call_once(|| {
         let storage: Arc<MemoryStorage> = Arc::new(MemoryStorage::new());
@@ -162,10 +113,10 @@ fn ensure_installed() -> Arc<MemoryStorage> {
     SHARED_STORAGE.get().cloned().expect("storage installed")
 }
 
-/// `Decide` that routes by `bundle.mandate.text`, records every
-/// trigger the parent observes, and (for the parent role) materializes
-/// a `Decision::ReconcileChildren` lazily from the most recently
-/// observed `Trigger::ChildOutput` + the pending-reconcile slot.
+/// Routes decisions by mandate text. Records every trigger the parent
+/// observes, and for the parent role materializes a
+/// `Decision::ReconcileChildren` lazily from the most recently observed
+/// `Trigger::ChildOutput` plus the pending-reconcile slot.
 struct ReconcileRoutingDecide;
 
 #[async_trait]
@@ -221,7 +172,7 @@ impl Decide for ReconcileRoutingDecide {
             }
             other => panic!(
                 "ReconcileRoutingDecide saw unexpected mandate text: {other:?} \
-                 (JAR2-82 tests script only PARENT_MANDATE_TEXT / CHILD_MANDATE_TEXT)"
+                 (only PARENT_MANDATE_TEXT / CHILD_MANDATE_TEXT scripted)"
             ),
         }
     }
@@ -293,8 +244,8 @@ fn synthesize_reconcile_or_wait() -> anyhow::Result<Decision> {
     };
     let output_id = oid_override.unwrap_or(default_output_id);
 
-    // JAR2-83: lift any pending `ConflictRecordIntent` planted by the
-    // conflict-emitting live test. Default `None` reproduces JAR2-82's
+    // Lift any pending `ConflictRecordIntent` planted by the
+    // conflict-emitting live test; default `None` produces the
     // concordance-fold behaviour.
     let conflict = PARENT_PENDING_CONFLICT
         .get()
@@ -387,8 +338,8 @@ async fn build_client() -> Result<Client> {
     Ok(client)
 }
 
-/// Happy-path live test — parent reconciles one child output; one
-/// synthetic evidence record lands in the parent's `evidence/`.
+/// Happy path: parent reconciles one child output; one synthetic
+/// evidence record lands in the parent's `evidence/`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn parent_reconcile_writes_synthetic_evidence_under_parents_prefix() {
@@ -400,12 +351,11 @@ async fn parent_reconcile_writes_synthetic_evidence_under_parents_prefix() {
         return;
     }
     let _guard = LIVE_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-    run_happy_path().await.expect("JAR2-82 happy path");
+    run_happy_path().await.expect("happy path");
 }
 
-/// Failure-mode live test — parent reconciles a bogus output id; the
-/// activity errors typed, parent stages a correction context and
-/// retires normally.
+/// Failure mode: parent reconciles a bogus output id; the activity
+/// errors typed, parent stages a correction context and retires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn parent_reconcile_on_missing_child_output_stages_correction_and_continues() {
@@ -417,13 +367,13 @@ async fn parent_reconcile_on_missing_child_output_stages_correction_and_continue
         return;
     }
     let _guard = LIVE_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-    run_failure_path().await.expect("JAR2-82 failure path");
+    run_failure_path().await.expect("failure path");
 }
 
-/// JAR2-83 (stage 5.6): live test for the conflict-log writer. Parent
-/// emits a `Decision::ReconcileChildren { conflict: Some(...) }` with
-/// `resolution: None`; we assert the parent's `conflicts/<id>.json`
-/// lands with `kind: HeldOpen` and the planted alternatives.
+/// Conflict-log writer live test. Parent emits a
+/// `Decision::ReconcileChildren { conflict: Some(...) }` with
+/// `resolution: None`; asserts the parent's `conflicts/<id>.json` lands
+/// with `kind: HeldOpen` and the planted alternatives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn parent_reconcile_with_conflict_writes_held_open_record() {
@@ -435,12 +385,12 @@ async fn parent_reconcile_with_conflict_writes_held_open_record() {
         return;
     }
     let _guard = LIVE_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-    run_conflict_path().await.expect("JAR2-83 conflict path");
+    run_conflict_path().await.expect("conflict path");
 }
 
 async fn run_happy_path() -> Result<()> {
     let suffix = run_suffix();
-    let task_queue = format!("jarvis-jar2-82-happy-{suffix}");
+    let task_queue = format!("jarvis-reconcile-happy-{suffix}");
     let graph_id = GraphId::new(Uuid::new_v4());
     let parent_agent_id = AgentId::new(Uuid::new_v4());
     let child_agent_id =
@@ -469,21 +419,21 @@ async fn run_happy_path() -> Result<()> {
         .await
         .context("plant evidence for child EmitOutput")?;
 
-    // Parent script: wait for ChildOutput trigger by spinning on
-    // reconcile_placeholder; then Retire.
+    // Parent: wait for ChildOutput by spinning on reconcile_placeholder,
+    // then Retire.
     let parent_script = vec![
         reconcile_placeholder(),
         Decision::Retire {
-            reason: "JAR2-82 happy: scripted retire".into(),
+            reason: "happy: scripted retire".into(),
         },
     ];
     let child_script = vec![
         Decision::EmitOutput {
-            content: "JAR2-82 child output".into(),
+            content: "child output".into(),
             evidence: vec![planted_id.clone()],
         },
         Decision::Retire {
-            reason: "JAR2-82 child: scripted retire".into(),
+            reason: "child: scripted retire".into(),
         },
     ];
     install_role_scripts(parent_script, child_script);
@@ -572,7 +522,7 @@ async fn drive_happy_path(
         )
         .await
         .context("start_workflow(parent)")?;
-    eprintln!("JAR2-82 happy: parent started at {parent_workflow_id}");
+    eprintln!("happy: parent started at {parent_workflow_id}");
 
     let child_input = AgentInput {
         cfg: Default::default(),
@@ -597,15 +547,15 @@ async fn drive_happy_path(
         )
         .await
         .context("start_workflow(child)")?;
-    eprintln!("JAR2-82 happy: child started at {child_workflow_id}");
+    eprintln!("happy: child started at {child_workflow_id}");
 
-    // Wait for child to retire — its EmitOutput → Retire script
-    // terminates it. The EmitOutput signals the parent before Retire.
+    // Wait for child to retire. Its EmitOutput -> Retire script
+    // terminates it; the EmitOutput signals the parent before Retire.
     let _child_result: AgentResult = child_handle
         .get_result(WorkflowGetResultOptions::default())
         .await
         .context("child get_result")?;
-    eprintln!("JAR2-82 happy: child retired cleanly");
+    eprintln!("happy: child retired cleanly");
 
     // Wait for the parent to retire. The parent's script is
     // `[reconcile_placeholder, Retire]`: while no ChildOutput has
@@ -633,7 +583,7 @@ async fn drive_happy_path(
             parent_handle
                 .signal(
                     AgentWorkflow::retire,
-                    "JAR2-82 happy: test asked".to_string(),
+                    "happy: test asked".to_string(),
                     WorkflowSignalOptions::default(),
                 )
                 .await
@@ -645,10 +595,10 @@ async fn drive_happy_path(
         }
     };
     let AgentResult::Retired { reason } = parent_result;
-    eprintln!("JAR2-82 happy: parent retired ({reason})");
+    eprintln!("happy: parent retired ({reason})");
 
     // Inspect parent's `evidence/` directory for the synthetic
-    // record(s) — one per source the reconcile activity processed.
+    // record(s), one per source the reconcile activity processed.
     let inspect_mandate = Mandate::new("inspect", Duration::from_millis(0), None);
     let inspect_storage: Arc<dyn AgentStorage> = storage.clone();
     let parent_view = AgentFs::new_with_storage(
@@ -694,7 +644,7 @@ async fn drive_happy_path(
 
 async fn run_failure_path() -> Result<()> {
     let suffix = run_suffix();
-    let task_queue = format!("jarvis-jar2-82-fail-{suffix}");
+    let task_queue = format!("jarvis-reconcile-fail-{suffix}");
     let graph_id = GraphId::new(Uuid::new_v4());
     let parent_agent_id = AgentId::new(Uuid::new_v4());
     let child_agent_id =
@@ -730,16 +680,16 @@ async fn run_failure_path() -> Result<()> {
     let parent_script = vec![
         reconcile_placeholder(),
         Decision::Retire {
-            reason: "JAR2-82 fail: scripted retire after correction".into(),
+            reason: "fail: scripted retire after correction".into(),
         },
     ];
     let child_script = vec![
         Decision::EmitOutput {
-            content: "JAR2-82 fail child output".into(),
+            content: "fail child output".into(),
             evidence: vec![planted_id.clone()],
         },
         Decision::Retire {
-            reason: "JAR2-82 fail child: scripted retire".into(),
+            reason: "fail child: scripted retire".into(),
         },
     ];
     install_role_scripts(parent_script, child_script);
@@ -820,7 +770,7 @@ async fn drive_failure_path(
         )
         .await
         .context("start_workflow(parent fail)")?;
-    eprintln!("JAR2-82 fail: parent started at {parent_workflow_id}");
+    eprintln!("fail: parent started at {parent_workflow_id}");
 
     let child_input = AgentInput {
         cfg: Default::default(),
@@ -845,7 +795,7 @@ async fn drive_failure_path(
         )
         .await
         .context("start_workflow(child fail)")?;
-    eprintln!("JAR2-82 fail: child started at {child_workflow_id}");
+    eprintln!("fail: child started at {child_workflow_id}");
 
     let _child_result: AgentResult = child_handle
         .get_result(WorkflowGetResultOptions::default())
@@ -853,7 +803,7 @@ async fn drive_failure_path(
         .context("child get_result (fail path)")?;
 
     // Parent must complete (return AgentResult::Retired) despite the
-    // reconcile activity failing — workflow body catches the
+    // reconcile activity failing: the workflow body catches the
     // ApplicationFailure and stages a CorrectionContext instead of
     // bubbling.
     let parent_result = tokio::time::timeout(
@@ -868,13 +818,13 @@ async fn drive_failure_path(
         reason.contains("scripted retire"),
         "parent did not reach its scripted Retire arm after reconcile failure: {reason:?}"
     );
-    eprintln!("JAR2-82 fail: parent retired normally after staged correction");
+    eprintln!("fail: parent retired normally after staged correction");
     Ok(())
 }
 
 async fn run_conflict_path() -> Result<()> {
     let suffix = run_suffix();
-    let task_queue = format!("jarvis-jar2-83-conflict-{suffix}");
+    let task_queue = format!("jarvis-reconcile-conflict-{suffix}");
     let graph_id = GraphId::new(Uuid::new_v4());
     let parent_agent_id = AgentId::new(Uuid::new_v4());
     let child_agent_id =
@@ -910,12 +860,12 @@ async fn run_conflict_path() -> Result<()> {
     let alt_a = ConflictAlternative {
         source_child: alt_a_child,
         source_output_id: OutputId::from_hex("a1".repeat(32)),
-        claim: "JAR2-83 claim A".into(),
+        claim: "claim A".into(),
     };
     let alt_b = ConflictAlternative {
         source_child: alt_b_child,
         source_output_id: OutputId::from_hex("b2".repeat(32)),
-        claim: "JAR2-83 claim B".into(),
+        claim: "claim B".into(),
     };
     set_pending_conflict(ConflictRecordIntent {
         alternatives: vec![alt_a.clone(), alt_b.clone()],
@@ -925,16 +875,16 @@ async fn run_conflict_path() -> Result<()> {
     let parent_script = vec![
         reconcile_placeholder(),
         Decision::Retire {
-            reason: "JAR2-83 conflict: scripted retire".into(),
+            reason: "conflict: scripted retire".into(),
         },
     ];
     let child_script = vec![
         Decision::EmitOutput {
-            content: "JAR2-83 child output".into(),
+            content: "conflict child output".into(),
             evidence: vec![planted_id.clone()],
         },
         Decision::Retire {
-            reason: "JAR2-83 child: scripted retire".into(),
+            reason: "conflict child: scripted retire".into(),
         },
     ];
     install_role_scripts(parent_script, child_script);
@@ -1027,7 +977,7 @@ async fn drive_conflict_path(
         )
         .await
         .context("start_workflow(parent conflict)")?;
-    eprintln!("JAR2-83 conflict: parent started at {parent_workflow_id}");
+    eprintln!("conflict: parent started at {parent_workflow_id}");
 
     let child_input = AgentInput {
         cfg: Default::default(),
@@ -1052,7 +1002,7 @@ async fn drive_conflict_path(
         )
         .await
         .context("start_workflow(child conflict)")?;
-    eprintln!("JAR2-83 conflict: child started at {child_workflow_id}");
+    eprintln!("conflict: child started at {child_workflow_id}");
 
     let _child_result: AgentResult = child_handle
         .get_result(WorkflowGetResultOptions::default())
@@ -1067,11 +1017,11 @@ async fn drive_conflict_path(
     .map_err(|_| anyhow::anyhow!("parent never retired in 90s (conflict path)"))?
     .context("parent get_result (conflict path)")?;
     let AgentResult::Retired { reason } = parent_result;
-    eprintln!("JAR2-83 conflict: parent retired ({reason})");
+    eprintln!("conflict: parent retired ({reason})");
 
-    // Inspect the parent's `conflicts/` directory — the activity
-    // should have landed exactly one HeldOpen record matching the
-    // planted alternatives.
+    // Inspect the parent's `conflicts/` directory: the activity should
+    // have landed exactly one HeldOpen record matching the planted
+    // alternatives.
     let inspect_mandate = Mandate::new("inspect", Duration::from_millis(0), None);
     let inspect_storage: Arc<dyn AgentStorage> = storage.clone();
     let parent_view = AgentFs::new_with_storage(

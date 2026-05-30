@@ -1,46 +1,17 @@
-//! Hand-rolled VCR-style fixture infrastructure for JAR2-21.
+//! Hand-rolled VCR-style fixture infrastructure for vendor LLM tests.
 //!
-//! Spawns a tiny HTTP/1.1 listener on a loopback port that serves
-//! pre-recorded vendor responses for each `POST` the system under test
-//! makes. Per-test fixture: one listener, a `Vec<ResponseFixture>` of
-//! scripted responses popped FIFO on each request. The vendor clients are
-//! pointed at `http://127.0.0.1:<port>/` via the already-public
-//! `with_base_url` setter, so the production HTTP path runs end-to-end
-//! against recorded wire bytes — closing the `CallStats::latency_ms`
-//! / `vendor` gap that the pure `parse_response` unit tests leave open.
+//! Spawns a loopback HTTP/1.1 listener that serves pre-recorded vendor
+//! responses for each `POST` the system under test makes. Per-test
+//! fixture: one listener, a `Vec<ResponseFixture>` popped FIFO. Vendor
+//! clients are pointed at the mock via `with_base_url`, so the production
+//! HTTP path runs end-to-end against recorded wire bytes — closing the
+//! `CallStats::latency_ms` / `vendor` gap that pure `parse_response` unit
+//! tests leave open. The mock sleeps a few ms before responding so the
+//! millisecond-resolution `latency_ms` measurement clears zero.
 //!
-//! Why hand-rolled: see `scratch/post_bootstrap_followups.md` § A1 ("Test
-//! isolation. Recorded-response fixtures (VCR-style) for CI") plus
-//! JAR2-21's bright-red "do not pull in a VCR crate". The implementation
-//! sticks to the existing dependency set: `tokio` + `serde_json`.
-//!
-//! # Latency-ms floor
-//!
-//! Vendor adapters compute `started.elapsed().as_millis()` as a `u64`; a
-//! localhost round-trip can complete in <1ms and truncate to zero. The
-//! ticket spec asks tests to assert `stats.latency_ms > 0`, so the mock
-//! sleeps a small amount before responding. The delay is small enough to
-//! not slow the suite materially (~10ms × 6 tests).
-//!
-//! # Per-fixture format
-//!
-//! Each fixture file is a JSON document with at least:
-//!
-//! ```text
-//! {
-//!   "synthesized": true | false,   // for the PR-description audit trail
-//!   "vendor": "anthropic" | "cohere",
-//!   "note": "<free-form>",
-//!   "responses": [
-//!     { "status": 200, "body": { ...vendor-shaped JSON... } },
-//!     ...
-//!   ]
-//! }
-//! ```
-//!
-//! Only `responses` is load-bearing for the test runner; the other fields
-//! exist so a reviewer can tell at a glance whether a fixture is hand-
-//! written or recorded-from-live.
+//! Fixture file format: a JSON document with a `responses` array of
+//! `{ "status": u16, "body": <vendor-shaped JSON> }` entries; other
+//! fields (`synthesized`, `vendor`, `note`) are reviewer-facing only.
 
 #![allow(dead_code)] // Each test file uses a subset of helpers.
 

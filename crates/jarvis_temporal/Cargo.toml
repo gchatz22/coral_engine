@@ -1,96 +1,53 @@
 [package]
 name = "jarvis_temporal"
 version = "0.0.0"
-# `temporalio-sdk` is `edition = "2024"`. Edition 2024 stabilised in Rust 1.85;
-# the workspace toolchain pin is 1.88 (see `rust-toolchain.toml`), so the SDK
-# compiles. We keep this crate on 2021 because the smoke is small and nothing
-# in it needs 2024 — staying on 2021 matches `jarvis_node` and avoids letting
-# the edition leak into a load-bearing decision that's really about the SDK.
+# `temporalio-sdk` is `edition = "2024"`; the workspace toolchain pin is 1.88
+# (see `rust-toolchain.toml`), so the SDK compiles. This crate stays on 2021 to
+# match `jarvis_node` — nothing here needs 2024.
 edition = "2021"
 rust-version = "1.88"
-description = "Temporal-hosted agent workflow runtime for the Jarvis Engine (stage 0 SDK smoke)."
+description = "Temporal-hosted agent workflow runtime for the Jarvis Engine."
 license = "Apache-2.0 OR MIT"
 publish = false
 
-# Stage 3.2 (JAR2-58) replaces the stage-0.3 stub. The `worker` binary now
-# spins up a Temporal worker registering `AgentWorkflow` + a noop activity
-# set; real workflow body + activities land in JAR2-60..66.
 [[bin]]
 name = "worker"
 path = "src/bin/worker.rs"
 
-# Stage 0.2 smoke (JAR2-41) — exercises the Temporal Rust SDK primitive set
-# (`scratch/agent_runtime.md` § 4) end-to-end against a locally-running
-# Temporal Server. The binary deletes itself when stage 3 lands the real
-# `AgentWorkflow` (see `scratch/temporal_staged_plan.md` § 5 stage 0). The
-# accompanying smoke doc lives at `scratch/temporal_rust_sdk_smoke.md`.
 [[bin]]
 name = "temporal-smoke"
 path = "src/bin/temporal_smoke.rs"
 
 [dependencies]
-# JAR2-59 — signal handler payload types live with the rest of the
-# operator-facing core (`Trigger`, `HumanOp`, `MandatePatch`). Importing
-# them here keeps `jarvis_temporal` as the *host* and `jarvis_node` as
-# the *type owner*. See `crates/jarvis_temporal/src/workflow.rs` signal
-# handler doc for the placement decision.
+# Signal handler payload types (`Trigger`, `HumanOp`, `MandatePatch`) live in
+# `jarvis_node`; this crate is the *host*, `jarvis_node` is the *type owner*.
 jarvis_node = { path = "../jarvis_node" }
-# `temporalio-sdk` is in Public Preview at v0.4.0 (released 2026-04-29). The
-# SDK lib.rs documents itself as having a "very unstable" workflow API; the
-# smoke doc records what worked and what surprised us against this pin.
-# Pinned with `=` so a future `cargo update` doesn't silently shift the
-# SDK under us — stage 3 will revisit this pin deliberately.
+# `temporalio-sdk` is in Public Preview at v0.4.0; the SDK's `lib.rs` documents
+# its workflow API as "very unstable". Pinned with `=` so a future
+# `cargo update` doesn't silently shift the SDK under us.
 temporalio-sdk = "=0.4.0"
 temporalio-client = "=0.4.0"
 temporalio-common = "=0.4.0"
 temporalio-sdk-core = "=0.4.0"
 temporalio-macros = "=0.4.0"
 anyhow = "1"
-# The `#[activities]`, `#[workflow]`, `#[workflow_methods]` macros and the
-# `temporalio_sdk::workflows::select!` macro expand to paths under `futures` /
-# `futures_util` (notably `FutureExt::boxed`), so both must be in-scope
-# direct deps of the crate using them. Confirmed against macro expansion
-# error output, not just SDK example tomls.
+# The `#[activities]`, `#[workflow]`, `#[workflow_methods]` macros and
+# `temporalio_sdk::workflows::select!` expand to paths under `futures` /
+# `futures_util` (notably `FutureExt::boxed`), so both must be direct deps.
 futures = "0.3"
 futures-util = "0.3"
-# `AgentInput`, `AgentResult`, and placeholder types in `workflow.rs` need to
-# round-trip through Temporal's payload codec, which uses serde under the
-# hood. `derive` covers the macro forms each type uses.
 serde = { version = "1", features = ["derive"] }
-# JAR2-60 — the activity input/output types in `src/activities.rs` carry
-# `serde_json::Value` payloads (mirror of `ToolCall.args` etc.), so the
-# library crate needs serde_json as a direct runtime dep. Was a
-# dev-only dep pre-JAR2-60; promoted here.
 serde_json = "1"
-# JAR2-66 — the `persist_retirement` activity body sources a deterministic
-# `retired_at: DateTime<Utc>` from `ActivityContext::info().scheduled_time`
-# (a `SystemTime`) and passes it to `AgentFs::persist_retirement`. The
-# conversion uses `DateTime::<Utc>::from(SystemTime)` from chrono. Feature
-# `clock` enables `Utc::now()` for the fallback when the SDK hasn't filled
-# in `scheduled_time` (test harnesses).
+# `clock` enables `Utc::now()` for the fallback when the SDK hasn't filled in
+# `scheduled_time` (test harnesses).
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-# JAR2-68 — the `append_decision_log` activity body PUTs `<tick>.jsonl`
-# bytes via [`AgentStorage::put`], which takes `bytes::Bytes`. `bytes`
-# was already in the dep graph transitively (tokio, temporalio); add it
-# as a direct dep so the activity body can construct `Bytes` without
-# pulling it through a re-export.
 bytes = "1"
-# JAR2-80 — `register_child_in_structural_db` activity mints a fresh
-# child `Uuid` via `Uuid::new_v4()` and returns it wrapped in `AgentId`.
-# The activity body lives in `jarvis_temporal`; `jarvis_node`'s `AgentId`
-# is the wire type but the v4 generator lives at the call site. `serde`
-# covers the test-time round-trip; `v4` is the runtime generator.
+# `v4` is the runtime generator used by `register_child_in_structural_db` to
+# mint fresh child `Uuid`s at the activity-body call site.
 uuid = { version = "1", default-features = false, features = ["serde", "std", "v4"] }
-# JAR2-80 — `StructuralDbStore` trait in `worker.rs` is `#[async_trait]`
-# so `jarvis_graph::GraphStore` can impl it from outside this crate (the
-# JAR2-69-style `OnceLock` pattern resolved against a trait keeps
-# `jarvis_temporal` free of a `jarvis_graph` dep, which would otherwise
-# cycle). Pre-JAR2-80 `async-trait` was a dev-only dep; promoted here.
 async-trait = "0.1"
-# JAR2-82 — `ReconciliationError` in `activities.rs` is `thiserror`-
-# derived so the typed errors hit `ApplicationFailure::non_retryable`
-# via `anyhow::Error::new` (which requires `StdError + Send + Sync`).
-# Mirrors `jarvis_node`'s `FsError` shape — same crate, same usage.
+# `thiserror`-derived errors hit `ApplicationFailure::non_retryable` via
+# `anyhow::Error::new`, which requires `StdError + Send + Sync`.
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
 tracing = "0.1"
@@ -98,39 +55,23 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 url = "2"
 
 [features]
-# JAR2-62 — pass-through to `jarvis_node`'s vendor features so the
-# `worker` binary can be built against one or both LLM vendors. The
-# library itself (`worker.rs`, `activities.rs`) is feature-agnostic:
-# it traffics in `Arc<dyn Decide>`, which is always available because
-# the `Decide` trait lives in `jarvis_node::decision` (un-gated).
-# Only `bin/worker.rs` reaches for vendor-specific `ModelClient`
-# constructors and is itself `#[cfg]`-gated on these features. See
-# `src/bin/worker.rs` for the dispatch shape (mirrors
-# `jarvis_node/src/bin/node_run_llm.rs`).
+# Pass-through to `jarvis_node`'s vendor features so the `worker` binary can be
+# built against one or both LLM vendors. The library itself is feature-agnostic;
+# only `bin/worker.rs` reaches for vendor-specific `ModelClient` constructors
+# and is `#[cfg]`-gated on these features.
 default = []
 llm-anthropic = ["jarvis_node/llm-anthropic"]
 llm-cohere = ["jarvis_node/llm-cohere"]
 
 [dev-dependencies]
-# JAR2-62 — `async-trait` is also exercised by test-only `ErrDecide` /
-# `AliasEchoTool` / `FailingTool` impls (`#[async_trait]`-annotated
-# traits in `jarvis_node`). The crate itself now lists `async-trait` as
-# a runtime dep (JAR2-80 promoted it for `StructuralDbStore`), so this
-# section no longer needs to declare it — it's available transitively.
-# JAR2-69 — the unit test for `install_agent_storage` / `agent_storage`
-# in `src/worker.rs` needs `MemoryStorage`, which is gated behind the
-# `memory-storage` feature on `jarvis_node`. Dev-only dep override
-# turns the feature on for the test build without dragging
-# `MemoryStorage` into production worker binaries.
+# `memory-storage` feature pulls in `MemoryStorage` for the unit tests in
+# `src/worker.rs` without dragging it into production worker binaries.
 jarvis_node = { path = "../jarvis_node", features = ["memory-storage"] }
-# Only the unit tests in `workflow.rs` need a concrete codec to prove the
-# `Serialize`/`Deserialize` derives are present on every placeholder
-# type. Temporal's wire-level payload codec at runtime handles the
-# serialization itself — we don't need `serde_json` at runtime, just in
-# tests as a cheap, hermetic round-trip check.
+# Test-only concrete codec to prove `Serialize`/`Deserialize` derives are
+# present on every placeholder type; Temporal's wire-level payload codec
+# handles serialization at runtime.
 serde_json = "1"
-# JAR2-64 — `persist_output_impl` hermetic tests plant `EvidenceRecord`s
-# whose constructor takes a `chrono::DateTime<Utc>`. Test-only dep so
-# production worker binaries don't pull `chrono` into their runtime
-# graph.
+# Test-only dep so production worker binaries don't pull `chrono` into their
+# runtime graph; the hermetic tests plant `EvidenceRecord`s whose constructor
+# takes a `chrono::DateTime<Utc>`.
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

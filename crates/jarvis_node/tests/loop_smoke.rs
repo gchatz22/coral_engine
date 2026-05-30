@@ -1,31 +1,10 @@
 //! Integration tests for the `Agent` run loop.
 //!
-//! These tests exercise the public surface only (`Agent::new`,
-//! `Agent::signal`, `Agent::run`) plus the FS root the agent writes to.
-//! They cover:
-//!
-//! * **JAR2-8** verification list (`scratch/minimal_node_backend.md` § 7):
-//!   wakes on signal, wakes on deadline, `EmitOutput` with valid evidence
-//!   writes a file, `Retire` exits cleanly, `RewriteFs` writes under
-//!   `notes/`, `CallTool` records evidence, `max_ticks` caps the loop.
-//! * **JAR2-19** correction loop and health transitions: `EmitOutput` with
-//!   empty / unknown evidence and `CallTool` for an unregistered tool now
-//!   route through `ApplyOutcome::NeedsCorrection` and stage a
-//!   `CorrectionContext` for the next tick (agent-internal continuation
-//!   state, not a queue trigger — see `agent.rs`'s module doc); persistent
-//!   failure exhausts the inference budget and flips the tracker to
-//!   `Unhealthy`; the next successful tick recovers and archives the prior
-//!   incident; Decide-side `Err` transitions to `Unhealthy` directly while
-//!   keeping the run loop alive. A regression test
-//!   (`apply_failure_correction_budget_is_immune_to_concurrent_external_triggers`)
-//!   pins the contract that external triggers landing between an apply
-//!   failure and the next tick cannot reset the per-tick retry budget.
-//! * **JAR2-30** symmetric correction loop for tool failures: when
-//!   `ApplyOutcome::ToolError` surfaces (the tool's internal retry policy
-//!   exhausted), the run loop stages a `CorrectionContext` describing the
-//!   call (tool, args, error) so the next tick's `ContextBundle` gives the
-//!   model a chance to self-correct — same mechanism JAR2-19 uses, applied
-//!   to the tool-call failure mode.
+//! Exercises the public surface only (`Agent::new`, `Agent::signal`,
+//! `Agent::run`) plus the FS root the agent writes to: signal/deadline
+//! wakeups, `EmitOutput` / `Retire` / `RewriteFs` / `CallTool` arms,
+//! `max_ticks` cap, the apply-time correction loop, tool-failure
+//! correction, health budget exhaustion + recovery.
 //!
 //! Time-sensitive tests use `#[tokio::test(flavor = "current_thread",
 //! start_paused = true)]` so the runtime auto-advances when the only
@@ -81,10 +60,10 @@ fn registry_with_echo() -> ToolRegistry {
 }
 
 /// Read `dir` and return the files that are *agent record files* —
-/// excluding the JAR2-54 tail-index sidecar (`_tail.json`). Returns
-/// an empty Vec for a missing dir to match the post-JAR2-53 lazy-
-/// directory-creation behavior. Used by every assertion that counts
-/// "how many outputs/evidence files were written" — the tail file is
+/// excluding the tail-index sidecar (`_tail.json`). Returns an empty
+/// Vec for a missing dir to match `AgentFs::open`'s lazy
+/// directory-creation behavior. Used by assertions that count
+/// "how many outputs/evidence files were written"; the tail file is
 /// an index artefact, not a record.
 fn agent_record_files(dir: &Path) -> Vec<PathBuf> {
     if !dir.exists() {
@@ -397,13 +376,10 @@ async fn max_ticks_caps_loop_iterations_and_writes_retirement() {
     assert!(tmp.path().join("retirement.json").is_file());
 }
 
-// ---- JAR2-19: correction loop + health transitions ----
-
-/// JAR2-19 acceptance test 1: model emits an unsatisfiable `Decision`
-/// (`CallTool` for an unregistered tool); the runtime must catch the
-/// apply-time failure, stage a correction for the next tick, and the next
-/// tick must produce a valid `Decision` that completes. The agent stays
-/// Healthy throughout.
+/// Model emits an unsatisfiable `Decision` (`CallTool` for an
+/// unregistered tool); the runtime must catch the apply-time failure,
+/// stage a correction for the next tick, and the next tick must produce
+/// a valid `Decision` that completes. The agent stays Healthy throughout.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn invalid_call_tool_stages_correction_then_recovers() {
     let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
@@ -465,10 +441,9 @@ async fn invalid_call_tool_stages_correction_then_recovers() {
 }
 
 /// `EmitOutput` with an *empty* evidence list is rejected by
-/// `AgentFs::persist_output` with `FsError::EmptyEvidence`. Per JAR2-19,
-/// that maps to `ApplyOutcome::NeedsCorrection` rather than the legacy
-/// "log + continue" warn — the next iteration runs as a correction
-/// continuation and the script's second decision retires.
+/// `AgentFs::persist_output` with `FsError::EmptyEvidence`; that maps
+/// to `ApplyOutcome::NeedsCorrection` and the next iteration runs as a
+/// correction continuation whose script retires.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn emit_output_with_empty_evidence_stages_correction() {
     let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
@@ -497,11 +472,8 @@ async fn emit_output_with_empty_evidence_stages_correction() {
         .expect("run ok");
     assert_eq!(reason, "recovered");
 
-    // No output file written (the failed EmitOutput never persisted).
-    // Post-JAR2-53 `AgentFs::open` no longer proactively mkdirs
-    // `outputs/` — the directory only materialises on first write,
-    // which never happened here. Treat both an absent dir and an
-    // empty dir as "no output was persisted."
+    // `outputs/` materialises on first write; treat absent dir as no
+    // output persisted.
     let outputs_dir = tmp.path().join("outputs");
     if outputs_dir.exists() {
         assert!(std::fs::read_dir(&outputs_dir)
@@ -518,7 +490,7 @@ async fn emit_output_with_empty_evidence_stages_correction() {
     assert_eq!(v.get("state").and_then(|x| x.as_str()), Some("Healthy"));
 }
 
-/// Same shape of failure but driven through the `EmitOutput` arm with a
+/// Same shape of failure driven through the `EmitOutput` arm with a
 /// well-formed-but-not-on-disk evidence id (`FsError::EvidenceNotFound`).
 /// Mirrors the empty-evidence test above; the two cover the two distinct
 /// `FsError` variants the apply-time correction path catches.
@@ -551,11 +523,8 @@ async fn emit_output_with_unknown_evidence_stages_correction() {
         .expect("run ok");
     assert_eq!(reason, "recovered");
 
-    // No output file written (the failed EmitOutput never persisted).
-    // Post-JAR2-53 `AgentFs::open` no longer proactively mkdirs
-    // `outputs/` — the directory only materialises on first write,
-    // which never happened here. Treat both an absent dir and an
-    // empty dir as "no output was persisted."
+    // `outputs/` materialises on first write; treat absent dir as no
+    // output persisted.
     let outputs_dir = tmp.path().join("outputs");
     if outputs_dir.exists() {
         assert!(std::fs::read_dir(&outputs_dir)
@@ -572,12 +541,11 @@ async fn emit_output_with_unknown_evidence_stages_correction() {
     assert_eq!(v.get("state").and_then(|x| x.as_str()), Some("Healthy"));
 }
 
-/// JAR2-19 acceptance test 2: persistent apply-time failure exhausts the
-/// per-tick inference budget across the original attempt + one correction
-/// continuation. The agent transitions to `Unhealthy`, the run loop
-/// **does not halt**, and a subsequent successful tick (here, an `Idle`
-/// decision) recovers the tracker to `Healthy` while archiving the prior
-/// incident.
+/// Persistent apply-time failure exhausts the per-tick inference budget
+/// across the original attempt + one correction continuation. The agent
+/// transitions to `Unhealthy`, the run loop **does not halt**, and a
+/// subsequent successful tick (here, an `Idle` decision) recovers the
+/// tracker to `Healthy` while archiving the prior incident.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn persistent_apply_time_failure_exhausts_budget_and_recovers_on_next_success() {
     let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
@@ -680,7 +648,7 @@ async fn persistent_apply_time_failure_exhausts_budget_and_recovers_on_next_succ
     assert_eq!(
         failing.get("type").and_then(|x| x.as_str()),
         Some("Inference"),
-        "apply-time failures count as inference failures per JAR2-19"
+        "apply-time failures count as inference failures"
     );
     let retry_trail = inc
         .get("incident")
@@ -752,7 +720,7 @@ async fn decide_err_transitions_to_unhealthy_and_keeps_loop_alive() {
             .and_then(|f| f.get("type"))
             .and_then(|x| x.as_str()),
         Some("Inference"),
-        "Decide-Err is an inference failure per JAR2-19"
+        "Decide-Err is an inference failure"
     );
     let last_err = v
         .get("incident")
@@ -930,8 +898,6 @@ async fn apply_failure_correction_budget_is_immune_to_concurrent_external_trigge
     );
 }
 
-// ---- JAR2-25: tool-call retry + health wiring ----
-
 /// Test-only `Tool` impl: fails its first `fail_count` calls with a
 /// caller-supplied `anyhow::Error`, then succeeds. Used to exercise the
 /// agent-side `ApplyOutcome::ToolError` path without standing up an MCP
@@ -990,13 +956,12 @@ fn registry_with_flaky(name: &str, fail_count: u32) -> ToolRegistry {
     r
 }
 
-/// JAR2-25 acceptance test: a tool that fails persistently exhausts the
-/// per-tick `FailureKind::ToolCall` budget and trips the tracker to
-/// `Unhealthy`. We pin `max_tool = 0` so a single exhausted call is
-/// enough to exhaust the budget — that's the cleanest interpretation of
-/// "trip `Unhealthy` after max retries": each exhausted tool call counts
-/// as one tick-level slot, and with budget = 0 the first one trips it.
-/// The run loop must **not** halt — verified by the fact that the script
+/// A tool that fails persistently exhausts the per-tick
+/// `FailureKind::ToolCall` budget and trips the tracker to `Unhealthy`.
+/// We pin `max_tool = 0` so a single exhausted call exhausts the budget
+/// — each exhausted tool call counts as one tick-level slot, and with
+/// budget = 0 the first one trips it. The run loop must **not** halt —
+/// verified by the fact that the script
 /// then runs a successful `Idle` and a `Retire` decision in the recovery
 /// test below.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1085,12 +1050,12 @@ async fn tool_call_exhausts_retry_budget_trips_unhealthy() {
     );
 }
 
-/// JAR2-25 acceptance test: after the per-tick tool-call budget exhausts
-/// and trips `Unhealthy`, the very next successful tick must recover the
-/// tracker to `Healthy` and archive the prior incident — same recovery
-/// contract A1.5 (`src/health.rs`) defines for the inference path. We
-/// reuse the same flaky tool but only fail it once, so the next tick's
-/// `CallTool` succeeds and the tick is marked successful.
+/// After the per-tick tool-call budget exhausts and trips `Unhealthy`,
+/// the very next successful tick must recover the tracker to `Healthy`
+/// and archive the prior incident — the same recovery contract
+/// `src/health.rs` defines for the inference path. We reuse the same
+/// flaky tool but only fail it once, so the next tick's `CallTool`
+/// succeeds and the tick is marked successful.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
     let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
@@ -1194,17 +1159,11 @@ async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
     );
 }
 
-// ---- JAR2-30: tool-failure correction (mirrors JAR2-19 inference path) ----
-
-/// Capturing `Decide` wrapper that snapshots every `ContextBundle` it sees
-/// and then defers to a `MockDecide` script. Used by the JAR2-30 tests to
-/// assert on the bundle the run loop hands the model on the
-/// post-tool-failure tick — that's the surface the corrective signal
-/// rides on.
-///
-/// Pattern matches `DeferredSinkDecide` above (same "wrap a `MockDecide`,
-/// instrument decide()" shape); kept local rather than promoted to a
-/// crate-level helper because it has no callers outside this test file.
+/// Capturing `Decide` wrapper that snapshots every `ContextBundle` it
+/// sees and defers to a `MockDecide` script. Used by the tool-failure
+/// correction tests to assert on the bundle the run loop hands the
+/// model on the post-tool-failure tick — that's the surface the
+/// corrective signal rides on.
 struct CapturingDecide {
     inner: MockDecide,
     seen: Arc<Mutex<Vec<ContextBundle>>>,
@@ -1218,15 +1177,14 @@ impl Decide for CapturingDecide {
     }
 }
 
-/// JAR2-30 acceptance test 1: when a `CallTool` exhausts its retry budget
-/// inside the tool (surfaces as `Err` from `tools.call`) and the per-tick
+/// When a `CallTool` exhausts its retry budget inside the tool
+/// (surfaces as `Err` from `tools.call`) and the per-tick
 /// `FailureKind::ToolCall` budget still has room, the run loop must
-/// stage a `CorrectionContext` so the next tick's `ContextBundle` carries
-/// a corrective signal describing the failure (tool name, args, error).
-///
-/// This is the symmetric property to JAR2-19's apply-time correction
-/// loop — the model gets a chance to self-correct rather than having to
-/// rediscover from scratch why its last decision failed.
+/// stage a `CorrectionContext` so the next tick's `ContextBundle`
+/// carries a corrective signal describing the failure (tool name, args,
+/// error). This mirrors the apply-time correction loop: the model gets
+/// a chance to self-correct rather than rediscovering from scratch why
+/// its last decision failed.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn tool_call_failure_stages_correction_visible_on_next_tick_bundle() {
     let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
@@ -1312,7 +1270,7 @@ async fn tool_call_failure_stages_correction_visible_on_next_tick_bundle() {
         failure.contains("flaky tool"),
         "correction should preserve underlying error message, got: {failure}"
     );
-    // Concrete next-step instruction (mirrors JAR2-19's framing).
+    // Concrete next-step instruction.
     assert!(
         failure.contains("different decision"),
         "correction should end with a next-step cue, got: {failure}"
@@ -1332,12 +1290,11 @@ async fn tool_call_failure_stages_correction_visible_on_next_tick_bundle() {
     );
 }
 
-/// JAR2-30 acceptance test 2: after a tool failure stages a correction,
-/// the next tick uses the corrective context to emit a *different*
-/// decision (here, a different tool call that succeeds), the tick
-/// completes via `ApplyOutcome::Continue`, and the agent stays / returns
-/// to `Healthy`. This is symmetric to JAR2-19's
-/// `invalid_call_tool_stages_correction_then_recovers` test.
+/// After a tool failure stages a correction, the next tick uses the
+/// corrective context to emit a *different* decision (here, a different
+/// tool call that succeeds), the tick completes via
+/// `ApplyOutcome::Continue`, and the agent stays / returns to `Healthy`.
+/// Symmetric to `invalid_call_tool_stages_correction_then_recovers`.
 ///
 /// We assert against a `CapturingDecide` again so we can show the second
 /// tick saw the correction *and* emitted a different `Decision`.
@@ -1455,14 +1412,11 @@ async fn tool_call_failure_correction_then_different_decision_recovers_to_health
     );
 }
 
-// ---- JAR2-36: per-mandate ContextPolicy plumbing ------------------------
-
 /// Per-mandate `recent_outputs` cap reaches the run loop end-to-end.
 ///
 /// Pre-seed 5 outputs on disk, then run an agent whose mandate's
 /// `ContextPolicy::recent_outputs = 2`. The bundle the run loop hands
-/// `Decide::decide` on the first tick must carry at most 2 outputs — not
-/// the pre-JAR2-36 hardcoded `RECENT_WINDOW = 8` count.
+/// `Decide::decide` on the first tick must carry at most 2 outputs.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn per_mandate_recent_outputs_cap_reaches_the_run_loop() {
     let tmp = TempDir::new().expect("tempdir");
@@ -1539,13 +1493,10 @@ async fn per_mandate_recent_outputs_cap_reaches_the_run_loop() {
     assert_eq!(bundle.mandate.context_policy.recent_outputs, 2);
 }
 
-// ---- JAR2-38: parallel CallTools dispatch ----
-
-/// JAR2-38 acceptance test: K=3 parallel tool calls in a single tick.
-/// All three succeed; the agent loop must persist three distinct
-/// evidence records in input order and continue cleanly to the next
-/// tick's `EmitOutput`. Models the "synthesize 3 file reads in one
-/// tick" path that the JAR2-37 workaround forced into N+1 ticks.
+/// K=3 parallel tool calls in a single tick. All three succeed; the
+/// agent loop must persist three distinct evidence records in input
+/// order and continue cleanly to the next tick's `EmitOutput`. Models
+/// the "synthesize 3 file reads in one tick" path.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn parallel_call_tools_k3_all_succeed_persists_evidence_in_order() {
     let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
@@ -1643,13 +1594,12 @@ async fn parallel_call_tools_k3_all_succeed_persists_evidence_in_order() {
     assert_eq!(v["state"].as_str(), Some("Healthy"));
 }
 
-/// JAR2-38 partial-failure test: K=3 parallel tool calls where the
-/// middle call fails. The successful sibling calls must persist their
-/// evidence (the model can cite them next tick), the failure stages a
-/// correction describing only the failed call, and the per-tick
-/// `ToolCall` budget is decremented by exactly one slot (K=1 failure
-/// here) — pinning the "K against budget" accounting documented in
-/// `agent.rs`.
+/// Partial failure: K=3 parallel tool calls where the middle call
+/// fails. Successful siblings must persist their evidence (the model
+/// can cite them next tick), the failure stages a correction describing
+/// only the failed call, and the per-tick `ToolCall` budget is
+/// decremented by exactly one slot — pinning the "K against budget"
+/// accounting documented in `agent.rs`.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn parallel_call_tools_k3_partial_failure_persists_successes_and_stages_correction() {
     let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
@@ -1777,11 +1727,10 @@ async fn parallel_call_tools_k3_partial_failure_persists_successes_and_stages_co
     assert_eq!(v["state"].as_str(), Some("Healthy"));
 }
 
-/// JAR2-38 budget-accounting test: K parallel failures must consume K
-/// slots in the `FailureKind::ToolCall` budget. With `max_tool = 2`
-/// and a K=3 batch of all-failing calls, the budget exhausts and the
-/// tracker transitions to `Unhealthy`. Pins the documented
-/// "K against budget" choice.
+/// K parallel failures must consume K slots in the `FailureKind::ToolCall`
+/// budget. With `max_tool = 2` and a K=3 batch of all-failing calls,
+/// the budget exhausts and the tracker transitions to `Unhealthy`.
+/// Pins the documented "K against budget" choice.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn parallel_call_tools_k3_all_fail_consumes_k_budget_slots_and_trips_unhealthy() {
     let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;

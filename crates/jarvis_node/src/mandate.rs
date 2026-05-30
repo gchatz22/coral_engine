@@ -10,10 +10,7 @@ use std::time::Duration;
 /// Retry policy for tool calls invoked under this mandate. Bounds attempts
 /// within a single tool call and the fixed delay between them. Lives on
 /// `Mandate` so a per-mandate override propagates into the `McpTool`s an
-/// agent uses (see `ToolRegistry::register_mcp_server_with_policy`). Was
-/// previously inside `mcp::tool` (JAR2-25); JAR2-31 hoists it to the
-/// `mandate` module so the field on `Mandate` does not have to be feature-
-/// gated and so the wire format is identical across `--features` configs.
+/// agent uses (see `ToolRegistry::register_mcp_server_with_policy`).
 ///
 /// Defaults: 3 total attempts, 50 ms between retries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,14 +60,12 @@ impl RetryPolicy {
 ///
 /// `retry_policy` is an optional per-mandate override for the retry
 /// behaviour of any `McpTool`s registered for this agent (see
-/// `ToolRegistry::register_mcp_server_with_policy`). `None` keeps the
-/// `RetryPolicy::default()` semantics JAR2-25 wired at construction.
+/// `ToolRegistry::register_mcp_server_with_policy`). `None` falls back to
+/// `RetryPolicy::default()` at tool construction.
 ///
 /// `context_policy` tunes how `assemble_context` shapes the warm
 /// `ContextBundle` for this mandate (window sizes for recent outputs /
-/// evidence, cap on open-claims surfaced into the bundle). Defaults
-/// reproduce the pre-JAR2-36 hardcoded `RECENT_WINDOW = 8` behavior so
-/// existing graphs round-trip unchanged.
+/// evidence, cap on open-claims surfaced into the bundle).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mandate {
     pub text: String,
@@ -79,15 +74,11 @@ pub struct Mandate {
     pub max_ticks: Option<u64>,
     /// Per-mandate retry policy override. `None` (the default and the
     /// serialized shape when absent) leaves `RetryPolicy::default()` in
-    /// place. `#[serde(default, skip_serializing_if = "Option::is_none")]`
-    /// keeps the wire format backward-compatible with pre-JAR2-31 mandate
-    /// JSON.
+    /// place.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_policy: Option<RetryPolicy>,
-    /// Per-mandate context-assembly policy. `#[serde(default)]` keeps the
-    /// wire format backward-compatible with pre-JAR2-36 mandate JSON; a
-    /// missing field deserializes to `ContextPolicy::default()`, which
-    /// matches the pre-JAR2-36 hardcoded window sizes.
+    /// Per-mandate context-assembly policy. A missing field deserializes
+    /// to `ContextPolicy::default()`.
     #[serde(default)]
     pub context_policy: ContextPolicy,
 }
@@ -111,13 +102,6 @@ impl Mandate {
 /// `scratch/context_assembly_v2.md` § 3 + § 6 for the design rationale and
 /// `scratch/context_assembly_v1_measurements.md` for the empirical basis of
 /// the default values below.
-///
-/// Defaults match pre-JAR2-36 behavior (`RECENT_WINDOW = 8`) for
-/// `recent_outputs` / `recent_evidence` so existing graphs round-trip
-/// unchanged. `open_claims_max` is new in JAR2-36; its default is the
-/// strawman value from the design doc, retained after the measurement spike
-/// found no recorded-fixture mandate accumulating more than a handful of
-/// claims.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextPolicy {
     /// Max recent outputs to surface in the warm `ContextBundle`. Reads
@@ -136,10 +120,7 @@ pub struct ContextPolicy {
     pub open_claims_max: usize,
 }
 
-// Defaults pinned in `scratch/context_assembly_v1_measurements.md`. The
-// recent_* values match the pre-JAR2-36 `RECENT_WINDOW = 8` constant so
-// existing graphs are unaffected; `open_claims_max` is the design-doc
-// strawman, unchanged after the spike.
+// Defaults pinned in `scratch/context_assembly_v1_measurements.md`.
 fn default_recent_outputs() -> usize {
     8
 }
@@ -164,8 +145,8 @@ impl Default for ContextPolicy {
 /// its content; the run loop refuses outputs whose evidence does not resolve
 /// on disk (see `AgentFs::persist_output`).
 ///
-/// `id` is **content-addressed** (JAR2-70): `sha256` over the canonical
-/// JSON of `{content, evidence: sorted_ids}`, mirroring `EvidenceId::new`'s
+/// `id` is **content-addressed**: `sha256` over the canonical JSON of
+/// `{content, evidence: sorted_ids}`, mirroring `EvidenceId::new`'s
 /// shape. Two ticks that emit byte-identical `(content, evidence)` produce
 /// the same `OutputId`, which makes `persist_output` idempotent for free
 /// under Temporal activity retries.
@@ -295,9 +276,8 @@ mod tests {
 
     #[test]
     fn mandate_default_omits_retry_policy_field() {
-        // `skip_serializing_if = "Option::is_none"` is the backward-compat
-        // contract for pre-JAR2-31 mandate JSON: a default `Mandate` must
-        // not emit `retry_policy` so old fixtures still round-trip.
+        // `skip_serializing_if = "Option::is_none"`: a default `Mandate`
+        // must not emit `retry_policy` on the wire.
         let m = Mandate::new("x", Duration::from_millis(100), None);
         let s = serde_json::to_string(&m).unwrap();
         assert!(
@@ -331,25 +311,21 @@ mod tests {
 
     #[test]
     fn mandate_deserializes_legacy_json_without_retry_policy_field() {
-        // Pre-JAR2-31 mandate JSON had no `retry_policy` key. `#[serde(default)]`
-        // must fill in `None` rather than reject the input.
+        // Legacy mandate JSON without the `retry_policy` or
+        // `context_policy` keys: `#[serde(default)]` must fill in the
+        // defaults rather than reject the input.
         let legacy = r#"{"text":"old","idle_period":250,"max_ticks":null}"#;
         let back: Mandate = serde_json::from_str(legacy).unwrap();
         assert!(back.retry_policy.is_none());
         assert_eq!(back.text, "old");
         assert_eq!(back.idle_period, Duration::from_millis(250));
         assert_eq!(back.max_ticks, None);
-        // Pre-JAR2-36 mandate JSON also had no `context_policy`. The
-        // `#[serde(default)]` on the field fills in `ContextPolicy::default()`.
         assert_eq!(back.context_policy, ContextPolicy::default());
     }
 
     #[test]
-    fn context_policy_default_values_match_pre_jar2_36_behavior() {
-        // Pinned: the warm-cache defaults must reproduce the pre-JAR2-36
-        // `RECENT_WINDOW = 8` behavior so existing graphs are unaffected.
-        // `open_claims_max` is the design-doc strawman, retained after the
-        // measurement spike (see `scratch/context_assembly_v1_measurements.md`).
+    fn context_policy_default_values_are_pinned() {
+        // Defaults pinned per `scratch/context_assembly_v1_measurements.md`.
         let p = ContextPolicy::default();
         assert_eq!(p.recent_outputs, 8);
         assert_eq!(p.recent_evidence, 8);

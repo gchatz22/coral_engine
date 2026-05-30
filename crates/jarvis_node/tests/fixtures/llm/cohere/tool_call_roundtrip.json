@@ -1,7 +1,7 @@
 {
   "synthesized": true,
   "vendor": "cohere",
-  "note": "JAR2-37 Bug-A regression fixture. Two-tick sequence that drives a tool-call -> tool-result roundtrip through the Cohere adapter. Pre-fix, the second tick's request body carried an assistant turn with `content: \"\"` and no other tool_calls (the LlmDecide retry path echos the bad assistant turn verbatim), which Cohere rejects with HTTP 400 `must have non-empty content or tool calls`. With the build_body fix, that assistant turn omits `content` entirely and Cohere accepts it. The fixture itself only scripts Cohere's *responses*; the regression is checked at the captured-wire-body layer in the corresponding test. Hand-written; the maintainer's COHERE_API_KEY can re-record via JARVIS_LIVE_LLM=1 once a tool-call-roundtrip live smoke is in place.",
+  "note": "Regression fixture for the Cohere tool-call -> tool-result roundtrip. Two-tick sequence. The build_body adapter must omit `content` (rather than send `content: \"\"`) on an assistant turn whose `tool_calls` is empty; Cohere rejects empty `content` with HTTP 400 `must have non-empty content or tool calls`. The fixture only scripts Cohere's *responses*; the regression is checked at the captured-wire-body layer in the corresponding test. Hand-written; the maintainer's COHERE_API_KEY can re-record via JARVIS_LIVE_LLM=1 once a tool-call-roundtrip live smoke is in place.",
   "responses": [
     {
       "status": 200,
@@ -17,7 +17,7 @@
               "type": "function",
               "function": {
                 "name": "call_tool",
-                "arguments": "{\"name\":\"echo\",\"args\":{\"msg\":\"jar2-37 roundtrip\"},\"claim_seed\":\"roundtrip-seed\"}"
+                "arguments": "{\"name\":\"echo\",\"args\":{\"msg\":\"tool-call roundtrip\"},\"claim_seed\":\"roundtrip-seed\"}"
               }
             }
           ]
@@ -41,7 +41,7 @@
               "type": "function",
               "function": {
                 "name": "emit_output",
-                "arguments": "{\"content\":\"echoed jar2-37 roundtrip via the echo tool\",\"evidence\":[\"feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface\"]}"
+                "arguments": "{\"content\":\"echoed tool-call roundtrip via the echo tool\",\"evidence\":[\"feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface\"]}"
               }
             }
           ]

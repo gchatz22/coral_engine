@@ -1,7 +1,7 @@
 {
   "synthesized": true,
   "vendor": "anthropic",
-  "note": "JAR2-21 unhealthy-recovery cycle. Tick 1: both LlmDecide parse attempts fail (LlmDecide::decide returns Err -> Agent's Decide-Err arm transitions to Unhealthy directly). Tick 2: a valid `idle` decision -> mark_tick_success archives the prior Unhealthy incident and flips back to Healthy. Tick 3: a valid `retire` so the loop terminates cleanly. Four upstream responses total: 2 (bad x 2 in tick 1) + 1 (tick 2) + 1 (tick 3). Hand-written; re-record with `JARVIS_LIVE_LLM=1 cargo test --features llm-anthropic` when an Anthropic key is available.",
+  "note": "Unhealthy-recovery cycle. Tick 1: both LlmDecide parse attempts fail (LlmDecide::decide returns Err -> Agent's Decide-Err arm transitions to Unhealthy directly). Tick 2: a valid `idle` decision -> mark_tick_success archives the prior Unhealthy incident and flips back to Healthy. Tick 3: a valid `retire` so the loop terminates cleanly. Four upstream responses total: 2 (bad x 2 in tick 1) + 1 (tick 2) + 1 (tick 3). Hand-written; re-record with `JARVIS_LIVE_LLM=1 cargo test --features llm-anthropic` when an Anthropic key is available.",
   "responses": [
     {
       "status": 200,

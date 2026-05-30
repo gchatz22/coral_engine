@@ -1,28 +1,23 @@
--- Stage 4.2 cleanup (JAR2-77): DB-level UNIQUE backstop on `graphs.name`.
+-- DB-level UNIQUE backstop on `graphs.name`.
 --
--- Context: `GraphStore::create_from_yaml` (JAR2-73) enforces the v1
--- CREATE-only collision rule via a SELECT-then-INSERT inside a
--- `sqlx::Transaction`. That's correct for the operator-driven, single-
--- caller case `jarvis apply` runs in, but two concurrent applies racing
--- the SELECT-then-INSERT could in principle both insert. The fast-path
--- SELECT stays as-is (clean error semantics for the common case); this
--- migration adds the DB-level guarantee so the race is structurally
--- impossible. `create_from_yaml` is updated in the same PR to catch the
--- resulting Postgres SQLSTATE 23505 and surface it as the existing
--- `GraphStoreError::GraphAlreadyExists` variant.
+-- `GraphStore::create_from_yaml` enforces the CREATE-only collision
+-- rule via a SELECT-then-INSERT inside a `sqlx::Transaction`. That is
+-- correct for the operator-driven, single-caller case `jarvis apply`
+-- runs in, but two concurrent applies racing the SELECT-then-INSERT
+-- could in principle both insert. The fast-path SELECT stays as-is
+-- (clean error semantics for the common case); this migration adds
+-- the DB-level guarantee so the race is structurally impossible.
+-- `create_from_yaml` catches the resulting Postgres SQLSTATE 23505 and
+-- surfaces it as `GraphStoreError::GraphAlreadyExists`.
 --
--- Why `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE (...)` instead of
--- `CREATE UNIQUE INDEX`: `0001_initial.sql` explicitly avoids ad-hoc
--- indexes ("No extra indexes beyond PK / FK / explicit UNIQUE
--- constraints.") and declares its uniqueness via inline
--- `UNIQUE (...)` clauses on the relevant tables (see `edges`,
--- `agent_tools`). `ADD CONSTRAINT ... UNIQUE` is the post-hoc
--- equivalent: it creates a backing index implicitly *and* registers a
--- named constraint that surfaces in `\d graphs` as a UNIQUE CONSTRAINT
--- rather than a free-floating index. Match the existing schema voice.
+-- `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE` rather than
+-- `CREATE UNIQUE INDEX` matches the schema voice in `0001_initial.sql`,
+-- which avoids ad-hoc indexes and declares uniqueness via inline
+-- `UNIQUE (...)` clauses. The post-hoc form creates a backing index
+-- implicitly and registers a named constraint that surfaces in
+-- `\d graphs` as a UNIQUE CONSTRAINT.
 --
--- No `IF NOT EXISTS`: per the same convention in 0001's header, a
--- corrupted migration tracker should surface loudly rather than be
--- masked by idempotent DDL.
+-- No `IF NOT EXISTS`: a corrupted migration tracker should surface
+-- loudly rather than be masked by idempotent DDL.
 
 ALTER TABLE graphs ADD CONSTRAINT graphs_name_unique UNIQUE (name);

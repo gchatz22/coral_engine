@@ -6,14 +6,11 @@
 # worker`) against these containerized services — see README "Dev
 # environment" section.
 #
-# Production deployment shape is a separate concern (see JAR2-43 /
-# `scratch/temporal_ops.md` once that lands). This file is dev-only:
-# `temporalio/auto-setup` bundles all Temporal services into one container
-# for simplicity; production-shape splits them. Postgres here hosts both
-# Temporal's persistence (databases `temporal` + `temporal_visibility`,
-# created by auto-setup) and the structural DB (`jarvis_structural`,
-# created by an init script). One Postgres in dev keeps the stack light;
-# production may split.
+# Dev-only: `temporalio/auto-setup` bundles all Temporal services into
+# one container for simplicity. Postgres here hosts both Temporal's
+# persistence (databases `temporal` + `temporal_visibility`, created by
+# auto-setup) and the structural DB (`jarvis_structural`, created by an
+# init script). One Postgres in dev keeps the stack light.
 
 name: jarvis
 
@@ -32,8 +29,8 @@ services:
     environment:
       POSTGRES_USER: jarvis
       POSTGRES_PASSWORD: jarvis
-      # Default DB the structural-DB schema (stage 1) will own. Temporal
-      # creates its own `temporal` + `temporal_visibility` DBs at startup.
+      # Default DB the structural-DB schema owns. Temporal creates its
+      # own `temporal` + `temporal_visibility` DBs at startup.
       POSTGRES_DB: jarvis_structural
     ports:
       - "5432:5432"

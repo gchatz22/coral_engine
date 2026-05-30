@@ -1,41 +1,16 @@
 //! `LlmDecide` — `Decide` impl backed by a `ModelClient`.
 //!
-//! This is the runtime adapter that turns a typed `ContextBundle` into a
-//! `Decision` by asking a model. The flow per `decide` call:
+//! Per `decide` call: render the bundle to messages, call
+//! `ModelClient::complete` with the decision-tool list, parse the response.
+//! On parse failure: append the bad turn plus a corrective `system` message
+//! and retry up to [`MAX_DECISION_RETRIES`] times; if every attempt fails,
+//! return `Err` (the run loop escalates to `Unhealthy`). Vendor errors
+//! bubble immediately without retry.
 //!
-//! 1. Render the bundle to messages via [`crate::decide_llm::prompt::render`].
-//! 2. Call `ModelClient::complete` with those messages and the
-//!    decision-tool list from
-//!    [`crate::decide_llm::schema::decision_tools`].
-//! 3. Parse the model's tool-use response with
-//!    [`crate::decide_llm::schema::parse_decision`].
-//! 4. **On parse failure**: append the model's bad turn plus a corrective
-//!    `system` message naming the failure, and call `complete` again — up
-//!    to [`MAX_DECISION_RETRIES`] additional times. If every attempt fails
-//!    to parse, return `Err`. The agent run loop treats this `Err` as
-//!    inference-retry exhaustion (per JAR2-19's spec) and goes straight to
-//!    the health-policy `Unhealthy` transition.
-//! 5. **On vendor error** (transport / rate-limit / auth / other): bubble
-//!    immediately, no retry — vendor-side backoff is out of scope per the
-//!    parent JAR2-12's "Decided" notes.
-//!
-//! The internal retry loop (capped at [`MAX_DECISION_RETRIES`]) exists
-//! because tool-use payload errors are frequently soft: a malformed
-//! `arguments` blob, a hallucinated tool name, a missing required field. A
-//! handful of corrective turns fix most of these without the runtime having
-//! to escalate to an `Unhealthy` transition. Anything past the cap is
-//! signal that the model is genuinely confused, and that is what the
-//! per-tick budget is for.
-//!
-//! # Why the corrective message is `system`
-//!
-//! The ticket asks for a "corrective system message", which is also the
-//! more reliable surface for the model: vendor adapters concatenate all
-//! `system` turns into the top-level `system` field (see
-//! `crate::model_client::anthropic`'s role-mapping notes), so the
-//! correction lands as part of the prompt's standing instructions rather
-//! than as an in-conversation user message that the model might
-//! misinterpret as additional context to summarize.
+//! The corrective message uses the `system` role because vendor adapters
+//! concatenate all `system` turns into the top-level `system` field, so the
+//! correction lands as standing instructions rather than as in-conversation
+//! context the model might summarize.
 
 use std::sync::{Arc, Mutex};
 
@@ -53,31 +28,22 @@ use crate::model_client::{
 
 /// Number of corrective re-asks performed after the first attempt fails to
 /// parse. Total upstream calls per `decide` is therefore at most
-/// `1 + MAX_DECISION_RETRIES`. The default of `1` matches the original
-/// JAR2-19 behavior; raise it if soft tool-use mistakes need more rope
-/// before falling through to the per-tick `RetryBudget`.
+/// `1 + MAX_DECISION_RETRIES`.
 pub const MAX_DECISION_RETRIES: usize = 1;
 
 /// `Decide` impl that asks a `ModelClient` what to do next.
 ///
-/// Holds the client behind `Arc` so callers can share one HTTP-backed
-/// instance across many agents and so `LlmDecide` itself stays cheap to
-/// clone if a future ticket needs to.
-///
-/// `tick_stats` is the JAR2-20 per-tick cost/latency accumulator. One
-/// `decide()` call == one tick (per the agent loop), and that may issue
-/// multiple `ModelClient::complete` calls because of JAR2-19's
-/// parse-retry / corrective re-ask. The accumulator captures *every*
-/// call within that tick and resets at the start of the next `decide`.
-/// `Decide::decide` takes `&self`, so the storage uses interior
-/// mutability via `Mutex` — the lock is held only for `push`/`clear`
-/// (microseconds), never across an `await`.
-///
-/// JAR2-33: the accumulator lives behind an `Arc<Mutex<...>>` so callers
-/// (notably `Agent<LlmDecide>::stats_handle`) can hand out a cheap
-/// post-construction handle that survives `Agent::run` consuming the
-/// `LlmDecide`. The handle is read-only from the caller's side; only
-/// `decide()` mutates the inner vec.
+/// `client` is behind `Arc` so callers can share one HTTP-backed instance
+/// across many agents. `tick_stats` is the per-tick cost/latency
+/// accumulator: one `decide()` call may issue multiple
+/// `ModelClient::complete` calls (parse-retry / corrective re-ask), and
+/// the accumulator captures every call within that tick and resets at the
+/// start of the next `decide`. `Decide::decide` takes `&self`, so storage
+/// uses interior mutability via `Mutex` — the lock is held only for
+/// `push`/`clear`, never across an `await`. The accumulator is wrapped in
+/// an `Arc<Mutex<...>>` so callers can capture a cheap read-only handle
+/// (via [`LlmDecide::stats_handle`]) before construction and survive
+/// `Agent::run` consuming the `LlmDecide`.
 pub struct LlmDecide {
     client: Arc<dyn ModelClient>,
     options: CompleteOptions,
@@ -116,26 +82,25 @@ impl LlmDecide {
             .clone()
     }
 
-    /// JAR2-33: clone of the per-tick stats accumulator handle. Callers
-    /// that need to read stats after `Agent::run` has consumed the
-    /// `LlmDecide` should capture this before construction and read it
-    /// post-run. The returned `Arc` shares storage with this `LlmDecide`'s
-    /// internal accumulator; the inner vec is updated at the end of every
-    /// upstream `complete()` call and cleared at the start of every
-    /// `decide()`. Lock the inner mutex only briefly — never across
-    /// `await` boundaries — and clone the contents out rather than
-    /// holding the guard.
+    /// Clone of the per-tick stats accumulator handle. Callers that need
+    /// to read stats after `Agent::run` has consumed the `LlmDecide`
+    /// should capture this before construction and read it post-run. The
+    /// returned `Arc` shares storage with this `LlmDecide`'s internal
+    /// accumulator; the inner vec is updated at the end of every upstream
+    /// `complete()` call and cleared at the start of every `decide()`.
+    /// Lock the inner mutex only briefly — never across `await`
+    /// boundaries — and clone the contents out rather than holding the
+    /// guard.
     pub fn stats_handle(&self) -> Arc<Mutex<Vec<CallStats>>> {
         self.tick_stats.clone()
     }
 }
 
 /// Sum of one tick's worth of `CallStats`. Tokens accumulate, latency
-/// sums (wall-clock budget is what callers want, not max or mean), and
-/// `calls` is the count of upstream `complete` invocations the tick
-/// issued. Vendor/model are deliberately *not* aggregated here — a
-/// future ticket may want a per-vendor breakdown, but a single Decide
-/// instance only talks to one client so the breakdown isn't needed yet.
+/// sums (wall-clock budget, not max or mean), and `calls` is the count of
+/// upstream `complete` invocations the tick issued. Vendor/model are
+/// deliberately not aggregated here — a single `Decide` instance only
+/// talks to one client.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TickTotals {
     pub input_tokens: u32,
@@ -163,15 +128,12 @@ impl Decide for LlmDecide {
         let tools = decision_tools();
         // Conversation grows across attempts: original prompt, then for
         // each parse failure an assistant-echo of the bad turn followed by
-        // a system-role corrective. The model thus sees its full failure
+        // a system-role corrective. The model sees its full failure
         // history, not just the most recent miss.
         let mut messages = prompt::render(&ctx);
         let mut errors: Vec<DecisionParseError> = Vec::new();
         let total_attempts = MAX_DECISION_RETRIES + 1;
 
-        // JAR2-20: reset the per-tick accumulator at the start of every
-        // `decide` so reading `last_tick_totals` between ticks reflects
-        // the previous tick only.
         self.tick_stats
             .lock()
             .expect("tick_stats mutex poisoned")
@@ -188,10 +150,6 @@ impl Decide for LlmDecide {
                 .await
                 .map_err(model_err_to_anyhow)?;
 
-            // JAR2-20: record per-call stats and emit a tracing event.
-            // Matches the `debug!` level used for per-tick decision
-            // events in `agent.rs`; `llm_decide.rs` has no prior
-            // tracing of its own to pattern-match against.
             debug!(
                 vendor = resp.stats.vendor.as_str(),
                 model = %resp.stats.model,
@@ -214,23 +172,15 @@ impl Decide for LlmDecide {
                 Err(e) => {
                     let is_last = attempt + 1 == total_attempts;
                     if !is_last {
-                        // Stage the next attempt's prompt before recording
-                        // the error so `e` is still owned by us.
-                        //
-                        // JAR2-38: when the bad assistant turn contains K
-                        // `tool_use` blocks (the parallel-tool path), both
-                        // vendor APIs require K matching `tool_result`
-                        // blocks in the immediately following user turn
-                        // before they will accept another assistant
-                        // response. We synthesize placeholder
-                        // `tool_result`s here so the retry request stays
-                        // schema-valid; the real semantic signal lives in
-                        // the corrective system message that follows.
-                        // Pre-JAR2-38 the disabled-parallel-tool flag
-                        // capped K at 1 and a single un-paired echo was
-                        // still tolerated by Anthropic in practice, but
-                        // the new path can replay K blocks at once and
-                        // the pairing requirement becomes load-bearing.
+                        // When the bad assistant turn contains K `tool_use`
+                        // blocks (parallel-tool path), both vendor APIs
+                        // require K matching `tool_result` blocks in the
+                        // immediately following user turn before they
+                        // accept another assistant response. Synthesize
+                        // placeholder `tool_result`s here so the retry
+                        // request stays schema-valid; the semantic signal
+                        // lives in the corrective system message that
+                        // follows.
                         messages.push(assistant_echo(&resp.content));
                         let tool_use_ids = tool_use_ids(&resp.content);
                         if !tool_use_ids.is_empty() {
@@ -318,15 +268,14 @@ fn tool_use_ids(content: &[ContentBlock]) -> Vec<String> {
         .collect()
 }
 
-/// JAR2-38: synthesize a single tool turn that carries one `tool_result`
-/// block per supplied `tool_use.id`. The vendor adapters reshape this
-/// into the correct wire form — Anthropic wraps the whole turn as a
-/// `user` message with K `tool_result` blocks; Cohere emits K `tool`
-/// messages, one per block, each carrying its own `tool_call_id` (see
-/// `cohere::build_body`). The placeholder text is deliberately the same
-/// across blocks: the corrective system message that follows carries
-/// the real "what went wrong" signal, and the per-block content only
-/// has to be non-empty to keep the request schema-valid.
+/// Synthesize a single tool turn that carries one `tool_result` block
+/// per supplied `tool_use.id`. The vendor adapters reshape this into the
+/// correct wire form — Anthropic wraps the whole turn as a `user`
+/// message with K `tool_result` blocks; Cohere emits K `tool` messages,
+/// one per block, each carrying its own `tool_call_id`. The placeholder
+/// text is the same across blocks: the corrective system message that
+/// follows carries the real "what went wrong" signal, and the per-block
+/// content only has to be non-empty to keep the request schema-valid.
 fn synthesized_tool_results(ids: &[String]) -> Message {
     Message {
         role: Role::Tool,
@@ -362,8 +311,8 @@ fn model_err_to_anyhow(err: ModelError) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for `LlmDecide`. A test-only `MockModelClient` returns
-    //! scripted `CompleteResponse`s; no live HTTP traffic.
+    //! A test-only `MockModelClient` returns scripted `CompleteResponse`s;
+    //! no live HTTP traffic.
 
     use super::*;
     use crate::decision::{ClaimSeed, ContextBundle, ToolCall as DecisionToolCall};
@@ -421,11 +370,7 @@ mod tests {
     }
 
     /// Zero-valued `CallStats` for mock responses that don't care about
-    /// per-call accounting. Real adapters fill these from the HTTP path;
-    /// these tests assert on `Decision` parsing, not on stats.
-    ///
-    /// `Vendor` no longer has a `Default` (JAR2-32), so pick one
-    /// arbitrarily — the tests that care about vendor stamping use
+    /// per-call accounting. Tests that care about vendor stamping use
     /// `resp_with_stats` with explicit per-vendor stats instead.
     fn stub_stats() -> CallStats {
         CallStats {
@@ -456,8 +401,8 @@ mod tests {
     }
 
     /// Like `resp_with_tool_calls`, but with a specific `CallStats` block.
-    /// Used by the JAR2-20 accumulator tests so they can assert on the
-    /// totals math without depending on a real wall-clock measurement.
+    /// Lets accumulator tests assert on the totals math without depending
+    /// on a real wall-clock measurement.
     fn resp_with_stats(calls: Vec<ToolCall>, stats: CallStats) -> CompleteResponse {
         let usage = stats.usage;
         CompleteResponse {
@@ -559,8 +504,8 @@ mod tests {
         assert_eq!(seen.len(), 2, "expected exactly two upstream calls");
 
         // The retry must replay the assistant's bad turn, follow it with
-        // matching `tool_result` blocks (JAR2-38 pairing requirement), and
-        // close with the corrective system message.
+        // matching `tool_result` blocks, and close with the corrective
+        // system message.
         let retry = &seen[1];
         let last = retry.messages.last().expect("retry has messages");
         assert_eq!(last.role, Role::System);
@@ -595,10 +540,9 @@ mod tests {
         ));
     }
 
-    /// JAR2-38: when the bad assistant turn contains K parallel
-    /// `tool_use` blocks, the retry must synthesize K matching
-    /// `tool_result` blocks so the next request stays schema-valid
-    /// against both vendor APIs.
+    /// When the bad assistant turn contains K parallel `tool_use` blocks,
+    /// the retry must synthesize K matching `tool_result` blocks so the
+    /// next request stays schema-valid against both vendor APIs.
     #[tokio::test]
     async fn parse_retry_synthesizes_one_tool_result_per_parallel_tool_use_block() {
         // First attempt: a malformed parallel batch (mixed shape) the
@@ -812,7 +756,7 @@ mod tests {
         }
     }
 
-    // ---------- JAR2-20: cost + latency accounting ---------------------
+    // ---------- cost + latency accounting ------------------------------
 
     fn anthropic_stats(input: u32, output: u32, latency_ms: u64) -> CallStats {
         CallStats {
@@ -870,7 +814,7 @@ mod tests {
     #[tokio::test]
     async fn tick_totals_multi_call_sum_correctly() {
         // Two upstream calls in one tick — first is a parse failure that
-        // forces a retry, second succeeds. JAR2-20 totals must cover both.
+        // forces a retry, second succeeds. Totals must cover both.
         let s1 = anthropic_stats(100, 25, 350);
         let s2 = anthropic_stats(180, 12, 410);
         let mock = MockModelClient::new(vec![
@@ -947,9 +891,9 @@ mod tests {
 
     #[tokio::test]
     async fn tick_totals_carry_vendor_and_model_for_both_vendors() {
-        // The accumulator must preserve per-call vendor and model fields
-        // so a future ticket can attribute cost by provider. Cover both
-        // sides of the `Vendor` enum.
+        // The accumulator preserves per-call vendor and model fields so
+        // cost can be attributed by provider. Cover both sides of the
+        // `Vendor` enum.
         for stats in [anthropic_stats(7, 2, 50), cohere_stats(12, 4, 75)] {
             let mock = MockModelClient::new(vec![MockOutcome::Resp(resp_with_stats(
                 vec![good_idle_call()],
@@ -973,8 +917,7 @@ mod tests {
         // `ParsedComplete { content, tool_calls, usage }` — no `stats`,
         // because latency/vendor/model are not on the wire and live on
         // `complete`. This pins the contract the vendor adapter depends
-        // on. The full `complete` wire path is end-to-end-tested by
-        // JAR2-21's recorded-fixture suite.
+        // on.
         let raw = br#"{
             "content": [{"type": "text", "text": "hi"}],
             "usage": {"input_tokens": 21, "output_tokens": 8}

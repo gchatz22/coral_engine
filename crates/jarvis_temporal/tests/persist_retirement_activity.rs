@@ -1,24 +1,14 @@
-//! Stage 3.10 (JAR2-66) — hermetic coverage for the `persist_retirement`
-//! activity body.
+//! Hermetic coverage for the `persist_retirement` activity body.
 //!
-//! Runs as its own integration test binary (separate from
-//! `workflow_loop.rs` and `signal_handlers.rs`) so it has a fresh
-//! per-process `OnceLock<Arc<dyn AgentStorage>>` and can call
-//! `install_agent_storage` without colliding with any other test that
-//! also installs.
+//! Runs as its own integration test binary so it has a fresh per-process
+//! `OnceLock<Arc<dyn AgentStorage>>` and can call `install_agent_storage`
+//! without colliding with any other test.
 //!
-//! The activity method itself (`AgentActivities::persist_retirement`)
-//! takes an `ActivityContext`, which can only be constructed from
-//! inside a worker (`pub fn ActivityContext::new` requires
-//! `Arc<CoreWorker>` — not reachable from a hermetic test). The body
-//! delegates to the free function
-//! [`jarvis_temporal::activities::persist_retirement_inner`]; this
-//! test exercises the inner function directly, which is the entire
-//! "real" work — only the `ctx.info().scheduled_time` source differs,
-//! and the activity-method body unconditionally extracts that into the
-//! same `Option<SystemTime>` parameter. The live test in
-//! `tests/workflow_loop.rs` (gated on `TEMPORAL_LIVE_TEST=1`) covers
-//! the `ctx.info().scheduled_time` plumbing end-to-end.
+//! The activity method itself takes an `ActivityContext` (constructible
+//! only from inside a worker), so this test exercises the inner free
+//! function [`jarvis_temporal::activities::persist_retirement_inner`]
+//! directly. The live test in `tests/workflow_loop.rs` covers the
+//! `ctx.info().scheduled_time` plumbing end-to-end.
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -56,7 +46,7 @@ fn install_or_reuse_storage() -> Arc<MemoryStorage> {
 async fn persist_retirement_writes_file_with_reason_and_deterministic_timestamp() {
     let storage = install_or_reuse_storage();
 
-    let prefix = "graphs/g-jar266-pinned/agents/a-jar266-pinned";
+    let prefix = "graphs/g-pinned/agents/a-pinned";
     let input = PersistRetirementInput {
         fs_handle: FsHandle {
             prefix: prefix.into(),
@@ -125,7 +115,7 @@ async fn persist_retirement_falls_back_to_wall_clock_when_scheduled_time_absent(
 
     // Distinct prefix per test so the two tests in this file don't
     // race on the same `retirement.json` key.
-    let prefix = "graphs/g-jar266-fallback/agents/a-jar266-fallback";
+    let prefix = "graphs/g-fallback/agents/a-fallback";
     let input = PersistRetirementInput {
         fs_handle: FsHandle {
             prefix: prefix.into(),

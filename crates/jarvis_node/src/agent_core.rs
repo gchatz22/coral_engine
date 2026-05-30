@@ -1,81 +1,20 @@
-//! `AgentCore` — pure per-tick logic shared between the in-process
-//! `Agent::run` loop and the future `AgentWorkflow` Temporal host
-//! (stage 3.2+).
+//! Pure per-tick logic shared between the in-process `Agent::run` loop
+//! and the workflow host. Three free functions, no internal async-runtime
+//! concerns (no `tokio::select!`, channels, or `sleep`):
+//! [`drain_triggers`] packages a drained `Vec<Trigger>` + FS reads into a
+//! `ContextBundle`; [`decide`] calls into a `&dyn Decide`; [`dispatch`]
+//! applies a `Decision` against the FS, tool registry, and scheduler and
+//! returns a typed [`DispatchOutcome`]. The workflow host matches on
+//! `Decision` directly and orchestrates activities itself, but its per-tick
+//! result is isomorphic to `DispatchOutcome` so the shared post-dispatch
+//! state machine (correction staging, budget accounting, health
+//! transitions) can branch on the same enum.
 //!
-//! # Why this module exists
-//!
-//! Today's `Agent::run` (in [`crate::agent`]) interleaves three concerns:
-//!
-//! 1. The **signal source** (`mpsc` + `tokio::select!` against the
-//!    scheduler deadline).
-//! 2. The **durability host** (in-memory state carried across ticks: the
-//!    correction continuation, the retry trail, the per-tick budget
-//!    accounting).
-//! 3. The **logic** (drain triggers → assemble context → decide → dispatch
-//!    → persist / retire / correction).
-//!
-//! Per the stage-3 plan in `scratch/temporal_staged_plan.md` § 2, the
-//! Temporal workflow that lands at stage 3.2 hosts (1) and (2) very
-//! differently — workflow signals replace the mpsc queue, workflow state
-//! replaces the in-memory continuation, and history replay replaces the
-//! `tokio::select!` race. What stays identical between the two hosts is
-//! exactly (3). Pulling it into a dedicated module is the seam every
-//! later sub-ticket in the stage-3 project depends on.
-//!
-//! # The seam
-//!
-//! Three free functions, no internal `async` runtime concerns (no
-//! `tokio::select!`, no channels, no `tokio::time::sleep`):
-//!
-//! * [`drain_triggers`] — sync packaging of the already-drained
-//!   `Vec<Trigger>` plus FS reads into a `ContextBundle`. Today this is a
-//!   thin wrapper around [`crate::decision::assemble_context`]; the rename
-//!   matches the seam vocabulary in `scratch/temporal_staged_plan.md` § 2.
-//! * [`decide`] — calls into a `&dyn Decide` and returns a `Decision`. A
-//!   one-line wrapper today, kept here so the workflow host has a single
-//!   shared call site for "ask the model what to do" and so the
-//!   in-process loop and workflow code remain symmetric.
-//! * [`dispatch`] — applies a `Decision` against the FS, the tool
-//!   registry, and the scheduler, returning a typed [`DispatchOutcome`].
-//!
-//! # `DispatchOutcome` and the workflow seam
-//!
-//! The ticket text describes `dispatch` as "returning a description of
-//! what to do" rather than calling side effects. That phrasing is
-//! aspirational for the workflow host: in `AgentWorkflow` (stage 3.4+),
-//! the workflow code matches on `Decision` directly and orchestrates
-//! activities (`execute_tool`, `persist_output`, `apply_fs_ops`, etc.) —
-//! it does **not** call `AgentCore::dispatch`. The workflow's per-tick
-//! match arms produce a value isomorphic to `DispatchOutcome` so the
-//! shared post-dispatch state machine in the host (correction staging,
-//! budget accounting, health transition) can branch on the same enum
-//! regardless of who produced it.
-//!
-//! For the in-process loop, `dispatch` is the *in-process* executor: it
-//! calls into [`crate::fs::AgentFs`] and [`crate::tools::ToolRegistry`]
-//! the same way today's `Agent::run` does. The seam value is the **typed
-//! outcome enum**, not literal side-effect-freeness — that interpretation
-//! is documented here and in the PR body for JAR2-57 so a future reader
-//! can validate the choice.
-//!
-//! # `Continue` / `Retired` / `NeedsCorrection` / `ToolError`
-//!
-//! The four variants of `DispatchOutcome` mirror today's
-//! `Agent::ApplyOutcome` shape one-for-one. They are kept distinct
-//! (rather than collapsing, say, `ToolError` into `NeedsCorrection`)
-//! because the in-process host's budget accounting in `Agent::run`
+//! The four `DispatchOutcome` variants mirror the host's
+//! `ApplyOutcome` shape and are kept distinct because budget accounting
 //! depends on the distinction: `NeedsCorrection` consumes one
 //! `FailureKind::Inference` slot; `ToolError { failures }` consumes K
-//! `FailureKind::ToolCall` slots, one per failed call, per JAR2-38. The
-//! workflow host preserves the same accounting on top of its own
-//! per-activity outcomes.
-//!
-//! `Continue` carries no payload today; the ticket sketch's
-//! `next_idle: Idle, recorded_evidence: Vec<EvidenceId>` are deliberately
-//! omitted as they are not load-bearing for the no-behavior-change
-//! refactor and would broaden the surface unnecessarily. The follow-up
-//! sub-tickets in the stage-3 project may extend `Continue` as the
-//! workflow host's needs become concrete.
+//! `FailureKind::ToolCall` slots, one per failed call.
 
 use anyhow::Result;
 use chrono::Utc;
@@ -94,10 +33,7 @@ use crate::tools::ToolRegistry;
 use crate::trigger::Trigger;
 
 /// Outcome of [`dispatch`] — a typed description of "what should the host
-/// do next?" the in-process loop or the future workflow can branch on.
-///
-/// One-for-one with today's private `Agent::ApplyOutcome`: every variant
-/// here is what the host sees after a tick's `Decision` has been applied.
+/// do next?" the in-process loop or the workflow can branch on.
 ///
 /// * `Continue` — the tick produced no terminal or recoverable-failure
 ///   outcome; the host clears any correction state, marks the tick a
@@ -107,18 +43,16 @@ use crate::trigger::Trigger;
 ///   (the side-effect lives in `dispatch` because the host needs to exit
 ///   *after* the marker lands, not before). The variant carries the
 ///   `RetireReason` so the host can return it from `Agent::run`.
-/// * `NeedsCorrection` — JAR2-19's "decision parsed but the runtime
-///   cannot satisfy it" case. The string is a human-readable failure
-///   description the host threads into the next tick's
-///   `CorrectionContext` (and into the `HealthIncident` retry trail on
-///   budget exhaustion).
-/// * `ToolError { failures }` — JAR2-25 / JAR2-38's "tool's internal
-///   retry policy exhausted on one or more of K parallel calls" case.
-///   Successful sibling calls in the same batch already had their
-///   evidence persisted to disk before this variant is constructed;
-///   the host does **not** unwind on partial failure (per JAR2-38's
-///   "successful evidence is kept" contract). Per-call accounting (K
-///   against budget) lives in the host, not here.
+/// * `NeedsCorrection` — the decision parsed but the runtime cannot
+///   satisfy it. The string is a human-readable failure description the
+///   host threads into the next tick's `CorrectionContext` (and into the
+///   `HealthIncident` retry trail on budget exhaustion).
+/// * `ToolError { failures }` — the tool's internal retry policy
+///   exhausted on one or more of K parallel calls. Successful sibling
+///   calls in the same batch already had their evidence persisted before
+///   this variant is constructed; the host does **not** unwind on
+///   partial failure. Per-call accounting (K against budget) lives in
+///   the host, not here.
 #[derive(Debug)]
 pub enum DispatchOutcome {
     Continue,
@@ -139,10 +73,10 @@ pub enum DispatchOutcome {
 /// `ToolRegistry::call`.
 ///
 /// `pub` because it leaks through [`DispatchOutcome::ToolError`], which
-/// must be `pub` for the workflow host (stage 3.4+) to branch on the
-/// shared seam. The in-process host (`Agent::run`) and the future
-/// workflow host both read these fields when staging the correction
-/// context and constructing the `HealthIncident` retry trail.
+/// must be `pub` for the workflow host to branch on the shared seam.
+/// Both the in-process host and the workflow host read these fields
+/// when staging the correction context and constructing the
+/// `HealthIncident` retry trail.
 #[derive(Debug, Clone)]
 pub struct ToolFailure {
     pub tool: String,
@@ -151,18 +85,9 @@ pub struct ToolFailure {
 }
 
 /// Drain the already-collected triggers into a `ContextBundle` for the
-/// current tick.
-///
-/// The "drain" name matches the seam vocabulary in
-/// `scratch/temporal_staged_plan.md` § 2 — in the workflow host, the
-/// `Vec<Trigger>` comes from a workflow-state buffer rather than an
-/// `mpsc::Receiver`, but the per-tick semantics are identical. The
-/// in-process host calls `triggers.drain_ordered()` first and then hands
-/// the resulting `Vec<Trigger>` to this function.
-///
-/// Today the body is a one-line delegate to
-/// [`crate::decision::assemble_context`]; the indirection costs us
-/// nothing and pins the seam shape for stage 3.4+.
+/// current tick. In the in-process host the `Vec<Trigger>` comes from
+/// `TriggerQueue::drain_ordered`; in the workflow host it comes from a
+/// workflow-state buffer. Per-tick semantics are identical.
 pub async fn drain_triggers(
     triggers: Vec<Trigger>,
     fs: &AgentFs,
@@ -172,12 +97,9 @@ pub async fn drain_triggers(
     assemble_context(fs, &triggers, cfg, prior_correction).await
 }
 
-/// Ask the [`Decide`] impl what to do this tick.
-///
-/// One-line wrapper today; lives here so the in-process loop and the
-/// workflow host share a single named call site for "ask the model" and
-/// so the workflow's `decide_next_action` activity (stage 3.6) can wrap
-/// the same function without duplicating semantics.
+/// Ask the [`Decide`] impl what to do this tick. Single shared call site
+/// for the in-process loop and the workflow host's `decide_next_action`
+/// activity.
 pub async fn decide<D: Decide + ?Sized>(bundle: ContextBundle, d: &D) -> Result<Decision> {
     d.decide(bundle).await
 }
@@ -191,13 +113,11 @@ pub async fn decide<D: Decide + ?Sized>(bundle: ContextBundle, d: &D) -> Result<
 /// [`DispatchOutcome::ToolError`]; everything else either continues,
 /// retires, or bubbles via `?`.
 ///
-/// **Side-effect semantics.** In the in-process host this is where
-/// today's `Agent::run` calls `fs.persist_output`, `tools.call`,
-/// `fs.record_evidence`, etc. In the workflow host (stage 3.4+) the
-/// workflow code matches on `Decision` directly and orchestrates
-/// activities — it does not call this function. The shared piece is the
-/// returned `DispatchOutcome` shape, not the body. See the module-level
-/// doc for the rationale.
+/// **Side-effect semantics.** In the in-process host this is the
+/// executor — it calls `fs.persist_output`, `tools.call`,
+/// `fs.record_evidence`, etc. The workflow host matches on `Decision`
+/// directly and orchestrates activities, so it does not call this
+/// function; the shared piece is the returned `DispatchOutcome` shape.
 pub async fn dispatch(
     fs: &AgentFs,
     tools: &ToolRegistry,
@@ -242,43 +162,33 @@ pub async fn dispatch(
             fs.persist_retirement(&reason, Utc::now()).await?;
             Ok(DispatchOutcome::Retired(RetireReason(reason)))
         }
-        // JAR2-78 (stage 5.1): the four parent-child topology variants
-        // are not dispatchable from `Agent::run`. Per Stage 5 Project
-        // decision 11, the in-process loop stays single-agent forever;
-        // the workflow host (5.3 / 5.5 / 5.7) is the only place these
-        // variants execute. Reaching this arm in the in-process loop is
-        // a wiring bug — `unimplemented!` is the boundary signal the
-        // ticket explicitly calls for.
-        Decision::SpawnChild { .. } => unimplemented!(
-            "stage 5: in-process dispatch for parent-child decisions is \
-             intentionally not wired — see Stage 5 Project decision 11"
-        ),
-        Decision::ReconcileChildren { .. } => unimplemented!(
-            "stage 5: in-process dispatch for parent-child decisions is \
-             intentionally not wired — see Stage 5 Project decision 11"
-        ),
-        Decision::RetireChild { .. } => unimplemented!(
-            "stage 5: in-process dispatch for parent-child decisions is \
-             intentionally not wired — see Stage 5 Project decision 11"
-        ),
-        Decision::ReplaceChild { .. } => unimplemented!(
-            "stage 5: in-process dispatch for parent-child decisions is \
-             intentionally not wired — see Stage 5 Project decision 11"
-        ),
+        // Parent-child topology variants execute only on the workflow
+        // host; reaching them here is a wiring bug.
+        Decision::SpawnChild { .. } => {
+            unimplemented!("in-process dispatch for parent-child decisions is not wired")
+        }
+        Decision::ReconcileChildren { .. } => {
+            unimplemented!("in-process dispatch for parent-child decisions is not wired")
+        }
+        Decision::RetireChild { .. } => {
+            unimplemented!("in-process dispatch for parent-child decisions is not wired")
+        }
+        Decision::ReplaceChild { .. } => {
+            unimplemented!("in-process dispatch for parent-child decisions is not wired")
+        }
     }
 }
 
-/// JAR2-38: dispatch the K calls in a `Decision::CallTools` together.
+/// Dispatch the K calls in a `Decision::CallTools` together.
 ///
 /// Order of operations matters for both correctness and determinism:
 ///
 /// 1. **Pre-check every tool name.** If any call names a tool the registry
 ///    does not know, surface a single `NeedsCorrection` that lists every
-///    missing name and dispatch *none* of the batch. This matches the
-///    JAR2-19 invariant that "no tool registered" is an inference-level
-///    correctable error rather than a tool-call failure — and refusing to
-///    dispatch the sibling calls keeps evidence persistence consistent
-///    with the rejection.
+///    missing name and dispatch *none* of the batch. "No tool registered"
+///    is an inference-level correctable error, not a tool-call failure;
+///    refusing to dispatch the sibling calls keeps evidence persistence
+///    consistent with the rejection.
 /// 2. **Dispatch all K concurrently** via `futures::future::join_all`,
 ///    capturing every result rather than short-circuiting on the first
 ///    error. The agent loop's K-against-budget accounting needs every
@@ -306,7 +216,7 @@ async fn dispatch_call_tools(
 
     // Step 1: pre-check tool-name registration for every call. A single
     // unknown name takes the whole batch through the inference
-    // correction loop (JAR2-19 semantics).
+    // correction loop.
     let unknown: Vec<&str> = calls
         .iter()
         .filter(|c| !tools.contains(&c.name))
@@ -356,12 +266,11 @@ async fn dispatch_call_tools(
 }
 
 /// Build the human-readable failure description for the
-/// `CorrectionContext` staged after a tool-call exhaustion (JAR2-30).
+/// `CorrectionContext` staged after a tool-call exhaustion.
 ///
-/// JAR2-38: accepts a batch of failed calls. For K=1 the wording
-/// matches the original single-tool phrasing; for K>1 the message
-/// lists every failed call so the model sees what each sibling did and
-/// failed with.
+/// Accepts a batch of failed calls. For K=1 the wording is single-tool;
+/// for K>1 the message lists every failed call so the model sees what
+/// each sibling did and failed with.
 ///
 /// `pub(crate)` because the in-process host (`Agent::run`) calls this
 /// to stage the `CorrectionContext` after a `DispatchOutcome::ToolError`.
@@ -444,8 +353,7 @@ mod tests {
 
     /// Build an `AgentFs` backed by an in-memory storage backend so the
     /// AgentCore seam tests stay hermetic, fast, and deterministic
-    /// without touching the real filesystem. Matches the ticket
-    /// directive ("`AgentCore`-level unit tests against `MemoryStorage`").
+    /// without touching the real filesystem.
     async fn fixture() -> (AgentFs, Mandate) {
         let m = mandate();
         let storage: Arc<dyn AgentStorage> = Arc::new(MemoryStorage::new());
@@ -468,8 +376,8 @@ mod tests {
 
     #[tokio::test]
     async fn decide_returns_scripted_decision() {
-        // The free function is a thin wrapper; the test exists to lock
-        // the call-site shape stage 3.6+ will mirror.
+        // The free function is a thin wrapper; the test locks the
+        // call-site shape the workflow activity mirrors.
         let m = mandate();
         let mock = MockDecide::new(vec![Decision::Idle {
             next_after: Duration::from_millis(7),
@@ -738,12 +646,12 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_idle_does_not_touch_outputs_or_evidence_or_retirement() {
-        // The seam test the ticket calls out: an Idle decision dispatched
-        // via `AgentCore::dispatch` must not write any of the three FS
-        // surfaces a host would expect to remain untouched. The signal
-        // source (mpsc), the async runtime race (`tokio::select!`), and
-        // the in-process loop's correction/health state are *not* exercised
-        // here — only `decide` + `dispatch` from the seam, via a scripted
+        // An Idle decision dispatched via `AgentCore::dispatch` must not
+        // write any of the three FS surfaces a host would expect to
+        // remain untouched. The signal source (mpsc), the async runtime
+        // race (`tokio::select!`), and the in-process loop's
+        // correction/health state are *not* exercised here — only
+        // `decide` + `dispatch` from the seam, via a scripted
         // `MockDecide`.
         let (fs, m) = fixture().await;
         let mock = MockDecide::new(vec![Decision::Idle {
@@ -774,10 +682,6 @@ mod tests {
     }
 
     // ---------- `tool_failure_correction_text` ---------------------------
-    //
-    // The deep coverage of the corrective-text helper relocated here
-    // with the helper itself (JAR2-57). Behaviour and assertions are
-    // unchanged — only the file the tests live in moved.
 
     fn failure(tool: &str, args: serde_json::Value, error: &str) -> ToolFailure {
         ToolFailure {
@@ -811,9 +715,8 @@ mod tests {
             s.contains("503 Service Unavailable"),
             "error should be preserved, got: {s}"
         );
-        // Standing instruction at the end mirrors JAR2-19's "reply by
-        // calling exactly one decision tool" framing so the model has a
-        // clear next-step cue.
+        // Standing instruction at the end gives the model a clear
+        // next-step cue.
         assert!(
             s.contains("Reply with a different decision"),
             "should end with next-step cue, got: {s}"
@@ -835,10 +738,9 @@ mod tests {
         assert!(s.contains("null"), "got: {s}");
     }
 
-    /// JAR2-38: when the batch carries K>1 failures, the corrective text
-    /// must enumerate each one (tool + args + error) so the model can
-    /// target a retry without re-deriving the failure from a generic
-    /// summary.
+    /// When the batch carries K>1 failures, the corrective text must
+    /// enumerate each one (tool + args + error) so the model can target a
+    /// retry without re-deriving the failure from a generic summary.
     #[test]
     fn tool_failure_correction_text_enumerates_batch_failures() {
         let s = tool_failure_correction_text(&[

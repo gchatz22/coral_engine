@@ -1,7 +1,7 @@
 {
   "synthesized": true,
   "vendor": "cohere",
-  "note": "JAR2-38 parallel tool calls for Cohere. Single response with K=3 `tool_calls` entries under `message.tool_calls[]` (Cohere keeps tool calls out of `message.content`; the adapter synthesizes `ContentBlock::ToolUse` from each entry). Each `function.arguments` is a JSON-encoded string per the V2 chat API. The parser folds the three into a single `Decision::CallTools` and carries each `id` through as the per-call `tool_use_id`. Hand-written against src/model_client/cohere.rs::parse_response.",
+  "note": "Parallel tool calls for Cohere. Single response with K=3 `tool_calls` entries under `message.tool_calls[]` (Cohere keeps tool calls out of `message.content`; the adapter synthesizes `ContentBlock::ToolUse` from each entry). Each `function.arguments` is a JSON-encoded string per the V2 chat API. The parser folds the three into a single `Decision::CallTools` and carries each `id` through as the per-call `tool_use_id`. Hand-written against src/model_client/cohere.rs::parse_response.",
   "responses": [
     {
       "status": 200,
