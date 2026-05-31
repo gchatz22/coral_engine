@@ -898,6 +898,7 @@ async fn dispatch_call_tools(
             ExecuteToolInput {
                 cfg: input.cfg.clone(),
                 fs_handle: input.fs_handle.clone(),
+                graph_id: input.graph_id,
                 call,
             },
             activity_opts(),
