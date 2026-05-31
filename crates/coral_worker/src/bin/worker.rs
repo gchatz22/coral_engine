@@ -1,7 +1,7 @@
 //! Long-lived Coral worker daemon. Connects to a Temporal Server,
 //! installs the process-wide backends every activity body reaches for
-//! (agent storage, the `Decide` impl, the tool registry, and the
-//! structural-DB store), registers [`coral_temporal::workflow::AgentWorkflow`]
+//! (agent storage, the `Decide` impl, the per-graph tool-registry provider,
+//! and the structural-DB store), registers [`coral_temporal::workflow::AgentWorkflow`]
 //! and [`coral_temporal::activities::AgentActivities`] against the
 //! canonical task queue, and runs until SIGINT.
 //!
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use coral_graph::GraphStore;
 use coral_node::storage::LocalStorage;
-use coral_node::tools::{EchoTool, ToolRegistry};
+use coral_worker::tool_provider::DbToolRegistryProvider;
 use sqlx::postgres::PgPoolOptions;
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
 use temporalio_common::telemetry::TelemetryOptions;
@@ -35,7 +35,8 @@ use tracing::info;
 
 use coral_temporal::worker::{
     build_decide_from_env, build_worker, install_agent_storage, install_decide,
-    install_structural_db_store, install_tool_registry, StructuralDbStore, DEFAULT_TASK_QUEUE,
+    install_structural_db_store, install_tool_registry_provider, StructuralDbStore,
+    DEFAULT_TASK_QUEUE,
 };
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
@@ -96,25 +97,28 @@ async fn main() -> Result<()> {
     install_decide(decide);
     info!(vendor = vendor_tag, "installed Decide backend");
 
-    let mut registry = ToolRegistry::new();
-    registry
-        .register(Arc::new(EchoTool))
-        .context("registering EchoTool in worker boot ToolRegistry")?;
-    install_tool_registry(Arc::new(registry));
-    info!("installed ToolRegistry with tools: echo");
-
     // Structural-DB store: installed before the worker serves any task so
     // `register_child_in_structural_db` always finds a real `GraphStore`.
-    // The URL is kept out of the logs because it carries the DB password.
+    // The same `GraphStore` backs the per-graph tool-registry provider. The
+    // URL is kept out of the logs because it carries the DB password.
     let database_url = require_database_url(env::var(DATABASE_URL_ENV).ok())?;
     let pool = PgPoolOptions::new()
         .max_connections(DB_POOL_MAX_CONNECTIONS)
         .connect(&database_url)
         .await
         .with_context(|| format!("connecting to structural DB at {DATABASE_URL_ENV}"))?;
-    let store: Arc<dyn StructuralDbStore> = Arc::new(GraphStore::new(pool));
-    install_structural_db_store(store);
+    let graph_store = Arc::new(GraphStore::new(pool));
+    let structural_store: Arc<dyn StructuralDbStore> = graph_store.clone();
+    install_structural_db_store(structural_store);
     info!("installed StructuralDbStore backend (GraphStore over DATABASE_URL)");
+
+    // Per-graph tool registries are built lazily from each graph's structural
+    // rows (builtin echo plus that graph's MCP servers), so `graph.yaml` is
+    // the runtime source of truth for tools.
+    install_tool_registry_provider(Arc::new(DbToolRegistryProvider::new(graph_store)));
+    info!(
+        "installed ToolRegistryProvider (per-graph registries from structural DB; builtin: echo)"
+    );
 
     let telemetry_options = TelemetryOptions::builder().build();
     let runtime = CoreRuntime::new_assume_tokio(

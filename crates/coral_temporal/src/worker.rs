@@ -2,7 +2,7 @@
 //!
 //! Lives in the library so both the `worker` binary and integration tests
 //! share one registration call site. Process-wide singletons
-//! ([`AgentStorage`], [`Decide`], [`ToolRegistry`], [`StructuralDbStore`])
+//! ([`AgentStorage`], [`Decide`], [`ToolRegistryProvider`], [`StructuralDbStore`])
 //! are installed once at worker boot and accessed from activity bodies via
 //! the matching getter. The `OnceLock` shape is required because the
 //! Temporal SDK's activity macro takes a value-typed bundle, so shared
@@ -98,26 +98,69 @@ pub fn decide_impl() -> Arc<dyn Decide> {
         .expect("decide_impl() accessed before install_decide()")
 }
 
-/// Process-wide [`ToolRegistry`] consulted by the `execute_tool` activity
-/// body. Installed via [`install_tool_registry`] and accessed via
-/// [`tool_registry`].
-static TOOL_REGISTRY: OnceLock<Arc<ToolRegistry>> = OnceLock::new();
-
-/// Install the process-wide [`ToolRegistry`]. Panics on double install.
-pub fn install_tool_registry(registry: Arc<ToolRegistry>) {
-    TOOL_REGISTRY
-        .set(registry)
-        .map_err(|_| ())
-        .expect("install_tool_registry called twice; one process, one registry");
+/// Resolves the [`ToolRegistry`] the `execute_tool` activity dispatches
+/// through, keyed by the calling agent's `graph_id`. The worker daemon
+/// installs a DB-backed implementation that builds one registry per graph
+/// (builtin `echo` plus that graph's MCP servers, read from the structural
+/// DB); tests install a static or map-backed double.
+///
+/// Defined as a trait (not a concrete type) so the registry-building path —
+/// which connects MCP servers and therefore needs `coral_node/mcp` — lives
+/// in the composition root (`coral_worker`) and this library stays
+/// feature-agnostic, mirroring how [`StructuralDbStore`] is defined here but
+/// implemented by `GraphStore`.
+#[async_trait]
+pub trait ToolRegistryProvider: Send + Sync {
+    /// Return the registry for `graph_id`. Implementations may build it
+    /// lazily on first call and cache it; the returned `Arc` keeps any
+    /// spawned MCP subprocesses alive for as long as it is held.
+    async fn registry_for_graph(&self, graph_id: GraphId) -> anyhow::Result<Arc<ToolRegistry>>;
 }
 
-/// Access the installed [`ToolRegistry`]. Panics if
-/// [`install_tool_registry`] hasn't been called.
-pub fn tool_registry() -> Arc<ToolRegistry> {
-    TOOL_REGISTRY
+/// A [`ToolRegistryProvider`] that ignores `graph_id` and hands back one
+/// shared registry for every graph — the builtin-only base. Installed via
+/// [`install_tool_registry`].
+struct StaticToolRegistryProvider {
+    registry: Arc<ToolRegistry>,
+}
+
+#[async_trait]
+impl ToolRegistryProvider for StaticToolRegistryProvider {
+    async fn registry_for_graph(&self, _graph_id: GraphId) -> anyhow::Result<Arc<ToolRegistry>> {
+        Ok(self.registry.clone())
+    }
+}
+
+/// Process-wide [`ToolRegistryProvider`] consulted by the `execute_tool`
+/// activity body. Installed via [`install_tool_registry_provider`] (or
+/// [`install_tool_registry`] for the static base) and accessed via
+/// [`tool_registry_provider`].
+static TOOL_REGISTRY_PROVIDER: OnceLock<Arc<dyn ToolRegistryProvider>> = OnceLock::new();
+
+/// Install the process-wide [`ToolRegistryProvider`]. Panics on double
+/// install.
+pub fn install_tool_registry_provider(provider: Arc<dyn ToolRegistryProvider>) {
+    TOOL_REGISTRY_PROVIDER
+        .set(provider)
+        .map_err(|_| ())
+        .expect("install_tool_registry_provider called twice; one process, one provider");
+}
+
+/// Install a single graph-agnostic [`ToolRegistry`] as the process-wide
+/// provider: every graph resolves to `registry`. Convenience for tests and
+/// builtin-only deployments. Panics on double install.
+pub fn install_tool_registry(registry: Arc<ToolRegistry>) {
+    install_tool_registry_provider(Arc::new(StaticToolRegistryProvider { registry }));
+}
+
+/// Access the installed [`ToolRegistryProvider`]. Panics if neither
+/// [`install_tool_registry_provider`] nor [`install_tool_registry`] has been
+/// called.
+pub fn tool_registry_provider() -> Arc<dyn ToolRegistryProvider> {
+    TOOL_REGISTRY_PROVIDER
         .get()
         .cloned()
-        .expect("tool_registry() accessed before install_tool_registry()")
+        .expect("tool_registry_provider() accessed before install_tool_registry[_provider]()")
 }
 
 /// Structural-DB writer surface the `register_child_in_structural_db`
@@ -393,20 +436,80 @@ mod tests {
         assert!(result.is_err(), "double install_decide should panic");
     }
 
-    #[test]
-    fn install_tool_registry_then_access_then_double_install_panics() {
+    #[tokio::test]
+    async fn install_tool_registry_then_access_then_double_install_panics() {
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(EchoTool))
             .expect("register echo tool");
         install_tool_registry(Arc::new(reg));
 
-        let r = tool_registry();
-        assert!(Arc::strong_count(&r) >= 2);
+        // The static provider hands the same registry back for any graph.
+        let provider = tool_registry_provider();
+        let g = GraphId::new(uuid::Uuid::nil());
+        let registry = provider
+            .registry_for_graph(g)
+            .await
+            .expect("static provider resolves any graph");
+        assert!(registry.contains("echo"));
 
         let result = std::panic::catch_unwind(|| {
             install_tool_registry(Arc::new(ToolRegistry::new()));
         });
         assert!(result.is_err(), "double install_tool_registry should panic");
+    }
+
+    /// The seam `execute_tool` relies on: a provider hands each graph its
+    /// own registry, so an agent can only reach its own graph's tools. The
+    /// live MCP-on-the-workflow path (real servers, two graphs on one
+    /// worker) is the env-gated smoke that ships with the example graph.
+    #[tokio::test]
+    async fn provider_routes_each_graph_to_its_own_registry() {
+        use coral_node::tools::Tool;
+        use std::collections::HashMap;
+
+        struct NamedTool(&'static str);
+        #[async_trait]
+        impl Tool for NamedTool {
+            fn name(&self) -> &str {
+                self.0
+            }
+            async fn call(&self, args: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+                Ok(args)
+            }
+        }
+
+        struct MapProvider(HashMap<GraphId, Arc<ToolRegistry>>);
+        #[async_trait]
+        impl ToolRegistryProvider for MapProvider {
+            async fn registry_for_graph(
+                &self,
+                graph_id: GraphId,
+            ) -> anyhow::Result<Arc<ToolRegistry>> {
+                self.0
+                    .get(&graph_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("no registry for this graph"))
+            }
+        }
+
+        let ga = GraphId::new(uuid::Uuid::from_u128(0xA));
+        let gb = GraphId::new(uuid::Uuid::from_u128(0xB));
+        let mut ra = ToolRegistry::new();
+        ra.register(Arc::new(NamedTool("alpha"))).unwrap();
+        let mut rb = ToolRegistry::new();
+        rb.register(Arc::new(NamedTool("beta"))).unwrap();
+        let mut map = HashMap::new();
+        map.insert(ga, Arc::new(ra));
+        map.insert(gb, Arc::new(rb));
+        let provider: Arc<dyn ToolRegistryProvider> = Arc::new(MapProvider(map));
+
+        let reg_a = provider.registry_for_graph(ga).await.expect("graph a");
+        assert!(reg_a.contains("alpha") && !reg_a.contains("beta"));
+        let reg_b = provider.registry_for_graph(gb).await.expect("graph b");
+        assert!(reg_b.contains("beta") && !reg_b.contains("alpha"));
+
+        let unknown = GraphId::new(uuid::Uuid::from_u128(0xC));
+        assert!(provider.registry_for_graph(unknown).await.is_err());
     }
 
     #[test]

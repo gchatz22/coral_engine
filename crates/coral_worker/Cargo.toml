@@ -17,12 +17,18 @@ path = "src/bin/worker.rs"
 # wires the two together: `coral_graph` depends on `coral_temporal`, so only
 # a third crate sitting above both can install a real `GraphStore` into the
 # worker's `StructuralDbStore` slot without a dependency cycle.
-coral_node = { path = "../coral_node" }
+#
+# `mcp` is enabled here (not in `coral_temporal`) so per-graph registry
+# building — which connects MCP servers — lives in this composition root and
+# the runtime library stays feature-agnostic.
+coral_node = { path = "../coral_node", features = ["mcp"] }
 coral_temporal = { path = "../coral_temporal" }
 coral_graph = { path = "../coral_graph" }
 
 anyhow = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+async-trait = "0.1"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
 
@@ -60,5 +66,6 @@ sqlx = { version = "=0.8.6", default-features = false, features = [
     "migrate",
 ] }
 coral_node = { path = "../coral_node", features = ["memory-storage"] }
-async-trait = "0.1"
-serde_json = "1"
+# Construct `ToolRecord` fixtures in the `tool_provider` unit tests.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+uuid = { version = "1", default-features = false }

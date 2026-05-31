@@ -78,6 +78,9 @@ pub struct DecideInput {
 pub struct ExecuteToolInput {
     pub cfg: AgentConfig,
     pub fs_handle: FsHandle,
+    /// Graph the calling agent belongs to. Selects the per-graph
+    /// [`ToolRegistry`] the dispatch resolves against.
+    pub graph_id: GraphId,
     pub call: ToolCall,
 }
 
@@ -499,7 +502,26 @@ impl AgentActivities {
         _ctx: ActivityContext,
         input: ExecuteToolInput,
     ) -> Result<ToolCallOutcome, ActivityError> {
-        let registry = crate::worker::tool_registry();
+        // Resolve the calling graph's registry. A build failure (e.g. an
+        // MCP server that won't spawn) folds into a tool-call `Failure`,
+        // not an `ActivityError` — same path as a call-time error, so the
+        // workflow surfaces it as next-tick correction rather than tripping
+        // Temporal's outer retry.
+        let registry = match crate::worker::tool_registry_provider()
+            .registry_for_graph(input.graph_id)
+            .await
+        {
+            Ok(registry) => registry,
+            Err(e) => {
+                return Ok(ToolCallOutcome::Failure {
+                    failure: ToolCallFailure {
+                        tool: input.call.name.clone(),
+                        args: input.call.args.clone(),
+                        error: format!("tool registry unavailable for graph: {e:#}"),
+                    },
+                });
+            }
+        };
         // One-shot dispatch — the tool implementation owns its retry
         // policy; another retry layer here would compound them.
         let call_result = registry
@@ -1087,15 +1109,18 @@ mod tests {
     #[test]
     fn execute_tool_input_round_trips_through_json() {
         use coral_node::decision::ClaimSeed;
+        let graph_id = GraphId::new(uuid::Uuid::from_u128(0x9c));
         let i = ExecuteToolInput {
             cfg: AgentConfig::default(),
             fs_handle: FsHandle {
                 prefix: "g1/a1".into(),
             },
+            graph_id,
             call: ToolCall::new("echo", json!({"msg": "hi"}), ClaimSeed::new("s")),
         };
         let s = serde_json::to_string(&i).unwrap();
-        let _back: ExecuteToolInput = serde_json::from_str(&s).unwrap();
+        let back: ExecuteToolInput = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.graph_id, graph_id);
     }
 
     #[test]

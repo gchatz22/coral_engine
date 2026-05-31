@@ -540,6 +540,30 @@ impl GraphStore {
         Ok(rows)
     }
 
+    /// Every distinct tool attached to any agent in a graph, resolved
+    /// through `agent_tools` → `agents`. The worker reads this to build a
+    /// graph's tool registry; a tool shared by several agents appears once.
+    pub async fn list_tools_for_graph(&self, graph_id: Uuid) -> sqlx::Result<Vec<ToolRecord>> {
+        let rows = sqlx::query_as!(
+            ToolRecord,
+            r#"
+            SELECT DISTINCT t.id, t.kind, t.command,
+                   t.args as "args!: serde_json::Value",
+                   t.env_refs as "env_refs!: serde_json::Value",
+                   t.created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            FROM tools t
+            JOIN agent_tools at ON at.tool_id = t.id
+            JOIN agents a ON a.id = at.agent_id
+            WHERE a.graph_id = $1
+            ORDER BY t.created_at ASC
+            "#,
+            graph_id,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// All tools attached to an agent via `agent_tools`.
     pub async fn list_tools_for_agent(&self, agent_id: Uuid) -> sqlx::Result<Vec<ToolRecord>> {
         let rows = sqlx::query_as!(
@@ -845,6 +869,122 @@ mod tests {
         let agent = seed_agent(&store, graph.id, "a").await;
         let tools = store.list_tools_for_agent(agent.id).await?;
         assert!(tools.is_empty());
+        Ok(())
+    }
+
+    // --- list_tools_for_graph ---
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn list_tools_for_graph_dedups_shared_tools_and_spans_agents(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        const YAML: &str = r#"
+apiVersion: coral.engine/v1alpha1
+kind: Graph
+metadata:
+  name: graph-tools
+tools:
+  - id: echo
+    kind: builtin
+    builtin: echo
+  - id: web
+    kind: mcp
+    command: mcp-web-search
+    args: [--json]
+agents:
+  - id: parent
+    mandate:
+      text: parent
+      idle_period: 1s
+    tools: [echo, web]
+    children:
+      - id: child
+        mandate:
+          text: child
+          idle_period: 1s
+        tools: [echo]
+seed:
+  triggers:
+    - agent: parent
+      at: start
+      external:
+        kind: kickoff
+        payload: {}
+"#;
+        let store = GraphStore::new(pool);
+        let g = crate::yaml::parse_and_validate(YAML).expect("validator green");
+        let applied = store.create_from_yaml(&g).await.expect("create_from_yaml");
+
+        let tools = store
+            .list_tools_for_graph(applied.graph_id.into_uuid())
+            .await?;
+
+        // `echo` is attached to both parent and child but must appear once.
+        assert_eq!(
+            tools.len(),
+            2,
+            "expected echo + web once each, got {tools:?}"
+        );
+        let mut kinds: Vec<&str> = tools.iter().map(|t| t.kind.as_str()).collect();
+        kinds.sort_unstable();
+        assert_eq!(kinds, vec!["builtin", "mcp"]);
+
+        // A second graph with a different MCP server must not leak into the
+        // first's listing (and vice versa) — the per-graph scoping the
+        // worker relies on to keep each graph's registry isolated.
+        const OTHER: &str = r#"
+apiVersion: coral.engine/v1alpha1
+kind: Graph
+metadata:
+  name: other-graph
+tools:
+  - id: xsearch
+    kind: mcp
+    command: mcp-x-search
+agents:
+  - id: root
+    mandate:
+      text: root
+      idle_period: 1s
+    tools: [xsearch]
+seed:
+  triggers:
+    - agent: root
+      at: start
+      external:
+        kind: kickoff
+        payload: {}
+"#;
+        let other = crate::yaml::parse_and_validate(OTHER).expect("validator green");
+        let other_applied = store
+            .create_from_yaml(&other)
+            .await
+            .expect("create_from_yaml");
+
+        let other_tools = store
+            .list_tools_for_graph(other_applied.graph_id.into_uuid())
+            .await?;
+        assert_eq!(other_tools.len(), 1);
+        assert_eq!(other_tools[0].command.as_deref(), Some("mcp-x-search"));
+
+        // The first graph's listing is unchanged — no cross-graph leakage.
+        let first_again = store
+            .list_tools_for_graph(applied.graph_id.into_uuid())
+            .await?;
+        let mut first_commands: Vec<&str> = first_again
+            .iter()
+            .filter_map(|t| t.command.as_deref())
+            .collect();
+        first_commands.sort_unstable();
+        assert_eq!(first_commands, vec!["echo", "mcp-web-search"]);
+        assert!(
+            !first_commands.contains(&"mcp-x-search"),
+            "graph A leaked graph B's server",
+        );
+
+        // A graph with no agents/tools yields nothing.
+        let empty = store.list_tools_for_graph(Uuid::new_v4()).await?;
+        assert!(empty.is_empty());
         Ok(())
     }
 

@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT t.id, t.kind, t.command,\n                   t.args as \"args!: serde_json::Value\",\n                   t.env_refs as \"env_refs!: serde_json::Value\",\n                   t.created_at as \"created_at!: chrono::DateTime<chrono::Utc>\"\n            FROM tools t\n            JOIN agent_tools at ON at.tool_id = t.id\n            JOIN agents a ON a.id = at.agent_id\n            WHERE a.graph_id = $1\n            ORDER BY t.created_at ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "command",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "args!: serde_json::Value",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 4,
+        "name": "env_refs!: serde_json::Value",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at!: chrono::DateTime<chrono::Utc>",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "3aa4d2d56c927a65172aa25f0e605b77787260eeab14df3b9bf369e0b28b7c75"
+}
