@@ -237,6 +237,46 @@ impl ToolRegistry {
         }
         Ok(names)
     }
+
+    /// Like [`Self::register_mcp_server`], but **skips** (rather than
+    /// errors on) any advertised tool whose name is already registered.
+    /// Returns which names were registered and which were skipped.
+    ///
+    /// The worker builds a graph's registry from several sources — the
+    /// builtin `echo` plus one or more MCP servers — so a name collision
+    /// (two servers sharing a tool name, or a server advertising a builtin
+    /// name) should drop the colliding descriptor, not abort the whole
+    /// graph's registry. First registration wins; the caller logs skips.
+    pub async fn register_mcp_server_skipping_existing(
+        &mut self,
+        client: Arc<McpClient>,
+    ) -> anyhow::Result<McpRegistration> {
+        let descriptors = client.list_tools().await?;
+        let mut registered = Vec::new();
+        let mut skipped = Vec::new();
+        for descriptor in descriptors {
+            let name = descriptor.name.clone();
+            if self.contains(&name) {
+                skipped.push(name);
+                continue;
+            }
+            self.register(Arc::new(McpTool::new(descriptor, Arc::clone(&client))))?;
+            registered.push(name);
+        }
+        Ok(McpRegistration {
+            registered,
+            skipped,
+        })
+    }
+}
+
+/// Outcome of [`ToolRegistry::register_mcp_server_skipping_existing`]:
+/// the tool names actually registered and those skipped because the name
+/// was already taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpRegistration {
+    pub registered: Vec<String>,
+    pub skipped: Vec<String>,
 }
 
 fn to_descriptor(tool: rmcp::model::Tool) -> McpToolDescriptor {
@@ -686,6 +726,49 @@ mod tests {
             .await
             .expect("placeholder still wired");
         assert_eq!(placeholder.result, json!("placeholder"));
+
+        drop(registry);
+        drop(client);
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn register_mcp_server_skipping_existing_drops_collisions_without_erroring() {
+        // Mirror the real worker case: a builtin already owns a name the
+        // server also advertises. `repeat` is pre-registered; the server
+        // announces `repeat` + `shout`, so `repeat` is skipped and `shout`
+        // registers — no error, and the pre-registered tool survives.
+        let (client, server) = paired_multi().await;
+        let client = Arc::new(client);
+        let mut registry = ToolRegistry::new();
+
+        struct BuiltinRepeat;
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for BuiltinRepeat {
+            fn name(&self) -> &str {
+                "repeat"
+            }
+            async fn call(&self, _args: Value) -> anyhow::Result<Value> {
+                Ok(json!("builtin"))
+            }
+        }
+        registry.register(Arc::new(BuiltinRepeat)).unwrap();
+
+        let outcome = registry
+            .register_mcp_server_skipping_existing(Arc::clone(&client))
+            .await
+            .expect("skip-on-collision must not error");
+
+        assert_eq!(outcome.registered, vec!["shout".to_string()]);
+        assert_eq!(outcome.skipped, vec!["repeat".to_string()]);
+        assert!(registry.contains("repeat"));
+        assert!(registry.contains("shout"));
+        // The builtin (first-wins) is still the one wired under `repeat`.
+        let ev = registry
+            .call("repeat", json!({"text": "ignored"}))
+            .await
+            .expect("builtin repeat still wired");
+        assert_eq!(ev.result, json!("builtin"));
 
         drop(registry);
         drop(client);

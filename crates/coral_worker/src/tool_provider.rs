@@ -23,7 +23,7 @@ use coral_node::mcp::McpClient;
 use coral_node::tools::{EchoTool, ToolRegistry};
 use coral_temporal::worker::ToolRegistryProvider;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 /// A deduplicated MCP server to spawn for a graph. `env` is sorted so two
 /// rows naming the same `(command, args, env)` collapse to one spawn.
@@ -49,11 +49,6 @@ impl DbToolRegistryProvider {
     }
 
     async fn build_registry(&self, graph_id: GraphId) -> Result<ToolRegistry> {
-        let mut registry = ToolRegistry::new();
-        registry
-            .register(Arc::new(EchoTool))
-            .context("registering builtin echo in per-graph registry")?;
-
         let rows = self
             .store
             .list_tools_for_graph(graph_id.into_uuid())
@@ -61,6 +56,11 @@ impl DbToolRegistryProvider {
             .context("reading graph tools from structural DB")?;
         let specs = mcp_specs_from_rows(&rows)?;
 
+        // MCP servers register first; the builtin `echo` is a fallback added
+        // only if no server already provides that name. A name collision
+        // (between servers, or with the builtin) skips the colliding tool
+        // rather than aborting the whole graph's registry — first-wins.
+        let mut registry = ToolRegistry::new();
         let mut tool_names: Vec<String> = Vec::new();
         for spec in &specs {
             let args_refs: Vec<&str> = spec.args.iter().map(String::as_str).collect();
@@ -69,11 +69,26 @@ impl DbToolRegistryProvider {
                     .await
                     .with_context(|| format!("connecting MCP server {:?}", spec.command))?,
             );
-            let names = registry
-                .register_mcp_server(client)
+            let outcome = registry
+                .register_mcp_server_skipping_existing(client)
                 .await
                 .with_context(|| format!("registering tools from MCP server {:?}", spec.command))?;
-            tool_names.extend(names);
+            for name in &outcome.skipped {
+                warn!(
+                    graph_id = %graph_id,
+                    server = %spec.command,
+                    tool = %name,
+                    "skipped MCP tool: a tool with this name is already registered"
+                );
+            }
+            tool_names.extend(outcome.registered);
+        }
+
+        if !registry.contains("echo") {
+            registry
+                .register(Arc::new(EchoTool))
+                .context("registering builtin echo in per-graph registry")?;
+            tool_names.push("echo".to_string());
         }
 
         info!(

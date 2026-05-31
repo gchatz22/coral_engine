@@ -66,6 +66,18 @@ temporal workflow start \
 
 The Temporal Web UI at <http://localhost:8233> shows the queued + running workflows.
 
+### Apply a graph with MCP tools
+
+A `graph.yaml` may declare `kind: mcp` tools alongside builtins. `coral apply` persists them like any other tool; **the worker sources a graph's MCP servers from the structural DB**, not from the YAML file (which it never sees). On the first tool dispatch for a graph, the worker reads that graph's tool rows and builds a per-`graph_id` registry — the builtin `echo` plus one spawned MCP server per declared `kind: mcp` tool (deduplicated by `command + args + env`) — cached for the worker's lifetime, so each graph reaches only its own servers.
+
+```sh
+DATABASE_URL=postgres://coral:coral@localhost:5432/coral_structural \
+cargo run -p coral_graph --bin coral-apply -- \
+    examples/smoke_mcp_temporal/graph.yaml
+```
+
+The worker spawns each MCP server as a subprocess, so **Node.js must be on the worker's `$PATH`** for the reference `npx -y @modelcontextprotocol/server-everything` fixture (no paid key required). See [`examples/smoke_mcp_temporal/README.md`](examples/smoke_mcp_temporal/README.md) for the full recipe and the env-gated live smoke.
+
 ### Run the worker as a container (production-shape)
 
 ```sh
