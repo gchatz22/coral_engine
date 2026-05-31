@@ -1,10 +1,10 @@
 # `smoke_llm_temporal` — live-vendor smoke fixture
 
 Single-file `graph.yaml` fixture consumed by `coral-apply` against a
-running worker daemon. The temporal worker only registers the
-bootstrap `EchoTool` (MCP-server wiring through env vars is a planned
-follow-up), so this fixture's mandate prompt is echo-only — diverging
-from `smoke_llm_mcp/config.json`'s `get-sum` ask.
+running worker daemon. This fixture's mandate prompt is echo-only (it
+uses the builtin `echo` tool); for the worker driving a real MCP server
+from a `kind: mcp` graph, see
+[`smoke_mcp_temporal`](../smoke_mcp_temporal/README.md).
 
 ## Thin-client shape
 
