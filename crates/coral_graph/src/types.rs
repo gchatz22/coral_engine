@@ -40,6 +40,10 @@ pub struct AgentRecord {
     /// itself. Defaults to `false` at the schema level; see
     /// `migrations/0003_agents_persistent.sql`.
     pub persistent: bool,
+    /// Optional per-agent model override. `None` (the schema default) means
+    /// the worker's configured default model; see
+    /// `migrations/0004_agents_model.sql`.
+    pub model: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -103,12 +107,14 @@ mod tests {
             name: "worker".into(),
             mandate_ref: Some("v1".into()),
             persistent: true,
+            model: Some("claude-opus-4-8".into()),
             created_at: ts(),
         };
         let s = serde_json::to_string(&a).unwrap();
         let back: AgentRecord = serde_json::from_str(&s).unwrap();
         assert_eq!(a, back);
         assert!(back.persistent);
+        assert_eq!(back.model.as_deref(), Some("claude-opus-4-8"));
     }
 
     #[test]
@@ -119,6 +125,7 @@ mod tests {
             name: "leaf".into(),
             mandate_ref: None,
             persistent: false,
+            model: None,
             created_at: ts(),
         };
         let s = serde_json::to_string(&a).unwrap();

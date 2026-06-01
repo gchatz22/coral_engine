@@ -16,8 +16,8 @@ use std::time::Instant;
 use serde_json::{json, Value};
 
 use super::{
-    CallStats, CompleteRequest, CompleteResponse, ContentBlock, ModelClient, ModelError, Role,
-    ToolCall, Usage, Vendor,
+    effective_model, CallStats, CompleteRequest, CompleteResponse, ContentBlock, ModelClient,
+    ModelError, Role, ToolCall, Usage, Vendor,
 };
 
 /// Default model identifier. Used when neither `MODEL_ENV` nor
@@ -101,7 +101,8 @@ impl ModelClient for AnthropicClient {
         let api_key = env::var(API_KEY_ENV)
             .map_err(|_| ModelError::Auth(format!("{API_KEY_ENV} not set in environment")))?;
 
-        let body = build_body(&req, &self.model);
+        let model = effective_model(&req, &self.model).to_string();
+        let body = build_body(&req, &model);
         // End-to-end wall time including body read, matching wire observation.
         let started = Instant::now();
         let resp = self
@@ -130,7 +131,7 @@ impl ModelClient for AnthropicClient {
             usage: parsed.usage,
             latency_ms,
             vendor: Vendor::Anthropic,
-            model: self.model.clone(),
+            model,
         };
         Ok(CompleteResponse {
             content: parsed.content,
@@ -400,6 +401,7 @@ mod tests {
                     "required": ["location"],
                 }),
             }],
+            model: None,
             options: CompleteOptions {
                 max_tokens: 256,
                 temperature: Some(0.0),
@@ -459,6 +461,7 @@ mod tests {
         let req = CompleteRequest {
             messages: vec![Message::user("hi")],
             tools: vec![],
+            model: None,
             options: CompleteOptions {
                 max_tokens: 32,
                 temperature: None,
@@ -487,6 +490,7 @@ mod tests {
                 description: "echo".into(),
                 input_schema: json!({"type": "object"}),
             }],
+            model: None,
             options: CompleteOptions {
                 max_tokens: 32,
                 temperature: None,
@@ -509,6 +513,7 @@ mod tests {
                 Message::user("hi"),
             ],
             tools: vec![],
+            model: None,
             options: CompleteOptions {
                 max_tokens: 32,
                 temperature: None,
@@ -667,6 +672,7 @@ mod tests {
         let req = CompleteRequest {
             messages: vec![Message::user("hi")],
             tools: vec![],
+            model: None,
             options: CompleteOptions {
                 max_tokens: 32,
                 temperature: None,

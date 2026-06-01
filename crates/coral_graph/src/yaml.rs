@@ -146,6 +146,13 @@ pub struct Mandate {
     /// paths consume it.
     #[serde(default)]
     pub persistent: bool,
+    /// Optional per-agent model override (e.g. `claude-opus-4-8` for a
+    /// reconciling parent). Absent ⇒ the worker's configured default model.
+    /// Interpreted within the worker's configured vendor; a model id that
+    /// vendor doesn't recognize is an operator misconfig surfacing as a
+    /// runtime error.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Top-level `defaults:` block — knobs applied to every agent unless
@@ -529,6 +536,7 @@ pub(crate) fn resolve_mandate(agent: &Agent, defaults: &Option<AgentDefaults>) -
         .or_else(|| defaults.as_ref().and_then(|d| d.max_ticks));
     let mut mandate = NodeMandate::new(agent.mandate.text.clone(), idle_period, max_ticks);
     mandate.persistent = agent.mandate.persistent;
+    mandate.model = agent.mandate.model.clone();
     mandate
 }
 
@@ -1375,6 +1383,8 @@ seed:
         assert_eq!(input.mandate.max_ticks, Some(8));
         // Absent `persistent:` ⇒ false (today's one-shot default).
         assert!(!input.mandate.persistent);
+        // Absent `model:` ⇒ None (worker's configured default model).
+        assert!(input.mandate.model.is_none());
 
         assert!(input.mandate.retry_policy.is_none());
         assert_eq!(
@@ -1438,6 +1448,33 @@ seed:
     fn persistent_absent_defaults_to_false_at_parse() {
         let g = parse_and_validate(HAPPY_YAML).expect("happy path");
         assert!(!g.agents[0].mandate.persistent);
+    }
+
+    #[test]
+    fn model_override_in_mandate_reaches_agent_input() {
+        let yaml = HAPPY_YAML.replace(
+            "      idle_period: 1s\n",
+            "      idle_period: 1s\n      model: claude-opus-4-8\n",
+        );
+        let g = parse_and_validate(&yaml).expect("model graph validates");
+        assert_eq!(
+            g.agents[0].mandate.model.as_deref(),
+            Some("claude-opus-4-8")
+        );
+        let graph_id = coral_node::agent_ref::GraphId::new(uuid::Uuid::new_v4());
+        let agent_id = coral_node::agent_ref::AgentId::new(uuid::Uuid::new_v4());
+        let input = super::into_agent_input(&g, graph_id, agent_id);
+        assert_eq!(
+            input.mandate.model.as_deref(),
+            Some("claude-opus-4-8"),
+            "model: must reach the workflow input mandate"
+        );
+    }
+
+    #[test]
+    fn model_absent_defaults_to_none_at_parse() {
+        let g = parse_and_validate(HAPPY_YAML).expect("happy path");
+        assert!(g.agents[0].mandate.model.is_none());
     }
 
     #[test]

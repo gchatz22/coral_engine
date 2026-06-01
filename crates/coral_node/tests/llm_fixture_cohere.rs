@@ -347,6 +347,7 @@ async fn tool_call_roundtrip_assistant_turn_omits_empty_content() {
             },
         ],
         tools: vec![],
+        model: None,
         options: CompleteOptions::default(),
     };
 
@@ -358,6 +359,7 @@ async fn tool_call_roundtrip_assistant_turn_omits_empty_content() {
         .complete(CompleteRequest {
             messages: vec![Message::user("warmup")],
             tools: vec![],
+            model: None,
             options: CompleteOptions::default(),
         })
         .await

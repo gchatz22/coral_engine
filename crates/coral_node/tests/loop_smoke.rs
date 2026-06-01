@@ -1431,6 +1431,7 @@ async fn per_mandate_recent_outputs_cap_reaches_the_run_loop() {
             open_claims_max: 32,
         },
         persistent: false,
+        model: None,
     };
     let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
         .await

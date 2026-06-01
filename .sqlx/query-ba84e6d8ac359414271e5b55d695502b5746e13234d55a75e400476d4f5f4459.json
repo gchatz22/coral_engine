@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT a.id, a.graph_id, a.name, a.mandate_ref, a.persistent,\n                   a.created_at as \"created_at!: chrono::DateTime<chrono::Utc>\"\n            FROM agents a\n            JOIN edges e ON e.child_agent_id = a.id\n            WHERE e.parent_agent_id = $1\n            ORDER BY a.created_at ASC\n            ",
+  "query": "\n            INSERT INTO agents (id, graph_id, name, mandate_ref)\n            VALUES ($1, $2, $3, $4)\n            RETURNING id, graph_id, name, mandate_ref, persistent, model, created_at as \"created_at!: chrono::DateTime<chrono::Utc>\"\n            ",
   "describe": {
     "columns": [
       {
@@ -30,13 +30,21 @@
       },
       {
         "ordinal": 5,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
         "name": "created_at!: chrono::DateTime<chrono::Utc>",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text"
       ]
     },
     "nullable": [
@@ -45,8 +53,9 @@
       false,
       true,
       false,
+      true,
       false
     ]
   },
-  "hash": "de8fd1aa899e6f7e909bc05ab579a88dc16e732235549ebb0fd9001c18ac21f0"
+  "hash": "ba84e6d8ac359414271e5b55d695502b5746e13234d55a75e400476d4f5f4459"
 }
