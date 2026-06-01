@@ -108,7 +108,7 @@ impl GraphStore {
             r#"
             INSERT INTO agents (id, graph_id, name, mandate_ref)
             VALUES ($1, $2, $3, $4)
-            RETURNING id, graph_id, name, mandate_ref, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            RETURNING id, graph_id, name, mandate_ref, persistent, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
             "#,
             id,
             graph_id,
@@ -376,15 +376,18 @@ fn walk_agent_tree<'a>(
         sqlx::query_as!(
             AgentRecord,
             r#"
-            INSERT INTO agents (id, graph_id, name, mandate_ref)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id, graph_id, name, mandate_ref, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            INSERT INTO agents (id, graph_id, name, mandate_ref, persistent)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id, graph_id, name, mandate_ref, persistent, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
             "#,
             agent_uuid,
             graph_id,
             &yaml_agent.id,
-            // Mandate travels via `AgentInput.mandate` directly today.
+            // Mandate text/idle/max_ticks travel via `AgentInput.mandate`
+            // directly today; `persistent` is the one bit also recorded
+            // structurally.
             None as Option<&str>,
+            yaml_agent.mandate.persistent,
         )
         .fetch_one(&mut **tx)
         .await?;
@@ -468,7 +471,7 @@ impl GraphStore {
         let row = sqlx::query_as!(
             AgentRecord,
             r#"
-            SELECT id, graph_id, name, mandate_ref, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            SELECT id, graph_id, name, mandate_ref, persistent, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
             FROM agents
             WHERE id = $1
             "#,
@@ -487,7 +490,7 @@ impl GraphStore {
         let rows = sqlx::query_as!(
             AgentRecord,
             r#"
-            SELECT id, graph_id, name, mandate_ref, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            SELECT id, graph_id, name, mandate_ref, persistent, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
             FROM agents
             WHERE graph_id = $1
             ORDER BY created_at ASC
@@ -505,7 +508,7 @@ impl GraphStore {
         let rows = sqlx::query_as!(
             AgentRecord,
             r#"
-            SELECT a.id, a.graph_id, a.name, a.mandate_ref,
+            SELECT a.id, a.graph_id, a.name, a.mandate_ref, a.persistent,
                    a.created_at as "created_at!: chrono::DateTime<chrono::Utc>"
             FROM agents a
             JOIN edges e ON e.child_agent_id = a.id
@@ -1100,6 +1103,68 @@ seed:
             tools[0].env_refs,
             serde_json::json!({"API_KEY": "secret", "LOG": "debug"}),
         );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn create_from_yaml_persists_agent_persistent_flag(pool: PgPool) -> sqlx::Result<()> {
+        // `persistent: true` on one agent, absent on the other ⇒ false.
+        // Round-trips through the `agents.persistent` column.
+        const YAML: &str = r#"
+apiVersion: coral.engine/v1alpha1
+kind: Graph
+metadata:
+  name: persist-smoke
+tools:
+  - id: echo
+    kind: builtin
+    builtin: echo
+agents:
+  - id: monitor
+    mandate:
+      text: keep watching
+      idle_period: 1s
+      persistent: true
+    tools: [echo]
+    children:
+      - id: oneshot
+        mandate:
+          text: do once
+          idle_period: 1s
+        tools: []
+seed:
+  triggers:
+    - agent: monitor
+      at: start
+      external:
+        kind: kickoff
+        payload: {}
+"#;
+        let store = GraphStore::new(pool);
+        let g = crate::yaml::parse_and_validate(YAML).expect("validator green");
+        let applied = store.create_from_yaml(&g).await.expect("create_from_yaml");
+
+        let monitor = applied.id_map.get("monitor").expect("monitor in id_map");
+        let monitor_row = store
+            .get_agent(monitor.db_agent_id.into_uuid())
+            .await?
+            .expect("monitor row");
+        assert!(monitor_row.persistent, "monitor must persist");
+
+        let oneshot = applied.id_map.get("oneshot").expect("oneshot in id_map");
+        let oneshot_row = store
+            .get_agent(oneshot.db_agent_id.into_uuid())
+            .await?
+            .expect("oneshot row");
+        assert!(
+            !oneshot_row.persistent,
+            "absent persistent must default to false"
+        );
+
+        // The flag also reads back through the list/children query paths.
+        let children = store.list_children(monitor.db_agent_id.into_uuid()).await?;
+        assert_eq!(children.len(), 1);
+        assert!(!children[0].persistent);
         Ok(())
     }
 

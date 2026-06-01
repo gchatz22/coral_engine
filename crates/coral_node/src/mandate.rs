@@ -81,6 +81,12 @@ pub struct Mandate {
     /// to `ContextPolicy::default()`.
     #[serde(default)]
     pub context_policy: ContextPolicy,
+    /// Whether this agent must persist and refresh rather than terminate
+    /// itself. `false` (the default and the serialized shape when absent)
+    /// is today's one-shot behavior. Carries no behavior on its own; the
+    /// runtime's stop contract and wake/refresh paths consume it.
+    #[serde(default)]
+    pub persistent: bool,
 }
 
 impl Mandate {
@@ -94,6 +100,7 @@ impl Mandate {
             max_ticks,
             retry_policy: None,
             context_policy: ContextPolicy::default(),
+            persistent: false,
         }
     }
 }
@@ -294,6 +301,7 @@ mod tests {
             max_ticks: Some(1),
             retry_policy: Some(RetryPolicy::new(5, Duration::from_millis(10))),
             context_policy: ContextPolicy::default(),
+            persistent: false,
         };
         let s = serde_json::to_string(&m).unwrap();
         // Verify both subfields land on the wire under stable names.
@@ -321,6 +329,43 @@ mod tests {
         assert_eq!(back.idle_period, Duration::from_millis(250));
         assert_eq!(back.max_ticks, None);
         assert_eq!(back.context_policy, ContextPolicy::default());
+        assert!(!back.persistent);
+    }
+
+    #[test]
+    fn mandate_new_defaults_persistent_to_false() {
+        let m = Mandate::new("x", Duration::from_millis(100), None);
+        assert!(!m.persistent);
+    }
+
+    #[test]
+    fn mandate_round_trip_with_persistent_true() {
+        let m = Mandate {
+            text: "watch forever".into(),
+            idle_period: Duration::from_millis(100),
+            max_ticks: None,
+            retry_policy: None,
+            context_policy: ContextPolicy::default(),
+            persistent: true,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(
+            s.contains("\"persistent\":true"),
+            "expected persistent on wire, got {s}"
+        );
+        let back: Mandate = serde_json::from_str(&s).unwrap();
+        assert_eq!(m, back);
+        assert!(back.persistent);
+    }
+
+    #[test]
+    fn mandate_deserializes_legacy_json_without_persistent_field() {
+        // A serialized mandate from before the field existed (e.g. an
+        // in-flight Temporal continue-as-new `AgentInput`) must
+        // deserialize to `persistent: false`, not reject.
+        let legacy = r#"{"text":"old","idle_period":250,"max_ticks":null}"#;
+        let back: Mandate = serde_json::from_str(legacy).unwrap();
+        assert!(!back.persistent);
     }
 
     #[test]
@@ -374,6 +419,7 @@ mod tests {
                 recent_evidence: 3,
                 open_claims_max: 4,
             },
+            persistent: false,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(

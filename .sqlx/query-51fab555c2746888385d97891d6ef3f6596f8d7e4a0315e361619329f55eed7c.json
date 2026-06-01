@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, graph_id, name, mandate_ref, created_at as \"created_at!: chrono::DateTime<chrono::Utc>\"\n            FROM agents\n            WHERE graph_id = $1\n            ORDER BY created_at ASC\n            ",
+  "query": "\n            SELECT id, graph_id, name, mandate_ref, persistent, created_at as \"created_at!: chrono::DateTime<chrono::Utc>\"\n            FROM agents\n            WHERE graph_id = $1\n            ORDER BY created_at ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -25,6 +25,11 @@
       },
       {
         "ordinal": 4,
+        "name": "persistent",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
         "name": "created_at!: chrono::DateTime<chrono::Utc>",
         "type_info": "Timestamptz"
       }
@@ -39,8 +44,9 @@
       false,
       false,
       true,
+      false,
       false
     ]
   },
-  "hash": "5f13c39f5c23570d2ab6fcd1cd5a6a47ddc83d599684565ec46506a026c38874"
+  "hash": "51fab555c2746888385d97891d6ef3f6596f8d7e4a0315e361619329f55eed7c"
 }

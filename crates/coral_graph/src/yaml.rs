@@ -140,6 +140,12 @@ pub struct Mandate {
     /// `Retire`. May be supplied via [`AgentDefaults::max_ticks`].
     #[serde(default)]
     pub max_ticks: Option<u64>,
+    /// Whether this agent must persist and refresh rather than terminate
+    /// itself. Absent ⇒ `false` (today's one-shot behavior). Carries no
+    /// behavior on its own; the runtime's stop contract and wake/refresh
+    /// paths consume it.
+    #[serde(default)]
+    pub persistent: bool,
 }
 
 /// Top-level `defaults:` block — knobs applied to every agent unless
@@ -521,7 +527,9 @@ pub(crate) fn resolve_mandate(agent: &Agent, defaults: &Option<AgentDefaults>) -
         .mandate
         .max_ticks
         .or_else(|| defaults.as_ref().and_then(|d| d.max_ticks));
-    NodeMandate::new(agent.mandate.text.clone(), idle_period, max_ticks)
+    let mut mandate = NodeMandate::new(agent.mandate.text.clone(), idle_period, max_ticks);
+    mandate.persistent = agent.mandate.persistent;
+    mandate
 }
 
 /// Parse and validate in one shot, with `line:col` enrichment for the
@@ -1365,6 +1373,8 @@ seed:
         );
         assert_eq!(input.mandate.idle_period, Duration::from_secs(1));
         assert_eq!(input.mandate.max_ticks, Some(8));
+        // Absent `persistent:` ⇒ false (today's one-shot default).
+        assert!(!input.mandate.persistent);
 
         assert!(input.mandate.retry_policy.is_none());
         assert_eq!(
@@ -1405,6 +1415,29 @@ seed:
         let agent_id = coral_node::agent_ref::AgentId::new(uuid::Uuid::new_v4());
         let input = super::into_agent_input(&g, graph_id, agent_id);
         assert!(input.mandate.max_ticks.is_none());
+    }
+
+    #[test]
+    fn persistent_true_in_mandate_reaches_agent_input() {
+        let yaml = HAPPY_YAML.replace(
+            "      idle_period: 1s\n",
+            "      idle_period: 1s\n      persistent: true\n",
+        );
+        let g = parse_and_validate(&yaml).expect("persistent graph validates");
+        assert!(g.agents[0].mandate.persistent);
+        let graph_id = coral_node::agent_ref::GraphId::new(uuid::Uuid::new_v4());
+        let agent_id = coral_node::agent_ref::AgentId::new(uuid::Uuid::new_v4());
+        let input = super::into_agent_input(&g, graph_id, agent_id);
+        assert!(
+            input.mandate.persistent,
+            "persistent: true must reach the workflow input mandate"
+        );
+    }
+
+    #[test]
+    fn persistent_absent_defaults_to_false_at_parse() {
+        let g = parse_and_validate(HAPPY_YAML).expect("happy path");
+        assert!(!g.agents[0].mandate.persistent);
     }
 
     #[test]
