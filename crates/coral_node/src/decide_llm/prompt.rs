@@ -21,18 +21,18 @@ use crate::mandate::{Mandate, Output};
 use crate::model_client::Message;
 use crate::trigger::Trigger;
 
-/// Standing instructions appended after the mandate text in the system
-/// message. Promoted to a module-level constant so the snapshot tests can
-/// assert against the exact same string the renderer emits.
+/// Shared head of the standing invariants (clauses 1–4): provenance,
+/// one-decision-per-turn, parallel `call_tool`, evidence-from-tools. These
+/// hold for every agent regardless of lifecycle. [`render_system`] joins
+/// this head with a lifecycle-specific tail
+/// ([`ONESHOT_INVARIANTS_TAIL`] or [`PERSISTENT_INVARIANTS_TAIL`]) to form
+/// the full block; the snapshot tests pin the joined result.
 ///
-/// The list is split into six short, single-purpose clauses rather than a
-/// few dense paragraphs: empirically, models would re-emit Outputs across
-/// consecutive turns when the "do not re-emit" rule was buried as the
-/// last sentence of a long paragraph and worded conditionally. Invariant
-/// 5 gets its own numbered clause with unconditional phrasing, and the
-/// recent-outputs window is explicitly tagged as *yours* so the model
-/// treats those entries as work it already did rather than ambient
-/// context.
+/// The list is split into short, single-purpose clauses rather than a few
+/// dense paragraphs: empirically, models would re-emit Outputs across
+/// consecutive turns when the lifecycle rule was buried as the last
+/// sentence of a long paragraph and worded conditionally — so each rule
+/// gets its own numbered, unconditional clause.
 ///
 /// Invariant 3 permits K parallel `call_tool` blocks in a single
 /// response — the runtime folds them into a single
@@ -41,27 +41,29 @@ use crate::trigger::Trigger;
 /// Terminal decision tools (`emit_output`, `rewrite_fs`, `idle`,
 /// `retire`) remain singular: mixing a terminal with `call_tool` or
 /// issuing two terminals in one response is rejected.
-const INVARIANTS: &str = "\
+const INVARIANTS_HEAD: &str = "\
 Invariants:
 1. Provenance. Every `emit_output` decision must cite `evidence` ids that resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.
 2. One decision per turn. Reply by calling exactly one terminal decision tool (`emit_output`, `rewrite_fs`, `idle`, `retire`) OR one or more `call_tool` blocks dispatched together as a single parallel batch.
 3. Parallel call_tool is supported. K `call_tool` `tool_use` blocks in one response run together this tick; the next prompt carries the matching `tool_result` blocks. Do not mix `call_tool` with a terminal decision tool in the same response.
-4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` decisions can cite.
+4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` decisions can cite.";
+
+/// Lifecycle tail for a one-shot agent (the default): emit once, then
+/// retire. Invariant 5's unconditional phrasing and the explicit tagging of
+/// the recent-outputs window as *yours* are load-bearing — without them the
+/// model treats prior Outputs as ambient context and re-emits paraphrased
+/// copies across turns.
+const ONESHOT_INVARIANTS_TAIL: &str = "\
 5. Do not re-emit. Once you have emitted any Output on this run, your next decision must be `retire`. Do not emit a revised, paraphrased, or improved version of a prior Output. Outputs shown in the \"Recent outputs by you on this run\" window were emitted by you and count toward this rule.
 6. Retire is final. After the mandate's required Output has been emitted, `retire` is the only correct decision.";
 
-/// Standing instructions for a **persistent** agent — a continuous monitor
-/// that refreshes its work on a cadence instead of retiring after one
-/// Output. Clauses 1–4 are identical to [`INVARIANTS`]; clauses 5–6 replace
-/// the one-shot "retire after Output / never re-emit" rules with the
-/// refresh contract. The snapshot tests pin both strings so the two can't
-/// drift in clauses 1–4.
-const PERSISTENT_INVARIANTS: &str = "\
-Invariants:
-1. Provenance. Every `emit_output` decision must cite `evidence` ids that resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.
-2. One decision per turn. Reply by calling exactly one terminal decision tool (`emit_output`, `rewrite_fs`, `idle`, `retire`) OR one or more `call_tool` blocks dispatched together as a single parallel batch.
-3. Parallel call_tool is supported. K `call_tool` `tool_use` blocks in one response run together this tick; the next prompt carries the matching `tool_result` blocks. Do not mix `call_tool` with a terminal decision tool in the same response.
-4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` decisions can cite.
+/// Lifecycle tail for a `persistent` agent — a continuous monitor that
+/// refreshes its work on a cadence instead of retiring after one Output.
+/// Replaces the one-shot "retire after Output / never re-emit" rules with
+/// the refresh contract. The runtime enforces the non-termination (a
+/// model-emitted `Retire` is demoted to `Idle`); this tail aligns the
+/// model's intent so it does useful refresh work between wakes.
+const PERSISTENT_INVARIANTS_TAIL: &str = "\
 5. Refresh, don't stop. You are a persistent monitor. After you `emit_output`, choose `idle` to wait for your cadence; on the next scheduled wake, re-research and emit an updated Output that reflects what changed since the last one. The \"Recent outputs by you on this run\" window is your durable memory — build on it rather than re-emitting an unchanged copy.
 6. Do not retire yourself. `retire` is not a valid self-decision for a persistent agent: the runtime stops you only via a retirement signal or your tick budget, and a `retire` decision is treated as `idle`. Keep cycling: research -> emit_output -> idle -> refresh.";
 
@@ -102,13 +104,13 @@ pub fn render(bundle: &ContextBundle) -> Vec<Message> {
 /// time, not the renderer's — the kernel treats the mandate string as
 /// already-trusted input.
 fn render_system(m: &Mandate) -> String {
-    let invariants = if m.persistent {
-        PERSISTENT_INVARIANTS
+    let tail = if m.persistent {
+        PERSISTENT_INVARIANTS_TAIL
     } else {
-        INVARIANTS
+        ONESHOT_INVARIANTS_TAIL
     };
     format!(
-        "You are an agent operating under the following mandate:\n\n{}\n\n{invariants}",
+        "You are an agent operating under the following mandate:\n\n{}\n\n{INVARIANTS_HEAD}\n{tail}",
         m.text
     )
 }
