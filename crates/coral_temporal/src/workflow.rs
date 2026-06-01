@@ -466,10 +466,11 @@ impl AgentWorkflow {
             // Retirement short-circuit fires before any activity invocation
             // and before any CAN check, so a `retire` signal can never
             // trigger a continue-as-new.
-            let drained = ctx.state_mut(drain_buckets);
+            let mut drained = ctx.state_mut(drain_buckets);
             if let Some(reason) = drained.retirement {
                 return retire(ctx, &input, reason).await;
             }
+            synthesize_scheduled_wake(&mut drained);
 
             let bundle = assemble(ctx, &input, drained).await?;
             let decision = decide(ctx, bundle).await?;
@@ -645,6 +646,25 @@ fn demote_retire_if_persistent(decision: Decision, mandate: &Mandate) -> Decisio
             }
         }
         other => other,
+    }
+}
+
+/// Give a pure idle-timer wake an explicit "you woke on schedule" signal.
+///
+/// When the drained tick carried no triggers, human ops, mandate patches,
+/// pending correction, or retirement request, the agent woke because its
+/// `idle_period` elapsed with nothing queued. Synthesize a `ScheduledWake`
+/// so the model has a "why" to act on instead of an empty bundle — mirrors
+/// the in-process loop, which pushes `ScheduledWake` only when the deadline
+/// fires with an empty queue. No-op when any real work was drained.
+fn synthesize_scheduled_wake(drained: &mut DrainedBuckets) {
+    if drained.triggers.is_empty()
+        && drained.human_ops.is_empty()
+        && drained.mandate_patches.is_empty()
+        && drained.prior_correction.is_none()
+        && drained.retirement.is_none()
+    {
+        drained.triggers.push(Trigger::ScheduledWake);
     }
 }
 
@@ -2020,5 +2040,67 @@ mod tests {
                 evidence: vec![],
             }
         );
+    }
+
+    fn empty_drained() -> DrainedBuckets {
+        DrainedBuckets {
+            triggers: vec![],
+            human_ops: vec![],
+            mandate_patches: vec![],
+            retirement: None,
+            prior_correction: None,
+        }
+    }
+
+    #[test]
+    fn synthesize_scheduled_wake_injects_only_on_an_empty_idle_tick() {
+        // Pure idle wake: nothing was queued → one synthesized ScheduledWake
+        // lands in the trigger list that `assemble` forwards verbatim.
+        let mut idle = empty_drained();
+        synthesize_scheduled_wake(&mut idle);
+        assert_eq!(idle.triggers, vec![Trigger::ScheduledWake]);
+    }
+
+    #[test]
+    fn synthesize_scheduled_wake_is_a_noop_when_any_work_was_drained() {
+        // A real trigger already present: don't add a spurious wake.
+        let mut with_trigger = DrainedBuckets {
+            triggers: vec![Trigger::External {
+                kind: "webhook".into(),
+                payload: serde_json::json!({}),
+            }],
+            ..empty_drained()
+        };
+        synthesize_scheduled_wake(&mut with_trigger);
+        assert_eq!(with_trigger.triggers.len(), 1);
+        assert!(!with_trigger
+            .triggers
+            .iter()
+            .any(|t| matches!(t, Trigger::ScheduledWake)));
+
+        // Human op pending → the tick has work; no wake.
+        let mut with_human_op = DrainedBuckets {
+            human_ops: vec![HumanOp::new(serde_json::json!({"action": "pause"}))],
+            ..empty_drained()
+        };
+        synthesize_scheduled_wake(&mut with_human_op);
+        assert!(with_human_op.triggers.is_empty());
+
+        // Mandate patch pending → work; no wake.
+        let mut with_patch = DrainedBuckets {
+            mandate_patches: vec![MandatePatch::new(serde_json::json!({"model": "x"}))],
+            ..empty_drained()
+        };
+        synthesize_scheduled_wake(&mut with_patch);
+        assert!(with_patch.triggers.is_empty());
+
+        // Re-deciding after a tool failure is "other work" — match the
+        // in-process semantic and skip the wake.
+        let mut with_correction = DrainedBuckets {
+            prior_correction: Some(CorrectionContext::new("prior failure")),
+            ..empty_drained()
+        };
+        synthesize_scheduled_wake(&mut with_correction);
+        assert!(with_correction.triggers.is_empty());
     }
 }
