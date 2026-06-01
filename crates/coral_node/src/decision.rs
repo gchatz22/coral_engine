@@ -1042,6 +1042,7 @@ mod tests {
                 recent_evidence: 8,
                 open_claims_max: 32,
             },
+            persistent: false,
         };
         let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
             .await
@@ -1083,6 +1084,7 @@ mod tests {
                 recent_evidence: 3,
                 open_claims_max: 32,
             },
+            persistent: false,
         };
         let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
             .await
@@ -1115,6 +1117,7 @@ mod tests {
                 recent_evidence: 8,
                 open_claims_max: 2,
             },
+            persistent: false,
         };
         let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
             .await

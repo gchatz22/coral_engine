@@ -36,6 +36,10 @@ pub struct AgentRecord {
     pub graph_id: Uuid,
     pub name: String,
     pub mandate_ref: Option<String>,
+    /// Whether this agent must persist and refresh rather than terminate
+    /// itself. Defaults to `false` at the schema level; see
+    /// `migrations/0003_agents_persistent.sql`.
+    pub persistent: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -98,11 +102,13 @@ mod tests {
             graph_id: Uuid::new_v4(),
             name: "worker".into(),
             mandate_ref: Some("v1".into()),
+            persistent: true,
             created_at: ts(),
         };
         let s = serde_json::to_string(&a).unwrap();
         let back: AgentRecord = serde_json::from_str(&s).unwrap();
         assert_eq!(a, back);
+        assert!(back.persistent);
     }
 
     #[test]
@@ -112,6 +118,7 @@ mod tests {
             graph_id: Uuid::new_v4(),
             name: "leaf".into(),
             mandate_ref: None,
+            persistent: false,
             created_at: ts(),
         };
         let s = serde_json::to_string(&a).unwrap();
