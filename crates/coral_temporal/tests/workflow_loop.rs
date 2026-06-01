@@ -691,3 +691,147 @@ async fn drive_partial(client: Client, task_queue: &str, workflow_id: &str) -> R
     );
     Ok(())
 }
+
+/// Regression for the silently-ignored `max_ticks` on the Temporal path: a
+/// non-persistent agent with `max_ticks=2` whose script never emits `Retire`
+/// must still stop at the cap with the in-process retire wording.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn workflow_loop_enforces_max_ticks_for_non_persistent_agent() {
+    if env::var("TEMPORAL_LIVE_TEST").ok().as_deref() != Some("1") {
+        eprintln!(
+            "skipping workflow_loop_enforces_max_ticks_for_non_persistent_agent; \
+             set TEMPORAL_LIVE_TEST=1 with a local Temporal Server to run"
+        );
+        return;
+    }
+    let _guard = LIVE_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+
+    let mut mandate = Mandate::new("max-ticks regression", Duration::from_millis(20), Some(2));
+    mandate.persistent = false;
+    // Buffer of Idles longer than the cap so the cap — not script
+    // exhaustion — is what stops the loop.
+    let script = vec![
+        Decision::Idle {
+            next_after: Duration::from_millis(20),
+        };
+        6
+    ];
+
+    let reason = run_stop_contract_test("maxticks", mandate, script)
+        .await
+        .expect("max_ticks regression live test");
+    assert_eq!(
+        reason, "max_ticks (2) reached",
+        "non-persistent agent must retire at the cap with the in-process wording, got {reason:?}"
+    );
+}
+
+/// A `persistent` agent scripted to emit `Retire` every tick must NOT
+/// terminate on its own decision — the runtime demotes each `Retire` to an
+/// `Idle`, so the only thing that stops it is the `max_ticks` guardrail.
+/// Proves demotion + cap enforcement in one run: the final reason is the cap
+/// wording, never the scripted `Retire` reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn workflow_loop_demotes_persistent_retire_until_max_ticks() {
+    if env::var("TEMPORAL_LIVE_TEST").ok().as_deref() != Some("1") {
+        eprintln!(
+            "skipping workflow_loop_demotes_persistent_retire_until_max_ticks; \
+             set TEMPORAL_LIVE_TEST=1 with a local Temporal Server to run"
+        );
+        return;
+    }
+    let _guard = LIVE_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+
+    let mut mandate = Mandate::new("persistent monitor", Duration::from_millis(20), Some(3));
+    mandate.persistent = true;
+    let script = vec![
+        Decision::Retire {
+            reason: "model tried to self-terminate".into(),
+        };
+        6
+    ];
+
+    let reason = run_stop_contract_test("persistent", mandate, script)
+        .await
+        .expect("persistent demotion live test");
+    assert_eq!(
+        reason, "max_ticks (3) reached",
+        "a persistent agent's scripted Retire must be demoted; only max_ticks stops it, got {reason:?}"
+    );
+}
+
+/// Drive an `AgentWorkflow` with `mandate` + `script` against a live server
+/// and return the `AgentResult::Retired` reason. No tool calls / outputs, so
+/// no evidence planting is needed.
+async fn run_stop_contract_test(
+    label: &str,
+    mandate: Mandate,
+    script: Vec<Decision>,
+) -> Result<String> {
+    let suffix = run_suffix();
+    let task_queue = format!("coral-agents-stop-{label}-{suffix}");
+    ensure_installed();
+    set_decision_script(script);
+
+    let telemetry_options = TelemetryOptions::builder().build();
+    let runtime = CoreRuntime::new_assume_tokio(
+        RuntimeOptions::builder()
+            .telemetry_options(telemetry_options)
+            .build()
+            .map_err(|e| anyhow::anyhow!("RuntimeOptions build failed: {e}"))?,
+    )?;
+    let client = build_client().await?;
+    let mut worker = build_worker(&runtime, client.clone(), &task_queue)?;
+    let shutdown = worker.shutdown_handle();
+
+    let driver_task_queue = task_queue.clone();
+    let driver_label = label.to_string();
+    let driver = tokio::spawn(async move {
+        let workflow_id = format!(
+            "{}-{driver_label}-{suffix}",
+            agent_workflow_id("g-stop-test", "a-stop-test")
+        );
+        struct ShutdownGuard<F: Fn()>(F);
+        impl<F: Fn()> Drop for ShutdownGuard<F> {
+            fn drop(&mut self) {
+                (self.0)();
+            }
+        }
+        let _guard = ShutdownGuard(shutdown);
+
+        let mut input = AgentInput::new_for_test(
+            GraphId::new(Uuid::new_v4()),
+            AgentId::new(Uuid::new_v4()),
+            "stop-contract-test",
+        );
+        input.fs_handle = coral_temporal::workflow::FsHandle {
+            prefix: format!("graphs/g-stop-test/agents/a-stop-{driver_label}-{suffix}"),
+        };
+        input.mandate = mandate;
+
+        let handle = client
+            .start_workflow(
+                AgentWorkflow::run,
+                input,
+                WorkflowStartOptions::new(&driver_task_queue, &workflow_id).build(),
+            )
+            .await
+            .context("start_workflow(AgentWorkflow) [stop-contract]")?;
+        let result: AgentResult = handle
+            .get_result(WorkflowGetResultOptions::default())
+            .await
+            .context("AgentWorkflow.get_result [stop-contract]")?;
+        let AgentResult::Retired { reason } = result;
+        Ok::<String, anyhow::Error>(reason)
+    });
+
+    let worker_result = tokio::time::timeout(Duration::from_secs(60), worker.run())
+        .await
+        .map_err(|_| anyhow::anyhow!("worker.run() timed out (60s)"))?
+        .map_err(|e| anyhow::anyhow!("worker.run() exited with error: {e}"));
+    let reason = driver.await.context("driver task panicked")??;
+    worker_result?;
+    Ok(reason)
+}

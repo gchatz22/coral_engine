@@ -451,6 +451,16 @@ impl AgentWorkflow {
             ctx.state_mut(|s| s.hydrate_from_carryover(c));
         }
         loop {
+            // `max_ticks` is the kernel-level guardrail stop (the only one
+            // besides a retire signal). Checked before `wait_for_tick` so an
+            // over-budget agent retires without waking or burning a decide
+            // call, mirroring the in-process loop. `tick` is the hydrated
+            // state value, so the cap spans a continue-as-new.
+            let tick = ctx.state(|s| s.tick);
+            if let Some(reason) = max_ticks_retire_reason(tick, input.mandate.max_ticks) {
+                return retire(ctx, &input, reason).await;
+            }
+
             wait_for_tick(ctx).await;
 
             // Retirement short-circuit fires before any activity invocation
@@ -468,9 +478,11 @@ impl AgentWorkflow {
             // activity errors out and short-circuits the workflow. The
             // activity sources its timestamp from
             // `ctx.info().scheduled_time` so Temporal retries write
-            // byte-identical bytes.
-            let tick = ctx.state(|s| s.tick);
+            // byte-identical bytes. The model's actual decision is logged
+            // here even when the next line demotes a persistent agent's
+            // `Retire`, so the artifact preserves what the model chose.
             log_decision(ctx, &input.fs_handle, tick, &decision).await?;
+            let decision = demote_retire_if_persistent(decision, &input.mandate);
             match decision {
                 Decision::CallTools { calls } => dispatch_call_tools(ctx, &input, calls).await?,
                 Decision::EmitOutput { content, evidence } => {
@@ -603,6 +615,36 @@ impl AgentWorkflow {
         self.cumulative_mandate_patches_observed = c.cumulative_mandate_patches_observed;
         self.tick = c.tick;
         self.child_handles = c.child_handles;
+    }
+}
+
+/// Retire reason when `tick` has reached the mandate's `max_ticks` safety
+/// cap, else `None`. The wording matches the in-process loop in
+/// `coral_node::agent` so `retirement.json` reads identically on both paths.
+fn max_ticks_retire_reason(tick: u64, max_ticks: Option<u64>) -> Option<String> {
+    max_ticks
+        .filter(|&max| tick >= max)
+        .map(|max| format!("max_ticks ({max}) reached"))
+}
+
+/// Enforce the persistent-agent stop contract on a fresh decision. A
+/// `persistent` agent may not self-terminate, so a model-emitted
+/// `Decision::Retire` is demoted to an `Idle` for one `idle_period`; only a
+/// retire signal or `max_ticks` may stop it. Every other decision, and every
+/// decision from a non-persistent agent, passes through unchanged.
+fn demote_retire_if_persistent(decision: Decision, mandate: &Mandate) -> Decision {
+    match decision {
+        Decision::Retire { reason } if mandate.persistent => {
+            tracing::info!(
+                demoted_reason = %reason,
+                idle_period_ms = mandate.idle_period.as_millis() as u64,
+                "persistent agent: demoting model Retire to Idle (stop contract)"
+            );
+            Decision::Idle {
+                next_after: mandate.idle_period,
+            }
+        }
+        other => other,
     }
 }
 
@@ -1912,5 +1954,71 @@ mod tests {
         assert!(s.contains("2 parallel"), "got: {s}");
         assert!(s.contains("\"a\""), "got: {s}");
         assert!(s.contains("\"b\""), "got: {s}");
+    }
+
+    #[test]
+    fn max_ticks_retire_reason_fires_at_or_past_the_cap() {
+        // Boundary: tick == max retires (the in-process loop performs `max`
+        // ticks then stops on the would-be tick `max`).
+        assert_eq!(
+            max_ticks_retire_reason(3, Some(3)).as_deref(),
+            Some("max_ticks (3) reached"),
+        );
+        assert_eq!(
+            max_ticks_retire_reason(4, Some(3)).as_deref(),
+            Some("max_ticks (3) reached"),
+        );
+        // Under budget: keep running.
+        assert_eq!(max_ticks_retire_reason(2, Some(3)), None);
+        assert_eq!(max_ticks_retire_reason(0, Some(1)), None);
+        // No cap: never retires on this axis.
+        assert_eq!(max_ticks_retire_reason(u64::MAX, None), None);
+    }
+
+    #[test]
+    fn demote_retire_if_persistent_only_demotes_a_persistent_retire() {
+        let idle = Duration::from_millis(500);
+        let mut persistent = Mandate::new("monitor", idle, None);
+        persistent.persistent = true;
+        let one_shot = Mandate::new("one-shot", idle, None);
+
+        // Persistent + Retire → Idle for one idle_period.
+        let demoted = demote_retire_if_persistent(
+            Decision::Retire {
+                reason: "model wants out".into(),
+            },
+            &persistent,
+        );
+        assert_eq!(demoted, Decision::Idle { next_after: idle });
+
+        // Non-persistent + Retire → unchanged (today's stop-on-decision).
+        let kept = demote_retire_if_persistent(
+            Decision::Retire {
+                reason: "done".into(),
+            },
+            &one_shot,
+        );
+        assert_eq!(
+            kept,
+            Decision::Retire {
+                reason: "done".into()
+            }
+        );
+
+        // Persistent + non-Retire → passes through untouched.
+        let passthrough = demote_retire_if_persistent(
+            Decision::EmitOutput {
+                content: "refreshed report".into(),
+                evidence: vec![],
+            },
+            &persistent,
+        );
+        assert_eq!(
+            passthrough,
+            Decision::EmitOutput {
+                content: "refreshed report".into(),
+                evidence: vec![],
+            }
+        );
     }
 }
