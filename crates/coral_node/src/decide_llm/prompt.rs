@@ -50,6 +50,21 @@ Invariants:
 5. Do not re-emit. Once you have emitted any Output on this run, your next decision must be `retire`. Do not emit a revised, paraphrased, or improved version of a prior Output. Outputs shown in the \"Recent outputs by you on this run\" window were emitted by you and count toward this rule.
 6. Retire is final. After the mandate's required Output has been emitted, `retire` is the only correct decision.";
 
+/// Standing instructions for a **persistent** agent — a continuous monitor
+/// that refreshes its work on a cadence instead of retiring after one
+/// Output. Clauses 1–4 are identical to [`INVARIANTS`]; clauses 5–6 replace
+/// the one-shot "retire after Output / never re-emit" rules with the
+/// refresh contract. The snapshot tests pin both strings so the two can't
+/// drift in clauses 1–4.
+const PERSISTENT_INVARIANTS: &str = "\
+Invariants:
+1. Provenance. Every `emit_output` decision must cite `evidence` ids that resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.
+2. One decision per turn. Reply by calling exactly one terminal decision tool (`emit_output`, `rewrite_fs`, `idle`, `retire`) OR one or more `call_tool` blocks dispatched together as a single parallel batch.
+3. Parallel call_tool is supported. K `call_tool` `tool_use` blocks in one response run together this tick; the next prompt carries the matching `tool_result` blocks. Do not mix `call_tool` with a terminal decision tool in the same response.
+4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` decisions can cite.
+5. Refresh, don't stop. You are a persistent monitor. After you `emit_output`, choose `idle` to wait for your cadence; on the next scheduled wake, re-research and emit an updated Output that reflects what changed since the last one. The \"Recent outputs by you on this run\" window is your durable memory — build on it rather than re-emitting an unchanged copy.
+6. Do not retire yourself. `retire` is not a valid self-decision for a persistent agent: the runtime stops you only via a retirement signal or your tick budget, and a `retire` decision is treated as `idle`. Keep cycling: research -> emit_output -> idle -> refresh.";
+
 /// Render a `ContextBundle` into the message list a `ModelClient::complete`
 /// call should send.
 ///
@@ -87,8 +102,13 @@ pub fn render(bundle: &ContextBundle) -> Vec<Message> {
 /// time, not the renderer's — the kernel treats the mandate string as
 /// already-trusted input.
 fn render_system(m: &Mandate) -> String {
+    let invariants = if m.persistent {
+        PERSISTENT_INVARIANTS
+    } else {
+        INVARIANTS
+    };
     format!(
-        "You are an agent operating under the following mandate:\n\n{}\n\n{INVARIANTS}",
+        "You are an agent operating under the following mandate:\n\n{}\n\n{invariants}",
         m.text
     )
 }
@@ -424,6 +444,47 @@ mod tests {
              4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` decisions can cite.\n\
              5. Do not re-emit. Once you have emitted any Output on this run, your next decision must be `retire`. Do not emit a revised, paraphrased, or improved version of a prior Output. Outputs shown in the \"Recent outputs by you on this run\" window were emitted by you and count toward this rule.\n\
              6. Retire is final. After the mandate's required Output has been emitted, `retire` is the only correct decision."
+        );
+    }
+
+    /// A `persistent` mandate renders the refresh invariant set: clauses 1–4
+    /// match the default verbatim, clauses 5–6 swap the one-shot
+    /// retire-after-Output rules for the refresh contract, and the
+    /// "Do not re-emit" / "Retire is final" wording is gone. `snapshot_empty_bundle`
+    /// guards the non-persistent string byte-for-byte (no regression).
+    #[test]
+    fn snapshot_persistent_mandate_renders_refresh_invariants() {
+        let mut m = mandate();
+        m.persistent = true;
+        let bundle = ContextBundle {
+            mandate: m,
+            ..empty_bundle()
+        };
+        let msgs = render(&bundle);
+        assert_eq!(msgs.len(), 1, "expected system message only");
+        assert_eq!(
+            text(&msgs[0]),
+            "You are an agent operating under the following mandate:\n\
+             \n\
+             Watch the FDA holds list and report drug-program risk.\n\
+             \n\
+             Invariants:\n\
+             1. Provenance. Every `emit_output` decision must cite `evidence` ids that resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.\n\
+             2. One decision per turn. Reply by calling exactly one terminal decision tool (`emit_output`, `rewrite_fs`, `idle`, `retire`) OR one or more `call_tool` blocks dispatched together as a single parallel batch.\n\
+             3. Parallel call_tool is supported. K `call_tool` `tool_use` blocks in one response run together this tick; the next prompt carries the matching `tool_result` blocks. Do not mix `call_tool` with a terminal decision tool in the same response.\n\
+             4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` decisions can cite.\n\
+             5. Refresh, don't stop. You are a persistent monitor. After you `emit_output`, choose `idle` to wait for your cadence; on the next scheduled wake, re-research and emit an updated Output that reflects what changed since the last one. The \"Recent outputs by you on this run\" window is your durable memory — build on it rather than re-emitting an unchanged copy.\n\
+             6. Do not retire yourself. `retire` is not a valid self-decision for a persistent agent: the runtime stops you only via a retirement signal or your tick budget, and a `retire` decision is treated as `idle`. Keep cycling: research -> emit_output -> idle -> refresh."
+        );
+
+        let body = text(&msgs[0]);
+        assert!(
+            !body.contains("Do not re-emit."),
+            "persistent invariants must drop the one-shot re-emit rule"
+        );
+        assert!(
+            !body.contains("Retire is final."),
+            "persistent invariants must drop the retire-is-final rule"
         );
     }
 
