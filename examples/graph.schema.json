@@ -159,6 +159,14 @@
           "default": null,
           "minimum": 0
         },
+        "model": {
+          "description": "Optional per-agent model override (e.g. `claude-opus-4-8` for a\nreconciling parent). Absent ⇒ the worker's configured default model.\nInterpreted within the worker's configured vendor; a model id that\nvendor doesn't recognize is an operator misconfig surfacing as a\nruntime error.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "persistent": {
           "description": "Whether this agent must persist and refresh rather than terminate\nitself. Absent ⇒ `false` (today's one-shot behavior). Carries no\nbehavior on its own; the runtime's stop contract and wake/refresh\npaths consume it.",
           "type": "boolean",

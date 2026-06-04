@@ -108,7 +108,7 @@ impl GraphStore {
             r#"
             INSERT INTO agents (id, graph_id, name, mandate_ref)
             VALUES ($1, $2, $3, $4)
-            RETURNING id, graph_id, name, mandate_ref, persistent, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            RETURNING id, graph_id, name, mandate_ref, persistent, model, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
             "#,
             id,
             graph_id,
@@ -376,18 +376,19 @@ fn walk_agent_tree<'a>(
         sqlx::query_as!(
             AgentRecord,
             r#"
-            INSERT INTO agents (id, graph_id, name, mandate_ref, persistent)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id, graph_id, name, mandate_ref, persistent, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            INSERT INTO agents (id, graph_id, name, mandate_ref, persistent, model)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, graph_id, name, mandate_ref, persistent, model, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
             "#,
             agent_uuid,
             graph_id,
             &yaml_agent.id,
             // Mandate text/idle/max_ticks travel via `AgentInput.mandate`
-            // directly today; `persistent` is the one bit also recorded
-            // structurally.
+            // directly today; `persistent` and `model` are the bits also
+            // recorded structurally.
             None as Option<&str>,
             yaml_agent.mandate.persistent,
+            yaml_agent.mandate.model.as_deref(),
         )
         .fetch_one(&mut **tx)
         .await?;
@@ -471,7 +472,7 @@ impl GraphStore {
         let row = sqlx::query_as!(
             AgentRecord,
             r#"
-            SELECT id, graph_id, name, mandate_ref, persistent, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            SELECT id, graph_id, name, mandate_ref, persistent, model, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
             FROM agents
             WHERE id = $1
             "#,
@@ -490,7 +491,7 @@ impl GraphStore {
         let rows = sqlx::query_as!(
             AgentRecord,
             r#"
-            SELECT id, graph_id, name, mandate_ref, persistent, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            SELECT id, graph_id, name, mandate_ref, persistent, model, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
             FROM agents
             WHERE graph_id = $1
             ORDER BY created_at ASC
@@ -508,7 +509,7 @@ impl GraphStore {
         let rows = sqlx::query_as!(
             AgentRecord,
             r#"
-            SELECT a.id, a.graph_id, a.name, a.mandate_ref, a.persistent,
+            SELECT a.id, a.graph_id, a.name, a.mandate_ref, a.persistent, a.model,
                    a.created_at as "created_at!: chrono::DateTime<chrono::Utc>"
             FROM agents a
             JOIN edges e ON e.child_agent_id = a.id
@@ -1165,6 +1166,65 @@ seed:
         let children = store.list_children(monitor.db_agent_id.into_uuid()).await?;
         assert_eq!(children.len(), 1);
         assert!(!children[0].persistent);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn create_from_yaml_persists_agent_model_override(pool: PgPool) -> sqlx::Result<()> {
+        // `model:` on the parent, absent on the child ⇒ NULL. Round-trips
+        // through the `agents.model` column on get/list/children paths.
+        const YAML: &str = r#"
+apiVersion: coral.engine/v1alpha1
+kind: Graph
+metadata:
+  name: model-smoke
+tools:
+  - id: echo
+    kind: builtin
+    builtin: echo
+agents:
+  - id: parent
+    mandate:
+      text: reconcile
+      idle_period: 1s
+      model: claude-opus-4-8
+    tools: [echo]
+    children:
+      - id: child
+        mandate:
+          text: research
+          idle_period: 1s
+        tools: []
+seed:
+  triggers:
+    - agent: parent
+      at: start
+      external:
+        kind: kickoff
+        payload: {}
+"#;
+        let store = GraphStore::new(pool);
+        let g = crate::yaml::parse_and_validate(YAML).expect("validator green");
+        let applied = store.create_from_yaml(&g).await.expect("create_from_yaml");
+
+        let parent = applied.id_map.get("parent").expect("parent in id_map");
+        let parent_row = store
+            .get_agent(parent.db_agent_id.into_uuid())
+            .await?
+            .expect("parent row");
+        assert_eq!(
+            parent_row.model.as_deref(),
+            Some("claude-opus-4-8"),
+            "parent must persist its model override"
+        );
+
+        // Absent ⇒ NULL, both on get and via the children query path.
+        let children = store.list_children(parent.db_agent_id.into_uuid()).await?;
+        assert_eq!(children.len(), 1);
+        assert!(
+            children[0].model.is_none(),
+            "absent model must default to NULL"
+        );
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO agents (id, graph_id, name, mandate_ref, persistent)\n            VALUES ($1, $2, $3, $4, $5)\n            RETURNING id, graph_id, name, mandate_ref, persistent, created_at as \"created_at!: chrono::DateTime<chrono::Utc>\"\n            ",
+  "query": "\n            SELECT id, graph_id, name, mandate_ref, persistent, model, created_at as \"created_at!: chrono::DateTime<chrono::Utc>\"\n            FROM agents\n            WHERE graph_id = $1\n            ORDER BY created_at ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -30,17 +30,18 @@
       },
       {
         "ordinal": 5,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
         "name": "created_at!: chrono::DateTime<chrono::Utc>",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Uuid",
-        "Text",
-        "Text",
-        "Bool"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -49,8 +50,9 @@
       false,
       true,
       false,
+      true,
       false
     ]
   },
-  "hash": "650cc0388c5fbcc94144fad678acab5e9494b95cbfbe6b7f6954df8acfc9ac04"
+  "hash": "0862db1230df8a7f5d566542a43e14f97f65eac0c88775d52cc6ea191b0efba6"
 }

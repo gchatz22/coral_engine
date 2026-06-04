@@ -337,6 +337,7 @@ fn build_request(parsed: &ParsedArgs, prompt: String) -> Result<CompleteRequest>
     Ok(CompleteRequest {
         messages,
         tools: vec![],
+        model: None,
         options: CompleteOptions {
             max_tokens: parsed.max_tokens,
             temperature: None,

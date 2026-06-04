@@ -126,6 +126,10 @@ impl TickTotals {
 impl Decide for LlmDecide {
     async fn decide(&self, ctx: ContextBundle) -> Result<Decision> {
         let tools = decision_tools();
+        // Per-agent model override (from `Mandate.model`) rides through to
+        // the vendor adapter on every attempt, including the corrective
+        // retry. `None` ⇒ the adapter's configured default.
+        let model = ctx.mandate.model.clone();
         // Conversation grows across attempts: original prompt, then for
         // each parse failure an assistant-echo of the bad turn followed by
         // a system-role corrective. The model sees its full failure
@@ -146,6 +150,7 @@ impl Decide for LlmDecide {
                     messages: messages.clone(),
                     tools: tools.clone(),
                     options: self.options.clone(),
+                    model: model.clone(),
                 })
                 .await
                 .map_err(model_err_to_anyhow)?;
@@ -475,6 +480,45 @@ mod tests {
         );
         // No retry → exactly one upstream call.
         assert_eq!(mock.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn decide_threads_mandate_model_onto_every_request() {
+        // First response fails to parse, forcing a corrective retry, so the
+        // assertion covers BOTH the initial request and the retry — the
+        // per-agent model must ride on every upstream call within a tick.
+        let mock = MockModelClient::new(vec![
+            MockOutcome::Resp(resp_with_tool_calls(vec![malformed_unknown_tool()])),
+            MockOutcome::Resp(resp_with_tool_calls(vec![good_idle_call()])),
+        ]);
+        let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
+
+        let mut bundle = empty_bundle();
+        bundle.mandate.model = Some("claude-opus-4-8".into());
+        decide.decide(bundle).await.unwrap();
+
+        let seen = mock.seen();
+        assert_eq!(seen.len(), 2, "expected initial + corrective request");
+        for (i, req) in seen.iter().enumerate() {
+            assert_eq!(
+                req.model.as_deref(),
+                Some("claude-opus-4-8"),
+                "mandate.model must ride on request {i}, got {:?}",
+                req.model
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn decide_leaves_request_model_none_when_mandate_omits_it() {
+        // `empty_bundle`'s mandate has `model: None` ⇒ the adapter falls back
+        // to its configured default (no per-request override on the wire).
+        let mock = MockModelClient::new(vec![MockOutcome::Resp(resp_with_tool_calls(vec![
+            good_idle_call(),
+        ]))]);
+        let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
+        decide.decide(empty_bundle()).await.unwrap();
+        assert_eq!(mock.seen()[0].model, None);
     }
 
     #[tokio::test]

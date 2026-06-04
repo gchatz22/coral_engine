@@ -122,6 +122,20 @@ pub struct CompleteRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub options: CompleteOptions,
+    /// Per-request model override. `None` (the default and the serialized
+    /// shape when absent) falls back to the adapter's configured model.
+    /// Carries a per-agent `Mandate.model` through to the vendor adapter;
+    /// resolve it via [`effective_model`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// The model id a `complete` call should hit: the request's per-request
+/// override when set, else the adapter's configured default. Both the wire
+/// body and the reported [`CallStats::model`] must read this single value so
+/// cost accounting names the model actually called.
+pub fn effective_model<'a>(req: &'a CompleteRequest, default_model: &'a str) -> &'a str {
+    req.model.as_deref().unwrap_or(default_model)
 }
 
 /// Output of `ModelClient::complete`.
@@ -295,6 +309,41 @@ mod tests {
         let o = CompleteOptions::default();
         assert!(o.max_tokens > 0);
         assert!(o.temperature.is_none());
+    }
+
+    #[test]
+    fn effective_model_prefers_request_override_then_default() {
+        let base = CompleteRequest {
+            messages: vec![],
+            tools: vec![],
+            model: None,
+            options: CompleteOptions::default(),
+        };
+        assert_eq!(effective_model(&base, "worker-default"), "worker-default");
+
+        let overridden = CompleteRequest {
+            model: Some("claude-opus-4-8".into()),
+            ..base
+        };
+        assert_eq!(
+            effective_model(&overridden, "worker-default"),
+            "claude-opus-4-8"
+        );
+    }
+
+    #[test]
+    fn complete_request_omits_model_from_wire_when_none() {
+        let req = CompleteRequest {
+            messages: vec![],
+            tools: vec![],
+            model: None,
+            options: CompleteOptions::default(),
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(
+            !s.contains("model"),
+            "model should be omitted when None: {s}"
+        );
     }
 
     #[test]

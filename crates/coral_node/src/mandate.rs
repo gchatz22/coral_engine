@@ -87,6 +87,14 @@ pub struct Mandate {
     /// runtime's stop contract and wake/refresh paths consume it.
     #[serde(default)]
     pub persistent: bool,
+    /// Per-agent model override. `None` (the default and the serialized
+    /// shape when absent) falls back to the worker's configured model. When
+    /// set, the `decide` path sends this model id to the worker's configured
+    /// vendor — a stronger model for a reconciling parent than its children,
+    /// say. A model id the vendor doesn't recognize is an operator misconfig
+    /// that surfaces as a runtime vendor error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl Mandate {
@@ -101,6 +109,7 @@ impl Mandate {
             retry_policy: None,
             context_policy: ContextPolicy::default(),
             persistent: false,
+            model: None,
         }
     }
 }
@@ -302,6 +311,7 @@ mod tests {
             retry_policy: Some(RetryPolicy::new(5, Duration::from_millis(10))),
             context_policy: ContextPolicy::default(),
             persistent: false,
+            model: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         // Verify both subfields land on the wire under stable names.
@@ -347,6 +357,7 @@ mod tests {
             retry_policy: None,
             context_policy: ContextPolicy::default(),
             persistent: true,
+            model: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(
@@ -366,6 +377,46 @@ mod tests {
         let legacy = r#"{"text":"old","idle_period":250,"max_ticks":null}"#;
         let back: Mandate = serde_json::from_str(legacy).unwrap();
         assert!(!back.persistent);
+    }
+
+    #[test]
+    fn mandate_new_defaults_model_to_none() {
+        let m = Mandate::new("x", Duration::from_millis(100), None);
+        assert!(m.model.is_none());
+    }
+
+    #[test]
+    fn mandate_round_trip_with_model_override() {
+        let mut m = Mandate::new("reconcile", Duration::from_millis(100), None);
+        m.model = Some("claude-opus-4-8".into());
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(
+            s.contains("\"model\":\"claude-opus-4-8\""),
+            "expected model on wire, got {s}"
+        );
+        let back: Mandate = serde_json::from_str(&s).unwrap();
+        assert_eq!(m, back);
+        assert_eq!(back.model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn mandate_omits_model_from_wire_when_none() {
+        let m = Mandate::new("x", Duration::from_millis(100), None);
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(
+            !s.contains("model"),
+            "default mandate JSON should omit model, got {s}"
+        );
+    }
+
+    #[test]
+    fn mandate_deserializes_legacy_json_without_model_field() {
+        // A serialized mandate from before the field existed (e.g. an
+        // in-flight Temporal continue-as-new `AgentInput`) must
+        // deserialize to `model: None`, not reject.
+        let legacy = r#"{"text":"old","idle_period":250,"max_ticks":null}"#;
+        let back: Mandate = serde_json::from_str(legacy).unwrap();
+        assert!(back.model.is_none());
     }
 
     #[test]
@@ -420,6 +471,7 @@ mod tests {
                 open_claims_max: 4,
             },
             persistent: false,
+            model: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(
