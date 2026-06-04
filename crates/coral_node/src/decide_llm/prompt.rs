@@ -63,9 +63,15 @@ const ONESHOT_INVARIANTS_TAIL: &str = "\
 /// the refresh contract. The runtime enforces the non-termination (a
 /// model-emitted `Retire` is demoted to `Idle`); this tail aligns the
 /// model's intent so it does useful refresh work between wakes.
+///
+/// Clause 7 is worded conditionally ("when a child reports an output") so it
+/// stays dormant for a childless persistent leaf — the prompt keys only on
+/// `persistent`, with no "has children" signal in the bundle, and a leaf
+/// never receives a `ChildOutput` trigger.
 const PERSISTENT_INVARIANTS_TAIL: &str = "\
 5. Refresh, don't stop. You are a persistent monitor. After you `emit_output`, choose `idle` to wait for your cadence; on the next scheduled wake, re-research and emit an updated Output that reflects what changed since the last one. The \"Recent outputs by you on this run\" window is your durable memory — build on it rather than re-emitting an unchanged copy.
-6. Do not retire yourself. `retire` is not a valid self-decision for a persistent agent: the runtime stops you only via a retirement signal or your tick budget, and a `retire` decision is treated as `idle`. Keep cycling: research -> emit_output -> idle -> refresh.";
+6. Do not retire yourself. `retire` is not a valid self-decision for a persistent agent: the runtime stops you only via a retirement signal or your tick budget, and a `retire` decision is treated as `idle`. Keep cycling: research -> emit_output -> idle -> refresh.
+7. Fold child reports as they arrive. When a child reports an output (a `ChildOutput` trigger), reconcile the cited output, then emit a refreshed consolidated report that incorporates it and cites its evidence. When a child you have already folded reports again, reconcile its newer output rather than re-reconciling the one you already used.";
 
 /// Render a `ContextBundle` into the message list a `ModelClient::complete`
 /// call should send.
@@ -476,7 +482,8 @@ mod tests {
              3. Parallel call_tool is supported. K `call_tool` `tool_use` blocks in one response run together this tick; the next prompt carries the matching `tool_result` blocks. Do not mix `call_tool` with a terminal decision tool in the same response.\n\
              4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` decisions can cite.\n\
              5. Refresh, don't stop. You are a persistent monitor. After you `emit_output`, choose `idle` to wait for your cadence; on the next scheduled wake, re-research and emit an updated Output that reflects what changed since the last one. The \"Recent outputs by you on this run\" window is your durable memory — build on it rather than re-emitting an unchanged copy.\n\
-             6. Do not retire yourself. `retire` is not a valid self-decision for a persistent agent: the runtime stops you only via a retirement signal or your tick budget, and a `retire` decision is treated as `idle`. Keep cycling: research -> emit_output -> idle -> refresh."
+             6. Do not retire yourself. `retire` is not a valid self-decision for a persistent agent: the runtime stops you only via a retirement signal or your tick budget, and a `retire` decision is treated as `idle`. Keep cycling: research -> emit_output -> idle -> refresh.\n\
+             7. Fold child reports as they arrive. When a child reports an output (a `ChildOutput` trigger), reconcile the cited output, then emit a refreshed consolidated report that incorporates it and cites its evidence. When a child you have already folded reports again, reconcile its newer output rather than re-reconciling the one you already used."
         );
 
         let body = text(&msgs[0]);

@@ -1109,8 +1109,11 @@ seed:
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn create_from_yaml_persists_agent_persistent_flag(pool: PgPool) -> sqlx::Result<()> {
-        // `persistent: true` on one agent, absent on the other ⇒ false.
-        // Round-trips through the `agents.persistent` column.
+        // `persistent: true` on two agents, absent on the third ⇒ false.
+        // Round-trips through the `agents.persistent` column. The parent
+        // keeps one persistent child so the config isn't the degenerate
+        // persistent-parent/all-one-shot-children combo the validator
+        // rejects.
         const YAML: &str = r#"
 apiVersion: coral.engine/v1alpha1
 kind: Graph
@@ -1128,6 +1131,12 @@ agents:
       persistent: true
     tools: [echo]
     children:
+      - id: submonitor
+        mandate:
+          text: keep feeding
+          idle_period: 1s
+          persistent: true
+        tools: []
       - id: oneshot
         mandate:
           text: do once
@@ -1162,10 +1171,16 @@ seed:
             "absent persistent must default to false"
         );
 
-        // The flag also reads back through the list/children query paths.
+        // The flag also reads back through the list/children query paths:
+        // the persistent child reads true, the one-shot child reads false.
         let children = store.list_children(monitor.db_agent_id.into_uuid()).await?;
-        assert_eq!(children.len(), 1);
-        assert!(!children[0].persistent);
+        assert_eq!(children.len(), 2);
+        let by_persistent: std::collections::HashMap<bool, ()> =
+            children.iter().map(|c| (c.persistent, ())).collect();
+        assert!(
+            by_persistent.contains_key(&true) && by_persistent.contains_key(&false),
+            "children must include one persistent and one one-shot, got {children:?}"
+        );
         Ok(())
     }
 
