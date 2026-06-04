@@ -1,0 +1,80 @@
+# Reduced persistent-monitor fixture: one parent + two children, all
+# `persistent: true`. Proves the continuous loop end-to-end on the workflow
+# path — agents cycle (emit -> idle -> refresh), the parent re-reconciles
+# newer child outputs into refreshed reports, and the graph stops only via
+# the `max_ticks` guardrail (never a model `Retire`, which is demoted to
+# `Idle` for persistent agents).
+#
+# Two run modes share this one file (the graph never picks the `Decide`
+# impl, so the same topology serves both):
+#
+#   1. Deterministic contract smoke — `persistent_monitor_live.rs` installs a
+#      custom cycling `Decide` and plants evidence, so it needs only Temporal
+#      + Postgres (no Node, no model key). It asserts the three runtime
+#      contract properties below.
+#   2. Real-model loop-viability run — host the real worker with a vendor key
+#      so a live model drives the loop and the children call the `get-sum`
+#      MCP tool. See README.md. (Bump `idle_period` / `max_ticks` for real
+#      inference; the cheap values below are tuned for the deterministic
+#      smoke to finish in seconds.)
+apiVersion: coral.engine/v1alpha1
+kind: Graph
+metadata:
+  name: persistent-monitor
+  description: |
+    Continuous-monitor fixture: a persistent parent reconciles two
+    persistent children's refreshed outputs over several cycles, stopping
+    only at the max_ticks guardrail.
+defaults:
+  idle_period: 500ms
+tools:
+  # Cheap, deterministic reference tool. Used only by the real-model run;
+  # the deterministic smoke plants evidence and never dispatches a tool, so
+  # the server is never spawned (no Node dependency on that path). The model
+  # calls it by its advertised name `get-sum`, not by this `id`.
+  - id: everything
+    kind: mcp
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-everything@2026.1.26"]
+agents:
+  - id: analyst
+    mandate:
+      text: |
+        You coordinate two researchers. As each child reports an output,
+        reconcile that output and emit a refreshed consolidated summary that
+        cites the child outputs you folded in. On a later report from a child
+        you have already folded, reconcile its newer output. Re-run on your
+        schedule to keep the summary current.
+      persistent: true
+      max_ticks: 8
+    tools: [everything]
+    children:
+      - id: researcher-alpha
+        mandate:
+          text: |
+            Research topic alpha. On each scheduled wake, compute a fresh
+            figure with the get-sum tool and emit an updated finding that
+            cites the resulting evidence. Keep refreshing; do not stop.
+          persistent: true
+          max_ticks: 4
+        tools: [everything]
+      - id: researcher-beta
+        mandate:
+          text: |
+            Research topic beta. On each scheduled wake, compute a fresh
+            figure with the get-sum tool and emit an updated finding that
+            cites the resulting evidence. Keep refreshing; do not stop.
+          persistent: true
+          max_ticks: 4
+        tools: [everything]
+seed:
+  triggers:
+    - agent: analyst
+      at: start
+      external: { kind: kickoff, payload: {} }
+    - agent: researcher-alpha
+      at: start
+      external: { kind: kickoff, payload: {} }
+    - agent: researcher-beta
+      at: start
+      external: { kind: kickoff, payload: {} }
