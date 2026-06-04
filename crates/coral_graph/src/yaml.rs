@@ -304,6 +304,16 @@ pub enum GraphYamlError {
     )]
     MissingMandateIdlePeriod { agent_id: String },
 
+    /// A `persistent` parent whose children are *all* one-shot
+    /// (non-persistent). The children retire after a single output and the
+    /// parent then idles forever with no newer child outputs to fold —
+    /// a dead configuration. Make at least one child `persistent` so it
+    /// keeps reporting, or drop the parent's `persistent` flag.
+    #[error(
+        "agent {agent_id:?} is `persistent` but all of its children are one-shot (non-persistent); the children retire after one output, leaving the parent to idle forever with nothing new to fold. Make at least one child `persistent`, or remove `persistent` from {agent_id:?}"
+    )]
+    PersistentParentWithOneshotChildren { agent_id: String },
+
     /// A `kind: mcp` tool had an empty `command`; there is nothing to
     /// spawn for the server.
     #[error("tool {tool_id:?} has `kind: mcp` with an empty `command` (set the executable to spawn for the MCP server)")]
@@ -500,6 +510,18 @@ fn validate_agent_tree(
                 location: None,
             });
         }
+    }
+    // A `persistent` parent whose children are *all* one-shot is a dead
+    // config: the children retire after one output and the parent then has
+    // nothing newer to fold. A single persistent child keeps it alive, so
+    // the condition is `all`, not `any`.
+    if agent.mandate.persistent
+        && !agent.children.is_empty()
+        && agent.children.iter().all(|c| !c.mandate.persistent)
+    {
+        return Err(GraphYamlError::PersistentParentWithOneshotChildren {
+            agent_id: agent.id.clone(),
+        });
     }
     for child in &agent.children {
         // Surface a child id matching its parent's id as
@@ -1475,6 +1497,80 @@ seed:
     fn model_absent_defaults_to_none_at_parse() {
         let g = parse_and_validate(HAPPY_YAML).expect("happy path");
         assert!(g.agents[0].mandate.model.is_none());
+    }
+
+    /// Degenerate combo: a `persistent` parent whose children are all
+    /// one-shot retires its children after one output and then idles
+    /// forever. Rejected at validation.
+    const PERSISTENT_PARENT_YAML: &str = r#"
+apiVersion: coral.engine/v1alpha1
+kind: Graph
+metadata:
+  name: monitor-graph
+defaults:
+  idle_period: 1h
+tools:
+  - id: echo
+    kind: builtin
+    builtin: echo
+agents:
+  - id: parent
+    mandate:
+      text: reconcile children
+      persistent: true
+    tools: [echo]
+    children:
+      - id: child-a
+        mandate:
+          text: research a
+        tools: [echo]
+      - id: child-b
+        mandate:
+          text: research b
+        tools: [echo]
+seed:
+  triggers:
+    - agent: parent
+      at: start
+      external:
+        kind: kickoff
+        payload: {}
+"#;
+
+    #[test]
+    fn persistent_parent_with_all_oneshot_children_is_rejected() {
+        let err = validate_err(PERSISTENT_PARENT_YAML);
+        assert!(
+            matches!(
+                err,
+                GraphYamlError::PersistentParentWithOneshotChildren { ref agent_id }
+                    if agent_id == "parent"
+            ),
+            "expected PersistentParentWithOneshotChildren for `parent`, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn persistent_parent_with_one_persistent_child_is_accepted() {
+        // One persistent child keeps feeding the parent ⇒ live config.
+        let yaml = PERSISTENT_PARENT_YAML.replace(
+            "          text: research a\n",
+            "          text: research a\n          persistent: true\n",
+        );
+        parse_and_validate(&yaml).expect("mixed-persistence children must validate");
+    }
+
+    #[test]
+    fn persistent_leaf_without_children_is_accepted() {
+        // A childless persistent agent never receives ChildOutputs, so the
+        // degenerate check must not fire (no false positive).
+        let yaml = HAPPY_YAML.replace(
+            "      max_ticks: 8\n",
+            "      max_ticks: 8\n      persistent: true\n",
+        );
+        let g = parse_and_validate(&yaml).expect("persistent leaf must validate");
+        assert!(g.agents[0].mandate.persistent);
+        assert!(g.agents[0].children.is_empty());
     }
 
     #[test]

@@ -1967,6 +1967,132 @@ mod tests {
         }
     }
 
+    /// A persistent parent folds successive outputs from the *same* child
+    /// over time: reconciling a newer output writes a second, distinct
+    /// synthetic record (the parent's report can refresh), and re-citing an
+    /// already-folded output is idempotent (`record_evidence` rides
+    /// `put_if_absent`) — so a re-seen `output_id` refreshes without looping
+    /// or duplicating evidence. This is why CM-4 needs no runtime
+    /// already-seen guard.
+    #[tokio::test]
+    async fn reconcile_children_impl_folds_newer_output_and_is_idempotent_on_reseen() {
+        use coral_node::agent_ref::AgentRef;
+        use uuid::Uuid;
+
+        let storage: Arc<dyn coral_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
+        let graph_id = GraphId::new(Uuid::new_v4());
+        let parent_agent_id = AgentId::new(Uuid::new_v4());
+        let child_id = AgentId::new(Uuid::new_v4());
+
+        // The same child emits two outputs over time (same workflow id,
+        // distinct output ids).
+        let (child_wf, out1, _) =
+            plant_child_output(storage.clone(), graph_id, child_id, "first report").await;
+        let (child_wf2, out2, _) =
+            plant_child_output(storage.clone(), graph_id, child_id, "second report").await;
+        assert_eq!(child_wf, child_wf2, "same child ⇒ same workflow id");
+        assert_ne!(out1, out2, "two emits ⇒ distinct output ids");
+
+        let reconcile_one = |output_id: OutputId| ReconcileChildrenInput {
+            parent_graph_id: graph_id,
+            parent_agent_id,
+            sources: vec![ReconcileSource {
+                child_ref: AgentRef::new(child_wf.clone(), child_id),
+                output_id,
+            }],
+            conflict: None,
+        };
+
+        // Tick 1: fold the first output.
+        let r1 = reconcile_children_impl(storage.clone(), reconcile_one(out1.clone()), fixed_now())
+            .await
+            .expect("reconcile out1");
+        assert_eq!(r1.synthetic_evidence.len(), 1);
+
+        // Later tick: fold the newer output → a second, distinct record so
+        // the parent's refreshed report can cite it.
+        let r2 = reconcile_children_impl(storage.clone(), reconcile_one(out2.clone()), fixed_now())
+            .await
+            .expect("reconcile out2");
+        assert_eq!(r2.synthetic_evidence.len(), 1);
+        assert_ne!(
+            r1.synthetic_evidence[0], r2.synthetic_evidence[0],
+            "a newer output must produce distinct synthetic evidence"
+        );
+
+        let parent_view = AgentFs::open_for_agent(storage.clone(), graph_id, parent_agent_id);
+        let after_two = parent_view
+            .list_recent_evidence(8)
+            .await
+            .expect("list parent evidence");
+        assert_eq!(after_two.len(), 2, "two folded outputs ⇒ two records");
+
+        // The citation half of the contract: each reconcile is followed by a
+        // refreshed parent Output citing the synthetic evidence it just
+        // produced. Two distinct parent outputs result, the second citing
+        // B's synthetic evidence — the provenance check inside
+        // `persist_output` passes because reconcile wrote that evidence
+        // under the parent's own prefix. (Trigger delivery + loop driving is
+        // generic machinery proven elsewhere; CM-6 covers the full
+        // multi-cycle persistent flow live.)
+        let parent_prefix = format!("graphs/{graph_id}/agents/{parent_agent_id}");
+        let out_v1 = persist_output_impl(
+            storage.clone(),
+            &parent_prefix,
+            "consolidated report (folds A)",
+            &[r1.synthetic_evidence[0].clone()],
+        )
+        .await
+        .expect("parent emits refreshed report v1");
+        let out_v2 = persist_output_impl(
+            storage.clone(),
+            &parent_prefix,
+            "consolidated report (folds A + newer B)",
+            &[r2.synthetic_evidence[0].clone()],
+        )
+        .await
+        .expect("parent emits refreshed report v2");
+        assert_ne!(out_v1, out_v2, "two refreshed reports ⇒ distinct outputs");
+
+        let parent_outputs = parent_view
+            .list_recent_outputs(8)
+            .await
+            .expect("list parent outputs");
+        assert_eq!(
+            parent_outputs.len(),
+            2,
+            "parent emitted two distinct refreshed reports"
+        );
+        let newest = parent_outputs
+            .iter()
+            .find(|o| o.id == out_v2)
+            .expect("v2 present");
+        assert!(
+            newest.evidence.contains(&r2.synthetic_evidence[0]),
+            "the second refreshed report must cite B's synthetic evidence"
+        );
+
+        // Re-cite the already-folded first output: idempotent. Same
+        // content-addressed id, no new record — the parent never loops.
+        let r1_again =
+            reconcile_children_impl(storage.clone(), reconcile_one(out1.clone()), fixed_now())
+                .await
+                .expect("re-reconcile out1");
+        assert_eq!(
+            r1_again.synthetic_evidence, r1.synthetic_evidence,
+            "re-reconciling an already-folded output yields the same evidence id"
+        );
+        let after_reseen = parent_view
+            .list_recent_evidence(8)
+            .await
+            .expect("list parent evidence after re-seen");
+        assert_eq!(
+            after_reseen.len(),
+            2,
+            "re-seen output must not add a synthetic record"
+        );
+    }
+
     #[tokio::test]
     async fn reconcile_children_impl_returns_typed_error_for_missing_child_output() {
         use coral_node::agent_ref::AgentRef;
