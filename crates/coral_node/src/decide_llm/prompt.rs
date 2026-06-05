@@ -14,7 +14,7 @@
 //! lex-sorted listings). That stability is what makes the snapshot tests
 //! below viable.
 
-use crate::decision::{ContextBundle, CorrectionContext};
+use crate::decision::{ContextBundle, CorrectionContext, ReconcileSource};
 use crate::evidence::EvidenceRecord;
 use crate::fs::Claim;
 use crate::mandate::{Mandate, Output};
@@ -160,14 +160,22 @@ fn render_triggers(triggers: &[Trigger]) -> String {
         s.push_str("\n\n- ");
         match t {
             Trigger::ChildOutput {
+                child_ref,
                 agent_name,
                 output_id,
-                ..
             } => {
-                // The agent name is the load-bearing piece; output_id is
-                // the citation handle the model needs if it later emits
-                // a `ReconcileChildren` decision pointing at this output.
-                s.push_str(&format!("Child output: {agent_name} emitted {output_id}"));
+                // `reconcile_children` requires the child's `child_ref`
+                // (workflow_id + agent_id), which the model can see nowhere
+                // else — so render the exact `sources` entry it must echo
+                // back, not just the name.
+                let source = serde_json::to_string(&ReconcileSource {
+                    child_ref: child_ref.clone(),
+                    output_id: output_id.clone(),
+                })
+                .expect("ReconcileSource serializes");
+                s.push_str(&format!(
+                    "Child output: {agent_name} emitted {output_id}. To fold it, pass this exact object in the `reconcile_children` `sources` array: {source}"
+                ));
             }
             Trigger::ChildRetired {
                 agent_name, reason, ..
@@ -259,7 +267,7 @@ mod tests {
 
     use super::*;
     use crate::agent_ref::{AgentId, AgentRef};
-    use crate::decision::{ContextBundle, CorrectionContext};
+    use crate::decision::{ContextBundle, CorrectionContext, ReconcileSource};
     use crate::evidence::{EvidenceId, EvidenceRecord};
     use crate::mandate::OutputId;
     use crate::mandate::{Mandate, Output};
@@ -574,12 +582,16 @@ mod tests {
         };
         let msgs = render(&bundle);
         assert_eq!(msgs.len(), 2);
+        let source = serde_json::to_string(&ReconcileSource {
+            child_ref: child_ref(),
+            output_id: output_id.clone(),
+        })
+        .expect("ReconcileSource serializes");
         assert_eq!(
             text(&msgs[1]),
             format!(
-                "# Triggers (1)\n\
-                 \n\
-                 - Child output: fda_scraper emitted {output_id}"
+                "# Triggers (1)\n\n- Child output: fda_scraper emitted {output_id}. \
+                 To fold it, pass this exact object in the `reconcile_children` `sources` array: {source}"
             )
         );
     }
@@ -684,6 +696,11 @@ mod tests {
         };
         let msgs = render(&bundle);
         assert_eq!(msgs.len(), 2);
+        let source = serde_json::to_string(&ReconcileSource {
+            child_ref: child_ref(),
+            output_id: output_id.clone(),
+        })
+        .expect("ReconcileSource serializes");
         assert_eq!(
             text(&msgs[1]),
             format!(
@@ -693,7 +710,7 @@ mod tests {
                  \n\
                  - {{\"type\":\"external\",\"kind\":\"webhook\",\"payload\":{{\"x\":1}}}}\n\
                  \n\
-                 - Child output: fda_scraper emitted {output_id}\n\
+                 - Child output: fda_scraper emitted {output_id}. To fold it, pass this exact object in the `reconcile_children` `sources` array: {source}\n\
                  \n\
                  - Child retired: fda_scraper (mandate satisfied)\n\
                  \n\
