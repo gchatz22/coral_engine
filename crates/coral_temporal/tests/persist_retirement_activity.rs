@@ -87,21 +87,21 @@ async fn persist_retirement_writes_file_with_reason_and_deterministic_timestamp(
         "wrong retired_at: {v}",
     );
 
-    // mandate.json must NOT exist — `AgentFs::attach` (used by the
+    // mandate.md must NOT exist — `AgentFs::attach` (used by the
     // activity body) skips the mandate write that `new_with_storage`
     // performs. The retirement-signal short-circuit has no Mandate in
     // scope, and the file we write doesn't need one. Pin the property
     // here so a regression that swaps the constructor back to
     // `new_with_storage` (and silently materialises an empty
-    // `mandate.json`) fails loudly.
-    let mandate_key = format!("{prefix}/mandate.json");
+    // `mandate.md`) fails loudly.
+    let mandate_key = format!("{prefix}/mandate.md");
     let mandate = storage
         .get(&mandate_key)
         .await
         .expect("MemoryStorage::get must not error");
     assert!(
         mandate.is_none(),
-        "attach must not write mandate.json; got: {mandate:?}",
+        "attach must not write mandate.md; got: {mandate:?}",
     );
 }
 

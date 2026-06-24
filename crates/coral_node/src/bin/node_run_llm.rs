@@ -141,7 +141,7 @@ ARGS:
     <fs_root>         *Parent* directory for the per-agent FS. The binary
                       stamps a fresh timestamped subdirectory inside it for
                       this invocation (`<YYYY-MM-DDTHH-MM-SS-sssZ>`) and
-                      writes the agent's FS layout there (mandate.json,
+                      writes the agent's FS layout there (mandate.md,
                       outputs/, evidence/, notes/, retirement.json). The
                       resolved absolute path is printed on the first line
                       of stdout (`node-run-llm: fs_root=...`). Two

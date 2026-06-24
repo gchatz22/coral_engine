@@ -41,7 +41,7 @@
 //!
 //! The agent will execute three scripted decisions (call echo, emit one
 //! output backed by the resulting evidence record, idle), then retire on
-//! `max_ticks`. The printed tree should contain `mandate.json`,
+//! `max_ticks`. The printed tree should contain `mandate.md`,
 //! `outputs/<ulid>.json`, `evidence/<sha256>.json`, and `retirement.json`.
 
 use std::fs;
@@ -77,7 +77,7 @@ ARGS:
                       envelope: {\"delay_ms\": <u64>, \"trigger\": <Trigger>}.
                       Blank lines and lines starting with `#` are ignored.
     <fs_root>         Directory for the agent's per-agent FS layout
-                      (mandate.json, outputs/, evidence/, notes/, retirement.json).
+                      (mandate.md, outputs/, evidence/, notes/, retirement.json).
 
 EXAMPLE:
     node-run examples/smoke/config.json \\

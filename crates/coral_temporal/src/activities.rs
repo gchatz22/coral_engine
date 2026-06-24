@@ -126,9 +126,9 @@ pub struct PersistOutputInput {
 /// [`coral_node::fs::AgentFs::new_with_storage`] requires one to reify
 /// an `AgentFs` against the shared storage. The mandate is decorative
 /// for this call path — `AgentFs::new_with_storage` only writes
-/// `mandate.json` when absent, and `apply_fs_ops` runs only against
+/// `mandate.md` when absent, and `apply_fs_ops` runs only against
 /// agents that have already gone through `assemble_context` at least
-/// once (so `mandate.json` already exists on disk). Carrying the real
+/// once (so `mandate.md` already exists on disk). Carrying the real
 /// mandate rather than fishing it out of disk keeps the activity body
 /// single-storage-roundtrip.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -362,7 +362,7 @@ pub(crate) async fn persist_output_impl(
     content: &str,
     evidence: &[EvidenceId],
 ) -> anyhow::Result<OutputId> {
-    // Placeholder mandate: `AgentFs` only writes `mandate.json` when
+    // Placeholder mandate: `AgentFs` only writes `mandate.md` when
     // absent, so the real mandate persisted by an earlier
     // `assemble_context` (or prior agent boot) is not clobbered.
     let mandate = Mandate::new("", Duration::ZERO, None);
@@ -386,7 +386,7 @@ impl AgentActivities {
     /// the warm `ContextBundle`.
     ///
     /// FS open is idempotent — `AgentFs::new_with_storage` only writes
-    /// `mandate.json` when absent, so passing the workflow's mandate
+    /// `mandate.md` when absent, so passing the workflow's mandate
     /// through on every tick is correct. The cost is one storage `get`
     /// per tick + a one-time put on first open per agent.
     #[activity]
@@ -614,7 +614,7 @@ impl AgentActivities {
     ///
     /// # Why `AgentFs::attach` (not `new_with_storage`)
     ///
-    /// `new_with_storage` reads-or-writes `mandate.json` to confirm
+    /// `new_with_storage` reads-or-writes `mandate.md` to confirm
     /// the per-agent FS is initialized. At the retirement-signal
     /// short-circuit no `Mandate` is in scope — the workflow body
     /// never loaded one. `attach` is the strictly weaker constructor
@@ -677,7 +677,7 @@ impl AgentActivities {
     /// [`crate::worker::StructuralDbStore`] trait object (installed
     /// via [`crate::worker::install_structural_db_store`]).
     ///
-    /// The activity does **not** write `mandate.json` to the child's
+    /// The activity does **not** write `mandate.md` to the child's
     /// FS — that's the child workflow's first-run `assemble_context`
     /// job. Scope is structural state only.
     ///
@@ -828,7 +828,7 @@ pub async fn reconcile_children_impl(
 ) -> anyhow::Result<ReconcileChildrenOutput> {
     // Parent FS — write target. `open_for_agent` uses `attach`
     // semantics (no mandate read, no tail reconcile); the parent's
-    // `assemble_context` has already written `mandate.json` on its
+    // `assemble_context` has already written `mandate.md` on its
     // first tick, and `record_evidence` doesn't need it.
     let parent_fs = AgentFs::open_for_agent(
         storage.clone(),

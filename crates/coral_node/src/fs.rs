@@ -4,7 +4,7 @@
 //! `graphs/<graph_id>/agents/<agent_id>/`):
 //!
 //! ```text
-//! mandate.json           — standing instruction
+//! mandate.md             — standing instruction (pure prose; no metadata)
 //! outputs/<sha256>.json  — claims, content-addressed, immutable, require evidence
 //! evidence/<sha256>.json — raw tool-call record, content-addressed, dedup via put_if_absent
 //! notes/                 — mutable private working memory
@@ -158,17 +158,19 @@ pub struct Claim {
 /// typical filesystem name limits.
 const SLUG_BODY_MAX: usize = 80;
 
-/// Derive the on-disk slug for a claim from its seed string.
+/// Derive an interpretable kebab slug from a seed/label.
 ///
-/// Rules: lowercase, runs of non-`[a-z0-9]` collapse to `-`, leading
-/// and trailing `-` are trimmed, the body is truncated to
-/// [`SLUG_BODY_MAX`] bytes, and `-<first 8 hex chars of sha256(seed)>`
-/// is *always* appended. The hash suffix is unconditional so the slug
-/// is a function of the seed alone — same seed always resolves to the
-/// same file, and two seeds that slugify to the same body still get
-/// distinct filenames. If the body is empty after trimming, the slug
-/// is just the hash suffix.
-pub fn claim_slug(seed: &str) -> String {
+/// Rules: lowercase, runs of non-`[a-z0-9]` collapse to `-`, leading and
+/// trailing `-` are trimmed, and the body is truncated to
+/// [`SLUG_BODY_MAX`] bytes (slugs are ASCII, so the byte truncation is
+/// always on a char boundary). May return an empty string when the seed
+/// has no alphanumerics.
+///
+/// This is the human-readable file-name *body* (`tsmc-cowos-capacity`),
+/// never a hash. It is not guaranteed unique — two seeds can slugify to
+/// the same body — so a writer that needs a unique *path* disambiguates
+/// against the DB index (the metadata layer owns uniqueness).
+pub fn slug(seed: &str) -> String {
     let mut body = String::with_capacity(seed.len());
     let mut prev_dash = true;
     for ch in seed.chars() {
@@ -190,7 +192,17 @@ pub fn claim_slug(seed: &str) -> String {
             body.pop();
         }
     }
+    body
+}
 
+/// Derive the on-disk slug for a claim from its seed string: the
+/// interpretable [`slug`] plus an unconditional `-<first 8 hex chars of
+/// sha256(seed)>` suffix. The hash suffix makes the result a collision-free
+/// function of the seed alone — same seed always resolves to the same file,
+/// and two seeds that slugify to the same body still get distinct
+/// filenames. If the slug body is empty, the result is just the suffix.
+pub fn claim_slug(seed: &str) -> String {
+    let body = slug(seed);
     let digest = Sha256::digest(seed.as_bytes());
     let suffix = hex::encode(&digest[..4]);
 
@@ -234,7 +246,7 @@ impl AgentFs {
     /// to `new_with_storage(Arc::new(LocalStorage::new(root)?), "", mandate)`.
     ///
     /// Idempotent: opening an existing FS does not clobber
-    /// `mandate.json`, `outputs/`, `evidence/`, `notes/`, or
+    /// `mandate.md`, `outputs/`, `evidence/`, `notes/`, or
     /// `retirement.json` — the mandate file is only written when absent.
     pub async fn open(root: PathBuf, mandate: &Mandate) -> anyhow::Result<Self> {
         let storage = Arc::new(LocalStorage::new(root)?);
@@ -245,7 +257,7 @@ impl AgentFs {
     /// prefix.
     ///
     /// `prefix` is normalized to either `""` or "`...something/`" — a
-    /// trailing slash is appended if missing. Writing `mandate.json`
+    /// trailing slash is appended if missing. Writing `mandate.md`
     /// (when absent) is the only state side effect; directory creation
     /// is handled lazily by the backend.
     pub async fn new_with_storage(
@@ -260,16 +272,19 @@ impl AgentFs {
         let me = Self { storage, prefix };
 
         // Idempotent: re-open must not clobber an existing mandate.
-        let mandate_key = me.key("mandate.json");
+        // The file is pure prose — just the standing instruction. Mandate
+        // config (cadence/model/...) is not persisted here; it flows
+        // in-memory and lives in the DB (A1: content in the FS, metadata
+        // in the DB).
+        let mandate_key = me.key("mandate.md");
         let existing = me
             .storage
             .get(&mandate_key)
             .await
             .map_err(|e| FsError::storage(&mandate_key, e))?;
         if existing.is_none() {
-            let bytes = serde_json::to_vec_pretty(mandate)?;
             me.storage
-                .put(&mandate_key, Bytes::from(bytes))
+                .put(&mandate_key, Bytes::from(mandate.text.clone()))
                 .await
                 .map_err(|e| FsError::storage(&mandate_key, e))?;
         }
@@ -284,7 +299,7 @@ impl AgentFs {
     }
 
     /// Build an `AgentFs` over `storage` at `prefix` without the
-    /// `mandate.json` read/write or the tail-index reconciliation
+    /// `mandate.md` read/write or the tail-index reconciliation
     /// that [`AgentFs::new_with_storage`] performs. Makes no I/O calls.
     ///
     /// Use when the caller has no `Mandate` in scope, or when the
@@ -306,7 +321,7 @@ impl AgentFs {
     /// storage backend. Cross-agent reads (a parent reading a child's
     /// `outputs/<id>.json`) flow through this constructor.
     ///
-    /// An `attach` wrapper — no `mandate.json` read, no tail-index
+    /// An `attach` wrapper — no `mandate.md` read, no tail-index
     /// reconcile. The caller does not have the other agent's `Mandate`
     /// in scope, and reconcile-target reads are point lookups that do
     /// not depend on the tail's freshness.
@@ -1007,17 +1022,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_creates_layout_and_writes_mandate() {
+    async fn open_writes_mandate_as_pure_prose_md() {
         let (tmp, _fs, mandate) = fresh_fs().await;
         let root = tmp.path();
-        // mandate.json present.
-        assert!(root.join("mandate.json").is_file());
-        // Subdirectories are created lazily by `LocalStorage` on
-        // first write, so `open` alone does not materialise them.
-        // Verify the mandate write round-trips instead.
-        let bytes = std::fs::read(root.join("mandate.json")).unwrap();
-        let back: Mandate = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(back, mandate);
+        // mandate.md present — no mandate.json.
+        assert!(root.join("mandate.md").is_file());
+        assert!(!root.join("mandate.json").exists());
+        // Body is exactly the prose; no JSON wrapper, no metadata fields
+        // (idle_period / max_ticks / etc.) leak into the file.
+        let body = std::fs::read_to_string(root.join("mandate.md")).unwrap();
+        assert_eq!(body, mandate.text);
+        assert!(!body.contains('{'), "mandate.md must not be JSON: {body:?}");
+        assert!(
+            !body.contains("idle_period") && !body.contains("max_ticks"),
+            "mandate config must not leak into the file body: {body:?}"
+        );
     }
 
     #[tokio::test]
@@ -1029,15 +1048,50 @@ mod tests {
             .unwrap();
 
         // Re-open with a *different* mandate; the on-disk file must keep
-        // the original.
+        // the original prose.
         let other = Mandate::new("second", Duration::from_millis(999), Some(7));
         let _fs2 = AgentFs::open(tmp.path().to_path_buf(), &other)
             .await
             .unwrap();
 
-        let bytes = std::fs::read(tmp.path().join("mandate.json")).unwrap();
-        let back: Mandate = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(back, original);
+        let body = std::fs::read_to_string(tmp.path().join("mandate.md")).unwrap();
+        assert_eq!(body, original.text);
+    }
+
+    #[test]
+    fn slug_is_interpretable_kebab_without_hash() {
+        assert_eq!(slug("TSMC CoWoS Capacity"), "tsmc-cowos-capacity");
+        // Runs of non-alphanumerics collapse; ends are trimmed.
+        assert_eq!(slug("  Foo / Bar -- baz!! "), "foo-bar-baz");
+        // No alphanumerics => empty (the writer must disambiguate).
+        assert_eq!(slug("!!! ---"), "");
+        // No hash suffix — a plain interpretable name.
+        assert!(!slug("hello world").contains(|c: char| c.is_ascii_hexdigit() && c == '-'));
+        assert_eq!(slug("hello world"), "hello-world");
+    }
+
+    #[test]
+    fn slug_truncates_long_bodies_at_boundary() {
+        let long = "a".repeat(200);
+        let s = slug(&long);
+        assert!(s.len() <= SLUG_BODY_MAX);
+        assert!(s.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn claim_slug_is_slug_plus_stable_hash_suffix() {
+        // claim_slug builds on slug() + an unconditional 8-hex suffix.
+        let cs = claim_slug("TSMC CoWoS Capacity");
+        assert!(cs.starts_with("tsmc-cowos-capacity-"));
+        let suffix = cs.rsplit('-').next().unwrap();
+        assert_eq!(suffix.len(), 8);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+        // Deterministic in the seed.
+        assert_eq!(cs, claim_slug("TSMC CoWoS Capacity"));
+        // Empty body => just the hash suffix.
+        let only_suffix = claim_slug("!!!");
+        assert_eq!(only_suffix.len(), 8);
+        assert!(only_suffix.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[tokio::test]
@@ -1507,14 +1561,11 @@ mod tests {
             .with_timezone(&Utc);
         fs.persist_retirement("attached", pinned).await.unwrap();
 
-        // mandate.json is *not* created — attach skipped it.
-        let mandate = storage
-            .get("graphs/g1/agents/a1/mandate.json")
-            .await
-            .unwrap();
+        // mandate.md is *not* created — attach skipped it.
+        let mandate = storage.get("graphs/g1/agents/a1/mandate.md").await.unwrap();
         assert!(
             mandate.is_none(),
-            "attach must not write mandate.json (no mandate in scope)"
+            "attach must not write mandate.md (no mandate in scope)"
         );
 
         // retirement.json lives under the prefix and carries the
@@ -1860,11 +1911,10 @@ mod tests {
         // inside `new_with_storage`.
         let mandate = Mandate::new("flaky", Duration::from_millis(100), Some(1));
         let storage: Arc<dyn AgentStorage> = Arc::new(FlakyPutStorage::new(1));
-        // Pre-seed mandate.json so new_with_storage's existence check
-        // sees it and skips the put.
-        let mandate_bytes = serde_json::to_vec_pretty(&mandate).unwrap();
+        // Burn the single allowed failure on a throwaway put so
+        // new_with_storage's own mandate.md write lands on a healthy put.
         storage
-            .put("mandate.json", Bytes::from(mandate_bytes))
+            .put("mandate.md", Bytes::from_static(b"seed"))
             .await
             .ok(); // first put consumes the failure
         let fs = AgentFs::new_with_storage(storage, "", &mandate)
@@ -1895,13 +1945,13 @@ mod tests {
         // `persist_retirement` (a plain `put`) performs.
         let mandate2 = Mandate::new("flaky2", Duration::from_millis(100), Some(1));
         let storage2: Arc<dyn AgentStorage> = Arc::new(FlakyPutStorage::new(2));
-        // First flaky consumes mandate.json write inside new_with_storage.
+        // First flaky consumes the mandate.md write inside new_with_storage.
         let fs2 = match AgentFs::new_with_storage(storage2, "", &mandate2).await {
             Ok(f) => f,
             Err(e) => {
                 let typed = e
                     .downcast_ref::<FsError>()
-                    .expect("mandate.json write should surface FsError");
+                    .expect("mandate.md write should surface FsError");
                 match typed {
                     FsError::Storage { source, .. } => {
                         assert!(matches!(source, crate::storage::StorageError::Transient(_)));

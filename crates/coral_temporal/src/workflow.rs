@@ -790,8 +790,8 @@ async fn signal_parent_with_trigger(
 /// Invoke the `apply_fs_ops` activity for a `Decision::RewriteFs`.
 ///
 /// `Mandate::new("", Duration::ZERO, None)` is decorative because
-/// `AgentFs::new_with_storage` only writes `mandate.json` when absent, and
-/// `apply_fs_ops` runs only against agents whose `mandate.json` already
+/// `AgentFs::new_with_storage` only writes `mandate.md` when absent, and
+/// `apply_fs_ops` runs only against agents whose `mandate.md` already
 /// exists on disk (assemble_context wrote it on tick 1). The activity body
 /// never reads the mandate — it only forwards it to `new_with_storage`,
 /// which short-circuits the write.
