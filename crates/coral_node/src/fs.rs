@@ -517,10 +517,16 @@ impl AgentFs {
         Ok(output)
     }
 
-    /// Apply a batch of filesystem ops. Only writes and deletes under
-    /// `notes/` are accepted; any path that escapes `<root>/notes/`
-    /// causes the entire batch to be rejected before any write
+    /// Apply a batch of model-authored filesystem ops. Writes and
+    /// deletes are accepted **only** under `notes/`; any path that
+    /// escapes `<root>/notes/` rejects the entire batch before any write
     /// happens.
+    ///
+    /// `notes/` being the model's sole writable surface *is* the
+    /// authorship boundary: `evidence/` is runtime-authored, so the
+    /// model can never hand-forge an observation — what keeps provenance
+    /// non-fakeable. Any future widening of the model's writable set
+    /// must keep `evidence/` excluded.
     pub async fn apply_ops(&self, ops: Vec<FsOp>) -> anyhow::Result<()> {
         // Pre-validate so a bad path mid-batch leaves no partial state.
         let mut planned: Vec<(String, FsOp)> = Vec::with_capacity(ops.len());
@@ -1389,6 +1395,59 @@ mod tests {
         assert!(err.downcast_ref::<FsError>().is_some());
         // Pre-flight validation rejects the batch before any write.
         assert!(!tmp.path().join("notes").join("good.md").exists());
+    }
+
+    #[tokio::test]
+    async fn authorship_boundary_rejects_model_writes_to_evidence() {
+        let (tmp, fs, _m) = fresh_fs().await;
+        // A model-driven op targeting evidence/ is refused, and nothing
+        // lands under evidence/. Asserted mechanism-agnostically (just
+        // `is_err` + untouched dir) so this stays an authorship-boundary
+        // test even if the model's writable surface is later widened.
+        for op in [
+            FsOp::WriteFile {
+                path: "evidence/forged.md".into(),
+                content: "the model wrote this".into(),
+            },
+            FsOp::DeleteFile {
+                path: "evidence/anything.md".into(),
+            },
+        ] {
+            assert!(
+                fs.apply_ops(vec![op]).await.is_err(),
+                "model op against evidence/ must be rejected"
+            );
+        }
+        let evidence_dir = tmp.path().join("evidence");
+        if evidence_dir.exists() {
+            let entries: Vec<_> = std::fs::read_dir(&evidence_dir).unwrap().collect();
+            assert!(
+                entries.is_empty(),
+                "no model write may land under evidence/"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authorship_boundary_runtime_writes_evidence_and_model_reads_it() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        // The runtime tool-observation path writes evidence...
+        let id = fs
+            .record_evidence(record(
+                "web_search",
+                json!({"q": "cowos"}),
+                json!({"hits": 1}),
+            ))
+            .await
+            .unwrap();
+        fs.evidence_must_exist(&id).await.unwrap();
+
+        // ...and the model's read surface returns it (reads are ungated).
+        let recent = fs.list_recent_evidence(8).await.unwrap();
+        assert!(
+            recent.iter().any(|r| r.id == id),
+            "model must be able to read runtime-authored evidence"
+        );
     }
 
     #[tokio::test]
