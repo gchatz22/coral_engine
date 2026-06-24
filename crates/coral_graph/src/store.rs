@@ -93,28 +93,20 @@ impl GraphStore {
         Ok(row)
     }
 
-    /// Insert an agent into a graph. `mandate_ref` is an opaque text
-    /// handle per the schema decision in `migrations/0001_initial.sql`
-    /// — authored mandates live outside this DB (git-versioned
-    /// `graph.yaml`), so there's no FK target.
-    pub async fn add_agent(
-        &self,
-        graph_id: Uuid,
-        name: &str,
-        mandate_ref: Option<&str>,
-    ) -> sqlx::Result<AgentRecord> {
+    /// Insert an agent into a graph. The row is identity + topology only;
+    /// authored config travels via the agent's workflow input, not the DB.
+    pub async fn add_agent(&self, graph_id: Uuid, name: &str) -> sqlx::Result<AgentRecord> {
         let id = Uuid::new_v4();
         let row = sqlx::query_as!(
             AgentRecord,
             r#"
-            INSERT INTO agents (id, graph_id, name, mandate_ref)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id, graph_id, name, mandate_ref, persistent, model, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            INSERT INTO agents (id, graph_id, name)
+            VALUES ($1, $2, $3)
+            RETURNING id, graph_id, name, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
             "#,
             id,
             graph_id,
             name,
-            mandate_ref,
         )
         .fetch_one(&self.pool)
         .await?;
@@ -593,24 +585,20 @@ fn walk_agent_tree<'a>(
     id_map: &'a mut HashMap<String, ResolvedAgentWorkflow>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), GraphStoreError>> + Send + 'a>> {
     Box::pin(async move {
-        // Allocate this agent's UUID + insert its row.
+        // Allocate this agent's UUID + insert its topology row. Config
+        // (persistent/model/cadence) travels via `AgentInput.mandate`, not
+        // the DB, so the row carries only identity.
         let agent_uuid = Uuid::new_v4();
         sqlx::query_as!(
             AgentRecord,
             r#"
-            INSERT INTO agents (id, graph_id, name, mandate_ref, persistent, model)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id, graph_id, name, mandate_ref, persistent, model, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            INSERT INTO agents (id, graph_id, name)
+            VALUES ($1, $2, $3)
+            RETURNING id, graph_id, name, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
             "#,
             agent_uuid,
             graph_id,
             &yaml_agent.id,
-            // Mandate text/idle/max_ticks travel via `AgentInput.mandate`
-            // directly today; `persistent` and `model` are the bits also
-            // recorded structurally.
-            None as Option<&str>,
-            yaml_agent.mandate.persistent,
-            yaml_agent.mandate.model.as_deref(),
         )
         .fetch_one(&mut **tx)
         .await?;
@@ -694,7 +682,7 @@ impl GraphStore {
         let row = sqlx::query_as!(
             AgentRecord,
             r#"
-            SELECT id, graph_id, name, mandate_ref, persistent, model, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            SELECT id, graph_id, name, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
             FROM agents
             WHERE id = $1
             "#,
@@ -713,7 +701,7 @@ impl GraphStore {
         let rows = sqlx::query_as!(
             AgentRecord,
             r#"
-            SELECT id, graph_id, name, mandate_ref, persistent, model, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            SELECT id, graph_id, name, created_at as "created_at!: chrono::DateTime<chrono::Utc>"
             FROM agents
             WHERE graph_id = $1
             ORDER BY created_at ASC
@@ -731,7 +719,7 @@ impl GraphStore {
         let rows = sqlx::query_as!(
             AgentRecord,
             r#"
-            SELECT a.id, a.graph_id, a.name, a.mandate_ref, a.persistent, a.model,
+            SELECT a.id, a.graph_id, a.name,
                    a.created_at as "created_at!: chrono::DateTime<chrono::Utc>"
             FROM agents a
             JOIN edges e ON e.child_agent_id = a.id
@@ -819,13 +807,8 @@ impl GraphStore {
 // to the trait's kernel-newtype shape.
 #[async_trait]
 impl StructuralDbStore for GraphStore {
-    async fn add_agent(
-        &self,
-        graph_id: GraphId,
-        name: &str,
-        mandate_ref: Option<&str>,
-    ) -> anyhow::Result<AgentId> {
-        let record = GraphStore::add_agent(self, graph_id.into_uuid(), name, mandate_ref).await?;
+    async fn add_agent(&self, graph_id: GraphId, name: &str) -> anyhow::Result<AgentId> {
+        let record = GraphStore::add_agent(self, graph_id.into_uuid(), name).await?;
         Ok(AgentId::new(record.id))
     }
 
@@ -863,10 +846,7 @@ mod tests {
     }
 
     async fn seed_agent(store: &GraphStore, graph_id: Uuid, name: &str) -> AgentRecord {
-        store
-            .add_agent(graph_id, name, None)
-            .await
-            .expect("add_agent")
+        store.add_agent(graph_id, name).await.expect("add_agent")
     }
 
     // --- create_graph ---
@@ -888,10 +868,9 @@ mod tests {
     async fn add_agent_happy_path(pool: PgPool) -> sqlx::Result<()> {
         let store = GraphStore::new(pool);
         let graph = seed_graph(&store).await;
-        let agent = store.add_agent(graph.id, "alice", Some("v1")).await?;
+        let agent = store.add_agent(graph.id, "alice").await?;
         assert_eq!(agent.graph_id, graph.id);
         assert_eq!(agent.name, "alice");
-        assert_eq!(agent.mandate_ref.as_deref(), Some("v1"));
         Ok(())
     }
 
@@ -900,7 +879,7 @@ mod tests {
         let store = GraphStore::new(pool);
         let bad_graph = Uuid::new_v4();
         let err = store
-            .add_agent(bad_graph, "ghost", None)
+            .add_agent(bad_graph, "ghost")
             .await
             .expect_err("FK violation expected");
         // Postgres surfaces FK violations with SQLSTATE 23503.
@@ -1267,11 +1246,6 @@ seed:
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name, "root");
         assert_eq!(AgentId::new(agents[0].id), applied.agents[0].db_agent_id);
-        assert!(
-            agents[0].mandate_ref.is_none(),
-            "v1 leaves mandate_ref None; got {:?}",
-            agents[0].mandate_ref,
-        );
 
         let tools = store.list_tools_for_agent(agents[0].id).await?;
         assert_eq!(tools.len(), 1);
@@ -1325,142 +1299,6 @@ seed:
         assert_eq!(
             tools[0].env_refs,
             serde_json::json!({"API_KEY": "secret", "LOG": "debug"}),
-        );
-        Ok(())
-    }
-
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn create_from_yaml_persists_agent_persistent_flag(pool: PgPool) -> sqlx::Result<()> {
-        // `persistent: true` on two agents, absent on the third ⇒ false.
-        // Round-trips through the `agents.persistent` column. The parent
-        // keeps one persistent child so the config isn't the degenerate
-        // persistent-parent/all-one-shot-children combo the validator
-        // rejects.
-        const YAML: &str = r#"
-apiVersion: coral.engine/v1alpha1
-kind: Graph
-metadata:
-  name: persist-smoke
-tools:
-  - id: echo
-    kind: builtin
-    builtin: echo
-agents:
-  - id: monitor
-    mandate:
-      text: keep watching
-      idle_period: 1s
-      persistent: true
-    tools: [echo]
-    children:
-      - id: submonitor
-        mandate:
-          text: keep feeding
-          idle_period: 1s
-          persistent: true
-        tools: []
-      - id: oneshot
-        mandate:
-          text: do once
-          idle_period: 1s
-        tools: []
-seed:
-  triggers:
-    - agent: monitor
-      at: start
-      external:
-        kind: kickoff
-        payload: {}
-"#;
-        let store = GraphStore::new(pool);
-        let g = crate::yaml::parse_and_validate(YAML).expect("validator green");
-        let applied = store.create_from_yaml(&g).await.expect("create_from_yaml");
-
-        let monitor = applied.id_map.get("monitor").expect("monitor in id_map");
-        let monitor_row = store
-            .get_agent(monitor.db_agent_id.into_uuid())
-            .await?
-            .expect("monitor row");
-        assert!(monitor_row.persistent, "monitor must persist");
-
-        let oneshot = applied.id_map.get("oneshot").expect("oneshot in id_map");
-        let oneshot_row = store
-            .get_agent(oneshot.db_agent_id.into_uuid())
-            .await?
-            .expect("oneshot row");
-        assert!(
-            !oneshot_row.persistent,
-            "absent persistent must default to false"
-        );
-
-        // The flag also reads back through the list/children query paths:
-        // the persistent child reads true, the one-shot child reads false.
-        let children = store.list_children(monitor.db_agent_id.into_uuid()).await?;
-        assert_eq!(children.len(), 2);
-        let by_persistent: std::collections::HashMap<bool, ()> =
-            children.iter().map(|c| (c.persistent, ())).collect();
-        assert!(
-            by_persistent.contains_key(&true) && by_persistent.contains_key(&false),
-            "children must include one persistent and one one-shot, got {children:?}"
-        );
-        Ok(())
-    }
-
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn create_from_yaml_persists_agent_model_override(pool: PgPool) -> sqlx::Result<()> {
-        // `model:` on the parent, absent on the child ⇒ NULL. Round-trips
-        // through the `agents.model` column on get/list/children paths.
-        const YAML: &str = r#"
-apiVersion: coral.engine/v1alpha1
-kind: Graph
-metadata:
-  name: model-smoke
-tools:
-  - id: echo
-    kind: builtin
-    builtin: echo
-agents:
-  - id: parent
-    mandate:
-      text: reconcile
-      idle_period: 1s
-      model: claude-opus-4-8
-    tools: [echo]
-    children:
-      - id: child
-        mandate:
-          text: research
-          idle_period: 1s
-        tools: []
-seed:
-  triggers:
-    - agent: parent
-      at: start
-      external:
-        kind: kickoff
-        payload: {}
-"#;
-        let store = GraphStore::new(pool);
-        let g = crate::yaml::parse_and_validate(YAML).expect("validator green");
-        let applied = store.create_from_yaml(&g).await.expect("create_from_yaml");
-
-        let parent = applied.id_map.get("parent").expect("parent in id_map");
-        let parent_row = store
-            .get_agent(parent.db_agent_id.into_uuid())
-            .await?
-            .expect("parent row");
-        assert_eq!(
-            parent_row.model.as_deref(),
-            Some("claude-opus-4-8"),
-            "parent must persist its model override"
-        );
-
-        // Absent ⇒ NULL, both on get and via the children query path.
-        let children = store.list_children(parent.db_agent_id.into_uuid()).await?;
-        assert_eq!(children.len(), 1);
-        assert!(
-            children[0].model.is_none(),
-            "absent model must default to NULL"
         );
         Ok(())
     }
@@ -1790,7 +1628,7 @@ policy:
 
         // Trait dispatch: returns AgentId, not AgentRecord.
         let child_id: AgentId =
-            <GraphStore as StructuralDbStore>::add_agent(&store, graph_id, "child", None)
+            <GraphStore as StructuralDbStore>::add_agent(&store, graph_id, "child")
                 .await
                 .expect("trait add_agent");
         <GraphStore as StructuralDbStore>::add_edge(&store, parent_id, child_id)

@@ -130,7 +130,7 @@ async fn run_smoke(database_url: &str) -> Result<()> {
         .await
         .context("seeding parent graph")?;
     let parent = store
-        .add_agent(graph.id, "parent", None)
+        .add_agent(graph.id, "parent")
         .await
         .context("seeding parent agent")?;
     let parent_graph_id = GraphId::new(graph.id);

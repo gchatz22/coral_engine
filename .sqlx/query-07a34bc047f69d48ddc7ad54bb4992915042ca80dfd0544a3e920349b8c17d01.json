@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT a.id, a.graph_id, a.name,\n                   a.created_at as \"created_at!: chrono::DateTime<chrono::Utc>\"\n            FROM agents a\n            JOIN edges e ON e.child_agent_id = a.id\n            WHERE e.parent_agent_id = $1\n            ORDER BY a.created_at ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "graph_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at!: chrono::DateTime<chrono::Utc>",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "07a34bc047f69d48ddc7ad54bb4992915042ca80dfd0544a3e920349b8c17d01"
+}

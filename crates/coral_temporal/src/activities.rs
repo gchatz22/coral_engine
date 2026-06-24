@@ -168,17 +168,11 @@ pub struct AppendDecisionLogInput {
 /// the parent's `(graph_id, agent_id)` so the activity can write the
 /// child's `agents` row (scoped to the parent's graph) and the
 /// parent → child `edges` row in one transaction's worth of writes.
-///
-/// `child_mandate_ref` is the opaque text handle from the
-/// structural-DB schema. Runtime spawns (`Decision::SpawnChild`) pass
-/// `None` — the child's mandate travels via `AgentInput.mandate` and
-/// the runtime spawn never produces a stable text handle.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegisterChildInStructuralDbInput {
     pub parent_graph_id: GraphId,
     pub parent_agent_id: AgentId,
     pub child_agent_name: String,
-    pub child_mandate_ref: Option<String>,
 }
 
 /// Output of the `register_child_in_structural_db` activity. Returns
@@ -766,11 +760,7 @@ pub async fn register_child_in_structural_db_impl(
     input: RegisterChildInStructuralDbInput,
 ) -> anyhow::Result<RegisterChildInStructuralDbOutput> {
     let child_agent_id = store
-        .add_agent(
-            input.parent_graph_id,
-            &input.child_agent_name,
-            input.child_mandate_ref.as_deref(),
-        )
+        .add_agent(input.parent_graph_id, &input.child_agent_name)
         .await?;
     store
         .add_edge(input.parent_agent_id, child_agent_id)
@@ -1674,14 +1664,13 @@ mod tests {
 
     /// In-memory `StructuralDbStore` fake. Records every `add_agent`
     /// / `add_edge` call so hermetic tests can assert without Postgres.
-    /// Extracted to a struct (rather than a 4-tuple) to keep clippy's
+    /// Extracted to a struct (rather than a tuple) to keep clippy's
     /// `type_complexity` lint happy and give the assertions readable
     /// field names.
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct RecordedAgent {
         graph_id: GraphId,
         name: String,
-        mandate_ref: Option<String>,
         allocated_id: AgentId,
     }
 
@@ -1701,17 +1690,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::worker::StructuralDbStore for MemoryStructuralDbStore {
-        async fn add_agent(
-            &self,
-            graph_id: GraphId,
-            name: &str,
-            mandate_ref: Option<&str>,
-        ) -> anyhow::Result<AgentId> {
+        async fn add_agent(&self, graph_id: GraphId, name: &str) -> anyhow::Result<AgentId> {
             let id = AgentId::new(uuid::Uuid::new_v4());
             self.agents.lock().unwrap().push(RecordedAgent {
                 graph_id,
                 name: name.to_string(),
-                mandate_ref: mandate_ref.map(str::to_string),
                 allocated_id: id,
             });
             Ok(id)
@@ -1747,7 +1730,6 @@ mod tests {
                 parent_graph_id,
                 parent_agent_id,
                 child_agent_name: "fetcher".into(),
-                child_mandate_ref: Some("v1".into()),
             },
         )
         .await
@@ -1757,7 +1739,6 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].graph_id, parent_graph_id);
         assert_eq!(agents[0].name, "fetcher");
-        assert_eq!(agents[0].mandate_ref.as_deref(), Some("v1"));
         assert_eq!(agents[0].allocated_id, out.child_agent_id);
 
         let edges = fake.edges.lock().unwrap();
@@ -1781,30 +1762,14 @@ mod tests {
                 Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap(),
             ),
             child_agent_name: "fetcher".into(),
-            child_mandate_ref: Some("v1".into()),
         };
         let s = serde_json::to_string(&i).unwrap();
         let back: RegisterChildInStructuralDbInput = serde_json::from_str(&s).unwrap();
         assert_eq!(i, back);
-        // The mandate_ref Option is on the wire (no `skip_serializing_if`).
         assert!(
-            s.contains("\"child_mandate_ref\":\"v1\""),
+            s.contains("\"child_agent_name\":\"fetcher\""),
             "wire shape: {s}"
         );
-    }
-
-    #[test]
-    fn register_child_input_round_trips_with_no_mandate_ref() {
-        use uuid::Uuid;
-        let i = RegisterChildInStructuralDbInput {
-            parent_graph_id: GraphId::new(Uuid::nil()),
-            parent_agent_id: AgentId::new(Uuid::nil()),
-            child_agent_name: "x".into(),
-            child_mandate_ref: None,
-        };
-        let s = serde_json::to_string(&i).unwrap();
-        let back: RegisterChildInStructuralDbInput = serde_json::from_str(&s).unwrap();
-        assert_eq!(i, back);
     }
 
     #[test]

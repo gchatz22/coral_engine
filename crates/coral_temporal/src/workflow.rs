@@ -1078,7 +1078,6 @@ async fn spawn_child(
                 parent_graph_id: input.graph_id,
                 parent_agent_id: input.agent_id,
                 child_agent_name: child_agent_name.clone(),
-                child_mandate_ref: None,
             },
             activity_opts(),
         )

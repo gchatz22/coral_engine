@@ -47,13 +47,12 @@ static SHARED_STORAGE: OnceLock<Arc<MemoryStorage>> = OnceLock::new();
 static SHARED_DB: OnceLock<Arc<MemoryStructuralDb>> = OnceLock::new();
 static INIT: std::sync::Once = std::sync::Once::new();
 
-/// One recorded `add_agent` call. Struct (rather than 4-tuple) keeps
+/// One recorded `add_agent` call. Struct (rather than a tuple) keeps
 /// clippy's `type_complexity` happy and the test assertions readable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RecordedAgent {
     graph_id: GraphId,
     name: String,
-    mandate_ref: Option<String>,
     allocated_id: AgentId,
 }
 
@@ -76,12 +75,7 @@ impl MemoryStructuralDb {
 
 #[async_trait]
 impl StructuralDbStore for MemoryStructuralDb {
-    async fn add_agent(
-        &self,
-        graph_id: GraphId,
-        name: &str,
-        mandate_ref: Option<&str>,
-    ) -> anyhow::Result<AgentId> {
+    async fn add_agent(&self, graph_id: GraphId, name: &str) -> anyhow::Result<AgentId> {
         let mut next = self.next_id.lock().unwrap();
         // Use a counter-driven UUID so the child's workflow id is
         // deterministic across test runs (UUID v4 random would still
@@ -93,7 +87,6 @@ impl StructuralDbStore for MemoryStructuralDb {
         self.agents.lock().unwrap().push(RecordedAgent {
             graph_id,
             name: name.to_string(),
-            mandate_ref: mandate_ref.map(str::to_string),
             allocated_id: id,
         });
         Ok(id)
