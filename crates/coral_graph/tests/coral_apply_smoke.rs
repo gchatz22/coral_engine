@@ -39,7 +39,7 @@ use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
 use coral_graph::yaml::{
-    into_agent_input, parse_and_validate, yaml_seed_triggers, AppliedGraph, ResolvedAgent,
+    into_agent_input, parse_and_validate, yaml_seed_triggers, AppliedGraph, Cadence, ResolvedAgent,
     ResolvedAgentWorkflow,
 };
 use coral_node::agent_ref::{AgentId, GraphId};
@@ -175,9 +175,8 @@ async fn run_smoke() -> Result<()> {
     assert_eq!(graph.agents[0].tools, vec!["echo".to_string()]);
     assert_eq!(
         graph.agents[0].mandate.idle_period,
-        Some(Duration::from_secs(1))
+        Some(Cadence::Every(Duration::from_secs(1)))
     );
-    assert_eq!(graph.agents[0].mandate.max_ticks, Some(8));
     assert_eq!(graph.seed.triggers.len(), 1);
     assert_eq!(graph.seed.triggers[0].external.kind, "kickoff");
 
@@ -190,8 +189,12 @@ async fn run_smoke() -> Result<()> {
     let synth_graph_id = GraphId::new(uuid::Uuid::new_v4());
     let synth_agent_id = AgentId::new(uuid::Uuid::new_v4());
     let agent_input = into_agent_input(&graph, synth_graph_id, synth_agent_id);
-    assert_eq!(agent_input.mandate.idle_period, Duration::from_secs(1));
-    assert_eq!(agent_input.mandate.max_ticks, Some(8));
+    assert_eq!(
+        agent_input.mandate.idle_period,
+        Some(Duration::from_secs(1))
+    );
+    // `step_cap` is the harness-only runaway backstop; YAML never authors it.
+    assert!(agent_input.mandate.step_cap.is_none());
     assert!(
         agent_input.mandate.text.contains("call the `echo` tool"),
         "mandate.text drifted from the smoke fixture's intent: {:?}",
@@ -231,7 +234,7 @@ async fn run_smoke() -> Result<()> {
         .context("plant evidence for EmitOutput")?;
 
     // Scripted sequence: Idle → CallTools(echo) → EmitOutput citing the
-    // planted id, then the `max_ticks` cap stops the loop (agents never
+    // planted id, then the `step_cap` backstop stops the loop (agents never
     // self-terminate). Proves the YAML-derived AgentInput drives the
     // expected agent-loop end-state.
     set_decision_script(vec![
@@ -271,10 +274,10 @@ async fn run_smoke() -> Result<()> {
         prefix: agent_prefix.clone(),
     };
     // Cap the run at the 3 scripted decisions so the loop terminates on
-    // the safety cap right after EmitOutput (the YAML's max_ticks=8,
-    // asserted above on the input, would let the script exhaust into the
-    // installed decide impl). The agent never self-terminates.
-    input.mandate.max_ticks = Some(3);
+    // the runaway backstop right after EmitOutput. Without this the script
+    // would exhaust into the installed decide impl rather than stopping at a
+    // small cap. The agent never self-terminates; `step_cap` is harness-only.
+    input.mandate.step_cap = Some(3);
     // `yaml_seed_triggers` takes an `AppliedGraph` so it can resolve
     // each `seed.triggers[].agent` to a concrete workflow_id (any node
     // in the tree, not just the root). Synthesize a minimal
@@ -393,7 +396,7 @@ async fn drive(
         .context("AgentWorkflow.get_result")?;
     let AgentResult::Retired { reason } = result;
     assert_eq!(
-        reason, "max_ticks (3) reached",
+        reason, "step_cap (3) reached",
         "workflow returned wrong retire reason: {reason:?}"
     );
 
@@ -411,7 +414,7 @@ async fn drive(
         .and_then(|x| x.as_str())
         .ok_or_else(|| anyhow::anyhow!("retirement.json missing reason"))?;
     assert_eq!(
-        reason_on_disk, "max_ticks (3) reached",
+        reason_on_disk, "step_cap (3) reached",
         "retirement.json carries wrong reason: {reason_on_disk:?}"
     );
 
@@ -452,8 +455,8 @@ async fn drive(
     // ---- Artifact 3: `<prefix>/decisions/<tick>.jsonl` --------------------
     // One entry per logged decision. The scripted sequence produces three
     // decisions (Idle, CallTools, EmitOutput) at `decisions/{0,1,2}.jsonl`.
-    // The `max_ticks` cap retires at the top of the loop without logging a
-    // decision, so it adds no fourth entry.
+    // The `step_cap` backstop retires at the top of the loop without logging
+    // a decision, so it adds no fourth entry.
     let page = storage
         .list(&format!("{agent_prefix}/decisions/"), None, usize::MAX)
         .await

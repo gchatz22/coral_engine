@@ -420,7 +420,7 @@ async fn run_happy_path() -> Result<()> {
         .context("plant evidence for child EmitOutput")?;
 
     // Parent: spin on reconcile_placeholder until the ChildOutput lands,
-    // reconcile, then idle until the `max_ticks` cap stops it (agents
+    // reconcile, then idle until the `step_cap` cap stops it (agents
     // never self-terminate). The cap only bounds the post-reconcile idle
     // tail, so the synthetic evidence is durable before retirement.
     let parent_script = vec![reconcile_placeholder()];
@@ -542,7 +542,7 @@ async fn drive_happy_path(
     eprintln!("happy: child started at {child_workflow_id}");
 
     // Wait for child to retire. It emits once (the EmitOutput signals the
-    // parent), then the `max_ticks=1` cap retires it.
+    // parent), then the `step_cap=1` cap retires it.
     let _child_result: AgentResult = child_handle
         .get_result(WorkflowGetResultOptions::default())
         .await
@@ -555,7 +555,7 @@ async fn drive_happy_path(
     // the signal arrives. Once observed, `synthesize_reconcile_or_wait`
     // returns a real `Decision::ReconcileChildren`, the activity writes
     // synthetic evidence to the parent's `evidence/`, and the parent then
-    // idles until its `max_ticks` cap stops it (agents never self-terminate).
+    // idles until its `step_cap` cap stops it (agents never self-terminate).
     let retire_timer = tokio::time::timeout(
         Duration::from_secs(90),
         parent_handle.get_result(WorkflowGetResultOptions::default()),
@@ -795,7 +795,7 @@ async fn drive_failure_path(
     .context("parent get_result (fail path)")?;
     let AgentResult::Retired { reason } = parent_result;
     assert_eq!(
-        reason, "max_ticks (15) reached",
+        reason, "step_cap (15) reached",
         "parent did not complete (idle to the cap) after reconcile failure: {reason:?}"
     );
     eprintln!("fail: parent retired normally after staged correction");

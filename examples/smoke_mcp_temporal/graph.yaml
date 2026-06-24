@@ -24,7 +24,6 @@ agents:
     mandate:
       text: "Your task: call the `get-sum` tool exactly once with arguments {\"a\": 2, \"b\": 3}, then on the next tick emit an Output via the `emit_output` decision whose `content` is a short summary citing the resulting evidence id, then retire. Do not call any other tool; do not loop; do not idle except as a last resort."
       idle_period: 1s
-      max_ticks: 8
     tools: [everything]
 seed:
   triggers:

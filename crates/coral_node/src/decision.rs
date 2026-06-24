@@ -1022,8 +1022,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mandate = Mandate {
             text: "tiny window".into(),
-            idle_period: Duration::from_millis(100),
-            max_ticks: Some(1),
+            idle_period: Some(Duration::from_millis(100)),
+            step_cap: Some(1),
             retry_policy: None,
             context_policy: ContextPolicy {
                 recent_outputs: 2,
@@ -1065,8 +1065,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mandate = Mandate {
             text: "tiny evidence window".into(),
-            idle_period: Duration::from_millis(100),
-            max_ticks: Some(1),
+            idle_period: Some(Duration::from_millis(100)),
+            step_cap: Some(1),
             retry_policy: None,
             context_policy: ContextPolicy {
                 recent_outputs: 8,
@@ -1099,8 +1099,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mandate = Mandate {
             text: "claims window".into(),
-            idle_period: Duration::from_millis(100),
-            max_ticks: Some(1),
+            idle_period: Some(Duration::from_millis(100)),
+            step_cap: Some(1),
             retry_policy: None,
             context_policy: ContextPolicy {
                 recent_outputs: 8,

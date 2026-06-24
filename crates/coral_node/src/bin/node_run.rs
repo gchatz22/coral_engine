@@ -18,7 +18,7 @@
 //! ```
 //!
 //! * `<config.json>` — a JSON-serialized [`coral_node::mandate::Mandate`].
-//!   Set `max_ticks` so the loop retires deterministically.
+//!   Set `step_cap` so the loop retires deterministically.
 //! * `<triggers.jsonl>` — one JSON object per line. Each line is either a
 //!   bare [`coral_node::trigger::Trigger`] (pushed with zero delay) or an
 //!   envelope `{"delay_ms": <u64>, "trigger": <Trigger>}`. Blank lines and
@@ -41,7 +41,7 @@
 //!
 //! The agent will execute three scripted decisions (call echo, emit one
 //! output backed by the resulting evidence record, idle), then retire on
-//! `max_ticks`. The printed tree should contain `mandate.md`,
+//! `step_cap`. The printed tree should contain `mandate.md`,
 //! `outputs/<ulid>.json`, `evidence/<sha256>.json`, and `retirement.json`.
 
 use std::fs;
@@ -70,7 +70,7 @@ USAGE:
     node-run <config.json> <triggers.jsonl> <fs_root>
 
 ARGS:
-    <config.json>     JSON-serialized Mandate (text, idle_period ms, max_ticks).
+    <config.json>     JSON-serialized Mandate (text, idle_period ms, step_cap).
                       A sibling `decisions.jsonl` in the same directory scripts
                       the MockDecide (one JSON Decision per line).
     <triggers.jsonl>  One JSON object per line. Either a bare Trigger or an

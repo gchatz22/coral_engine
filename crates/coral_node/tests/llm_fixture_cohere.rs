@@ -250,7 +250,7 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "max_ticks (3) reached");
+    assert_eq!(reason, "step_cap (3) reached");
 
     // Wire-level count assertion — kept because the new stats accessor
     // only sees the most recent tick, not the whole run.

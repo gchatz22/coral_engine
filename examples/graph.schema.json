@@ -64,7 +64,7 @@
   ],
   "$defs": {
     "Agent": {
-      "description": "One node in the agent forest. `children:` makes the schema recursive;\nthe validator DFS-walks the tree.\n\n`mandate.idle_period` is `Option<Duration>` because the top-level\n`defaults:` block may provide it; the validator reports a typed\nerror if neither inline nor default supplies a value.",
+      "description": "One node in the agent forest. `children:` makes the schema recursive;\nthe validator DFS-walks the tree.\n\n`mandate.idle_period` is `Option<Cadence>` because the top-level\n`defaults:` block may provide it; the validator reports a typed\nerror if neither inline nor default supplies a value.",
       "type": "object",
       "properties": {
         "children": {
@@ -101,22 +101,11 @@
       "type": "object",
       "properties": {
         "idle_period": {
-          "description": "Default `idle_period` when an agent's inline value is absent.\nSame `humantime` grammar as the inline field.",
+          "description": "Default `idle_period` when an agent's inline value is absent.\nSame grammar as the inline field (a `humantime` duration or `never`).",
           "type": [
             "string",
             "null"
-          ],
-          "default": null
-        },
-        "max_ticks": {
-          "description": "Default `max_ticks` when an agent's inline value is absent.\n`None` ⇒ no cap by default.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "default": null,
-          "minimum": 0
+          ]
         }
       },
       "additionalProperties": false
@@ -142,22 +131,11 @@
       "type": "object",
       "properties": {
         "idle_period": {
-          "description": "Wake cadence when no signal arrives. Accepts the\n[`humantime`](https://docs.rs/humantime) duration grammar\n(`100ms`, `5m`, `1h30m`, ...). Malformed values surface as\n[`GraphYamlError::Parse`] with a `line:col`.\n\nOptional so [`AgentDefaults::idle_period`] can supply the value;\nthe validator emits [`GraphYamlError::MissingMandateIdlePeriod`]\nif neither inline nor default is present.",
+          "description": "Self-wake cadence. Accepts the\n[`humantime`](https://docs.rs/humantime) duration grammar\n(`100ms`, `5m`, `1h30m`, ...) for a recurring self-wake, or the\nliteral **`never`** for an agent that self-wakes only its first cycle\nand thereafter wakes solely on triggers (child/upstream updates,\nhuman ops, external signals). Malformed values surface as\n[`GraphYamlError::Parse`] with a `line:col`.\n\nOptional so [`AgentDefaults::idle_period`] can supply the value;\nthe validator emits [`GraphYamlError::MissingMandateIdlePeriod`]\nif neither inline nor default is present.",
           "type": [
             "string",
             "null"
-          ],
-          "default": null
-        },
-        "max_ticks": {
-          "description": "Optional safety cap on loop iterations. `None` ⇒ no cap (agents\nnever self-terminate; only the cap, a `retire` signal, or teardown\nstops a loop). May be supplied via [`AgentDefaults::max_ticks`].",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "default": null,
-          "minimum": 0
+          ]
         },
         "model": {
           "description": "Optional per-agent model override (e.g. `claude-opus-4-8` for a\nreconciling parent). Absent ⇒ the worker's configured default model.\nInterpreted within the worker's configured vendor; a model id that\nvendor doesn't recognize is an operator misconfig surfacing as a\nruntime error.",

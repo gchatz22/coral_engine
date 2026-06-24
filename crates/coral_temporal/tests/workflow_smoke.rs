@@ -109,7 +109,7 @@ async fn build_client() -> Result<Client> {
 }
 
 /// Scripts a three-decision run (Idle → CallTools → EmitOutput) capped by
-/// `max_ticks=3`, drives it via Temporal, and asserts the three durable
+/// `step_cap=3`, drives it via Temporal, and asserts the three durable
 /// artifacts land. The agent never self-terminates; the cap stops the loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Lock is held across `await` because the scripted decision queue + the
@@ -154,7 +154,7 @@ async fn run_smoke() -> Result<()> {
         .context("plant evidence for EmitOutput")?;
 
     // Scripted sequence: Idle (tick 0) → CallTools(echo) (tick 1) →
-    // EmitOutput citing the planted id (tick 2), then the `max_ticks=3`
+    // EmitOutput citing the planted id (tick 2), then the `step_cap=3`
     // cap stops the loop. Three decisions, three decision-log files (the
     // cap-driven retirement is not itself a logged decision).
     set_decision_script(vec![
@@ -242,7 +242,7 @@ async fn drive(
     };
     input.mandate.tools = vec![TOOL_NAME.to_string()];
     // The loop runs the 3 scripted decisions, then the cap stops it.
-    input.mandate.max_ticks = Some(3);
+    input.mandate.step_cap = Some(3);
     let handle = client
         .start_workflow(
             AgentWorkflow::run,
@@ -258,7 +258,7 @@ async fn drive(
         .context("AgentWorkflow.get_result")?;
     let AgentResult::Retired { reason } = result;
     assert_eq!(
-        reason, "max_ticks (3) reached",
+        reason, "step_cap (3) reached",
         "workflow returned wrong retire reason: {reason:?}"
     );
 
@@ -276,7 +276,7 @@ async fn drive(
         .and_then(|x| x.as_str())
         .ok_or_else(|| anyhow::anyhow!("retirement.json missing reason"))?;
     assert_eq!(
-        reason_on_disk, "max_ticks (3) reached",
+        reason_on_disk, "step_cap (3) reached",
         "retirement.json carries wrong reason: {reason_on_disk:?}"
     );
 
@@ -318,7 +318,7 @@ async fn drive(
     // ---- Artifact 3: `<prefix>/decisions/<tick>.jsonl` --------------------
     // One entry per logged decision. The scripted sequence produces three
     // decisions (Idle, CallTools, EmitOutput) at `decisions/{0,1,2}.jsonl`.
-    // The `max_ticks` cap retires at the top of the loop without logging a
+    // The `step_cap` cap retires at the top of the loop without logging a
     // decision, so it adds no fourth entry.
     let page = storage
         .list(&format!("{agent_prefix}/decisions/"), None, usize::MAX)

@@ -1034,12 +1034,12 @@ mod tests {
         // mandate.md present
         assert!(root.join("mandate.md").is_file());
         // Body is exactly the prose; no JSON wrapper, no metadata fields
-        // (idle_period / max_ticks / etc.) leak into the file.
+        // (idle_period / step_cap / etc.) leak into the file.
         let body = std::fs::read_to_string(root.join("mandate.md")).unwrap();
         assert_eq!(body, mandate.text);
         assert!(!body.contains('{'), "mandate.md must not be JSON: {body:?}");
         assert!(
-            !body.contains("idle_period") && !body.contains("max_ticks"),
+            !body.contains("idle_period") && !body.contains("step_cap"),
             "mandate config must not leak into the file body: {body:?}"
         );
     }

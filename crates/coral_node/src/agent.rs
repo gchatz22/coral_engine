@@ -23,8 +23,8 @@
 //!    mark the tick a success (`HealthTracker::mark_tick_success`) — this
 //!    archives any prior Unhealthy incident on recovery.
 //! 7. **The agent never self-terminates.** No decision ends the loop;
-//!    persistence is universal. The loop exits only on the
-//!    `Mandate.max_ticks` safety cap (checked at the top of each
+//!    persistence is universal. The loop exits only on the interim
+//!    `step_cap` runaway backstop (checked at the top of each
 //!    iteration) or a non-recoverable error.
 //! 8. **On [`DispatchOutcome::NeedsCorrection`]**: the model emitted a
 //!    `Decision` the runtime cannot satisfy (an unregistered tool, an
@@ -78,7 +78,7 @@ use crate::health::{
     Attempt, FailingCall, FailureKind, HealthError, HealthIncident, HealthTracker,
 };
 use crate::mandate::Mandate;
-use crate::scheduler::Scheduler;
+use crate::scheduler::{arm_self_wake, Scheduler};
 use crate::tools::ToolRegistry;
 use crate::trigger::Trigger;
 use crate::trigger_queue::{SignalSink, TriggerQueue};
@@ -133,7 +133,11 @@ impl<D: Decide> Agent<D> {
         tools: ToolRegistry,
         health: HealthTracker,
     ) -> Self {
-        let scheduler = Scheduler::new(cfg.idle_period);
+        // A `never`-cadence mandate carries no recurring interval; the
+        // scheduler is consulted only to bootstrap the first cycle, so seed
+        // it with a fire-now deadline. After that first cycle the wake gate
+        // stops arming the timer for `never` nodes.
+        let scheduler = Scheduler::new(cfg.idle_period.unwrap_or(std::time::Duration::ZERO));
         let (triggers, sink) = TriggerQueue::new();
         Self {
             cfg,
@@ -155,8 +159,8 @@ impl<D: Decide> Agent<D> {
     }
 
     /// Run the loop until one of:
-    /// - the `Mandate.max_ticks` safety cap is hit (writes
-    ///   `retirement.json`, with a synthesized `max_ticks (N) reached`
+    /// - the interim `step_cap` runaway backstop is hit (writes
+    ///   `retirement.json`, with a synthesized `step_cap (N) reached`
     ///   reason, and returns it);
     /// - a non-recoverable error bubbles via `?`.
     ///
@@ -175,6 +179,12 @@ impl<D: Decide> Agent<D> {
             mut health,
         } = self;
 
+        // `never` cadence (`idle_period == None`): self-wake only the first
+        // cycle, then wait on triggers alone (the wake gate stops arming the
+        // idle timer). The interim runaway backstop.
+        let never = cfg.is_never();
+        let step_cap = cfg.step_cap.unwrap_or(crate::mandate::INTERIM_STEP_CAP);
+
         // Continuation state. `Some` means the previous tick produced an
         // unsatisfiable `Decision`; this tick is a correction attempt.
         // Cleared on a successful Continue, on transition_to_unhealthy
@@ -190,15 +200,13 @@ impl<D: Decide> Agent<D> {
 
         let mut tick: u64 = 0;
         loop {
-            // `Mandate.max_ticks` is a safety cap on loop iterations.
-            // `None` means "run until `Retire`." Check before incrementing
-            // so the cap is the count of ticks actually performed.
-            if let Some(max) = cfg.max_ticks {
-                if tick >= max {
-                    let reason = format!("max_ticks ({}) reached", max);
-                    fs.persist_retirement(&reason, Utc::now()).await?;
-                    return Ok(RetireReason(reason));
-                }
+            // The interim `step_cap` runaway backstop. Checked before
+            // incrementing so the cap is the count of ticks actually
+            // performed.
+            if tick >= step_cap {
+                let reason = format!("step_cap ({}) reached", step_cap);
+                fs.persist_retirement(&reason, Utc::now()).await?;
+                return Ok(RetireReason(reason));
             }
             tick += 1;
             let span = info_span!("agent.tick", tick);
@@ -209,24 +217,30 @@ impl<D: Decide> Agent<D> {
                 // queue against the deadline as usual.
                 let is_correction = pending_correction.is_some();
                 if !is_correction {
-                    // `biased;` makes tokio poll arms in declaration order
-                    // rather than randomly. The queue arm is listed first
-                    // so that when both are ready (the prior tick took
-                    // longer than `idle_period`, leaving an elapsed
-                    // deadline alongside buffered triggers), the queue
-                    // wins and we don't push a spurious `ScheduledWake`
-                    // onto a queue that already has work. `ScheduledWake`
-                    // should mean "the idle period elapsed without other
-                    // work" — a stronger semantic than tokio's default
-                    // tie-break gives us — and pinning it here keeps the
-                    // bundle deterministic across runs that share world
-                    // state.
-                    tokio::select! {
-                        biased;
-                        _ = triggers.wait_nonempty() => {}
-                        _ = sleep_until(scheduler.next_deadline()) => {
-                            triggers.push(Trigger::ScheduledWake);
+                    if arm_self_wake(never, tick == 1) {
+                        // `biased;` makes tokio poll arms in declaration order
+                        // rather than randomly. The queue arm is listed first
+                        // so that when both are ready (the prior tick took
+                        // longer than `idle_period`, leaving an elapsed
+                        // deadline alongside buffered triggers), the queue
+                        // wins and we don't push a spurious `ScheduledWake`
+                        // onto a queue that already has work. `ScheduledWake`
+                        // should mean "the idle period elapsed without other
+                        // work" — a stronger semantic than tokio's default
+                        // tie-break gives us — and pinning it here keeps the
+                        // bundle deterministic across runs that share world
+                        // state.
+                        tokio::select! {
+                            biased;
+                            _ = triggers.wait_nonempty() => {}
+                            _ = sleep_until(scheduler.next_deadline()) => {
+                                triggers.push(Trigger::ScheduledWake);
+                            }
                         }
+                    } else {
+                        // `never` cadence past the first cycle: no self-wake
+                        // timer, so block until a trigger arrives.
+                        triggers.wait_nonempty().await;
                     }
                 }
 
@@ -655,14 +669,14 @@ mod tests {
                 script: StdMutex::new(vec![
                     // Tick 1: idle → loop continues.
                     resp(s.clone(), idle_call()),
-                    // Tick 2: idle again; `max_ticks` stops the loop after it.
+                    // Tick 2: idle again; `step_cap` stops the loop after it.
                     resp(stats(3, 2, 5), idle_call()),
                 ]),
             });
             let decide = LlmDecide::new(client, CompleteOptions::default());
             let tmp = tempfile::TempDir::new().unwrap();
             // Small idle_period + a 2-tick cap so the loop runs both scripted
-            // ticks then retires on the `max_ticks` safety cap (the agent no
+            // ticks then retires on the `step_cap` backstop (the agent no
             // longer self-terminates).
             let mandate = Mandate::new("stats-test", std::time::Duration::from_millis(1), Some(2));
             let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
@@ -686,7 +700,7 @@ mod tests {
                     .await
                     .expect("agent retired")
                     .expect("run ok");
-            assert_eq!(reason, "max_ticks (2) reached");
+            assert_eq!(reason, "step_cap (2) reached");
 
             // Stats handle must reflect the *last* tick (the second idle),
             // not the first tick. LlmDecide resets its accumulator at the

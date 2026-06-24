@@ -1,5 +1,5 @@
 # Three scripted decisions for the smoke fixture. The Mandate caps the loop
-# at max_ticks = 3, so the agent retires cleanly after these three execute.
+# at step_cap = 3, so the agent retires cleanly after these three execute.
 #
 # Tick 1: invoke the echo tool. Produces an evidence record on disk whose id
 # is sha256(canonical_json({"args":{"hello":"smoke"},"result":{"echoed":{"hello":"smoke"}},"tool":"echo"})).
@@ -8,5 +8,5 @@
 {"type":"call_tools","calls":[{"name":"echo","args":{"hello":"smoke"},"claim_seed":"seed-1"}]}
 # Tick 2: emit one output backed by that evidence id.
 {"type":"emit_output","content":"smoke test passed","evidence":["1d6a153a69d110156ca44ed281f859ca09d9875747e3ed16b9964c52632fd96e"]}
-# Tick 3: idle. The loop's max_ticks=3 cap retires the agent after this tick.
+# Tick 3: idle. The loop's step_cap=3 cap retires the agent after this tick.
 {"type":"idle","next_after":50}

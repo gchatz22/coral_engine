@@ -99,7 +99,7 @@ pub enum ToolKind {
 /// One node in the agent forest. `children:` makes the schema recursive;
 /// the validator DFS-walks the tree.
 ///
-/// `mandate.idle_period` is `Option<Duration>` because the top-level
+/// `mandate.idle_period` is `Option<Cadence>` because the top-level
 /// `defaults:` block may provide it; the validator reports a typed
 /// error if neither inline nor default supplies a value.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -128,22 +128,20 @@ pub struct Agent {
 pub struct Mandate {
     /// Free-form mandate text. YAML block scalars (`|`) are fine.
     pub text: String,
-    /// Wake cadence when no signal arrives. Accepts the
+    /// Self-wake cadence. Accepts the
     /// [`humantime`](https://docs.rs/humantime) duration grammar
-    /// (`100ms`, `5m`, `1h30m`, ...). Malformed values surface as
+    /// (`100ms`, `5m`, `1h30m`, ...) for a recurring self-wake, or the
+    /// literal **`never`** for an agent that self-wakes only its first cycle
+    /// and thereafter wakes solely on triggers (child/upstream updates,
+    /// human ops, external signals). Malformed values surface as
     /// [`GraphYamlError::Parse`] with a `line:col`.
     ///
     /// Optional so [`AgentDefaults::idle_period`] can supply the value;
     /// the validator emits [`GraphYamlError::MissingMandateIdlePeriod`]
     /// if neither inline nor default is present.
-    #[serde(default, deserialize_with = "deserialize_duration_opt")]
+    #[serde(default, deserialize_with = "deserialize_cadence_opt")]
     #[schemars(with = "Option<String>")]
-    pub idle_period: Option<Duration>,
-    /// Optional safety cap on loop iterations. `None` ⇒ no cap (agents
-    /// never self-terminate; only the cap, a `retire` signal, or teardown
-    /// stops a loop). May be supplied via [`AgentDefaults::max_ticks`].
-    #[serde(default)]
-    pub max_ticks: Option<u64>,
+    pub idle_period: Option<Cadence>,
     /// Optional per-agent model override (e.g. `claude-opus-4-8` for a
     /// reconciling parent). Absent ⇒ the worker's configured default model.
     /// Interpreted within the worker's configured vendor; a model id that
@@ -163,14 +161,10 @@ pub struct Mandate {
 #[serde(deny_unknown_fields)]
 pub struct AgentDefaults {
     /// Default `idle_period` when an agent's inline value is absent.
-    /// Same `humantime` grammar as the inline field.
-    #[serde(default, deserialize_with = "deserialize_duration_opt")]
+    /// Same grammar as the inline field (a `humantime` duration or `never`).
+    #[serde(default, deserialize_with = "deserialize_cadence_opt")]
     #[schemars(with = "Option<String>")]
-    pub idle_period: Option<Duration>,
-    /// Default `max_ticks` when an agent's inline value is absent.
-    /// `None` ⇒ no cap by default.
-    #[serde(default)]
-    pub max_ticks: Option<u64>,
+    pub idle_period: Option<Cadence>,
 }
 
 /// `policy:` block — operator-level constraints. Pass-through only:
@@ -215,19 +209,30 @@ pub struct ExternalEnvelope {
     pub payload: serde_json::Value,
 }
 
-// --- duration deserializer -----------------------------------------------
+// --- cadence deserializer ------------------------------------------------
 
-/// Serde adapter for `Option<Duration>` using `humantime::parse_duration`.
-fn deserialize_duration_opt<'de, D>(de: D) -> Result<Option<Duration>, D::Error>
+/// An agent's self-wake cadence: a recurring interval, or `Never` (the agent
+/// self-wakes only its first cycle, then wakes solely on triggers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cadence {
+    Every(Duration),
+    Never,
+}
+
+/// Serde adapter for `Option<Cadence>`: the literal `"never"` maps to
+/// [`Cadence::Never`], any other string parses as a `humantime` duration
+/// ([`Cadence::Every`]), and an absent field is `None` (resolves to the
+/// default).
+fn deserialize_cadence_opt<'de, D>(de: D) -> Result<Option<Cadence>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let opt = Option::<String>::deserialize(de)?;
-    match opt {
-        Some(s) => humantime::parse_duration(&s)
-            .map(Some)
-            .map_err(|e| serde::de::Error::custom(format!("invalid duration {s:?}: {e}"))),
+    match Option::<String>::deserialize(de)? {
         None => Ok(None),
+        Some(s) if s.eq_ignore_ascii_case("never") => Ok(Some(Cadence::Never)),
+        Some(s) => humantime::parse_duration(&s)
+            .map(|d| Some(Cadence::Every(d)))
+            .map_err(|e| serde::de::Error::custom(format!("invalid cadence {s:?}: {e}"))),
     }
 }
 
@@ -523,16 +528,17 @@ pub fn is_multi_agent(g: &GraphYaml) -> bool {
 /// `idle_period` is resolvable; callers must have already run
 /// [`validate`].
 pub(crate) fn resolve_mandate(agent: &Agent, defaults: &Option<AgentDefaults>) -> NodeMandate {
-    let idle_period = agent
+    let cadence = agent
         .mandate
         .idle_period
         .or_else(|| defaults.as_ref().and_then(|d| d.idle_period))
         .expect("validate() should have rejected agents without idle_period");
-    let max_ticks = agent
-        .mandate
-        .max_ticks
-        .or_else(|| defaults.as_ref().and_then(|d| d.max_ticks));
-    let mut mandate = NodeMandate::new(agent.mandate.text.clone(), idle_period, max_ticks);
+    // `step_cap` is the harness-only runaway backstop, never authored in
+    // YAML; leave it `None` so the loop applies its interim default.
+    let mut mandate = match cadence {
+        Cadence::Every(d) => NodeMandate::new(agent.mandate.text.clone(), d, None),
+        Cadence::Never => NodeMandate::new_never(agent.mandate.text.clone(), None),
+    };
     mandate.model = agent.mandate.model.clone();
     mandate.tools = agent.tools.clone();
     mandate
@@ -918,7 +924,6 @@ agents:
         summary citing the resulting evidence id, then retire. Do not call any other tool; do not loop;
         do not idle except as a last resort.
       idle_period: 1s
-      max_ticks: 8
     tools: [echo]
 seed:
   triggers:
@@ -953,8 +958,10 @@ seed:
         let agent = &g.agents[0];
         assert_eq!(agent.id, "root");
         assert_eq!(agent.tools, vec!["echo".to_string()]);
-        assert_eq!(agent.mandate.idle_period, Some(Duration::from_secs(1)));
-        assert_eq!(agent.mandate.max_ticks, Some(8));
+        assert_eq!(
+            agent.mandate.idle_period,
+            Some(Cadence::Every(Duration::from_secs(1)))
+        );
         assert_eq!(g.seed.triggers.len(), 1);
         let trigger = &g.seed.triggers[0];
         assert_eq!(trigger.agent, "root");
@@ -979,8 +986,8 @@ seed:
     #[test]
     fn rejects_mandate_from_file() {
         let yaml = HAPPY_YAML.replace(
-            "    mandate:\n      text: |\n        Your task: call the `echo` tool exactly once with arguments {\"msg\": \"hello from temporal\"},\n        then on the next tick emit an Output via the `emit_output` decision whose `content` is a short\n        summary citing the resulting evidence id, then retire. Do not call any other tool; do not loop;\n        do not idle except as a last resort.\n      idle_period: 1s\n      max_ticks: 8\n",
-            "    mandate:\n      text: stub\n      from_file: ./mandates/root.md\n      idle_period: 1s\n      max_ticks: 8\n",
+            "    mandate:\n      text: |\n        Your task: call the `echo` tool exactly once with arguments {\"msg\": \"hello from temporal\"},\n        then on the next tick emit an Output via the `emit_output` decision whose `content` is a short\n        summary citing the resulting evidence id, then retire. Do not call any other tool; do not loop;\n        do not idle except as a last resort.\n      idle_period: 1s\n",
+            "    mandate:\n      text: stub\n      from_file: ./mandates/root.md\n      idle_period: 1s\n",
         );
         let err = parse_err(&yaml);
         let msg = format!("{err}");
@@ -1046,7 +1053,7 @@ seed:
     #[test]
     fn rejects_zero_agents() {
         let yaml = HAPPY_YAML.replace(
-            "agents:\n  - id: root\n    mandate:\n      text: |\n        Your task: call the `echo` tool exactly once with arguments {\"msg\": \"hello from temporal\"},\n        then on the next tick emit an Output via the `emit_output` decision whose `content` is a short\n        summary citing the resulting evidence id, then retire. Do not call any other tool; do not loop;\n        do not idle except as a last resort.\n      idle_period: 1s\n      max_ticks: 8\n    tools: [echo]\n",
+            "agents:\n  - id: root\n    mandate:\n      text: |\n        Your task: call the `echo` tool exactly once with arguments {\"msg\": \"hello from temporal\"},\n        then on the next tick emit an Output via the `emit_output` decision whose `content` is a short\n        summary citing the resulting evidence id, then retire. Do not call any other tool; do not loop;\n        do not idle except as a last resort.\n      idle_period: 1s\n    tools: [echo]\n",
             "agents: []\n",
         );
         let err = validate_err(&yaml);
@@ -1275,41 +1282,54 @@ seed:
     // --- Duration parser ----------------------------------------------
 
     #[test]
-    fn duration_accepts_100ms() {
+    fn cadence_accepts_100ms() {
         let yaml = HAPPY_YAML.replace("      idle_period: 1s\n", "      idle_period: 100ms\n");
         let g = parse_graph_yaml(&yaml).unwrap();
         assert_eq!(
             g.agents[0].mandate.idle_period,
-            Some(Duration::from_millis(100))
+            Some(Cadence::Every(Duration::from_millis(100)))
         );
     }
 
     #[test]
-    fn duration_accepts_5m() {
+    fn cadence_accepts_5m() {
         let yaml = HAPPY_YAML.replace("      idle_period: 1s\n", "      idle_period: 5m\n");
         let g = parse_graph_yaml(&yaml).unwrap();
         assert_eq!(
             g.agents[0].mandate.idle_period,
-            Some(Duration::from_secs(5 * 60))
+            Some(Cadence::Every(Duration::from_secs(5 * 60)))
         );
     }
 
     #[test]
-    fn duration_accepts_1h() {
+    fn cadence_accepts_1h() {
         let yaml = HAPPY_YAML.replace("      idle_period: 1s\n", "      idle_period: 1h\n");
         let g = parse_graph_yaml(&yaml).unwrap();
         assert_eq!(
             g.agents[0].mandate.idle_period,
-            Some(Duration::from_secs(3600))
+            Some(Cadence::Every(Duration::from_secs(3600)))
         );
     }
 
     #[test]
-    fn duration_rejects_garbage() {
+    fn cadence_accepts_never_sentinel() {
+        let yaml = HAPPY_YAML.replace("      idle_period: 1s\n", "      idle_period: never\n");
+        let g = parse_graph_yaml(&yaml).unwrap();
+        assert_eq!(g.agents[0].mandate.idle_period, Some(Cadence::Never));
+        // A `never` cadence is an explicit value, so the validator accepts it
+        // (it is not the "missing idle_period" case).
+        validate(&g).expect("never cadence is a valid authored value");
+        // And it resolves to a `never` NodeMandate (no recurring self-wake).
+        let mandate = resolve_mandate(&g.agents[0], &g.defaults);
+        assert!(mandate.is_never());
+    }
+
+    #[test]
+    fn cadence_rejects_garbage() {
         let yaml = HAPPY_YAML.replace("      idle_period: 1s\n", "      idle_period: garbage\n");
         let err = parse_err(&yaml);
         let msg = format!("{err}");
-        assert!(msg.contains("invalid duration"), "{msg}");
+        assert!(msg.contains("invalid cadence"), "{msg}");
         assert!(msg.contains("garbage"), "{msg}");
     }
 
@@ -1410,8 +1430,10 @@ seed:
             "mandate text propagated: {}",
             input.mandate.text,
         );
-        assert_eq!(input.mandate.idle_period, Duration::from_secs(1));
-        assert_eq!(input.mandate.max_ticks, Some(8));
+        assert_eq!(input.mandate.idle_period, Some(Duration::from_secs(1)));
+        // `step_cap` is the harness-only runaway backstop; YAML never
+        // authors it, so the resolved mandate leaves it `None`.
+        assert!(input.mandate.step_cap.is_none());
         // Absent `model:` ⇒ None (worker's configured default model).
         assert!(input.mandate.model.is_none());
 
@@ -1443,17 +1465,18 @@ seed:
         let graph_id = coral_node::agent_ref::GraphId::new(uuid::Uuid::new_v4());
         let agent_id = coral_node::agent_ref::AgentId::new(uuid::Uuid::new_v4());
         let input = super::into_agent_input(&g, graph_id, agent_id);
-        assert_eq!(input.mandate.idle_period, Duration::from_millis(100));
+        assert_eq!(input.mandate.idle_period, Some(Duration::from_millis(100)));
     }
 
     #[test]
-    fn into_agent_input_propagates_max_ticks_none_when_absent() {
-        let yaml = HAPPY_YAML.replace("      max_ticks: 8\n", "");
-        let g = parse_and_validate(&yaml).expect("happy path");
+    fn into_agent_input_resolves_never_cadence_to_none_idle_period() {
+        let yaml = HAPPY_YAML.replace("      idle_period: 1s\n", "      idle_period: never\n");
+        let g = parse_and_validate(&yaml).expect("never cadence is valid");
         let graph_id = coral_node::agent_ref::GraphId::new(uuid::Uuid::new_v4());
         let agent_id = coral_node::agent_ref::AgentId::new(uuid::Uuid::new_v4());
         let input = super::into_agent_input(&g, graph_id, agent_id);
-        assert!(input.mandate.max_ticks.is_none());
+        assert!(input.mandate.is_never());
+        assert!(input.mandate.idle_period.is_none());
     }
 
     #[test]
@@ -1636,7 +1659,7 @@ policy:
         assert!(g.defaults.is_some());
         assert_eq!(
             g.defaults.as_ref().unwrap().idle_period,
-            Some(Duration::from_secs(3600))
+            Some(Cadence::Every(Duration::from_secs(3600)))
         );
         // drug-alpha has no inline idle_period; the validator allows
         // that only because defaults provides one.
@@ -1670,7 +1693,7 @@ policy:
         let root = &g.agents[0];
         let alpha = root.children.iter().find(|a| a.id == "drug-alpha").unwrap();
         let mandate = super::resolve_mandate(alpha, &g.defaults);
-        assert_eq!(mandate.idle_period, Duration::from_secs(3600));
+        assert_eq!(mandate.idle_period, Some(Duration::from_secs(3600)));
         assert_eq!(mandate.text, "Watch Drug Alpha");
     }
 
@@ -1679,7 +1702,7 @@ policy:
         let g = parse_and_validate(HIERARCHICAL_YAML).expect("happy");
         let root = &g.agents[0];
         let mandate = super::resolve_mandate(root, &g.defaults);
-        assert_eq!(mandate.idle_period, Duration::from_secs(4 * 3600));
+        assert_eq!(mandate.idle_period, Some(Duration::from_secs(4 * 3600)));
     }
 
     #[test]
@@ -1903,7 +1926,7 @@ seed:
             .unwrap();
         assert_eq!(
             alpha_start.input.mandate.idle_period,
-            Duration::from_secs(3600)
+            Some(Duration::from_secs(3600))
         );
     }
 
@@ -2077,7 +2100,7 @@ seed:
         // (cadence/model/tools live in the DB + durable input, not the file).
         assert_eq!(text, starts[0].input.mandate.text);
         assert!(!text.contains("idle_period"), "config leaked: {text:?}");
-        assert!(!text.contains("max_ticks"), "config leaked: {text:?}");
+        assert!(!text.contains("step_cap"), "config leaked: {text:?}");
     }
 
     #[tokio::test]

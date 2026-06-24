@@ -59,7 +59,7 @@ USAGE:
     node-run-mcp <config.json> <triggers.jsonl> <fs_root> -- <cmd> [args...]
 
 ARGS:
-    <config.json>     JSON-serialized Mandate (text, idle_period ms, max_ticks).
+    <config.json>     JSON-serialized Mandate (text, idle_period ms, step_cap).
                       A sibling `decisions.jsonl` in the same directory scripts
                       the MockDecide (one JSON Decision per line).
     <triggers.jsonl>  One JSON object per line. Either a bare Trigger or an

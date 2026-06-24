@@ -52,11 +52,28 @@ impl RetryPolicy {
     }
 }
 
+/// Interim runaway backstop applied when a mandate carries no explicit
+/// `step_cap`: the loop retires once its cycle counter reaches this value.
+/// A coarse ceiling sized to catch a genuinely runaway agent, not to bound a
+/// legitimate long-lived monitor — but it *is* a hard ceiling, so a monitor
+/// that cycles long enough will eventually hit it. Temporary scaffolding
+/// until the budget primitive becomes the sole runaway guard (the design's
+/// end state has no iteration cap); it is not an authoring knob.
+pub const INTERIM_STEP_CAP: u64 = 1_000_000;
+
 /// What an agent has been told to do, and how patient to be about it.
 ///
-/// `idle_period` is the wake cadence when no signal arrives. `max_ticks`
-/// is an optional safety cap on loop iterations; `None` means "run until
-/// `Retire`."
+/// `idle_period` is the self-wake cadence: `Some(d)` wakes the agent every
+/// `d` when no signal arrives; `None` is the **"never"** cadence — the agent
+/// self-wakes only its first cycle, then waits for triggers (child/upstream
+/// updates, human ops, external signals) and never re-arms a self-wake
+/// timer. An agent never self-terminates; the loop stops only via a
+/// retire signal, teardown, or the runaway `step_cap` backstop.
+///
+/// `step_cap` is the interim runaway backstop, in cycles. `None` falls back
+/// to [`INTERIM_STEP_CAP`]. It is deliberately **not** part of the authoring
+/// surface (no `graph.yaml` field): the test harness sets a small value to
+/// terminate hermetically; operators rely on cadence + budget.
 ///
 /// `retry_policy` is an optional per-mandate override for the retry
 /// behaviour of any `McpTool`s registered for this agent (see
@@ -69,9 +86,10 @@ impl RetryPolicy {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mandate {
     pub text: String,
-    #[serde(with = "crate::duration_ms")]
-    pub idle_period: Duration,
-    pub max_ticks: Option<u64>,
+    #[serde(with = "crate::duration_ms_opt")]
+    pub idle_period: Option<Duration>,
+    #[serde(default)]
+    pub step_cap: Option<u64>,
     /// Per-mandate retry policy override. `None` (the default and the
     /// serialized shape when absent) leaves `RetryPolicy::default()` in
     /// place.
@@ -100,20 +118,43 @@ pub struct Mandate {
 }
 
 impl Mandate {
-    /// Convenience constructor. Retry policy defaults to `None` (uses
+    /// Convenience constructor for the recurring-cadence case: the agent
+    /// self-wakes every `idle_period`. Retry policy defaults to `None` (uses
     /// `RetryPolicy::default()` at tool-construction time) and context
     /// policy defaults to `ContextPolicy::default()`. `tools` defaults to
-    /// empty — set it explicitly for an agent that calls tools.
-    pub fn new(text: impl Into<String>, idle_period: Duration, max_ticks: Option<u64>) -> Self {
+    /// empty — set it explicitly for an agent that calls tools. `step_cap`
+    /// is the interim runaway backstop; `None` falls back to
+    /// [`INTERIM_STEP_CAP`].
+    pub fn new(text: impl Into<String>, idle_period: Duration, step_cap: Option<u64>) -> Self {
         Self {
             text: text.into(),
-            idle_period,
-            max_ticks,
+            idle_period: Some(idle_period),
+            step_cap,
             retry_policy: None,
             context_policy: ContextPolicy::default(),
             model: None,
             tools: Vec::new(),
         }
+    }
+
+    /// Constructor for the **"never"** cadence: the agent self-wakes only its
+    /// first cycle, then waits for triggers and never re-arms a self-wake
+    /// timer. Other defaults match [`Mandate::new`].
+    pub fn new_never(text: impl Into<String>, step_cap: Option<u64>) -> Self {
+        Self {
+            text: text.into(),
+            idle_period: None,
+            step_cap,
+            retry_policy: None,
+            context_policy: ContextPolicy::default(),
+            model: None,
+            tools: Vec::new(),
+        }
+    }
+
+    /// Whether this mandate's cadence is **"never"** — no recurring self-wake.
+    pub fn is_never(&self) -> bool {
+        self.idle_period.is_none()
     }
 }
 
@@ -278,11 +319,31 @@ mod tests {
     }
 
     #[test]
-    fn mandate_round_trip_with_no_max_ticks() {
+    fn mandate_round_trip_with_no_step_cap() {
         let m = Mandate::new("watch", Duration::from_secs(30), None);
         let s = serde_json::to_string(&m).unwrap();
         let back: Mandate = serde_json::from_str(&s).unwrap();
         assert_eq!(m, back);
+    }
+
+    #[test]
+    fn never_mandate_round_trips_with_null_idle_period() {
+        let m = Mandate::new_never("wait for children", Some(3));
+        assert!(m.is_never());
+        let s = serde_json::to_string(&m).unwrap();
+        // The "never" cadence serializes as a null idle_period.
+        assert!(s.contains("\"idle_period\":null"), "got {s}");
+        let back: Mandate = serde_json::from_str(&s).unwrap();
+        assert_eq!(m, back);
+        assert!(back.is_never());
+        assert_eq!(back.step_cap, Some(3));
+    }
+
+    #[test]
+    fn new_is_recurring_cadence_not_never() {
+        let m = Mandate::new("watch", Duration::from_secs(30), None);
+        assert!(!m.is_never());
+        assert_eq!(m.idle_period, Some(Duration::from_secs(30)));
     }
 
     #[test]
@@ -309,8 +370,8 @@ mod tests {
     fn mandate_round_trip_with_retry_policy_override() {
         let m = Mandate {
             text: "tune retry".into(),
-            idle_period: Duration::from_millis(100),
-            max_ticks: Some(1),
+            idle_period: Some(Duration::from_millis(100)),
+            step_cap: Some(1),
             retry_policy: Some(RetryPolicy::new(5, Duration::from_millis(10))),
             context_policy: ContextPolicy::default(),
             model: None,
@@ -335,27 +396,28 @@ mod tests {
         // Legacy mandate JSON without the `retry_policy` or
         // `context_policy` keys: `#[serde(default)]` must fill in the
         // defaults rather than reject the input.
-        let legacy = r#"{"text":"old","idle_period":250,"max_ticks":null}"#;
+        let legacy = r#"{"text":"old","idle_period":250}"#;
         let back: Mandate = serde_json::from_str(legacy).unwrap();
         assert!(back.retry_policy.is_none());
         assert_eq!(back.text, "old");
-        assert_eq!(back.idle_period, Duration::from_millis(250));
-        assert_eq!(back.max_ticks, None);
+        assert_eq!(back.idle_period, Some(Duration::from_millis(250)));
+        assert_eq!(back.step_cap, None);
         assert_eq!(back.context_policy, ContextPolicy::default());
     }
 
     #[test]
-    fn mandate_deserializes_input_still_carrying_removed_persistent_field() {
-        // Persistence is now universal — `Mandate` carries no `persistent`
-        // field. An in-flight durable `AgentInput` serialized before the
-        // removal may still carry `persistent`; `Mandate` has no
-        // `deny_unknown_fields`, so the stale key is dropped on deserialize
-        // rather than rejected. This keeps continue-as-new replay safe
-        // across the field removal.
-        let stale = r#"{"text":"old","idle_period":250,"max_ticks":null,"persistent":true}"#;
+    fn mandate_deserializes_input_still_carrying_removed_max_ticks_field() {
+        // `max_ticks` was relocated to the harness-only `step_cap`. An
+        // in-flight durable `AgentInput` serialized before the removal may
+        // still carry `max_ticks`; `Mandate` has no `deny_unknown_fields`, so
+        // the stale key is dropped on deserialize rather than rejected (and
+        // `step_cap` falls back to its default). This keeps continue-as-new
+        // replay safe across the field removal.
+        let stale = r#"{"text":"old","idle_period":250,"max_ticks":8,"persistent":true}"#;
         let back: Mandate = serde_json::from_str(stale).unwrap();
         assert_eq!(back.text, "old");
-        assert_eq!(back.idle_period, Duration::from_millis(250));
+        assert_eq!(back.idle_period, Some(Duration::from_millis(250)));
+        assert_eq!(back.step_cap, None);
     }
 
     #[test]
@@ -441,8 +503,8 @@ mod tests {
     fn mandate_round_trip_with_context_policy_override() {
         let m = Mandate {
             text: "tune context".into(),
-            idle_period: Duration::from_millis(100),
-            max_ticks: Some(1),
+            idle_period: Some(Duration::from_millis(100)),
+            step_cap: Some(1),
             retry_policy: None,
             context_policy: ContextPolicy {
                 recent_outputs: 2,
