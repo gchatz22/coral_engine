@@ -81,6 +81,9 @@ pub struct ExecuteToolInput {
     /// Graph the calling agent belongs to. Selects the per-graph
     /// [`ToolRegistry`] the dispatch resolves against.
     pub graph_id: GraphId,
+    /// The calling agent's assigned tool def ids (`Mandate.tools`). Dispatch
+    /// rejects a call whose advertised name resolves to no assigned def.
+    pub allowed_tools: Vec<String>,
     pub call: ToolCall,
 }
 
@@ -173,15 +176,29 @@ pub struct RegisterChildInStructuralDbInput {
     pub parent_graph_id: GraphId,
     pub parent_agent_id: AgentId,
     pub child_agent_name: String,
+    /// The tool def ids the parent is granting the child (the child's
+    /// `Mandate.tools`). Validated against the graph's defined tools before
+    /// any row is written — a parent may grant only graph-defined tools.
+    pub child_tools: Vec<String>,
 }
 
-/// Output of the `register_child_in_structural_db` activity. Returns
-/// the child's freshly-allocated `AgentId` so the workflow body can
-/// construct the child workflow id (`graphs/<gid>/agents/<aid>`) and
-/// pass it to `ctx.child_workflow(..)`.
+/// Outcome of the `register_child_in_structural_db` activity.
+///
+/// A spawn that grants a tool the graph doesn't define is a model error,
+/// not an infra failure: it surfaces as `RejectedUnknownTool` (data the
+/// workflow folds into next-tick correction) rather than an `ActivityError`,
+/// so the parent keeps running and the model can retry with a valid grant.
+/// Genuine write failures still surface as `Err` from the activity.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RegisterChildInStructuralDbOutput {
-    pub child_agent_id: AgentId,
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum RegisterChildOutcome {
+    /// Child row + parent→child edge written. Carries the freshly-allocated
+    /// `AgentId` so the workflow body can construct the child workflow id
+    /// (`graphs/<gid>/agents/<aid>`) and pass it to `ctx.child_workflow(..)`.
+    Registered { child_agent_id: AgentId },
+    /// The grant named a tool def id the graph does not define; nothing was
+    /// written. Carries the offending id for the correction text.
+    RejectedUnknownTool { tool: String },
 }
 
 /// Input to the `reconcile_children` activity. Carries the parent's
@@ -516,6 +533,20 @@ impl AgentActivities {
                 });
             }
         };
+        // Per-agent scoping: the model calls a tool by its advertised name;
+        // allow it only if some def that advertises that name is in the
+        // caller's assigned set. A rejection folds into next-tick correction
+        // (a `Failure`, not an `ActivityError`) — same path as a call error —
+        // so the model sees why and can pick an assigned tool instead.
+        if !registry.is_call_allowed(&input.call.name, &input.allowed_tools) {
+            return Ok(ToolCallOutcome::Failure {
+                failure: ToolCallFailure {
+                    tool: input.call.name.clone(),
+                    args: input.call.args.clone(),
+                    error: format!("tool {:?} is not assigned to this agent", input.call.name),
+                },
+            });
+        }
         // One-shot dispatch — the tool implementation owns its retry
         // policy; another retry layer here would compound them.
         let call_result = registry
@@ -686,7 +717,7 @@ impl AgentActivities {
     pub async fn register_child_in_structural_db(
         _ctx: ActivityContext,
         input: RegisterChildInStructuralDbInput,
-    ) -> Result<RegisterChildInStructuralDbOutput, ActivityError> {
+    ) -> Result<RegisterChildOutcome, ActivityError> {
         let store = structural_db_store();
         let out = register_child_in_structural_db_impl(store, input).await?;
         Ok(out)
@@ -758,14 +789,27 @@ impl AgentActivities {
 pub async fn register_child_in_structural_db_impl(
     store: std::sync::Arc<dyn crate::worker::StructuralDbStore>,
     input: RegisterChildInStructuralDbInput,
-) -> anyhow::Result<RegisterChildInStructuralDbOutput> {
+) -> anyhow::Result<RegisterChildOutcome> {
+    // Validate the grant before writing any rows: a parent may grant only
+    // tools the graph defines. A bad grant is a model error, not infra
+    // failure — return it as data so the workflow folds it into next-tick
+    // correction instead of terminating the parent. Dispatch enforces the
+    // same boundary again on the child's own calls.
+    if !input.child_tools.is_empty() {
+        let defined = store
+            .list_tool_def_ids_for_graph(input.parent_graph_id)
+            .await?;
+        if let Some(tool) = input.child_tools.iter().find(|t| !defined.contains(t)) {
+            return Ok(RegisterChildOutcome::RejectedUnknownTool { tool: tool.clone() });
+        }
+    }
     let child_agent_id = store
         .add_agent(input.parent_graph_id, &input.child_agent_name)
         .await?;
     store
         .add_edge(input.parent_agent_id, child_agent_id)
         .await?;
-    Ok(RegisterChildInStructuralDbOutput { child_agent_id })
+    Ok(RegisterChildOutcome::Registered { child_agent_id })
 }
 
 /// Substantive body of [`AgentActivities::reconcile_children`],
@@ -1106,11 +1150,13 @@ mod tests {
                 prefix: "g1/a1".into(),
             },
             graph_id,
+            allowed_tools: vec!["echo-tool".into()],
             call: ToolCall::new("echo", json!({"msg": "hi"}), ClaimSeed::new("s")),
         };
         let s = serde_json::to_string(&i).unwrap();
         let back: ExecuteToolInput = serde_json::from_str(&s).unwrap();
         assert_eq!(back.graph_id, graph_id);
+        assert_eq!(back.allowed_tools, vec!["echo-tool".to_string()]);
     }
 
     #[test]
@@ -1677,13 +1723,19 @@ mod tests {
     struct MemoryStructuralDbStore {
         agents: std::sync::Mutex<Vec<RecordedAgent>>,
         edges: std::sync::Mutex<Vec<(AgentId, AgentId)>>,
+        defined_tools: Vec<String>,
     }
 
     impl MemoryStructuralDbStore {
         fn new() -> Self {
+            Self::with_tools(Vec::new())
+        }
+
+        fn with_tools(defined_tools: Vec<String>) -> Self {
             Self {
                 agents: std::sync::Mutex::new(Vec::new()),
                 edges: std::sync::Mutex::new(Vec::new()),
+                defined_tools,
             }
         }
     }
@@ -1711,6 +1763,13 @@ mod tests {
                 .push((parent_agent_id, child_agent_id));
             Ok(())
         }
+
+        async fn list_tool_def_ids_for_graph(
+            &self,
+            _graph_id: GraphId,
+        ) -> anyhow::Result<Vec<String>> {
+            Ok(self.defined_tools.clone())
+        }
     }
 
     /// Activity-body hermetic coverage: the helper writes one agent
@@ -1730,21 +1789,77 @@ mod tests {
                 parent_graph_id,
                 parent_agent_id,
                 child_agent_name: "fetcher".into(),
+                child_tools: Vec::new(),
             },
         )
         .await
         .expect("activity body ok");
 
+        let RegisterChildOutcome::Registered { child_agent_id } = out else {
+            panic!("expected Registered, got {out:?}");
+        };
         let agents = fake.agents.lock().unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].graph_id, parent_graph_id);
         assert_eq!(agents[0].name, "fetcher");
-        assert_eq!(agents[0].allocated_id, out.child_agent_id);
+        assert_eq!(agents[0].allocated_id, child_agent_id);
 
         let edges = fake.edges.lock().unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].0, parent_agent_id);
-        assert_eq!(edges[0].1, out.child_agent_id);
+        assert_eq!(edges[0].1, child_agent_id);
+    }
+
+    /// A granted tool the graph defines is accepted; one it doesn't is
+    /// rejected as data (no rows written) so the workflow can fold it into
+    /// next-tick correction rather than terminating the parent.
+    #[tokio::test]
+    async fn register_child_validates_granted_tools_against_graph_defs() {
+        let parent_graph_id = GraphId::new(uuid::Uuid::new_v4());
+        let parent_agent_id = AgentId::new(uuid::Uuid::new_v4());
+
+        // Grant a subset of the graph's defs → registered.
+        let fake = std::sync::Arc::new(MemoryStructuralDbStore::with_tools(vec![
+            "web-search".into(),
+            "x-search".into(),
+        ]));
+        let store: std::sync::Arc<dyn crate::worker::StructuralDbStore> = fake.clone();
+        let out = register_child_in_structural_db_impl(
+            store,
+            RegisterChildInStructuralDbInput {
+                parent_graph_id,
+                parent_agent_id,
+                child_agent_name: "fetcher".into(),
+                child_tools: vec!["web-search".into()],
+            },
+        )
+        .await
+        .expect("subset grant ok");
+        assert!(matches!(out, RegisterChildOutcome::Registered { .. }));
+        assert_eq!(fake.agents.lock().unwrap().len(), 1);
+
+        // Grant a tool the graph doesn't define → rejected, nothing written.
+        let fake2 = std::sync::Arc::new(MemoryStructuralDbStore::with_tools(vec![
+            "web-search".into()
+        ]));
+        let store2: std::sync::Arc<dyn crate::worker::StructuralDbStore> = fake2.clone();
+        let out = register_child_in_structural_db_impl(
+            store2,
+            RegisterChildInStructuralDbInput {
+                parent_graph_id,
+                parent_agent_id,
+                child_agent_name: "rogue".into(),
+                child_tools: vec!["web-search".into(), "rm-rf".into()],
+            },
+        )
+        .await
+        .expect("validation surfaces as data, not error");
+        assert!(matches!(
+            out,
+            RegisterChildOutcome::RejectedUnknownTool { ref tool } if tool == "rm-rf"
+        ));
+        assert!(fake2.agents.lock().unwrap().is_empty());
+        assert!(fake2.edges.lock().unwrap().is_empty());
     }
 
     /// Pin the wire shape of the activity's input/output types so a
@@ -1762,6 +1877,7 @@ mod tests {
                 Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap(),
             ),
             child_agent_name: "fetcher".into(),
+            child_tools: vec!["web-search".into()],
         };
         let s = serde_json::to_string(&i).unwrap();
         let back: RegisterChildInStructuralDbInput = serde_json::from_str(&s).unwrap();
@@ -1775,14 +1891,25 @@ mod tests {
     #[test]
     fn register_child_output_round_trips_through_json() {
         use uuid::Uuid;
-        let o = RegisterChildInStructuralDbOutput {
+        let registered = RegisterChildOutcome::Registered {
             child_agent_id: AgentId::new(
                 Uuid::parse_str("bbbbbbbb-cccc-dddd-eeee-ffffffffffff").unwrap(),
             ),
         };
-        let s = serde_json::to_string(&o).unwrap();
-        let back: RegisterChildInStructuralDbOutput = serde_json::from_str(&s).unwrap();
-        assert_eq!(o, back);
+        let s = serde_json::to_string(&registered).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RegisterChildOutcome>(&s).unwrap(),
+            registered
+        );
+
+        let rejected = RegisterChildOutcome::RejectedUnknownTool {
+            tool: "rm-rf".into(),
+        };
+        let s = serde_json::to_string(&rejected).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RegisterChildOutcome>(&s).unwrap(),
+            rejected
+        );
     }
 
     /// Wire-shape check for `AppendDecisionLogInput` + `DecisionLogEntry`.

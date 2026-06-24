@@ -52,6 +52,17 @@ static LIVE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const SUCCEEDING_TOOL_NAMES: &[&str] = &["tool_a", "tool_b", "tool_c"];
 const FAILING_TOOL_NAME: &str = "errbomb";
 
+/// Every tool the scripted agents call, as the `Mandate.tools` grant. Dispatch
+/// is scoped per agent, so a tool must be both registered (with a recorded
+/// owner) and granted on the mandate for a call to reach it.
+fn assigned_tools() -> Vec<String> {
+    SUCCEEDING_TOOL_NAMES
+        .iter()
+        .map(|s| s.to_string())
+        .chain(std::iter::once(FAILING_TOOL_NAME.to_string()))
+        .collect()
+}
+
 /// `Tool` impl with a configurable `name()` so the workflow_loop test
 /// can register three distinct names that all dispatch to the same
 /// in-memory body.
@@ -103,11 +114,16 @@ fn ensure_installed() -> Arc<MemoryStorage> {
                 name: (*name).into(),
             }))
             .expect("register alias echo tool");
+            // Dispatch is scoped per agent; these tests assign each tool to
+            // itself (def id == advertised name) and grant them on the
+            // scripted mandate (see `assigned_tools`).
+            reg.record_owner(name, name);
         }
         reg.register(Arc::new(FailingTool {
             name: FAILING_TOOL_NAME.into(),
         }))
         .expect("register failing tool");
+        reg.record_owner(FAILING_TOOL_NAME, FAILING_TOOL_NAME);
         install_tool_registry(Arc::new(reg));
     });
     SHARED_STORAGE.get().cloned().expect("storage installed")
@@ -295,6 +311,7 @@ async fn drive(
     input.fs_handle = coral_temporal::workflow::FsHandle {
         prefix: agent_prefix.into(),
     };
+    input.mandate.tools = assigned_tools();
     let handle = client
         .start_workflow(
             AgentWorkflow::run,
@@ -642,11 +659,12 @@ async fn run_partial_failure_test() -> Result<()> {
 }
 
 async fn drive_partial(client: Client, task_queue: &str, workflow_id: &str) -> Result<()> {
-    let input = AgentInput::new_for_test(
+    let mut input = AgentInput::new_for_test(
         GraphId::new(Uuid::new_v4()),
         AgentId::new(Uuid::new_v4()),
         "workflow-loop-pf-test",
     );
+    input.mandate.tools = assigned_tools();
     let handle = client
         .start_workflow(
             AgentWorkflow::run,

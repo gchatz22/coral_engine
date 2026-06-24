@@ -12,7 +12,7 @@
 //! the spawned subprocesses; those are torn down when the worker process
 //! exits and the OS reaps its children.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -27,11 +27,14 @@ use tracing::{info, warn};
 
 /// A deduplicated MCP server to spawn for a graph. `env` is sorted so two
 /// rows naming the same `(command, args, env)` collapse to one spawn.
+/// `def_ids` accumulates every tool def that resolved to this server, so the
+/// names it advertises can be attributed to all of them for dispatch scoping.
 #[derive(Debug, PartialEq, Eq)]
 struct McpServerSpec {
     command: String,
     args: Vec<String>,
     env: Vec<(String, String)>,
+    def_ids: Vec<String>,
 }
 
 /// Builds per-graph [`ToolRegistry`]s from the structural DB and caches them.
@@ -81,6 +84,14 @@ impl DbToolRegistryProvider {
                     "skipped MCP tool: a tool with this name is already registered"
                 );
             }
+            // Attribute every name this server registered to all defs that
+            // resolved to it, so dispatch scoping can map a call back to its
+            // owning def(s).
+            for name in &outcome.registered {
+                for def_id in &spec.def_ids {
+                    registry.record_owner(name, def_id);
+                }
+            }
             tool_names.extend(outcome.registered);
         }
 
@@ -88,6 +99,9 @@ impl DbToolRegistryProvider {
             registry
                 .register(Arc::new(EchoTool))
                 .context("registering builtin echo in per-graph registry")?;
+            for def_id in builtin_echo_def_ids(&rows) {
+                registry.record_owner("echo", def_id);
+            }
             tool_names.push("echo".to_string());
         }
 
@@ -122,10 +136,13 @@ impl ToolRegistryProvider for DbToolRegistryProvider {
 type McpSpecKey = (String, Vec<String>, Vec<(String, String)>);
 
 /// Parse the `mcp`-kind rows of a graph into deduplicated server specs.
-/// `builtin` rows are skipped (every registry already gets `echo`).
+/// `builtin` rows are skipped (every registry already gets `echo`). Rows
+/// that collapse to the same `(command, args, env)` merge their def ids onto
+/// the single spec, so an advertised name can be attributed to every def
+/// that resolved to that server.
 fn mcp_specs_from_rows(rows: &[ToolRecord]) -> Result<Vec<McpServerSpec>> {
-    let mut seen: HashSet<McpSpecKey> = HashSet::new();
-    let mut specs = Vec::new();
+    let mut index: HashMap<McpSpecKey, usize> = HashMap::new();
+    let mut specs: Vec<McpServerSpec> = Vec::new();
     for row in rows {
         if row.kind != "mcp" {
             continue;
@@ -139,11 +156,29 @@ fn mcp_specs_from_rows(rows: &[ToolRecord]) -> Result<Vec<McpServerSpec>> {
         let env = parse_env(&row.env_refs)
             .with_context(|| format!("parsing env for mcp command {command:?}"))?;
         let key = (command.clone(), args.clone(), env.clone());
-        if seen.insert(key) {
-            specs.push(McpServerSpec { command, args, env });
+        match index.get(&key) {
+            Some(&i) => specs[i].def_ids.push(row.def_id.clone()),
+            None => {
+                index.insert(key, specs.len());
+                specs.push(McpServerSpec {
+                    command,
+                    args,
+                    env,
+                    def_ids: vec![row.def_id.clone()],
+                });
+            }
         }
     }
     Ok(specs)
+}
+
+/// The def ids of every `builtin` row whose command is `echo`. The builtin
+/// `echo` is registered once per graph regardless of how many defs declare
+/// it; this attributes that one tool to each declaring def for scoping.
+fn builtin_echo_def_ids(rows: &[ToolRecord]) -> impl Iterator<Item = &str> {
+    rows.iter()
+        .filter(|r| r.kind == "builtin" && r.command.as_deref() == Some("echo"))
+        .map(|r| r.def_id.as_str())
 }
 
 fn parse_args(value: &serde_json::Value) -> Result<Vec<String>> {
@@ -188,6 +223,7 @@ mod tests {
     use uuid::Uuid;
 
     fn tool(
+        def_id: &str,
         kind: &str,
         command: Option<&str>,
         args: serde_json::Value,
@@ -196,6 +232,7 @@ mod tests {
         ToolRecord {
             id: Uuid::nil(),
             graph_id: Uuid::nil(),
+            def_id: def_id.to_string(),
             kind: kind.to_string(),
             command: command.map(str::to_owned),
             args,
@@ -209,8 +246,9 @@ mod tests {
     #[test]
     fn skips_builtin_and_parses_mcp_rows() {
         let rows = vec![
-            tool("builtin", Some("echo"), json!([]), json!([])),
+            tool("echo-tool", "builtin", Some("echo"), json!([]), json!([])),
             tool(
+                "web",
                 "mcp",
                 Some("mcp-web"),
                 json!(["--json", "--quiet"]),
@@ -221,6 +259,7 @@ mod tests {
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].command, "mcp-web");
         assert_eq!(specs[0].args, vec!["--json", "--quiet"]);
+        assert_eq!(specs[0].def_ids, vec!["web".to_string()]);
         // env sorted by key for a canonical dedup key + deterministic spawn.
         assert_eq!(
             specs[0].env,
@@ -232,22 +271,41 @@ mod tests {
     }
 
     #[test]
-    fn dedups_identical_servers() {
-        let a = tool("mcp", Some("srv"), json!(["--x"]), json!({"E": "1"}));
-        let b = tool("mcp", Some("srv"), json!(["--x"]), json!({"E": "1"}));
+    fn dedups_identical_servers_and_merges_def_ids() {
+        let a = tool("web", "mcp", Some("srv"), json!(["--x"]), json!({"E": "1"}));
+        let b = tool(
+            "web-alt",
+            "mcp",
+            Some("srv"),
+            json!(["--x"]),
+            json!({"E": "1"}),
+        );
         // Same command/args, different env → distinct spec.
-        let c = tool("mcp", Some("srv"), json!(["--x"]), json!({"E": "2"}));
+        let c = tool(
+            "web-e2",
+            "mcp",
+            Some("srv"),
+            json!(["--x"]),
+            json!({"E": "2"}),
+        );
         let specs = mcp_specs_from_rows(&[a, b, c]).expect("parse");
         assert_eq!(
             specs.len(),
             2,
             "identical (cmd,args,env) collapse; differing env stays"
         );
+        // The collapsed spec carries both defs that resolved to it, so its
+        // advertised names get attributed to each.
+        assert_eq!(
+            specs[0].def_ids,
+            vec!["web".to_string(), "web-alt".to_string()]
+        );
+        assert_eq!(specs[1].def_ids, vec!["web-e2".to_string()]);
     }
 
     #[test]
     fn empty_env_object_yields_no_pairs() {
-        let rows = vec![tool("mcp", Some("srv"), json!([]), json!({}))];
+        let rows = vec![tool("srv-tool", "mcp", Some("srv"), json!([]), json!({}))];
         let specs = mcp_specs_from_rows(&rows).expect("parse");
         assert_eq!(specs.len(), 1);
         assert!(specs[0].env.is_empty());
@@ -255,11 +313,23 @@ mod tests {
     }
 
     #[test]
+    fn builtin_echo_def_ids_collects_declaring_defs() {
+        let rows = vec![
+            tool("e1", "builtin", Some("echo"), json!([]), json!([])),
+            tool("e2", "builtin", Some("echo"), json!([]), json!([])),
+            tool("other", "builtin", Some("noop"), json!([]), json!([])),
+            tool("web", "mcp", Some("srv"), json!([]), json!({})),
+        ];
+        let ids: Vec<&str> = builtin_echo_def_ids(&rows).collect();
+        assert_eq!(ids, vec!["e1", "e2"]);
+    }
+
+    #[test]
     fn rejects_non_string_args_and_missing_command() {
-        let bad_args = vec![tool("mcp", Some("srv"), json!([1, 2]), json!({}))];
+        let bad_args = vec![tool("web", "mcp", Some("srv"), json!([1, 2]), json!({}))];
         assert!(mcp_specs_from_rows(&bad_args).is_err());
 
-        let no_command = vec![tool("mcp", None, json!([]), json!({}))];
+        let no_command = vec![tool("web", "mcp", None, json!([]), json!({}))];
         assert!(mcp_specs_from_rows(&no_command).is_err());
     }
 }

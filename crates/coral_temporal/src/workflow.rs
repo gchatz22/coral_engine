@@ -45,7 +45,7 @@ use temporalio_sdk::{
 use crate::activities::{
     AgentActivities, AppendDecisionLogInput, ApplyFsOpsInput, AssembleContextInput, DecideInput,
     ExecuteToolInput, PersistOutputInput, PersistRetirementInput, ReconcileChildrenInput,
-    RegisterChildInStructuralDbInput, ToolCallFailure, ToolCallOutcome,
+    RegisterChildInStructuralDbInput, RegisterChildOutcome, ToolCallFailure, ToolCallOutcome,
 };
 use coral_node::decision::{ConflictRecordIntent, ReconcileSource};
 
@@ -961,6 +961,7 @@ async fn dispatch_call_tools(
                 cfg: input.cfg.clone(),
                 fs_handle: input.fs_handle.clone(),
                 graph_id: input.graph_id,
+                allowed_tools: input.mandate.tools.clone(),
                 call,
             },
             activity_opts(),
@@ -1078,11 +1079,26 @@ async fn spawn_child(
                 parent_graph_id: input.graph_id,
                 parent_agent_id: input.agent_id,
                 child_agent_name: child_agent_name.clone(),
+                child_tools: child_mandate.tools.clone(),
             },
             activity_opts(),
         )
         .await?;
-    let child_agent_id = reg.child_agent_id;
+    let child_agent_id = match reg {
+        RegisterChildOutcome::Registered { child_agent_id } => child_agent_id,
+        // A grant the graph doesn't define is a model error: stage a
+        // correction so the next tick can re-decide, and leave the parent
+        // running rather than terminating it over a bad spawn.
+        RegisterChildOutcome::RejectedUnknownTool { tool } => {
+            ctx.state_mut(|s| {
+                s.staged_correction = Some(CorrectionContext::new(format!(
+                    "spawn rejected: tool {tool:?} is not defined in this graph; \
+                     grant the child only tools this graph defines"
+                )));
+            });
+            return Ok(());
+        }
+    };
 
     let child_workflow_id =
         agent_workflow_id(&input.graph_id.to_string(), &child_agent_id.to_string());

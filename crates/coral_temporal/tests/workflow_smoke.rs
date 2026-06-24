@@ -80,6 +80,9 @@ fn ensure_installed() -> Arc<MemoryStorage> {
             name: TOOL_NAME.into(),
         }))
         .expect("register echo tool");
+        // Dispatch is scoped per agent; assign the tool to itself (def id ==
+        // advertised name) and grant it on the scripted mandate below.
+        reg.record_owner(TOOL_NAME, TOOL_NAME);
         install_tool_registry(Arc::new(reg));
     });
     SHARED_STORAGE.get().cloned().expect("storage installed")
@@ -238,6 +241,7 @@ async fn drive(
     input.fs_handle = coral_temporal::workflow::FsHandle {
         prefix: agent_prefix.into(),
     };
+    input.mandate.tools = vec![TOOL_NAME.to_string()];
     let handle = client
         .start_workflow(
             AgentWorkflow::run,

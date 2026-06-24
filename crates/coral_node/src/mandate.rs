@@ -98,7 +98,9 @@ pub struct Mandate {
     /// The tools this agent is assigned, by definition id (a subset of the
     /// graph's tool defs). Tool definitions are graph-scoped; assignment is
     /// per-agent config that rides this durable input. Surfaced to the model
-    /// as its tool catalog. Empty (the default) means no tools assigned.
+    /// as its tool catalog and enforced at dispatch: a tool call whose
+    /// advertised name resolves to no assigned def is rejected. Empty (the
+    /// default) means no tools assigned — the agent can call none.
     #[serde(default)]
     pub tools: Vec<String>,
 }
