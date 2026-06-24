@@ -66,7 +66,7 @@ ARGS:
                       envelope: {\"delay_ms\": <u64>, \"trigger\": <Trigger>}.
                       Blank lines and lines starting with `#` are ignored.
     <fs_root>         Directory for the agent's per-agent FS layout
-                      (mandate.json, outputs/, evidence/, notes/, retirement.json).
+                      (mandate.md, outputs/, evidence/, notes/, retirement.json).
     --                Separates coral args from the MCP server spawn command.
     <cmd> [args...]   Executable + args that speak the MCP stdio protocol on
                       stdin/stdout. The process is spawned by this binary and
