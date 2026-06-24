@@ -182,6 +182,11 @@ pub trait StructuralDbStore: Send + Sync {
         parent_agent_id: AgentId,
         child_agent_id: AgentId,
     ) -> anyhow::Result<()>;
+
+    /// The operator-authored tool ids defined in a graph. The spawn path
+    /// validates a child's granted `Mandate.tools` against this set so a
+    /// parent can only grant tools the graph actually defines.
+    async fn list_tool_def_ids_for_graph(&self, graph_id: GraphId) -> anyhow::Result<Vec<String>>;
 }
 
 /// Process-wide [`StructuralDbStore`] backend the
@@ -395,6 +400,15 @@ mod tests {
                 _child_agent_id: AgentId,
             ) -> anyhow::Result<()> {
                 panic!("PanicStructuralDbStore::add_edge must not be called from this test")
+            }
+
+            async fn list_tool_def_ids_for_graph(
+                &self,
+                _graph_id: GraphId,
+            ) -> anyhow::Result<Vec<String>> {
+                panic!(
+                    "PanicStructuralDbStore::list_tool_def_ids_for_graph must not be called from this test"
+                )
             }
         }
     }

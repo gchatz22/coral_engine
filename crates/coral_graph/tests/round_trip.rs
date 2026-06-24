@@ -37,6 +37,7 @@ async fn applies_a_simple_parent_child_graph_and_reads_it_back(pool: PgPool) -> 
     let tool = store
         .register_tool(
             graph.id,
+            "echo-tool",
             "echo",
             Some("/bin/echo"),
             serde_json::json!(["hello", "from", "round_trip"]),

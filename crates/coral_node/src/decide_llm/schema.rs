@@ -152,7 +152,8 @@ pub fn decision_tools() -> Vec<ToolSpec> {
                  graphs/<graph_id>/agents/<new_agent_id>. The variant \
                  carries the agent's logical name + mandate. The mandate's \
                  `tools` list is the child's assigned tools (definition ids \
-                 from this graph's tools)."
+                 from this graph's tools); you may grant only tools this \
+                 graph defines — spawning with an undefined tool is rejected."
                 .into(),
             input_schema: json!({
                 "type": "object",

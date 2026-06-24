@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// A single side-effecting capability the runtime can invoke by name.
@@ -33,8 +33,17 @@ pub trait Tool: Send + Sync {
 /// Cheap to construct, cheap to clone the inner `Arc`s. Dispatch is by the
 /// string name so that adding a `call_batch(&self, calls)` extension later
 /// does not require changing existing tools.
+///
+/// `owners` maps each registered tool's advertised name to the operator
+/// def ids that contributed it (`graph.yaml` `tools[].id`). One def (one
+/// MCP server) advertises several names; two defs that dedup to the same
+/// server share all of those names, so the value is a *set*. Per-agent
+/// dispatch scoping ([`Self::is_call_allowed`]) resolves a call's advertised
+/// name through this map and checks the owning defs against the caller's
+/// assigned set.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    owners: HashMap<String, HashSet<String>>,
 }
 
 impl ToolRegistry {
@@ -42,7 +51,29 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            owners: HashMap::new(),
         }
+    }
+
+    /// Record that the tool advertised as `name` is owned by `def_id`. The
+    /// worker calls this for each name an MCP server (or builtin) registered,
+    /// so dispatch can later map the name back to its owning def(s). Safe to
+    /// call repeatedly for the same `(name, def_id)`; the def set is unioned.
+    pub fn record_owner(&mut self, name: &str, def_id: &str) {
+        self.owners
+            .entry(name.to_string())
+            .or_default()
+            .insert(def_id.to_string());
+    }
+
+    /// Is a call to the tool advertised as `name` permitted for an agent
+    /// assigned `allowed_defs`? True iff some def that owns `name` is in the
+    /// assigned set. An unknown name (no recorded owner) is rejected — the
+    /// agent may only call tools whose owning def it was granted.
+    pub fn is_call_allowed(&self, name: &str, allowed_defs: &[String]) -> bool {
+        self.owners
+            .get(name)
+            .is_some_and(|defs| defs.iter().any(|d| allowed_defs.iter().any(|a| a == d)))
     }
 
     /// Insert `tool` keyed on its `name()`. Returns `Err` if a tool is
@@ -182,6 +213,39 @@ mod tests {
             msg.contains("echo") && msg.contains("already"),
             "duplicate register error should name the tool, got: {msg}"
         );
+    }
+
+    #[test]
+    fn is_call_allowed_checks_owning_def_against_assignment() {
+        let mut reg = ToolRegistry::new();
+        // One MCP def (`web-search`) advertises two names.
+        reg.record_owner("web_search_exa", "web-search");
+        reg.record_owner("web_fetch_exa", "web-search");
+        reg.record_owner("post_x", "x-search");
+
+        let assigned = vec!["web-search".to_string()];
+        // Any advertised name of an assigned def is callable.
+        assert!(reg.is_call_allowed("web_search_exa", &assigned));
+        assert!(reg.is_call_allowed("web_fetch_exa", &assigned));
+        // A name owned only by an unassigned def is not.
+        assert!(!reg.is_call_allowed("post_x", &assigned));
+        // An unknown advertised name is rejected even with a non-empty grant.
+        assert!(!reg.is_call_allowed("rm_rf", &assigned));
+        // No assignment → nothing is callable.
+        assert!(!reg.is_call_allowed("web_search_exa", &[]));
+    }
+
+    #[test]
+    fn is_call_allowed_accepts_a_name_shared_by_two_defs() {
+        // Two defs that dedup to the same server both own its advertised
+        // names; a grant of either def authorizes the call.
+        let mut reg = ToolRegistry::new();
+        reg.record_owner("web_search_exa", "web-search");
+        reg.record_owner("web_search_exa", "web-search-alt");
+
+        assert!(reg.is_call_allowed("web_search_exa", &["web-search-alt".to_string()]));
+        assert!(reg.is_call_allowed("web_search_exa", &["web-search".to_string()]));
+        assert!(!reg.is_call_allowed("web_search_exa", &["unrelated".to_string()]));
     }
 
     #[tokio::test]

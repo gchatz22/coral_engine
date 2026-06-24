@@ -124,14 +124,15 @@ fn render_system(m: &Mandate) -> String {
 
 /// Render the per-agent tool catalog: the tool *definitions* the agent is
 /// assigned (e.g. an MCP server), each of which may expose one or more named
-/// operations. Trailing blank line so it composes into the system message
-/// ahead of the invariants.
+/// operations. Assignment is enforced at dispatch — a call to a tool outside
+/// this set is rejected — so the catalog states the boundary. Trailing blank
+/// line so it composes into the system message ahead of the invariants.
 fn render_tool_catalog(tools: &[String]) -> String {
     if tools.is_empty() {
-        return "You have no tools assigned.\n\n".to_string();
+        return "You have no tools assigned; you cannot call any tool.\n\n".to_string();
     }
     format!(
-        "Tools assigned to you: {}. Each may expose one or more named operations.\n\n",
+        "You may call only these assigned tools: {}. Each may expose one or more named operations.\n\n",
         tools.join(", ")
     )
 }
@@ -342,7 +343,7 @@ mod tests {
         let msgs = render(&bundle);
         let sys = text(&msgs[0]);
         assert!(
-            sys.contains("Tools assigned to you: echo, web-search"),
+            sys.contains("You may call only these assigned tools: echo, web-search"),
             "system message must list the assigned tools, got: {sys}"
         );
     }
@@ -496,7 +497,7 @@ mod tests {
              \n\
              Watch the FDA holds list and report drug-program risk.\n\
              \n\
-             You have no tools assigned.\n\
+             You have no tools assigned; you cannot call any tool.\n\
              \n\
              Invariants:\n\
              1. Provenance. Every `emit_output` decision must cite `evidence` ids that resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.\n\
@@ -529,7 +530,7 @@ mod tests {
              \n\
              Watch the FDA holds list and report drug-program risk.\n\
              \n\
-             You have no tools assigned.\n\
+             You have no tools assigned; you cannot call any tool.\n\
              \n\
              Invariants:\n\
              1. Provenance. Every `emit_output` decision must cite `evidence` ids that resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.\n\

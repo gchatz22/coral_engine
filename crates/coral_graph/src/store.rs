@@ -144,6 +144,7 @@ impl GraphStore {
     pub async fn register_tool(
         &self,
         graph_id: Uuid,
+        def_id: &str,
         kind: &str,
         command: Option<&str>,
         args: serde_json::Value,
@@ -153,12 +154,13 @@ impl GraphStore {
         let row = sqlx::query_as!(
             ToolRecord,
             r#"
-            INSERT INTO tools (id, graph_id, kind, command, args, env_refs)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id, graph_id, kind, command, args as "args!: serde_json::Value", env_refs as "env_refs!: serde_json::Value", created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            INSERT INTO tools (id, graph_id, def_id, kind, command, args, env_refs)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id, graph_id, def_id, kind, command, args as "args!: serde_json::Value", env_refs as "env_refs!: serde_json::Value", created_at as "created_at!: chrono::DateTime<chrono::Utc>"
             "#,
             id,
             graph_id,
+            def_id,
             kind,
             command,
             args,
@@ -503,12 +505,13 @@ impl GraphStore {
             sqlx::query_as!(
                 ToolRecord,
                 r#"
-                INSERT INTO tools (id, graph_id, kind, command, args, env_refs)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id, graph_id, kind, command, args as "args!: serde_json::Value", env_refs as "env_refs!: serde_json::Value", created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+                INSERT INTO tools (id, graph_id, def_id, kind, command, args, env_refs)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id, graph_id, def_id, kind, command, args as "args!: serde_json::Value", env_refs as "env_refs!: serde_json::Value", created_at as "created_at!: chrono::DateTime<chrono::Utc>"
                 "#,
                 tool_uuid,
                 graph_id,
+                tool.id,
                 kind_text,
                 command_text,
                 args_json,
@@ -722,7 +725,7 @@ impl GraphStore {
         let rows = sqlx::query_as!(
             ToolRecord,
             r#"
-            SELECT id, graph_id, kind, command,
+            SELECT id, graph_id, def_id, kind, command,
                    args as "args!: serde_json::Value",
                    env_refs as "env_refs!: serde_json::Value",
                    created_at as "created_at!: chrono::DateTime<chrono::Utc>"
@@ -734,6 +737,17 @@ impl GraphStore {
         )
         .fetch_all(&self.pool)
         .await?;
+        Ok(rows)
+    }
+
+    /// The operator-authored ids (`graph.yaml` `tools[].id`) of every tool
+    /// defined in a graph. The set a parent may grant a spawned child:
+    /// spawn-time validation checks the child's `Mandate.tools` against it.
+    pub async fn list_tool_def_ids_for_graph(&self, graph_id: Uuid) -> sqlx::Result<Vec<String>> {
+        let rows =
+            sqlx::query_scalar!(r#"SELECT def_id FROM tools WHERE graph_id = $1"#, graph_id,)
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows)
     }
 }
@@ -762,6 +776,11 @@ impl StructuralDbStore for GraphStore {
         )
         .await?;
         Ok(())
+    }
+
+    async fn list_tool_def_ids_for_graph(&self, graph_id: GraphId) -> anyhow::Result<Vec<String>> {
+        let ids = GraphStore::list_tool_def_ids_for_graph(self, graph_id.into_uuid()).await?;
+        Ok(ids)
     }
 }
 
@@ -870,6 +889,7 @@ mod tests {
         let tool = store
             .register_tool(
                 graph.id,
+                "echo-tool",
                 "echo",
                 Some("/bin/echo"),
                 serde_json::json!(["hello"]),
@@ -877,6 +897,7 @@ mod tests {
             )
             .await?;
         assert_eq!(tool.graph_id, graph.id);
+        assert_eq!(tool.def_id, "echo-tool");
         assert_eq!(tool.kind, "echo");
         assert_eq!(tool.command.as_deref(), Some("/bin/echo"));
         assert_eq!(tool.args, serde_json::json!(["hello"]));
@@ -889,6 +910,7 @@ mod tests {
         let err = store
             .register_tool(
                 Uuid::new_v4(),
+                "echo-tool",
                 "echo",
                 None,
                 serde_json::json!([]),
@@ -1050,6 +1072,12 @@ seed:
         kinds.sort_unstable();
         assert_eq!(kinds, vec!["builtin", "mcp"]);
 
+        // The operator-authored def ids are persisted — dispatch enforcement
+        // resolves a tool call's advertised name back to one of these.
+        let mut def_ids: Vec<&str> = tools.iter().map(|t| t.def_id.as_str()).collect();
+        def_ids.sort_unstable();
+        assert_eq!(def_ids, vec!["echo", "web"]);
+
         // A second graph with a different MCP server must not leak into the
         // first's listing (and vice versa) — the per-graph scoping the
         // worker relies on to keep each graph's registry isolated.
@@ -1105,6 +1133,44 @@ seed:
 
         // A graph with no agents/tools yields nothing.
         let empty = store.list_tools_for_graph(Uuid::new_v4()).await?;
+        assert!(empty.is_empty());
+        Ok(())
+    }
+
+    // --- list_tool_def_ids_for_graph ---
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn list_tool_def_ids_for_graph_returns_graph_def_ids(pool: PgPool) -> sqlx::Result<()> {
+        let store = GraphStore::new(pool);
+        let graph = seed_graph(&store).await;
+        store
+            .register_tool(
+                graph.id,
+                "web-search",
+                "mcp",
+                Some("npx"),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            )
+            .await?;
+        store
+            .register_tool(
+                graph.id,
+                "echo-tool",
+                "builtin",
+                Some("echo"),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            )
+            .await?;
+
+        let mut ids = store.list_tool_def_ids_for_graph(graph.id).await?;
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["echo-tool", "web-search"]);
+
+        // A graph with no tools yields nothing — the spawn-validation set
+        // is then empty, so any granted tool is rejected.
+        let empty = store.list_tool_def_ids_for_graph(Uuid::new_v4()).await?;
         assert!(empty.is_empty());
         Ok(())
     }
@@ -1210,6 +1276,7 @@ seed:
             .list_tools_for_graph(applied.graph_id.into_uuid())
             .await?;
         assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].def_id, "web");
         assert_eq!(tools[0].kind, "mcp");
         assert_eq!(tools[0].command.as_deref(), Some("mcp-web-search"));
         assert_eq!(tools[0].args, serde_json::json!(["--verbose", "--json"]));

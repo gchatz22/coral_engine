@@ -107,6 +107,10 @@ fn ensure_installed() -> Arc<MemoryStorage> {
             name: TOOL_NAME.into(),
         }))
         .expect("register echo tool");
+        // Dispatch is scoped per agent. The fixture YAML defines the tool
+        // with def id `echo` and assigns it to `root` (`tools: [echo]`), so
+        // map the advertised name to that def id for the call to be allowed.
+        reg.record_owner(TOOL_NAME, "echo");
         install_tool_registry(Arc::new(reg));
     });
     SHARED_STORAGE.get().cloned().expect("storage installed")

@@ -116,6 +116,10 @@ impl StructuralDbStore for MemoryStructuralDb {
             .push((parent_agent_id, child_agent_id));
         Ok(())
     }
+
+    async fn list_tool_def_ids_for_graph(&self, _graph_id: GraphId) -> anyhow::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Shared across parent + all children. Routes by mandate text: the

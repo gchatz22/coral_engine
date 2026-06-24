@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, graph_id, kind, command,\n                   args as \"args!: serde_json::Value\",\n                   env_refs as \"env_refs!: serde_json::Value\",\n                   created_at as \"created_at!: chrono::DateTime<chrono::Utc>\"\n            FROM tools\n            WHERE graph_id = $1\n            ORDER BY created_at ASC\n            ",
+  "query": "\n                INSERT INTO tools (id, graph_id, def_id, kind, command, args, env_refs)\n                VALUES ($1, $2, $3, $4, $5, $6, $7)\n                RETURNING id, graph_id, def_id, kind, command, args as \"args!: serde_json::Value\", env_refs as \"env_refs!: serde_json::Value\", created_at as \"created_at!: chrono::DateTime<chrono::Utc>\"\n                ",
   "describe": {
     "columns": [
       {
@@ -15,36 +15,48 @@
       },
       {
         "ordinal": 2,
-        "name": "kind",
+        "name": "def_id",
         "type_info": "Text"
       },
       {
         "ordinal": 3,
-        "name": "command",
+        "name": "kind",
         "type_info": "Text"
       },
       {
         "ordinal": 4,
+        "name": "command",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
         "name": "args!: serde_json::Value",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "env_refs!: serde_json::Value",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "created_at!: chrono::DateTime<chrono::Utc>",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Jsonb"
       ]
     },
     "nullable": [
+      false,
       false,
       false,
       false,
@@ -54,5 +66,5 @@
       false
     ]
   },
-  "hash": "2e81787b93b8e7df22abe4bca3315f1106befbb5b668baa3eb617aac687afb70"
+  "hash": "e306b25c6e0bb90c2df5955ea73d9c3919a13741055758fa3de70d1703cfa53f"
 }

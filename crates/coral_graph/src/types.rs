@@ -54,10 +54,16 @@ pub struct Edge {
 /// `env_refs` default to empty JSON arrays in the schema; in Rust we
 /// model them as `serde_json::Value` so the column shape is exactly
 /// what `coral apply` and the worker handle today.
+///
+/// `def_id` is the operator-authored id from `graph.yaml` (`tools[].id`,
+/// e.g. `web-search`) — unique within a graph and the id agents reference
+/// in their assignment. Dispatch enforcement maps a tool call's advertised
+/// name to the owning def via this id.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, FromRow)]
 pub struct ToolRecord {
     pub id: Uuid,
     pub graph_id: Uuid,
+    pub def_id: String,
     pub kind: String,
     pub command: Option<String>,
     pub args: serde_json::Value,
@@ -149,6 +155,7 @@ mod tests {
         let t = ToolRecord {
             id: Uuid::new_v4(),
             graph_id: Uuid::new_v4(),
+            def_id: "web-search".into(),
             kind: "mcp".into(),
             command: Some("npx".into()),
             args: serde_json::json!(["-y", "@modelcontextprotocol/server-everything"]),
