@@ -1238,6 +1238,67 @@ seed:
         Ok(())
     }
 
+    /// Config-home invariant: authored config (cadence/model/tools/
+    /// persistence) rides the Temporal durable input, never Postgres. Even
+    /// when the YAML sets `model` / `persistent` / `max_ticks`,
+    /// `create_from_yaml` writes only topology — the `agents` table holds no
+    /// config columns for those values to land in. Guards against a future
+    /// change silently re-introducing a config column on `agents`.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn create_from_yaml_writes_no_config_columns_to_agents(pool: PgPool) -> sqlx::Result<()> {
+        const CONFIG_YAML: &str = r#"
+apiVersion: coral.engine/v1alpha1
+kind: Graph
+metadata:
+  name: config-home
+tools:
+  - id: echo
+    kind: builtin
+    builtin: echo
+agents:
+  - id: root
+    mandate:
+      text: do the thing
+      idle_period: 1s
+      max_ticks: 4
+      persistent: true
+      model: claude-opus-4-8
+    tools: [echo]
+seed:
+  triggers:
+    - agent: root
+      at: start
+      external:
+        kind: kickoff
+        payload: {}
+"#;
+        let store = GraphStore::new(pool.clone());
+        let g = crate::yaml::parse_and_validate(CONFIG_YAML)
+            .expect("validator green on config fixture");
+        let applied = store.create_from_yaml(&g).await.expect("create_from_yaml");
+        assert_eq!(applied.agents.len(), 1);
+
+        let columns: Vec<String> = sqlx::query_scalar::<_, String>(
+            "SELECT column_name::text FROM information_schema.columns WHERE table_name = 'agents'",
+        )
+        .fetch_all(&pool)
+        .await?;
+        for leaked in [
+            "model",
+            "persistent",
+            "max_ticks",
+            "mandate_ref",
+            "idle_period",
+            "cadence",
+        ] {
+            assert!(
+                !columns.iter().any(|c| c == leaked),
+                "config column {leaked:?} present on `agents`; config must ride the durable input, not Postgres (have {columns:?})",
+            );
+        }
+        Ok(())
+    }
+
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn create_from_yaml_persists_mcp_tool_row(pool: PgPool) -> sqlx::Result<()> {
         const MCP_YAML: &str = r#"
