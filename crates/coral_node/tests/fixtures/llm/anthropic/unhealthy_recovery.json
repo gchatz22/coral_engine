@@ -63,7 +63,7 @@
     {
       "status": 200,
       "body": {
-        "id": "msg_retire",
+        "id": "msg_idle",
         "type": "message",
         "role": "assistant",
         "model": "claude-haiku-4-5",
@@ -71,9 +71,9 @@
         "content": [
           {
             "type": "tool_use",
-            "id": "toolu_retire",
-            "name": "retire",
-            "input": {"reason": "post-recovery"}
+            "id": "toolu_idle",
+            "name": "idle",
+            "input": {"next_after": 50}
           }
         ],
         "usage": {"input_tokens": 174, "output_tokens": 14}

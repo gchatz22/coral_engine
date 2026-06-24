@@ -108,8 +108,9 @@ async fn build_client() -> Result<Client> {
     Ok(client)
 }
 
-/// Scripts a four-tick run (Idle → CallTools → EmitOutput → Retire),
-/// drives it via Temporal, and asserts the three durable artifacts land.
+/// Scripts a three-decision run (Idle → CallTools → EmitOutput) capped by
+/// `max_ticks=3`, drives it via Temporal, and asserts the three durable
+/// artifacts land. The agent never self-terminates; the cap stops the loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Lock is held across `await` because the scripted decision queue + the
 // installed storage / registry are process-wide.
@@ -153,8 +154,9 @@ async fn run_smoke() -> Result<()> {
         .context("plant evidence for EmitOutput")?;
 
     // Scripted sequence: Idle (tick 0) → CallTools(echo) (tick 1) →
-    // EmitOutput citing the planted id (tick 2) → Retire (tick 3).
-    // Total: four ticks, four decision-log files.
+    // EmitOutput citing the planted id (tick 2), then the `max_ticks=3`
+    // cap stops the loop. Three decisions, three decision-log files (the
+    // cap-driven retirement is not itself a logged decision).
     set_decision_script(vec![
         Decision::Idle {
             next_after: Duration::from_millis(50),
@@ -169,9 +171,6 @@ async fn run_smoke() -> Result<()> {
         Decision::EmitOutput {
             content: "workflow_smoke: echo result observed".into(),
             evidence: vec![planted_id.clone()],
-        },
-        Decision::Retire {
-            reason: "workflow_smoke: scripted retire".into(),
         },
     ]);
 
@@ -242,6 +241,8 @@ async fn drive(
         prefix: agent_prefix.into(),
     };
     input.mandate.tools = vec![TOOL_NAME.to_string()];
+    // The loop runs the 3 scripted decisions, then the cap stops it.
+    input.mandate.max_ticks = Some(3);
     let handle = client
         .start_workflow(
             AgentWorkflow::run,
@@ -256,8 +257,8 @@ async fn drive(
         .await
         .context("AgentWorkflow.get_result")?;
     let AgentResult::Retired { reason } = result;
-    assert!(
-        reason.contains("scripted retire"),
+    assert_eq!(
+        reason, "max_ticks (3) reached",
         "workflow returned wrong retire reason: {reason:?}"
     );
 
@@ -274,8 +275,8 @@ async fn drive(
         .get("reason")
         .and_then(|x| x.as_str())
         .ok_or_else(|| anyhow::anyhow!("retirement.json missing reason"))?;
-    assert!(
-        reason_on_disk.contains("scripted retire"),
+    assert_eq!(
+        reason_on_disk, "max_ticks (3) reached",
         "retirement.json carries wrong reason: {reason_on_disk:?}"
     );
 
@@ -315,10 +316,10 @@ async fn drive(
     );
 
     // ---- Artifact 3: `<prefix>/decisions/<tick>.jsonl` --------------------
-    // One entry per tick. The scripted sequence produces four decisions
-    // (Idle, CallTools, EmitOutput, Retire); the workflow body bumps
-    // `tick` only on non-retire arms, so the four ticks land at
-    // `decisions/{0,1,2,3}.jsonl`.
+    // One entry per logged decision. The scripted sequence produces three
+    // decisions (Idle, CallTools, EmitOutput) at `decisions/{0,1,2}.jsonl`.
+    // The `max_ticks` cap retires at the top of the loop without logging a
+    // decision, so it adds no fourth entry.
     let page = storage
         .list(&format!("{agent_prefix}/decisions/"), None, usize::MAX)
         .await
@@ -329,14 +330,14 @@ async fn drive(
     eprintln!("workflow_smoke: decision-log keys: {decision_keys:?}");
     assert_eq!(
         decision_keys.len(),
-        4,
-        "expected 4 decision-log entries (Idle, CallTools, EmitOutput, Retire); got {decision_keys:?}"
+        3,
+        "expected 3 decision-log entries (Idle, CallTools, EmitOutput); got {decision_keys:?}"
     );
 
     // Each file is a single JSONL line that deserializes back to a
     // typed `DecisionLogEntry`. Pin the per-tick decision_summary
-    // contract: the four entries match the four scripted decisions.
-    let mut summaries: Vec<String> = Vec::with_capacity(4);
+    // contract: the three entries match the three scripted decisions.
+    let mut summaries: Vec<String> = Vec::with_capacity(3);
     for k in &decision_keys {
         let bytes = storage
             .get(k)
@@ -350,11 +351,9 @@ async fn drive(
             .with_context(|| format!("{k} is not a DecisionLogEntry: {line}"))?;
         summaries.push(entry.decision_summary);
     }
-    // First decision was `Idle`, last was `Retire`. The middle two
-    // (`CallTools` / `EmitOutput`) are pinned for the same reason —
-    // the artifact stream must reflect every scripted tick. Pin a loose
-    // contains-check on each so the formatter is free to evolve without
-    // breaking this assertion's intent.
+    // The three logged decisions match the three scripted ticks. Pin a
+    // loose starts-with check on each so the formatter is free to evolve
+    // without breaking this assertion's intent.
     assert!(
         summaries[0].starts_with("Idle"),
         "tick 0 summary: {:?}",
@@ -369,11 +368,6 @@ async fn drive(
         summaries[2].starts_with("EmitOutput"),
         "tick 2 summary: {:?}",
         summaries[2]
-    );
-    assert!(
-        summaries[3].starts_with("Retire"),
-        "tick 3 summary: {:?}",
-        summaries[3]
     );
 
     Ok(())

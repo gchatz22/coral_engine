@@ -25,7 +25,6 @@ const TOOL_NAMES: &[&str] = &[
     "emit_output",
     "rewrite_fs",
     "idle",
-    "retire",
     "spawn_child",
     "reconcile_children",
     "retire_child",
@@ -122,21 +121,8 @@ pub fn decision_tools() -> Vec<ToolSpec> {
                 "required": ["next_after"]
             }),
         },
-        ToolSpec {
-            name: "retire".into(),
-            description: "Express the decision to stop running. The reason is \
-                 persisted so retirement is auditable."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "reason": { "type": "string" }
-                },
-                "required": ["reason"]
-            }),
-        },
         // Parent-child topology decision tools. Each is a terminal
-        // singleton (same shape contract as `retire`): mixing with
+        // singleton (same shape contract as `idle`): mixing with
         // `call_tool` or another terminal fails parsing. Inner shapes
         // (`mandate`, `sources`, `child_ref`, ...) are described as plain
         // `object` and left to serde validation, mirroring the
@@ -241,12 +227,12 @@ pub enum DecisionParseError {
     NoCalls,
     /// The model returned multiple tool calls that mix `call_tool` (the
     /// parallel-tool path) with one of the terminal decision tools
-    /// (`emit_output`, `rewrite_fs`, `idle`, `retire`). Terminal
-    /// decisions cannot batch with other calls in the same tick.
+    /// (`emit_output`, `rewrite_fs`, `idle`). Terminal decisions cannot
+    /// batch with other calls in the same tick.
     #[error("mixed decision tools in one response: {names:?}")]
     MixedDecisionTools { names: Vec<String> },
     /// The model returned multiple instances of a terminal decision tool
-    /// (e.g. two `retire` blocks in the same response). Terminal
+    /// (e.g. two `idle` blocks in the same response). Terminal
     /// decisions are singular by construction.
     #[error("expected exactly one `{tool}` call, got {count}")]
     DuplicateTerminalTool { tool: String, count: usize },
@@ -280,10 +266,9 @@ pub enum DecisionParseError {
 /// `ToolCall.id` (the `tool_use.id` on the wire) propagates into each
 /// `decision::ToolCall.tool_use_id` so the run loop can stage the paired
 /// `tool_result` blocks for the next prompt bundle. Terminal decision
-/// tools (`emit_output`, `rewrite_fs`, `idle`, `retire`) remain
-/// singular: a response that includes any terminal tool alongside
-/// another call fails as `MixedDecisionTools` rather than silently
-/// discarding the extras.
+/// tools (`emit_output`, `rewrite_fs`, `idle`) remain singular: a
+/// response that includes any terminal tool alongside another call fails
+/// as `MixedDecisionTools` rather than silently discarding the extras.
 pub fn parse_decision(calls: &[ToolCall]) -> Result<Decision, DecisionParseError> {
     if calls.is_empty() {
         return Err(DecisionParseError::NoCalls);
@@ -309,7 +294,7 @@ pub fn parse_decision(calls: &[ToolCall]) -> Result<Decision, DecisionParseError
         return Err(DecisionParseError::MixedDecisionTools { names });
     }
     if any_terminal && calls.len() > 1 {
-        // Two terminals (e.g. two `retire` blocks) — also invalid.
+        // Two terminals (e.g. two `idle` blocks) — also invalid.
         return Err(DecisionParseError::DuplicateTerminalTool {
             tool: calls[0].name.clone(),
             count: calls.len(),
@@ -349,7 +334,6 @@ pub fn parse_decision(calls: &[ToolCall]) -> Result<Decision, DecisionParseError
         "emit_output" => &["content", "evidence"],
         "rewrite_fs" => &["ops"],
         "idle" => &["next_after"],
-        "retire" => &["reason"],
         // Parent-child topology variants — terminal singletons. Inner-
         // shape validation (e.g. `mandate` field structure) falls through
         // to serde via the `tagged.insert("type", ...)` re-tagging below.
@@ -639,15 +623,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_retire_round_trips() {
-        let tc = call("retire", json!({"reason": "done"}));
-        let d = parse_decision(&[tc]).unwrap();
-        assert_eq!(
-            d,
-            Decision::Retire {
-                reason: "done".into(),
-            }
+    fn retire_is_not_in_the_model_vocabulary() {
+        // Persistence is universal: a model cannot self-terminate. `retire`
+        // is neither advertised nor parseable; a `retire` tool call is an
+        // unknown tool.
+        assert!(
+            !decision_tools().iter().any(|t| t.name == "retire"),
+            "`retire` must not be advertised to the model"
         );
+        assert!(!TOOL_NAMES.contains(&"retire"));
+        let err = parse_decision(&[call("retire", json!({"reason": "done"}))]).unwrap_err();
+        assert_eq!(err, DecisionParseError::UnknownTool("retire".into()));
     }
 
     #[test]
@@ -676,7 +662,6 @@ mod tests {
                 "emit_output" => json!({"content": "", "evidence": []}),
                 "rewrite_fs" => json!({"ops": []}),
                 "idle" => json!({"next_after": 0}),
-                "retire" => json!({"reason": "ok"}),
                 "spawn_child" => json!({
                     "agent_name": "child",
                     "mandate": mandate_minimal,
@@ -892,7 +877,7 @@ mod tests {
                 "reconcile_children",
                 json!({"sources": [{"child_ref": agent_ref, "output_id": "ab".repeat(32)}]}),
             ),
-            call("retire", json!({"reason": "stop"})),
+            call("idle", json!({"next_after": 0})),
         ])
         .unwrap_err();
         assert!(
@@ -940,34 +925,34 @@ mod tests {
     #[test]
     fn parse_mixed_call_tool_and_terminal_errors() {
         // `call_tool` is the parallel-call shape; mixing it with any
-        // terminal decision (`emit_output`, `rewrite_fs`, `idle`,
-        // `retire`) is never a valid single-tick decision.
+        // terminal decision (`emit_output`, `rewrite_fs`, `idle`) is never
+        // a valid single-tick decision.
         let err = parse_decision(&[
             call(
                 "call_tool",
                 json!({"name": "echo", "args": {}, "claim_seed": "s"}),
             ),
-            call("retire", json!({"reason": "stop"})),
+            call("idle", json!({"next_after": 0})),
         ])
         .unwrap_err();
         assert!(
             matches!(err, DecisionParseError::MixedDecisionTools { ref names }
-                if names == &["call_tool".to_string(), "retire".to_string()]),
+                if names == &["call_tool".to_string(), "idle".to_string()]),
             "got {err:?}"
         );
     }
 
     #[test]
     fn parse_duplicate_terminal_tools_errors() {
-        // Two `retire` blocks in one response — terminals are singular.
+        // Two `idle` blocks in one response — terminals are singular.
         let err = parse_decision(&[
-            call("retire", json!({"reason": "a"})),
-            call("retire", json!({"reason": "b"})),
+            call("idle", json!({"next_after": 1})),
+            call("idle", json!({"next_after": 2})),
         ])
         .unwrap_err();
         assert!(
             matches!(err, DecisionParseError::DuplicateTerminalTool { ref tool, count: 2 }
-                if tool == "retire"),
+                if tool == "idle"),
             "got {err:?}"
         );
     }
@@ -980,12 +965,12 @@ mod tests {
 
     #[test]
     fn parse_missing_field_errors() {
-        let err = parse_decision(&[call("retire", json!({}))]).unwrap_err();
+        let err = parse_decision(&[call("idle", json!({}))]).unwrap_err();
         assert_eq!(
             err,
             DecisionParseError::MissingField {
-                tool: "retire".into(),
-                field: "reason".into(),
+                tool: "idle".into(),
+                field: "next_after".into(),
             }
         );
     }

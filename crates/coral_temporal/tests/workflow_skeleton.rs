@@ -151,10 +151,10 @@ async fn drive(client: Client, task_queue: &str, workflow_id: &str) -> Result<()
         .await
         .context("start_workflow(AgentWorkflow)")?;
 
-    // The loop body runs until either `Decision::Retire` or the
-    // `retire` signal arrives. The signal terminates the workflow; the
-    // short sleep gives the worker time to register and start the first
-    // iteration so the eprintln order is legible during local debugging.
+    // The loop body runs until the `retire` signal (or the `max_ticks`
+    // cap) arrives. The signal terminates the workflow; the short sleep
+    // gives the worker time to register and start the first iteration so
+    // the eprintln order is legible during local debugging.
     tokio::time::sleep(Duration::from_millis(250)).await;
     handle
         .signal(

@@ -22,8 +22,10 @@
 //! 6. **On [`DispatchOutcome::Continue`]**: clear `pending_correction` and
 //!    mark the tick a success (`HealthTracker::mark_tick_success`) — this
 //!    archives any prior Unhealthy incident on recovery.
-//! 7. **On [`DispatchOutcome::Retired`]**: persist `retirement.json` and
-//!    exit the loop with the reason.
+//! 7. **The agent never self-terminates.** No decision ends the loop;
+//!    persistence is universal. The loop exits only on the
+//!    `Mandate.max_ticks` safety cap (checked at the top of each
+//!    iteration) or a non-recoverable error.
 //! 8. **On [`DispatchOutcome::NeedsCorrection`]**: the model emitted a
 //!    `Decision` the runtime cannot satisfy (an unregistered tool, an
 //!    unresolvable evidence id). We record the failure against the
@@ -153,15 +155,14 @@ impl<D: Decide> Agent<D> {
     }
 
     /// Run the loop until one of:
-    /// - a `Decision::Retire` arrives (the normal path; `retirement.json`
-    ///   is written and the reason is returned);
-    /// - the `Mandate.max_ticks` safety cap is hit (also writes
+    /// - the `Mandate.max_ticks` safety cap is hit (writes
     ///   `retirement.json`, with a synthesized `max_ticks (N) reached`
-    ///   reason);
+    ///   reason, and returns it);
     /// - a non-recoverable error bubbles via `?`.
     ///
-    /// `Unhealthy` transitions and pending corrections are **not** exit
-    /// conditions — see the module doc for why.
+    /// The agent never self-terminates: persistence is universal, so no
+    /// `Decision` ends the loop. `Unhealthy` transitions and pending
+    /// corrections are **not** exit conditions — see the module doc for why.
     pub async fn run(self) -> Result<RetireReason> {
         let Agent {
             cfg,
@@ -201,7 +202,7 @@ impl<D: Decide> Agent<D> {
             }
             tick += 1;
             let span = info_span!("agent.tick", tick);
-            let outcome = async {
+            async {
                 // Mid-correction: the loop is continuing where it left off,
                 // so do not wait on the world. Drain whatever happens to be
                 // queued (may be empty) and proceed. Fresh tick: race the
@@ -278,7 +279,7 @@ impl<D: Decide> Agent<D> {
                         // operative state, and the next fresh tick should
                         // begin_tick from a clean slate.
                         pending_correction = None;
-                        return Ok::<TickOutcome, anyhow::Error>(TickOutcome::Continue);
+                        return Ok::<(), anyhow::Error>(());
                     }
                 };
 
@@ -287,9 +288,8 @@ impl<D: Decide> Agent<D> {
                         health.mark_tick_success(Utc::now())?;
                         retry_trail.clear();
                         pending_correction = None;
-                        Ok(TickOutcome::Continue)
+                        Ok(())
                     }
-                    DispatchOutcome::Retired(reason) => Ok(TickOutcome::Retire(reason)),
                     DispatchOutcome::NeedsCorrection(desc) => {
                         let attempt = Attempt {
                             attempt: (retry_trail.len() as u32) + 1,
@@ -301,7 +301,7 @@ impl<D: Decide> Agent<D> {
                             Ok(()) => {
                                 warn!(failure = %desc, "apply-time failure; staging correction");
                                 pending_correction = Some(CorrectionContext::new(desc));
-                                Ok(TickOutcome::Continue)
+                                Ok(())
                             }
                             Err(HealthError::BudgetExhausted { kind }) => {
                                 warn!(
@@ -324,7 +324,7 @@ impl<D: Decide> Agent<D> {
                                 // Budget exhaustion closes the correction
                                 // window; next fresh tick starts clean.
                                 pending_correction = None;
-                                Ok(TickOutcome::Continue)
+                                Ok(())
                             }
                             Err(other) => Err(other.into()),
                         }
@@ -380,7 +380,7 @@ impl<D: Decide> Agent<D> {
                                     "tool call(s) exhausted retries; staging correction"
                                 );
                                 pending_correction = Some(CorrectionContext::new(desc));
-                                Ok(TickOutcome::Continue)
+                                Ok(())
                             }
                             Some(kind) => {
                                 warn!(
@@ -420,7 +420,7 @@ impl<D: Decide> Agent<D> {
                                 // window; the next fresh tick starts
                                 // clean.
                                 pending_correction = None;
-                                Ok(TickOutcome::Continue)
+                                Ok(())
                             }
                         }
                     }
@@ -428,19 +428,8 @@ impl<D: Decide> Agent<D> {
             }
             .instrument(span)
             .await?;
-
-            if let TickOutcome::Retire(reason) = outcome {
-                return Ok(reason);
-            }
         }
     }
-}
-
-/// What a single tick decided. Either continue to the next tick or
-/// terminate with a retirement reason.
-enum TickOutcome {
-    Continue,
-    Retire(RetireReason),
 }
 
 // ---------- Post-run / between-tick CallStats accessor ----------
@@ -666,22 +655,16 @@ mod tests {
                 script: StdMutex::new(vec![
                     // Tick 1: idle → loop continues.
                     resp(s.clone(), idle_call()),
-                    // Tick 2: retire → loop exits.
-                    resp(
-                        stats(3, 2, 5),
-                        ToolCall {
-                            id: "toolu_retire".into(),
-                            name: "retire".into(),
-                            arguments: json!({"reason": "done"}),
-                        },
-                    ),
+                    // Tick 2: idle again; `max_ticks` stops the loop after it.
+                    resp(stats(3, 2, 5), idle_call()),
                 ]),
             });
             let decide = LlmDecide::new(client, CompleteOptions::default());
             let tmp = tempfile::TempDir::new().unwrap();
-            // Small idle_period + max_ticks cap so the test is fast and
-            // bounded regardless of which retire path actually fires.
-            let mandate = Mandate::new("stats-test", std::time::Duration::from_millis(1), Some(4));
+            // Small idle_period + a 2-tick cap so the loop runs both scripted
+            // ticks then retires on the `max_ticks` safety cap (the agent no
+            // longer self-terminates).
+            let mandate = Mandate::new("stats-test", std::time::Duration::from_millis(1), Some(2));
             let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
                 .await
                 .unwrap();
@@ -703,17 +686,13 @@ mod tests {
                     .await
                     .expect("agent retired")
                     .expect("run ok");
-            assert_eq!(reason, "done");
+            assert_eq!(reason, "max_ticks (2) reached");
 
-            // Stats handle must reflect the *last* tick (the retire), not
-            // the first tick (idle). LlmDecide resets its accumulator at
-            // the start of every `decide`.
+            // Stats handle must reflect the *last* tick (the second idle),
+            // not the first tick. LlmDecide resets its accumulator at the
+            // start of every `decide`.
             let calls = stats_handle.last_tick_calls();
-            assert_eq!(
-                calls.len(),
-                1,
-                "last tick was a single-call retire decision"
-            );
+            assert_eq!(calls.len(), 1, "last tick was a single-call idle decision");
             assert_eq!(calls[0].usage.input_tokens, 3);
             assert_eq!(calls[0].usage.output_tokens, 2);
             assert_eq!(calls[0].latency_ms, 5);

@@ -72,18 +72,18 @@
     {
       "status": 200,
       "body": {
-        "id": "cohere_msg_retire",
+        "id": "cohere_msg_idle",
         "finish_reason": "TOOL_CALL",
         "message": {
           "role": "assistant",
           "content": [],
           "tool_calls": [
             {
-              "id": "tc_retire",
+              "id": "tc_idle",
               "type": "function",
               "function": {
-                "name": "retire",
-                "arguments": "{\"reason\":\"post-recovery\"}"
+                "name": "idle",
+                "arguments": "{\"next_after\":50}"
               }
             }
           ]

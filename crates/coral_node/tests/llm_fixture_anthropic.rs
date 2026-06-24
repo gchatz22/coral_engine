@@ -270,10 +270,13 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
     let mock = MockServer::spawn(fixtures).await;
 
     let tmp = TempDir::new().expect("tempdir");
+    // The fixture's 4 responses span 3 ticks (one tick parse-fails then
+    // recovers on its internal retry); cap at 3 so the loop consumes them
+    // all then stops on the safety cap (agents never self-terminate).
     let mandate = Mandate::new(
         "unhealthy recovery cycle",
         Duration::from_millis(50),
-        Some(8),
+        Some(3),
     );
     let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
         .await
@@ -304,7 +307,7 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "post-recovery");
+    assert_eq!(reason, "max_ticks (3) reached");
 
     // All four fixtures should have been consumed across the three ticks.
     // We keep this wire-level remaining/captured check because it pins
@@ -313,9 +316,10 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
     assert_eq!(mock.remaining(), 0);
     assert_eq!(mock.captured().len(), 4);
 
-    // The final tick is the recovery `Retire("post-recovery")` — a
-    // single successful upstream call. The handle therefore reports
-    // exactly one call carrying Anthropic vendor + the configured model.
+    // The final tick is the recovery `idle` — a single successful upstream
+    // call (the `max_ticks` cap retires the agent on the next iteration).
+    // The handle therefore reports exactly one call carrying Anthropic
+    // vendor + the configured model.
     //
     // Latency is *not* asserted here (unlike tests (a)/(b)): this test
     // uses `start_paused = true`, which freezes tokio's clock; the
@@ -325,7 +329,7 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
     assert_eq!(
         calls.len(),
         1,
-        "last tick was the recovery retire — one upstream call"
+        "last tick was the recovery idle — one upstream call"
     );
     assert_eq!(calls[0].vendor, Vendor::Anthropic);
     assert_eq!(calls[0].model, expected_model());

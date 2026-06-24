@@ -561,15 +561,16 @@ async fn run_end_to_end() -> Result<()> {
 
     // ---- 3. Scripts ---------------------------------------------------
     //
-    // Children: plain Idle → EmitOutput → Retire. Each EmitOutput
-    // cites its planted evidence id (one per child) so
-    // `persist_output`'s provenance contract is satisfied.
+    // Children: plain Idle → EmitOutput, then the `max_ticks=2` cap stops
+    // each (agents never self-terminate). Each EmitOutput cites its planted
+    // evidence id (one per child) so `persist_output`'s provenance contract
+    // is satisfied.
     //
-    // Parent: idle (so children get scheduling room) → reconcile (via
-    // sentinel; pushes itself back until both ChildOutput signals
-    // land) → emit with synthetic (via sentinel; pushes itself back
-    // until 2 reconcile-evidence records appear in recent_evidence) →
-    // retire.
+    // Parent: reconcile (via sentinel; pushes itself back until both
+    // ChildOutput signals land) → emit with synthetic (via sentinel; pushes
+    // itself back until 2 reconcile-evidence records appear in
+    // recent_evidence) → then idle until its generous `max_ticks` cap stops
+    // it. The cap only bounds the post-emit idle tail.
     let child_a_script = vec![
         Decision::Idle {
             next_after: Duration::from_millis(50),
@@ -577,9 +578,6 @@ async fn run_end_to_end() -> Result<()> {
         Decision::EmitOutput {
             content: CHILD_A_CONTENT.into(),
             evidence: vec![planted_a_id.clone()],
-        },
-        Decision::Retire {
-            reason: "child-a: scripted retire".into(),
         },
     ];
     let child_b_script = vec![
@@ -590,17 +588,8 @@ async fn run_end_to_end() -> Result<()> {
             content: CHILD_B_CONTENT.into(),
             evidence: vec![planted_b_id.clone()],
         },
-        Decision::Retire {
-            reason: "child-b: scripted retire".into(),
-        },
     ];
-    let parent_script = vec![
-        reconcile_placeholder(),
-        emit_with_synthetic_placeholder(),
-        Decision::Retire {
-            reason: "parent: smoke complete".into(),
-        },
-    ];
+    let parent_script = vec![reconcile_placeholder(), emit_with_synthetic_placeholder()];
     install_role_scripts(parent_script, child_a_script, child_b_script);
 
     // ---- 4. Worker + driver ------------------------------------------
@@ -692,7 +681,7 @@ async fn drive(
         // Mandate idle_period sets the wake-gate cadence between
         // signal arrivals. 50ms balances "quick reaction to
         // ChildOutput" against "don't hammer Temporal".
-        mandate: Mandate::new(PARENT_MANDATE_TEXT, Duration::from_millis(50), None),
+        mandate: Mandate::new(PARENT_MANDATE_TEXT, Duration::from_millis(50), Some(30)),
         graph_id,
         agent_id: parent_agent_id,
         agent_name: "root".into(),
@@ -717,7 +706,7 @@ async fn drive(
             ..ParentRef::default()
         }),
         carryover: None,
-        mandate: Mandate::new(CHILD_A_MANDATE_TEXT, Duration::from_millis(50), None),
+        mandate: Mandate::new(CHILD_A_MANDATE_TEXT, Duration::from_millis(50), Some(2)),
         graph_id,
         agent_id: child_a_agent_id,
         agent_name: "child-a".into(),
@@ -742,7 +731,7 @@ async fn drive(
             ..ParentRef::default()
         }),
         carryover: None,
-        mandate: Mandate::new(CHILD_B_MANDATE_TEXT, Duration::from_millis(50), None),
+        mandate: Mandate::new(CHILD_B_MANDATE_TEXT, Duration::from_millis(50), Some(2)),
         graph_id,
         agent_id: child_b_agent_id,
         agent_name: "child-b".into(),
@@ -757,10 +746,10 @@ async fn drive(
         .context("start_workflow(child-b)")?;
     eprintln!("child-b started at {child_b_workflow_id}");
 
-    // Wait for each child to retire (EmitOutput → Retire). Each
-    // signals the parent on its EmitOutput tick before retiring. The
-    // retirement also fires `Trigger::ChildRetired` at the parent —
-    // orthogonal to the reconcile assertion but exercises the
+    // Wait for each child to retire (EmitOutput, then the max_ticks cap).
+    // Each signals the parent on its EmitOutput tick before the cap stops
+    // it. The cap-driven retirement also fires `Trigger::ChildRetired` at
+    // the parent — orthogonal to the reconcile assertion but exercises the
     // lifecycle-signal path as a side effect.
     let _child_a_result: AgentResult = child_a_handle
         .get_result(WorkflowGetResultOptions::default())

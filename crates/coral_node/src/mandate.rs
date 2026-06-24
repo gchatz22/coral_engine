@@ -81,12 +81,6 @@ pub struct Mandate {
     /// to `ContextPolicy::default()`.
     #[serde(default)]
     pub context_policy: ContextPolicy,
-    /// Whether this agent must persist and refresh rather than terminate
-    /// itself. `false` (the default and the serialized shape when absent)
-    /// is today's one-shot behavior. Carries no behavior on its own; the
-    /// runtime's stop contract and wake/refresh paths consume it.
-    #[serde(default)]
-    pub persistent: bool,
     /// Per-agent model override. `None` (the default and the serialized
     /// shape when absent) falls back to the worker's configured model. When
     /// set, the `decide` path sends this model id to the worker's configured
@@ -117,7 +111,6 @@ impl Mandate {
             max_ticks,
             retry_policy: None,
             context_policy: ContextPolicy::default(),
-            persistent: false,
             model: None,
             tools: Vec::new(),
         }
@@ -320,7 +313,6 @@ mod tests {
             max_ticks: Some(1),
             retry_policy: Some(RetryPolicy::new(5, Duration::from_millis(10))),
             context_policy: ContextPolicy::default(),
-            persistent: false,
             model: None,
             tools: Vec::new(),
         };
@@ -350,45 +342,20 @@ mod tests {
         assert_eq!(back.idle_period, Duration::from_millis(250));
         assert_eq!(back.max_ticks, None);
         assert_eq!(back.context_policy, ContextPolicy::default());
-        assert!(!back.persistent);
     }
 
     #[test]
-    fn mandate_new_defaults_persistent_to_false() {
-        let m = Mandate::new("x", Duration::from_millis(100), None);
-        assert!(!m.persistent);
-    }
-
-    #[test]
-    fn mandate_round_trip_with_persistent_true() {
-        let m = Mandate {
-            text: "watch forever".into(),
-            idle_period: Duration::from_millis(100),
-            max_ticks: None,
-            retry_policy: None,
-            context_policy: ContextPolicy::default(),
-            persistent: true,
-            model: None,
-            tools: Vec::new(),
-        };
-        let s = serde_json::to_string(&m).unwrap();
-        assert!(
-            s.contains("\"persistent\":true"),
-            "expected persistent on wire, got {s}"
-        );
-        let back: Mandate = serde_json::from_str(&s).unwrap();
-        assert_eq!(m, back);
-        assert!(back.persistent);
-    }
-
-    #[test]
-    fn mandate_deserializes_legacy_json_without_persistent_field() {
-        // A serialized mandate from before the field existed (e.g. an
-        // in-flight Temporal continue-as-new `AgentInput`) must
-        // deserialize to `persistent: false`, not reject.
-        let legacy = r#"{"text":"old","idle_period":250,"max_ticks":null}"#;
-        let back: Mandate = serde_json::from_str(legacy).unwrap();
-        assert!(!back.persistent);
+    fn mandate_deserializes_input_still_carrying_removed_persistent_field() {
+        // Persistence is now universal — `Mandate` carries no `persistent`
+        // field. An in-flight durable `AgentInput` serialized before the
+        // removal may still carry `persistent`; `Mandate` has no
+        // `deny_unknown_fields`, so the stale key is dropped on deserialize
+        // rather than rejected. This keeps continue-as-new replay safe
+        // across the field removal.
+        let stale = r#"{"text":"old","idle_period":250,"max_ticks":null,"persistent":true}"#;
+        let back: Mandate = serde_json::from_str(stale).unwrap();
+        assert_eq!(back.text, "old");
+        assert_eq!(back.idle_period, Duration::from_millis(250));
     }
 
     #[test]
@@ -482,7 +449,6 @@ mod tests {
                 recent_evidence: 3,
                 open_claims_max: 4,
             },
-            persistent: false,
             model: None,
             tools: Vec::new(),
         };

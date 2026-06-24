@@ -93,8 +93,6 @@ pub enum Decision {
         #[serde(with = "crate::duration_ms")]
         next_after: Duration,
     },
-    /// Stop running. The reason is persisted so retirement is auditable.
-    Retire { reason: String },
     /// Parent spawns a child agent at decision time. The host-side
     /// `register_child_in_structural_db` activity allocates the child's
     /// `AgentId` deterministically and instantiates an `AgentWorkflow`
@@ -605,16 +603,6 @@ mod tests {
         assert_eq!(d, back);
     }
 
-    #[test]
-    fn retire_round_trip() {
-        let d = Decision::Retire {
-            reason: "done".into(),
-        };
-        let s = serde_json::to_string(&d).unwrap();
-        let back: Decision = serde_json::from_str(&s).unwrap();
-        assert_eq!(d, back);
-    }
-
     // ---- Parent-child topology variants ---------------------------------
 
     use crate::agent_ref::{AgentId, AgentRef};
@@ -883,8 +871,8 @@ mod tests {
             Decision::Idle {
                 next_after: Duration::from_millis(50),
             },
-            Decision::Retire {
-                reason: "done".into(),
+            Decision::Idle {
+                next_after: Duration::from_millis(100),
             },
         ];
         let mock = MockDecide::new(script.clone());
@@ -913,11 +901,11 @@ mod tests {
     async fn mock_decide_is_object_safe_via_dyn_decide() {
         // Compile-time check: Decide is dyn-compatible. The run loop will
         // hold an `Arc<dyn Decide>`, so this property is load-bearing.
-        let mock: Box<dyn Decide> = Box::new(MockDecide::new(vec![Decision::Retire {
-            reason: "ok".into(),
+        let mock: Box<dyn Decide> = Box::new(MockDecide::new(vec![Decision::Idle {
+            next_after: Duration::from_millis(10),
         }]));
         let d = mock.decide(dummy_bundle()).await.unwrap();
-        assert!(matches!(d, Decision::Retire { .. }));
+        assert!(matches!(d, Decision::Idle { .. }));
     }
 
     #[tokio::test]
@@ -1042,7 +1030,6 @@ mod tests {
                 recent_evidence: 8,
                 open_claims_max: 32,
             },
-            persistent: false,
             model: None,
             tools: Vec::new(),
         };
@@ -1086,7 +1073,6 @@ mod tests {
                 recent_evidence: 3,
                 open_claims_max: 32,
             },
-            persistent: false,
             model: None,
             tools: Vec::new(),
         };
@@ -1121,7 +1107,6 @@ mod tests {
                 recent_evidence: 8,
                 open_claims_max: 2,
             },
-            persistent: false,
             model: None,
             tools: Vec::new(),
         };

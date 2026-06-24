@@ -1,12 +1,11 @@
-# `persistent_monitor` — continuous-monitor fixture (persistent agents)
+# `persistent_monitor` — continuous-monitor fixture
 
-A reduced `graph.yaml` proving the **persistent loop** end-to-end on the
+A reduced `graph.yaml` proving the **continuous loop** end-to-end on the
 Temporal worker path: one parent (`analyst`) + two children
-(`researcher-alpha`, `researcher-beta`), all `persistent: true`. Persistent
-agents do not stop themselves — a model `Retire` is demoted to `Idle`
-(CM-2) — so they cycle (emit → idle → refresh, CM-3), the parent
-re-reconciles newer child outputs into refreshed reports (CM-4), and the
-graph stops only at the `max_ticks` guardrail.
+(`researcher-alpha`, `researcher-beta`). Persistence is universal — agents
+never self-terminate — so they cycle (emit → idle → refresh), the parent
+re-reconciles newer child outputs into refreshed reports, and the graph
+stops only at the `max_ticks` guardrail.
 
 One file serves two run modes, because `graph.yaml` never picks the
 `Decide` implementation — only the topology, cadence, and budget.
@@ -21,7 +20,7 @@ and asserts the loop's runtime contract:
 - each agent emits **≥2 distinct outputs** (the refresh cycle repeats),
 - the parent performs **≥1 re-reconciliation** of a newer child output
   (≥2 distinct child outputs folded into synthetic evidence), and
-- every agent stops via **`max_ticks (N) reached`**, never a model `Retire`.
+- every agent stops via **`max_ticks (N) reached`** (agents never self-terminate).
 
 The children cite planted evidence and the parent reconciles real child
 outputs, so no model key and no Node are needed — only a local Temporal
@@ -34,15 +33,12 @@ TEMPORAL_LIVE_TEST=1 \
 ```
 
 It self-skips when either gate is absent, so the default `cargo test` stays
-hermetic. (The always-on
-`example_graph_parses_and_validates_as_all_persistent_monitor` test runs
-with no live deps and guards that the fixture still parses, validates, and
-clears CM-4's degenerate-combo check.)
+hermetic. (The always-on `example_graph_parses_and_validates` test runs with
+no live deps and guards that the fixture still parses and validates.)
 
-This proves the **machinery**. It does **not** exercise the persistent
-prompt clauses (CM-3/CM-4 prompt text — only a real model reads them;
-already snapshot-covered) or answer whether a model can drive the loop —
-that's Mode 2.
+This proves the **machinery**. It does **not** exercise the lifecycle prompt
+clauses (only a real model reads them; already snapshot-covered) or answer
+whether a model can drive the loop — that's Mode 2.
 
 ## Mode 2 — real-model loop-viability run (manual)
 

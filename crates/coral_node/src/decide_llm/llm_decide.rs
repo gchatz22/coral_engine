@@ -750,7 +750,9 @@ mod tests {
         assert!(names.contains(&"emit_output"));
         assert!(names.contains(&"rewrite_fs"));
         assert!(names.contains(&"idle"));
-        assert!(names.contains(&"retire"));
+        // Persistence is universal: the model is never offered a
+        // self-terminate tool.
+        assert!(!names.contains(&"retire"));
     }
 
     #[tokio::test]

@@ -231,8 +231,9 @@ async fn run_smoke() -> Result<()> {
         .context("plant evidence for EmitOutput")?;
 
     // Scripted sequence: Idle → CallTools(echo) → EmitOutput citing the
-    // planted id → Retire. Proves the YAML-derived AgentInput drives
-    // the expected agent-loop end-state.
+    // planted id, then the `max_ticks` cap stops the loop (agents never
+    // self-terminate). Proves the YAML-derived AgentInput drives the
+    // expected agent-loop end-state.
     set_decision_script(vec![
         Decision::Idle {
             next_after: Duration::from_millis(50),
@@ -247,9 +248,6 @@ async fn run_smoke() -> Result<()> {
         Decision::EmitOutput {
             content: "coral_apply_smoke: echo result observed".into(),
             evidence: vec![planted_id.clone()],
-        },
-        Decision::Retire {
-            reason: "coral_apply_smoke: scripted retire".into(),
         },
     ]);
 
@@ -272,6 +270,11 @@ async fn run_smoke() -> Result<()> {
     input.fs_handle = coral_temporal::workflow::FsHandle {
         prefix: agent_prefix.clone(),
     };
+    // Cap the run at the 3 scripted decisions so the loop terminates on
+    // the safety cap right after EmitOutput (the YAML's max_ticks=8,
+    // asserted above on the input, would let the script exhaust into the
+    // installed decide impl). The agent never self-terminates.
+    input.mandate.max_ticks = Some(3);
     // `yaml_seed_triggers` takes an `AppliedGraph` so it can resolve
     // each `seed.triggers[].agent` to a concrete workflow_id (any node
     // in the tree, not just the root). Synthesize a minimal
@@ -389,8 +392,8 @@ async fn drive(
         .await
         .context("AgentWorkflow.get_result")?;
     let AgentResult::Retired { reason } = result;
-    assert!(
-        reason.contains("scripted retire"),
+    assert_eq!(
+        reason, "max_ticks (3) reached",
         "workflow returned wrong retire reason: {reason:?}"
     );
 
@@ -407,8 +410,8 @@ async fn drive(
         .get("reason")
         .and_then(|x| x.as_str())
         .ok_or_else(|| anyhow::anyhow!("retirement.json missing reason"))?;
-    assert!(
-        reason_on_disk.contains("scripted retire"),
+    assert_eq!(
+        reason_on_disk, "max_ticks (3) reached",
         "retirement.json carries wrong reason: {reason_on_disk:?}"
     );
 
@@ -447,10 +450,10 @@ async fn drive(
     );
 
     // ---- Artifact 3: `<prefix>/decisions/<tick>.jsonl` --------------------
-    // One entry per tick. The scripted sequence produces four decisions
-    // (Idle, CallTools, EmitOutput, Retire); the workflow body bumps
-    // `tick` only on non-retire arms, so the four ticks land at
-    // `decisions/{0,1,2,3}.jsonl`.
+    // One entry per logged decision. The scripted sequence produces three
+    // decisions (Idle, CallTools, EmitOutput) at `decisions/{0,1,2}.jsonl`.
+    // The `max_ticks` cap retires at the top of the loop without logging a
+    // decision, so it adds no fourth entry.
     let page = storage
         .list(&format!("{agent_prefix}/decisions/"), None, usize::MAX)
         .await
@@ -461,11 +464,11 @@ async fn drive(
     eprintln!("coral_apply_smoke: decision-log keys: {decision_keys:?}");
     assert_eq!(
         decision_keys.len(),
-        4,
-        "expected 4 decision-log entries (Idle, CallTools, EmitOutput, Retire); got {decision_keys:?}"
+        3,
+        "expected 3 decision-log entries (Idle, CallTools, EmitOutput); got {decision_keys:?}"
     );
 
-    let mut summaries: Vec<String> = Vec::with_capacity(4);
+    let mut summaries: Vec<String> = Vec::with_capacity(3);
     for k in &decision_keys {
         let bytes = storage
             .get(k)
@@ -493,11 +496,6 @@ async fn drive(
         summaries[2].starts_with("EmitOutput"),
         "tick 2 summary: {:?}",
         summaries[2]
-    );
-    assert!(
-        summaries[3].starts_with("Retire"),
-        "tick 3 summary: {:?}",
-        summaries[3]
     );
 
     Ok(())
