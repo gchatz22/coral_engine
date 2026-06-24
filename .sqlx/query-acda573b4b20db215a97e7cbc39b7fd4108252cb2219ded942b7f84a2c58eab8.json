@@ -1,0 +1,48 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT agent_id, filepath, blob_sha,\n                   created_at as \"created_at!: chrono::DateTime<chrono::Utc>\",\n                   updated_at as \"updated_at!: chrono::DateTime<chrono::Utc>\"\n            FROM file_index\n            WHERE agent_id = $1 AND filepath LIKE $2\n            ORDER BY updated_at DESC, filepath\n            LIMIT $3\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "agent_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "filepath",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "blob_sha",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at!: chrono::DateTime<chrono::Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "updated_at!: chrono::DateTime<chrono::Utc>",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "acda573b4b20db215a97e7cbc39b7fd4108252cb2219ded942b7f84a2c58eab8"
+}

@@ -158,6 +158,14 @@ pub trait AgentStorage: Send + Sync + 'static {
 pub struct BlobSha(String);
 
 impl BlobSha {
+    /// Reconstruct a `BlobSha` from its hex digest — e.g. when reading a
+    /// pinned sha back out of the provenance DB. The string is taken
+    /// as-is (it originates from a prior [`as_str`](BlobSha::as_str) /
+    /// commit-manifest round-trip), so no validation is performed.
+    pub fn from_hex(hex: impl Into<String>) -> Self {
+        Self(hex.into())
+    }
+
     /// The 40-char lowercase hex digest.
     pub fn as_str(&self) -> &str {
         &self.0
