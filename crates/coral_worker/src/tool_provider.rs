@@ -195,6 +195,7 @@ mod tests {
     ) -> ToolRecord {
         ToolRecord {
             id: Uuid::nil(),
+            graph_id: Uuid::nil(),
             kind: kind.to_string(),
             command: command.map(str::to_owned),
             args,

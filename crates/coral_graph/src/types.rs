@@ -57,6 +57,7 @@ pub struct Edge {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, FromRow)]
 pub struct ToolRecord {
     pub id: Uuid,
+    pub graph_id: Uuid,
     pub kind: String,
     pub command: Option<String>,
     pub args: serde_json::Value,
@@ -147,6 +148,7 @@ mod tests {
     fn tool_record_serde_round_trip() {
         let t = ToolRecord {
             id: Uuid::new_v4(),
+            graph_id: Uuid::new_v4(),
             kind: "mcp".into(),
             command: Some("npx".into()),
             args: serde_json::json!(["-y", "@modelcontextprotocol/server-everything"]),

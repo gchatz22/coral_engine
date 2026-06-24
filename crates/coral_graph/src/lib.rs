@@ -64,7 +64,7 @@ mod migration_tests {
     /// Asserts every table the schema declares exists after migration.
     #[sqlx::test(migrator = "super::MIGRATOR")]
     async fn schema_creates_all_expected_tables(pool: PgPool) -> sqlx::Result<()> {
-        let expected = ["graphs", "agents", "edges", "tools", "agent_tools"];
+        let expected = ["graphs", "agents", "edges", "tools"];
         let rows = sqlx::query(
             "SELECT table_name FROM information_schema.tables \
              WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",

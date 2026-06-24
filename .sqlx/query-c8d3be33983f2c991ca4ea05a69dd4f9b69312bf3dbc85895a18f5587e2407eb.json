@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                INSERT INTO tools (id, kind, command, args, env_refs)\n                VALUES ($1, $2, $3, $4, $5)\n                RETURNING id, kind, command, args as \"args!: serde_json::Value\", env_refs as \"env_refs!: serde_json::Value\", created_at as \"created_at!: chrono::DateTime<chrono::Utc>\"\n                ",
+  "query": "\n                INSERT INTO tools (id, graph_id, kind, command, args, env_refs)\n                VALUES ($1, $2, $3, $4, $5, $6)\n                RETURNING id, graph_id, kind, command, args as \"args!: serde_json::Value\", env_refs as \"env_refs!: serde_json::Value\", created_at as \"created_at!: chrono::DateTime<chrono::Utc>\"\n                ",
   "describe": {
     "columns": [
       {
@@ -10,32 +10,38 @@
       },
       {
         "ordinal": 1,
+        "name": "graph_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
         "name": "kind",
         "type_info": "Text"
       },
       {
-        "ordinal": 2,
+        "ordinal": 3,
         "name": "command",
         "type_info": "Text"
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "args!: serde_json::Value",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "env_refs!: serde_json::Value",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "created_at!: chrono::DateTime<chrono::Utc>",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
+        "Uuid",
         "Uuid",
         "Text",
         "Text",
@@ -46,11 +52,12 @@
     "nullable": [
       false,
       false,
+      false,
       true,
       false,
       false,
       false
     ]
   },
-  "hash": "b1082b2492848dc5e77d0168bc980fb908847e96fd0d44b99ae9dcaba409337b"
+  "hash": "c8d3be33983f2c991ca4ea05a69dd4f9b69312bf3dbc85895a18f5587e2407eb"
 }

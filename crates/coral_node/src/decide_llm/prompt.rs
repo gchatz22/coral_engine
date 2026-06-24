@@ -115,9 +115,24 @@ fn render_system(m: &Mandate) -> String {
     } else {
         ONESHOT_INVARIANTS_TAIL
     };
+    let catalog = render_tool_catalog(&m.tools);
     format!(
-        "You are an agent operating under the following mandate:\n\n{}\n\n{INVARIANTS_HEAD}\n{tail}",
+        "You are an agent operating under the following mandate:\n\n{}\n\n{catalog}{INVARIANTS_HEAD}\n{tail}",
         m.text
+    )
+}
+
+/// Render the per-agent tool catalog: the tool *definitions* the agent is
+/// assigned (e.g. an MCP server), each of which may expose one or more named
+/// operations. Trailing blank line so it composes into the system message
+/// ahead of the invariants.
+fn render_tool_catalog(tools: &[String]) -> String {
+    if tools.is_empty() {
+        return "You have no tools assigned.\n\n".to_string();
+    }
+    format!(
+        "Tools assigned to you: {}. Each may expose one or more named operations.\n\n",
+        tools.join(", ")
     )
 }
 
@@ -314,6 +329,34 @@ mod tests {
         }
     }
 
+    // ---- tool catalog ----------------------------------------------------
+
+    #[test]
+    fn system_message_lists_assigned_tools() {
+        let mut m = mandate();
+        m.tools = vec!["echo".into(), "web-search".into()];
+        let bundle = ContextBundle {
+            mandate: m,
+            ..empty_bundle()
+        };
+        let msgs = render(&bundle);
+        let sys = text(&msgs[0]);
+        assert!(
+            sys.contains("Tools assigned to you: echo, web-search"),
+            "system message must list the assigned tools, got: {sys}"
+        );
+    }
+
+    #[test]
+    fn system_message_notes_no_tools_when_unassigned() {
+        // `mandate()` builds via `Mandate::new`, which defaults to no tools.
+        let sys = render_system(&mandate());
+        assert!(
+            sys.contains("no tools assigned"),
+            "system message must state when no tools are assigned, got: {sys}"
+        );
+    }
+
     // ---- shape invariants ------------------------------------------------
 
     #[test]
@@ -453,6 +496,8 @@ mod tests {
              \n\
              Watch the FDA holds list and report drug-program risk.\n\
              \n\
+             You have no tools assigned.\n\
+             \n\
              Invariants:\n\
              1. Provenance. Every `emit_output` decision must cite `evidence` ids that resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.\n\
              2. One decision per turn. Reply by calling exactly one terminal decision tool (`emit_output`, `rewrite_fs`, `idle`, `retire`) OR one or more `call_tool` blocks dispatched together as a single parallel batch.\n\
@@ -483,6 +528,8 @@ mod tests {
             "You are an agent operating under the following mandate:\n\
              \n\
              Watch the FDA holds list and report drug-program risk.\n\
+             \n\
+             You have no tools assigned.\n\
              \n\
              Invariants:\n\
              1. Provenance. Every `emit_output` decision must cite `evidence` ids that resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.\n\

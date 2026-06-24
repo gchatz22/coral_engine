@@ -559,6 +559,7 @@ pub(crate) fn resolve_mandate(agent: &Agent, defaults: &Option<AgentDefaults>) -
     let mut mandate = NodeMandate::new(agent.mandate.text.clone(), idle_period, max_ticks);
     mandate.persistent = agent.mandate.persistent;
     mandate.model = agent.mandate.model.clone();
+    mandate.tools = agent.tools.clone();
     mandate
 }
 
@@ -1497,6 +1498,20 @@ seed:
     fn model_absent_defaults_to_none_at_parse() {
         let g = parse_and_validate(HAPPY_YAML).expect("happy path");
         assert!(g.agents[0].mandate.model.is_none());
+    }
+
+    #[test]
+    fn tools_assignment_reaches_agent_input() {
+        let g = parse_and_validate(HAPPY_YAML).expect("happy path");
+        assert_eq!(g.agents[0].tools, vec!["echo".to_string()]);
+        let graph_id = coral_node::agent_ref::GraphId::new(uuid::Uuid::new_v4());
+        let agent_id = coral_node::agent_ref::AgentId::new(uuid::Uuid::new_v4());
+        let input = super::into_agent_input(&g, graph_id, agent_id);
+        assert_eq!(
+            input.mandate.tools,
+            vec!["echo".to_string()],
+            "per-agent tools: must reach the workflow input mandate"
+        );
     }
 
     /// Degenerate combo: a `persistent` parent whose children are all
