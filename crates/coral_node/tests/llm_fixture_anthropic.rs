@@ -307,7 +307,7 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "max_ticks (3) reached");
+    assert_eq!(reason, "step_cap (3) reached");
 
     // All four fixtures should have been consumed across the three ticks.
     // We keep this wire-level remaining/captured check because it pins
@@ -317,7 +317,7 @@ async fn unhealthy_then_recovery_cycle_via_agent_run() {
     assert_eq!(mock.captured().len(), 4);
 
     // The final tick is the recovery `idle` — a single successful upstream
-    // call (the `max_ticks` cap retires the agent on the next iteration).
+    // call (the `step_cap` cap retires the agent on the next iteration).
     // The handle therefore reports exactly one call carrying Anthropic
     // vendor + the configured model.
     //

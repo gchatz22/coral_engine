@@ -32,7 +32,8 @@ use std::time::Duration;
 use coral_node::agent_ref::{AgentId, AgentRef, GraphId};
 use coral_node::decision::{ContextBundle, CorrectionContext, Decision, ToolCall};
 use coral_node::evidence::EvidenceId;
-use coral_node::mandate::{Mandate, OutputId};
+use coral_node::mandate::{Mandate, OutputId, INTERIM_STEP_CAP};
+use coral_node::scheduler::arm_self_wake;
 use coral_node::trigger::{HumanOp, MandatePatch, Trigger};
 use serde::{Deserialize, Serialize};
 use temporalio_common::protos::temporal::api::enums::v1::ParentClosePolicy;
@@ -199,7 +200,7 @@ pub struct AgentInput {
     pub carryover: Option<Carryover>,
     /// Resolved [`Mandate`] for this agent. The workflow body passes it into
     /// every `assemble_context` activity invocation so the LLM sees the real
-    /// mandate text + idle period + max-ticks cap.
+    /// mandate text + cadence.
     pub mandate: Mandate,
     /// Graph this agent belongs to. Carried on `AgentInput` (rather than
     /// parsed from `ctx.workflow_id()` at activity-time) so the workflow
@@ -245,8 +246,9 @@ impl AgentInput {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum AgentResult {
     /// The workflow's loop body completed because the agent retired (the
-    /// `retire` signal fired or the `max_ticks` safety cap was hit). The
-    /// agent never self-terminates — termination is a kernel/human op.
+    /// `retire` signal fired or the interim `step_cap` runaway backstop was
+    /// hit). The agent never self-terminates — termination is a kernel/human
+    /// op.
     Retired { reason: String },
 }
 
@@ -440,8 +442,9 @@ impl AgentWorkflow {
     ///    `ctx.continue_as_new(&next_input, opts)`.
     ///
     /// Retirement structurally cannot trigger CAN: both retirement paths
-    /// (the `max_ticks` cap and the `drained.retirement` short-circuit, both
-    /// at the top of the loop) return before the CAN check.
+    /// (the interim `step_cap` backstop and the `drained.retirement`
+    /// short-circuit, both at the top of the loop) return before the CAN
+    /// check.
     #[run]
     pub async fn run(
         ctx: &mut WorkflowContext<Self>,
@@ -450,18 +453,22 @@ impl AgentWorkflow {
         if let Some(c) = input.carryover.clone() {
             ctx.state_mut(|s| s.hydrate_from_carryover(c));
         }
+        // `never` cadence (`idle_period == None`): self-wake only the first
+        // cycle, then wait on signals alone (the wake gate stops arming the
+        // idle timer).
+        let never = input.mandate.is_never();
         loop {
-            // `max_ticks` is the kernel-level guardrail stop (the only one
-            // besides a retire signal). Checked before `wait_for_tick` so an
-            // over-budget agent retires without waking or burning a decide
-            // call, mirroring the in-process loop. `tick` is the hydrated
-            // state value, so the cap spans a continue-as-new.
+            // The interim `step_cap` runaway backstop. Checked before
+            // `wait_for_tick` so an over-budget agent retires without waking
+            // or burning a decide call, mirroring the in-process loop. `tick`
+            // is the hydrated state value, so the cap spans a
+            // continue-as-new.
             let tick = ctx.state(|s| s.tick);
-            if let Some(reason) = max_ticks_retire_reason(tick, input.mandate.max_ticks) {
+            if let Some(reason) = step_cap_retire_reason(tick, input.mandate.step_cap) {
                 return retire(ctx, &input, reason).await;
             }
 
-            wait_for_tick(ctx).await;
+            wait_for_tick(ctx, never).await;
 
             // Retirement short-circuit fires before any activity invocation
             // and before any CAN check, so a `retire` signal can never
@@ -610,13 +617,13 @@ impl AgentWorkflow {
     }
 }
 
-/// Retire reason when `tick` has reached the mandate's `max_ticks` safety
-/// cap, else `None`. The wording matches the in-process loop in
-/// `coral_node::agent` so `retirement.json` reads identically on both paths.
-fn max_ticks_retire_reason(tick: u64, max_ticks: Option<u64>) -> Option<String> {
-    max_ticks
-        .filter(|&max| tick >= max)
-        .map(|max| format!("max_ticks ({max}) reached"))
+/// Retire reason when `tick` has reached the interim `step_cap` runaway
+/// backstop (`None` falls back to [`INTERIM_STEP_CAP`]), else `None`. The
+/// wording matches the in-process loop in `coral_node::agent` so
+/// `retirement.json` reads identically on both paths.
+fn step_cap_retire_reason(tick: u64, step_cap: Option<u64>) -> Option<String> {
+    let cap = step_cap.unwrap_or(INTERIM_STEP_CAP);
+    (tick >= cap).then(|| format!("step_cap ({cap}) reached"))
 }
 
 /// Give a pure idle-timer wake an explicit "you woke on schedule" signal.
@@ -646,19 +653,26 @@ fn synthesize_scheduled_wake(drained: &mut DrainedBuckets) {
 /// We wake on every non-retire signal bucket (not only `triggers_pending`)
 /// so operator-sent overrides round-trip through the loop within one tick
 /// rather than waiting up to `next_wake` for the next idle wake.
-async fn wait_for_tick(ctx: &WorkflowContext<AgentWorkflow>) {
-    let wake_after = ctx.state(|s| s.next_wake.unwrap_or(INITIAL_NEXT_WAKE));
+async fn wait_for_tick(ctx: &WorkflowContext<AgentWorkflow>, never: bool) {
+    let (wake_after, is_first_wake) =
+        ctx.state(|s| (s.next_wake.unwrap_or(INITIAL_NEXT_WAKE), s.tick == 0));
     let mut wait_signal = ctx.wait_condition(|s| {
         !s.pending_triggers.is_empty()
             || !s.pending_human_ops.is_empty()
             || !s.pending_mandate_patches.is_empty()
             || s.retirement_request.is_some()
     });
-    let mut wait_timer = ctx.timer(wake_after);
-    temporalio_sdk::workflows::select! {
-        _ = wait_signal => {},
-        _ = wait_timer => {},
-    };
+    if arm_self_wake(never, is_first_wake) {
+        let mut wait_timer = ctx.timer(wake_after);
+        temporalio_sdk::workflows::select! {
+            _ = wait_signal => {},
+            _ = wait_timer => {},
+        };
+    } else {
+        // `never` cadence past the first cycle: no self-wake timer, so block
+        // until a signal arrives.
+        wait_signal.await;
+    }
 }
 
 /// Invoke the `assemble_context` activity with the per-tick drained buckets.
@@ -838,7 +852,7 @@ fn decision_summary(decision: &Decision) -> String {
 }
 
 /// Invoke the `persist_retirement` activity and return the workflow result.
-/// Shared between the retire-signal short-circuit and the `max_ticks` cap.
+/// Shared between the retire-signal short-circuit and the `step_cap` cap.
 ///
 /// After `persist_retirement` returns and before the workflow exits, if
 /// `input.parent_handle.is_some()` the workflow body fires one final
@@ -1954,22 +1968,27 @@ mod tests {
     }
 
     #[test]
-    fn max_ticks_retire_reason_fires_at_or_past_the_cap() {
-        // Boundary: tick == max retires (the in-process loop performs `max`
-        // ticks then stops on the would-be tick `max`).
+    fn step_cap_retire_reason_fires_at_or_past_the_cap() {
+        // Boundary: tick == cap retires (the loop performs `cap` ticks then
+        // stops on the would-be tick `cap`).
         assert_eq!(
-            max_ticks_retire_reason(3, Some(3)).as_deref(),
-            Some("max_ticks (3) reached"),
+            step_cap_retire_reason(3, Some(3)).as_deref(),
+            Some("step_cap (3) reached"),
         );
         assert_eq!(
-            max_ticks_retire_reason(4, Some(3)).as_deref(),
-            Some("max_ticks (3) reached"),
+            step_cap_retire_reason(4, Some(3)).as_deref(),
+            Some("step_cap (3) reached"),
         );
-        // Under budget: keep running.
-        assert_eq!(max_ticks_retire_reason(2, Some(3)), None);
-        assert_eq!(max_ticks_retire_reason(0, Some(1)), None);
-        // No cap: never retires on this axis.
-        assert_eq!(max_ticks_retire_reason(u64::MAX, None), None);
+        // Under cap: keep running.
+        assert_eq!(step_cap_retire_reason(2, Some(3)), None);
+        assert_eq!(step_cap_retire_reason(0, Some(1)), None);
+        // `None` falls back to the interim default rather than meaning "no
+        // cap": below the default it keeps running, at it it retires.
+        assert_eq!(step_cap_retire_reason(INTERIM_STEP_CAP - 1, None), None);
+        assert_eq!(
+            step_cap_retire_reason(INTERIM_STEP_CAP, None).as_deref(),
+            Some(format!("step_cap ({INTERIM_STEP_CAP}) reached").as_str()),
+        );
     }
 
     fn empty_drained() -> DrainedBuckets {

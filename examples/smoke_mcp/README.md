@@ -37,20 +37,20 @@ shuts it down when the agent retires.
 
 ## What to expect
 
-The agent runs three scripted ticks under a `max_ticks = 3` cap:
+The agent runs three scripted ticks under a `step_cap = 3` cap:
 
 1. **Tick 1** — `CallTool { name: "get-sum", args: {"a": 2, "b": 3} }`.
    Dispatched through `ToolRegistry::call`, which forwards into the
    MCP client and writes an `EvidenceRecord` to disk.
 2. **Tick 2** — `EmitOutput` referencing the evidence id from tick 1.
-3. **Tick 3** — `Idle`. The mandate's `max_ticks` cap retires the
+3. **Tick 3** — `Idle`. The mandate's `step_cap` retires the
    agent at the end of this tick.
 
 On success, stdout includes:
 
 ```
 node-run-mcp: registered 13 MCP tool(s): echo, get-annotated-message, get-env, ...
-node-run-mcp: agent retired: max_ticks (3) reached
+node-run-mcp: agent retired: step_cap (3) reached
 node-run-mcp: fs tree at /tmp/coral-smoke-mcp-fs:
 /tmp/coral-smoke-mcp-fs
 ├── claims
@@ -70,7 +70,7 @@ Key files:
   triple the MCP server returned, content-addressed by sha256.
 * `outputs/<ulid>.json` — the `EmitOutput` payload, with its
   `evidence: [...]` array pointing at the evidence record above.
-* `retirement.json` — `{"reason": "max_ticks (3) reached", ...}`.
+* `retirement.json` — `{"reason": "step_cap (3) reached", ...}`.
 * `health.json` — `"state": "Healthy"`.
 
 The `13` tool count is what server-everything advertises today

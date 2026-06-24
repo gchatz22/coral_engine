@@ -47,6 +47,35 @@ pub(crate) mod duration_ms {
     }
 }
 
+pub(crate) mod duration_ms_opt {
+    //! Serialize/deserialize `Option<Duration>` as `u64` milliseconds or
+    //! `null`.
+    //!
+    //! Used via `#[serde(with = "crate::duration_ms_opt")]` on
+    //! `Mandate::idle_period`, where `None` is the "never self-wake" cadence
+    //! (serialized as `null`) and `Some(d)` is the self-wake interval.
+
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S>(d: &Option<Duration>, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match d {
+            Some(d) => s.serialize_some(&u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(d: D) -> Result<Option<Duration>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Option::<u64>::deserialize(d)?.map(Duration::from_millis))
+    }
+}
+
 /// Returns the crate name.
 pub fn crate_name() -> &'static str {
     "coral_node"

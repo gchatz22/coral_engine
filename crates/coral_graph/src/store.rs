@@ -1195,7 +1195,6 @@ agents:
     mandate:
       text: do the thing
       idle_period: 1s
-      max_ticks: 4
     tools: [echo]
 seed:
   triggers:
@@ -1240,10 +1239,10 @@ seed:
 
     /// Config-home invariant: authored config (cadence/model/tools) rides
     /// the Temporal durable input, never Postgres. Even when the YAML sets
-    /// `model` / `max_ticks`, `create_from_yaml` writes only topology — the
-    /// `agents` table holds no config columns for those values to land in.
-    /// Guards against a future change silently re-introducing a config
-    /// column on `agents` (the list includes the long-gone `persistent`).
+    /// `model`, `create_from_yaml` writes only topology — the `agents` table
+    /// holds no config columns for those values to land in. Guards against a
+    /// future change silently re-introducing a config column on `agents`
+    /// (the list includes the long-gone `persistent` / `max_ticks`).
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn create_from_yaml_writes_no_config_columns_to_agents(pool: PgPool) -> sqlx::Result<()> {
         const CONFIG_YAML: &str = r#"
@@ -1260,7 +1259,6 @@ agents:
     mandate:
       text: do the thing
       idle_period: 1s
-      max_ticks: 4
       model: claude-opus-4-8
     tools: [echo]
 seed:
@@ -1318,7 +1316,6 @@ agents:
     mandate:
       text: do the thing
       idle_period: 1s
-      max_ticks: 4
     tools: [web]
 seed:
   triggers:

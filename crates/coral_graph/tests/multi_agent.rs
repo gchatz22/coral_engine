@@ -561,7 +561,7 @@ async fn run_end_to_end() -> Result<()> {
 
     // ---- 3. Scripts ---------------------------------------------------
     //
-    // Children: plain Idle → EmitOutput, then the `max_ticks=2` cap stops
+    // Children: plain Idle → EmitOutput, then the `step_cap=2` cap stops
     // each (agents never self-terminate). Each EmitOutput cites its planted
     // evidence id (one per child) so `persist_output`'s provenance contract
     // is satisfied.
@@ -569,7 +569,7 @@ async fn run_end_to_end() -> Result<()> {
     // Parent: reconcile (via sentinel; pushes itself back until both
     // ChildOutput signals land) → emit with synthetic (via sentinel; pushes
     // itself back until 2 reconcile-evidence records appear in
-    // recent_evidence) → then idle until its generous `max_ticks` cap stops
+    // recent_evidence) → then idle until its generous `step_cap` cap stops
     // it. The cap only bounds the post-emit idle tail.
     let child_a_script = vec![
         Decision::Idle {
@@ -746,7 +746,7 @@ async fn drive(
         .context("start_workflow(child-b)")?;
     eprintln!("child-b started at {child_b_workflow_id}");
 
-    // Wait for each child to retire (EmitOutput, then the max_ticks cap).
+    // Wait for each child to retire (EmitOutput, then the step_cap cap).
     // Each signals the parent on its EmitOutput tick before the cap stops
     // it. The cap-driven retirement also fires `Trigger::ChildRetired` at
     // the parent — orthogonal to the reconcile assertion but exercises the

@@ -78,7 +78,7 @@ Optional flags (insert before the positional args):
 
 ## What to expect
 
-The agent runs under a `max_ticks = 8` cap. The model is instructed by
+The agent runs under a `step_cap = 8` cap. The model is instructed by
 the mandate text to:
 
 1. Call `get-sum` with `{"a": 2, "b": 3}` via the `call_tool` decision.
@@ -107,7 +107,7 @@ On success, stdout includes:
 node-run-llm: fs_root=/tmp/coral-smoke-llm-mcp-fs/2026-05-20T04-30-07-123Z
 node-run-llm: registered 13 MCP tool(s): echo, get-annotated-message, get-env, ...
 node-run-llm: vendor=anthropic model=claude-haiku-4-5
-node-run-llm: agent retired: <model's reason or max_ticks (8) reached>
+node-run-llm: agent retired: step_cap (8) reached
 node-run-llm: fs tree at /tmp/coral-smoke-llm-mcp-fs/2026-05-20T04-30-07-123Z:
 /tmp/coral-smoke-llm-mcp-fs/2026-05-20T04-30-07-123Z
 ├── claims
@@ -187,5 +187,5 @@ exits success.
 
 * **Reliability tuning.** The mandate text is calibrated for the default
   `claude-haiku-4-5` / Cohere `command-a-03-2025` models. If a future
-  ticket targets a smaller / cheaper model, expect to widen `max_ticks`
+  ticket targets a smaller / cheaper model, expect to widen `step_cap`
   or rephrase the mandate.

@@ -650,7 +650,6 @@ mod tests {
         let mandate_minimal = json!({
             "text": "",
             "idle_period": 0,
-            "max_ticks": null,
         });
         for spec in decision_tools() {
             let minimal: Value = match spec.name.as_str() {
@@ -705,7 +704,6 @@ mod tests {
         let mandate = json!({
             "text": "fetch foo",
             "idle_period": 500,
-            "max_ticks": 8,
         });
         let tc = call(
             "spawn_child",
@@ -719,8 +717,7 @@ mod tests {
             } => {
                 assert_eq!(agent_name, "fetcher");
                 assert_eq!(mandate.text, "fetch foo");
-                assert_eq!(mandate.idle_period, Duration::from_millis(500));
-                assert_eq!(mandate.max_ticks, Some(8));
+                assert_eq!(mandate.idle_period, Some(Duration::from_millis(500)));
             }
             other => panic!("expected SpawnChild, got {other:?}"),
         }
@@ -831,7 +828,6 @@ mod tests {
         let mandate = json!({
             "text": "v2",
             "idle_period": 100,
-            "max_ticks": null,
         });
         let tc = call(
             "replace_child",
@@ -845,7 +841,7 @@ mod tests {
             } => {
                 assert_eq!(child_ref.workflow_id, "graphs/g1/agents/c1");
                 assert_eq!(new_mandate.text, "v2");
-                assert_eq!(new_mandate.idle_period, Duration::from_millis(100));
+                assert_eq!(new_mandate.idle_period, Some(Duration::from_millis(100)));
             }
             other => panic!("expected ReplaceChild, got {other:?}"),
         }

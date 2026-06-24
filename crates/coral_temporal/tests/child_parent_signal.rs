@@ -4,7 +4,7 @@
 //! idle capturing every `Trigger` from its `pending_triggers` bucket,
 //! and a child that emits once (firing a `Trigger::ChildOutput` at the
 //! parent via `ctx.external_workflow(...).signal(...)`) then retires on
-//! its `max_ticks=1` cap (firing `Trigger::ChildRetired`). Asserts on the
+//! its `step_cap=1` cap (firing `Trigger::ChildRetired`). Asserts on the
 //! happy path and on the failure mode where the parent's workflow id does
 //! not resolve.
 
@@ -372,7 +372,7 @@ async fn drive_happy_path(
     eprintln!("happy: child started at {child_workflow_id}");
 
     // Wait for the child to retire. It emits once (the `EmitOutput` arm
-    // fires the ChildOutput signal at the parent), then the `max_ticks=1`
+    // fires the ChildOutput signal at the parent), then the `step_cap=1`
     // cap retires it (firing the ChildRetired signal).
     let child_result: AgentResult = child_handle
         .get_result(WorkflowGetResultOptions::default())
@@ -380,7 +380,7 @@ async fn drive_happy_path(
         .context("child get_result")?;
     let AgentResult::Retired { reason } = child_result;
     assert_eq!(
-        reason, "max_ticks (1) reached",
+        reason, "step_cap (1) reached",
         "child workflow returned wrong retire reason: {reason:?}"
     );
     eprintln!("happy: child retired cleanly");
@@ -644,14 +644,14 @@ async fn drive_failure_path(
     // Load-bearing assertion: despite the signal target being a
     // non-existent workflow, the child's workflow body does NOT error
     // out. It logs the failure and continues to the next tick (where the
-    // `max_ticks=1` cap retires it).
+    // `step_cap=1` cap retires it).
     let result: AgentResult = child_handle
         .get_result(WorkflowGetResultOptions::default())
         .await
         .context("child get_result (failure path)")?;
     let AgentResult::Retired { reason } = result;
     assert_eq!(
-        reason, "max_ticks (1) reached",
+        reason, "step_cap (1) reached",
         "child workflow did not complete normally despite signal-to-nonexistent-parent failure; \
          got: {reason:?}"
     );

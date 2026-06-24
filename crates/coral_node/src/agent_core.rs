@@ -425,7 +425,7 @@ mod tests {
             evidence: vec![ev_id],
         };
         let tools = ToolRegistry::new();
-        let mut scheduler = Scheduler::new(m.idle_period);
+        let mut scheduler = Scheduler::new(m.idle_period.unwrap_or_default());
         let outcome = dispatch(&fs, &tools, &mut scheduler, decision)
             .await
             .unwrap();
@@ -439,7 +439,7 @@ mod tests {
     async fn dispatch_idle_sets_scheduler_cadence_and_continues() {
         let (fs, m) = fixture().await;
         let tools = ToolRegistry::new();
-        let mut scheduler = Scheduler::new(m.idle_period);
+        let mut scheduler = Scheduler::new(m.idle_period.unwrap_or_default());
         let outcome = dispatch(
             &fs,
             &tools,
@@ -460,7 +460,7 @@ mod tests {
     async fn dispatch_emit_output_with_empty_evidence_returns_needs_correction() {
         let (fs, m) = fixture().await;
         let tools = ToolRegistry::new();
-        let mut scheduler = Scheduler::new(m.idle_period);
+        let mut scheduler = Scheduler::new(m.idle_period.unwrap_or_default());
         let outcome = dispatch(
             &fs,
             &tools,
@@ -493,7 +493,7 @@ mod tests {
     async fn dispatch_call_tools_with_unknown_name_returns_needs_correction() {
         let (fs, m) = fixture().await;
         let tools = ToolRegistry::new(); // empty registry — every name unknown
-        let mut scheduler = Scheduler::new(m.idle_period);
+        let mut scheduler = Scheduler::new(m.idle_period.unwrap_or_default());
         let outcome = dispatch(
             &fs,
             &tools,
@@ -520,7 +520,7 @@ mod tests {
     async fn dispatch_emit_output_with_unresolved_evidence_returns_needs_correction() {
         let (fs, m) = fixture().await;
         let tools = ToolRegistry::new();
-        let mut scheduler = Scheduler::new(m.idle_period);
+        let mut scheduler = Scheduler::new(m.idle_period.unwrap_or_default());
         // Construct a bogus evidence id that is not on disk.
         let bogus = EvidenceId::new("echo", &json!({"never": "written"}), &json!({"x": 0}));
         let outcome = dispatch(
@@ -569,7 +569,7 @@ mod tests {
                 name: "errbomb".into(),
             }))
             .unwrap();
-        let mut scheduler = Scheduler::new(m.idle_period);
+        let mut scheduler = Scheduler::new(m.idle_period.unwrap_or_default());
         let outcome = dispatch(
             &fs,
             &tools,
@@ -616,7 +616,7 @@ mod tests {
             .unwrap();
         let decision = decide(bundle, &mock).await.unwrap();
         let tools = ToolRegistry::new();
-        let mut scheduler = Scheduler::new(m.idle_period);
+        let mut scheduler = Scheduler::new(m.idle_period.unwrap_or_default());
         let outcome = dispatch(&fs, &tools, &mut scheduler, decision)
             .await
             .unwrap();

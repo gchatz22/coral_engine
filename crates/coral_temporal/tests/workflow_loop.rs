@@ -209,7 +209,7 @@ async fn run_live_test() -> Result<()> {
 
     // Install the scripted decision sequence BEFORE the worker starts.
     // Sequence: Idle → CallTools(3 parallel) → EmitOutput → RewriteFs, then
-    // the `max_ticks=4` cap stops the loop (agents never self-terminate).
+    // the `step_cap=4` cap stops the loop (agents never self-terminate).
     set_decision_script(vec![
         Decision::Idle {
             next_after: Duration::from_millis(50),
@@ -311,7 +311,7 @@ async fn drive(
     };
     input.mandate.tools = assigned_tools();
     // The loop runs the 4 scripted decisions, then the cap stops it.
-    input.mandate.max_ticks = Some(4);
+    input.mandate.step_cap = Some(4);
     let handle = client
         .start_workflow(
             AgentWorkflow::run,
@@ -322,7 +322,7 @@ async fn drive(
         .context("start_workflow(AgentWorkflow)")?;
 
     // Workflow runs through the scripted Idle → CallTools(3) → EmitOutput
-    // → RewriteFs sequence on its own, then the max_ticks cap stops it; no
+    // → RewriteFs sequence on its own, then the step_cap cap stops it; no
     // client-side signals needed. Each tick calls `decide_next_action`
     // which pops the next scripted decision.
     let result: AgentResult = handle
@@ -332,7 +332,7 @@ async fn drive(
     eprintln!("workflow_loop: workflow returned {result:?}");
     let AgentResult::Retired { reason } = result;
     assert_eq!(
-        reason, "max_ticks (4) reached",
+        reason, "step_cap (4) reached",
         "workflow returned wrong retire reason: {reason:?}"
     );
 
@@ -341,7 +341,7 @@ async fn drive(
     //
     // - exactly 3 `execute_tool` schedules (one per `ToolCall`);
     // - exactly 1 `persist_output` schedule (from `EmitOutput`);
-    // - exactly 1 `persist_retirement` schedule (from the `max_ticks` cap).
+    // - exactly 1 `persist_retirement` schedule (from the `step_cap` cap).
     //
     // `WorkflowFetchHistoryOptions::default()` leaves `event_filter_type`
     // at the proto enum's zero value (Unspecified), which the server
@@ -573,7 +573,7 @@ async fn run_partial_failure_test() -> Result<()> {
         .count();
 
     // Script: Idle → CallTools(one failing + two distinct succeeding
-    // calls), then the `max_ticks=2` cap stops the loop. The succeeding
+    // calls), then the `step_cap=2` cap stops the loop. The succeeding
     // calls use args distinct from run_live_test's so their EvidenceIds
     // (content-addressed on (tool, args, result)) don't collide with the
     // pre-run records.
@@ -665,7 +665,7 @@ async fn drive_partial(client: Client, task_queue: &str, workflow_id: &str) -> R
     );
     input.mandate.tools = assigned_tools();
     // The loop runs the 2 scripted decisions, then the cap stops it.
-    input.mandate.max_ticks = Some(2);
+    input.mandate.step_cap = Some(2);
     let handle = client
         .start_workflow(
             AgentWorkflow::run,
@@ -681,7 +681,7 @@ async fn drive_partial(client: Client, task_queue: &str, workflow_id: &str) -> R
         .context("AgentWorkflow.get_result [partial]")?;
     let AgentResult::Retired { reason } = result;
     assert_eq!(
-        reason, "max_ticks (2) reached",
+        reason, "step_cap (2) reached",
         "workflow returned wrong retire reason in partial-failure test: {reason:?}"
     );
 
@@ -711,16 +711,16 @@ async fn drive_partial(client: Client, task_queue: &str, workflow_id: &str) -> R
     Ok(())
 }
 
-/// Regression for the silently-ignored `max_ticks` on the Temporal path: an
-/// agent with `max_ticks=2` whose script never stops on its own must still
+/// Regression for the silently-ignored `step_cap` on the Temporal path: an
+/// agent with `step_cap=2` whose script never stops on its own must still
 /// stop at the cap with the in-process retire wording. (Agents never
-/// self-terminate; `max_ticks` is the cap.)
+/// self-terminate; `step_cap` is the cap.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
-async fn workflow_loop_enforces_max_ticks_cap() {
+async fn workflow_loop_enforces_step_cap() {
     if env::var("TEMPORAL_LIVE_TEST").ok().as_deref() != Some("1") {
         eprintln!(
-            "skipping workflow_loop_enforces_max_ticks_cap; \
+            "skipping workflow_loop_enforces_step_cap; \
              set TEMPORAL_LIVE_TEST=1 with a local Temporal Server to run"
         );
         return;
@@ -739,9 +739,9 @@ async fn workflow_loop_enforces_max_ticks_cap() {
 
     let reason = run_stop_contract_test("maxticks", mandate, script)
         .await
-        .expect("max_ticks regression live test");
+        .expect("step_cap regression live test");
     assert_eq!(
-        reason, "max_ticks (2) reached",
+        reason, "step_cap (2) reached",
         "agent must retire at the cap with the in-process wording, got {reason:?}"
     );
 }

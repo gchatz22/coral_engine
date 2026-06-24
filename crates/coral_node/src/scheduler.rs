@@ -7,6 +7,17 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+/// Whether the loop should arm a self-wake timer for the upcoming cycle.
+///
+/// A **"never"**-cadence node (`Mandate::idle_period == None`) must still
+/// fire its *first* cycle so a leaf with no inbound trigger produces once and
+/// a parent spawns its children — otherwise an all-`never` graph would block
+/// forever and never propagate a result. So the first wake always arms;
+/// afterwards a `never` node waits on triggers alone and never re-arms.
+pub fn arm_self_wake(never: bool, is_first_wake: bool) -> bool {
+    !never || is_first_wake
+}
+
 /// Per-agent scheduler stub. Holds the cadence at which the loop should
 /// wake when no external signal has arrived.
 #[derive(Debug, Clone)]
@@ -50,6 +61,17 @@ mod tests {
     use tokio::time::{self, Instant};
 
     use super::*;
+
+    #[test]
+    fn arm_self_wake_always_arms_the_first_wake() {
+        // A recurring node arms every wake.
+        assert!(arm_self_wake(false, true));
+        assert!(arm_self_wake(false, false));
+        // A `never` node arms only its first wake (so an all-`never` graph's
+        // leaves still produce once), then waits on triggers alone.
+        assert!(arm_self_wake(true, true));
+        assert!(!arm_self_wake(true, false));
+    }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn next_deadline_is_now_plus_next_after() {

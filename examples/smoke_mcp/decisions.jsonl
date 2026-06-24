@@ -1,7 +1,7 @@
 # Scripted decisions for the @modelcontextprotocol/server-everything smoke.
 # Tick 1: call the server's `get-sum` tool with two ints (a=2, b=3).
 # Tick 2: emit an output backed by the evidence id of that call.
-# Tick 3: idle; the Mandate's max_ticks=3 cap retires the agent after this tick.
+# Tick 3: idle; the Mandate's step_cap=3 cap retires the agent after this tick.
 #
 # The evidence id below is sha256(canonical_json) of the (tool, args, result)
 # triple that `tools/call get-sum {a: 2, b: 3}` produces, where `result` is

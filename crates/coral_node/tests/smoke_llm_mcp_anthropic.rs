@@ -93,7 +93,7 @@ fn read_json_dir(dir: &Path) -> Vec<Value> {
 
 /// Parallel-tool smoke: mandate asks for K=3 concurrent `get-sum` calls
 /// in a single tick and the run must complete Healthy within
-/// `max_ticks = 4` (1 parallel batch + 1 emit + 1 retire, with 1 slack
+/// `step_cap = 4` (1 parallel batch + 1 emit + 1 retire, with 1 slack
 /// tick). Gated identically to the single-call smoke; skips on missing
 /// env vars rather than failing so the hermetic CI matrix stays clean.
 #[test]
@@ -145,7 +145,7 @@ fn end_to_end_parallel_call_tools_against_server_everything() {
             .expect("parse retirement");
     let reason = retirement["reason"].as_str().expect("reason string");
     assert!(
-        !reason.contains("max_ticks"),
+        !reason.contains("step_cap"),
         "agent should retire on its own reason within the 4-tick cap, got: {reason}"
     );
 

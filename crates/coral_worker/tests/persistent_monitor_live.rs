@@ -3,13 +3,13 @@
 //! Proves the continuous loop's **runtime contract** end-to-end against a
 //! real Temporal Server + Postgres: a reduced graph of three agents (one
 //! parent + two children) cycles, the parent re-reconciles newer child
-//! outputs, and every agent stops only via the `max_ticks` guardrail —
+//! outputs, and every agent stops only via the `step_cap` guardrail —
 //! agents never self-terminate (persistence is universal).
 //!
 //! A deterministic [`CyclingDecide`] drives the loop and the children cite
 //! planted evidence, so this needs **no model key and no Node** — only the
 //! `TEMPORAL_LIVE_TEST=1` + `DATABASE_URL` gates. That keeps the three
-//! assertions (≥2 distinct outputs each, ≥1 re-reconciliation, max_ticks
+//! assertions (≥2 distinct outputs each, ≥1 re-reconciliation, step_cap
 //! stop) deterministic: they are properties of the loop machinery, not of
 //! model behaviour.
 //!
@@ -95,19 +95,19 @@ fn example_graph_path() -> PathBuf {
 /// - **Children** emit a fresh, distinct output every wake (`finding N`,
 ///   `N` derived from their own recent-outputs window) citing the planted
 ///   evidence — so each child accumulates ≥2 distinct outputs before its
-///   `max_ticks` stop. Never idles, never retires.
+///   `step_cap` stop. Never idles, never retires.
 /// - **Parent** reconciles whatever `ChildOutput`s the tick carries, then —
 ///   once it has reconciled more than it has reported — emits a refreshed
 ///   consolidated report citing a synthetic reconcile record. Distinct child
 ///   outputs arriving over time make it re-reconcile newer ones. Never
-///   retires; only `max_ticks` stops it.
+///   retires; only `step_cap` stops it.
 struct CyclingDecide;
 
 #[async_trait]
 impl Decide for CyclingDecide {
     async fn decide(&self, bundle: ContextBundle) -> Result<Decision> {
         let idle = Decision::Idle {
-            next_after: bundle.mandate.idle_period,
+            next_after: bundle.mandate.idle_period.unwrap_or_default(),
         };
         if bundle.mandate.text.contains(PARENT_MARKER) {
             // Parent.
@@ -198,17 +198,17 @@ fn example_graph_parses_and_validates() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::await_holding_lock)]
-async fn persistent_monitor_cycles_reconciles_and_stops_via_max_ticks() {
+async fn persistent_monitor_cycles_reconciles_and_stops_via_step_cap() {
     if env::var("TEMPORAL_LIVE_TEST").ok().as_deref() != Some("1") {
         eprintln!(
-            "skipping persistent_monitor_cycles_reconciles_and_stops_via_max_ticks; \
+            "skipping persistent_monitor_cycles_reconciles_and_stops_via_step_cap; \
              set TEMPORAL_LIVE_TEST=1 with a local Temporal Server to run"
         );
         return;
     }
     let Some(database_url) = env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
         eprintln!(
-            "skipping persistent_monitor_cycles_reconciles_and_stops_via_max_ticks; \
+            "skipping persistent_monitor_cycles_reconciles_and_stops_via_step_cap; \
              set DATABASE_URL to a docker-compose Postgres to run"
         );
         return;
@@ -328,10 +328,24 @@ async fn drive(
     client: Client,
     task_queue: &str,
     graph_id: GraphId,
-    starts: Vec<coral_graph::yaml::WorkflowStart>,
+    mut starts: Vec<coral_graph::yaml::WorkflowStart>,
     seeds: Vec<coral_graph::yaml::ResolvedSeedTrigger>,
     storage: Arc<MemoryStorage>,
 ) -> Result<()> {
+    // `step_cap` is the harness-only runaway backstop — it is not a YAML
+    // authoring field, so inject a small per-agent cap here to terminate the
+    // hermetic run (parent gets more cycles to fold its children's outputs).
+    let step_cap_by_agent = |name: &str| -> u64 {
+        if name == "analyst" {
+            8
+        } else {
+            4
+        }
+    };
+    for start in &mut starts {
+        start.input.mandate.step_cap = Some(step_cap_by_agent(&start.input.agent_name));
+    }
+
     // Start parents-first, then signal each seed kickoff.
     for start in &starts {
         client
@@ -356,15 +370,8 @@ async fn drive(
     }
 
     // Wait for every agent to stop. Agents never self-terminate, so the only
-    // stop is the max_ticks guardrail — assert the reason verbatim (proves
+    // stop is the step_cap guardrail — assert the reason verbatim (proves
     // the stop contract: no agent ended itself).
-    let max_ticks_by_agent = |name: &str| -> u64 {
-        if name == "analyst" {
-            8
-        } else {
-            4
-        }
-    };
     for start in &starts {
         let agent_name = start.input.agent_name.clone();
         let result: AgentResult = client
@@ -373,7 +380,7 @@ async fn drive(
             .await
             .with_context(|| format!("get_result for {agent_name}"))?;
         let AgentResult::Retired { reason } = result;
-        let expected = format!("max_ticks ({}) reached", max_ticks_by_agent(&agent_name));
+        let expected = format!("step_cap ({}) reached", step_cap_by_agent(&agent_name));
         assert_eq!(
             reason, expected,
             "{agent_name} must stop via the guardrail (agents never self-terminate)"
@@ -425,7 +432,7 @@ async fn drive(
     );
 
     eprintln!(
-        "persistent_monitor: all 3 agents stopped via max_ticks; parent folded {} distinct child outputs",
+        "persistent_monitor: all 3 agents stopped via step_cap; parent folded {} distinct child outputs",
         reconciled_outputs.len()
     );
     Ok(())

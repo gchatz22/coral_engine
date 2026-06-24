@@ -23,11 +23,11 @@ fail() {
     exit 1
 }
 
-# 1. retirement.json — the mandate's max_ticks cap should have retired the agent.
+# 1. retirement.json — the mandate's step_cap backstop should have retired the agent.
 [[ -f "$fs_root/retirement.json" ]] || fail "missing retirement.json"
 got_reason=$(jq -r '.reason' "$fs_root/retirement.json")
-[[ "$got_reason" == "max_ticks (3) reached" ]] \
-    || fail "retirement.reason: expected 'max_ticks (3) reached', got '$got_reason'"
+[[ "$got_reason" == "step_cap (3) reached" ]] \
+    || fail "retirement.reason: expected 'step_cap (3) reached', got '$got_reason'"
 
 # 2. health.json — the agent should have stayed Healthy through retirement.
 [[ -f "$fs_root/health.json" ]] || fail "missing health.json"

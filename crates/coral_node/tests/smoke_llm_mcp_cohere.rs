@@ -93,7 +93,7 @@ fn read_json_dir(dir: &Path) -> Vec<Value> {
 
 /// Parallel-tool smoke for Cohere. Mirrors the Anthropic sibling:
 /// issues a K=3 parallel-call mandate and asserts the run completes
-/// Healthy within `max_ticks = 4`.
+/// Healthy within `step_cap = 4`.
 #[test]
 fn end_to_end_parallel_call_tools_against_server_everything() {
     if std::env::var("CORAL_SMOKE_LLM_MCP").is_err() {
@@ -143,7 +143,7 @@ fn end_to_end_parallel_call_tools_against_server_everything() {
             .expect("parse retirement");
     let reason = retirement["reason"].as_str().expect("reason string");
     assert!(
-        !reason.contains("max_ticks"),
+        !reason.contains("step_cap"),
         "agent should retire on its own reason within the 4-tick cap, got: {reason}"
     );
 

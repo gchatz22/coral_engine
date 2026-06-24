@@ -134,7 +134,7 @@ ARGS:
     --max-tokens N    Optional sampling cap on the model's reply (default 1024).
     --temperature F   Optional sampling temperature; omitted from CompleteOptions when unset.
 
-    <config.json>     JSON-serialized Mandate (text, idle_period ms, max_ticks).
+    <config.json>     JSON-serialized Mandate (text, idle_period ms, step_cap).
     <triggers.jsonl>  One JSON object per line. Either a bare Trigger or an
                       envelope: {\"delay_ms\": <u64>, \"trigger\": <Trigger>}.
                       Blank lines and lines starting with `#` are ignored.
