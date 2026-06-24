@@ -4,12 +4,15 @@
 //! normalized; UUIDs come from `GraphStore`, not synthesized here.
 
 use coral_node::agent_ref::{AgentId, GraphId};
+use coral_node::fs::AgentFs;
 use coral_node::mandate::Mandate as NodeMandate;
+use coral_node::storage::AgentStorage;
 use coral_node::trigger::Trigger as NodeTrigger;
 use coral_temporal::workflow::{build_child_input, build_root_input, AgentConfig, AgentInput};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The exact `apiVersion` literal v1 accepts.
@@ -881,6 +884,39 @@ pub fn yaml_seed_triggers(
         });
     }
     Ok(out)
+}
+
+// --- FS materialization -------------------------------------------------
+
+/// Eagerly materialize every agent's per-agent FS at apply time.
+///
+/// For each [`WorkflowStart`], opens an [`AgentFs`] at the agent's
+/// canonical `graphs/<graph_id>/agents/<agent_id>/` prefix on `storage`,
+/// which writes that agent's `mandate.md` — pure prose, the standing
+/// instruction only. Authored config (cadence/model/tools) rides the
+/// durable workflow input and the DB, never the file. The graph's FS is
+/// therefore inspectable immediately after `coral apply` instead of only
+/// after each agent first wakes.
+///
+/// `storage` must be the **same backend the worker reads** — a
+/// `LocalStorage` rooted at the shared `AGENT_FS_ROOT` — or apply writes a
+/// tree the worker never sees.
+///
+/// Idempotent: [`AgentFs::new_with_storage`] writes `mandate.md` only when
+/// absent, so a re-run, or the worker's lazy first-tick open, is a no-op.
+pub async fn materialize_agent_fs(
+    storage: Arc<dyn AgentStorage>,
+    starts: &[WorkflowStart],
+) -> anyhow::Result<()> {
+    for start in starts {
+        AgentFs::new_with_storage(
+            Arc::clone(&storage),
+            start.input.fs_handle.prefix.clone(),
+            &start.input.mandate,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 // --- tests --------------------------------------------------------------
@@ -2058,5 +2094,176 @@ seed:
             .expect("workspace root above crates/coral_graph")
             .join("examples")
             .join("graph.schema.json")
+    }
+
+    // --- FS materialization -------------------------------------------
+
+    /// A `root` + nested `child` fixture for the tree-materialization test.
+    const TREE_YAML: &str = r#"
+apiVersion: coral.engine/v1alpha1
+kind: Graph
+metadata:
+  name: tree
+tools:
+  - id: echo
+    kind: builtin
+    builtin: echo
+agents:
+  - id: root
+    mandate:
+      text: root standing instruction
+      idle_period: 1s
+    tools: [echo]
+    children:
+      - id: child
+        mandate:
+          text: child standing instruction
+          idle_period: 1s
+        tools: []
+seed:
+  triggers:
+    - agent: root
+      at: start
+      external:
+        kind: kickoff
+        payload: {}
+"#;
+
+    /// Hand-built [`AppliedGraph`] for a `root` + first-child tree, mirroring
+    /// the UUID allocation `create_from_yaml` performs, so the hermetic
+    /// materialization test exercises `build_workflow_starts`' real
+    /// parents-first prefix derivation without a live DB.
+    fn synthetic_applied_tree(graph: &GraphYaml) -> AppliedGraph {
+        let graph_uuid = uuid::Uuid::new_v4();
+        let graph_id = GraphId::new(graph_uuid);
+        let root = &graph.agents[0];
+        let child = &root.children[0];
+        let root_uuid = uuid::Uuid::new_v4();
+        let child_uuid = uuid::Uuid::new_v4();
+        let root_db = AgentId::new(root_uuid);
+        let child_db = AgentId::new(child_uuid);
+        let mut id_map = HashMap::new();
+        id_map.insert(
+            root.id.clone(),
+            ResolvedAgentWorkflow {
+                db_agent_id: root_db,
+                workflow_id: format!("graphs/{graph_uuid}/agents/{root_uuid}"),
+            },
+        );
+        id_map.insert(
+            child.id.clone(),
+            ResolvedAgentWorkflow {
+                db_agent_id: child_db,
+                workflow_id: format!("graphs/{graph_uuid}/agents/{child_uuid}"),
+            },
+        );
+        AppliedGraph {
+            graph_id,
+            graph_name: graph.metadata.name.clone(),
+            agents: vec![
+                ResolvedAgent {
+                    operator_id: root.id.clone(),
+                    db_agent_id: root_db,
+                    parent_db_agent_id: None,
+                },
+                ResolvedAgent {
+                    operator_id: child.id.clone(),
+                    db_agent_id: child_db,
+                    parent_db_agent_id: Some(root_db),
+                },
+            ],
+            id_map,
+        }
+    }
+
+    #[tokio::test]
+    async fn materialize_agent_fs_writes_root_mandate_as_pure_prose() {
+        let g = parse_and_validate(HAPPY_YAML).expect("happy path");
+        let applied = synthetic_applied(&g, "root");
+        let starts = build_workflow_starts(&g, &applied);
+        assert_eq!(starts.len(), 1);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage: Arc<dyn AgentStorage> =
+            Arc::new(coral_node::storage::LocalStorage::new(tmp.path()).unwrap());
+        materialize_agent_fs(Arc::clone(&storage), &starts)
+            .await
+            .expect("materialize");
+
+        // The root's mandate.md lands under the root node's own prefix —
+        // `graphs/<g>/agents/<root>/`, where its outputs/ resolve too.
+        let root_prefix = &starts[0].input.fs_handle.prefix;
+        let mandate_key = format!("{root_prefix}/mandate.md");
+        let body = storage
+            .get(&mandate_key)
+            .await
+            .unwrap()
+            .expect("mandate.md materialized at the root prefix");
+        let text = std::str::from_utf8(&body).unwrap();
+        // Pure prose: exactly the standing instruction, no config leaking in
+        // (cadence/model/tools live in the DB + durable input, not the file).
+        assert_eq!(text, starts[0].input.mandate.text);
+        assert!(!text.contains("idle_period"), "config leaked: {text:?}");
+        assert!(!text.contains("max_ticks"), "config leaked: {text:?}");
+        assert!(!text.contains("persistent"), "config leaked: {text:?}");
+    }
+
+    #[tokio::test]
+    async fn materialize_agent_fs_is_idempotent() {
+        let g = parse_and_validate(HAPPY_YAML).expect("happy path");
+        let applied = synthetic_applied(&g, "root");
+        let starts = build_workflow_starts(&g, &applied);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage: Arc<dyn AgentStorage> =
+            Arc::new(coral_node::storage::LocalStorage::new(tmp.path()).unwrap());
+
+        materialize_agent_fs(Arc::clone(&storage), &starts)
+            .await
+            .expect("first materialize");
+        let key = format!("{}/mandate.md", starts[0].input.fs_handle.prefix);
+        let first = storage.get(&key).await.unwrap().unwrap();
+
+        // A second apply — or the worker's lazy first-tick open — must not
+        // error or clobber the existing mandate.
+        materialize_agent_fs(Arc::clone(&storage), &starts)
+            .await
+            .expect("second materialize");
+        let second = storage.get(&key).await.unwrap().unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn materialize_agent_fs_writes_every_agent_in_a_tree() {
+        let g = parse_and_validate(TREE_YAML).expect("tree fixture validates");
+        let applied = synthetic_applied_tree(&g);
+        let starts = build_workflow_starts(&g, &applied);
+        assert_eq!(starts.len(), 2);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage: Arc<dyn AgentStorage> =
+            Arc::new(coral_node::storage::LocalStorage::new(tmp.path()).unwrap());
+        materialize_agent_fs(Arc::clone(&storage), &starts)
+            .await
+            .expect("materialize tree");
+
+        // Each agent's mandate.md lands under its OWN prefix, carrying its
+        // own standing instruction — the child does not inherit the root's.
+        for start in &starts {
+            let key = format!("{}/mandate.md", start.input.fs_handle.prefix);
+            let body = storage
+                .get(&key)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("mandate.md absent for {key}"));
+            assert_eq!(
+                std::str::from_utf8(&body).unwrap(),
+                start.input.mandate.text
+            );
+        }
+        assert_ne!(
+            starts[0].input.fs_handle.prefix, starts[1].input.fs_handle.prefix,
+            "root and child must materialize at distinct prefixes",
+        );
     }
 }

@@ -18,16 +18,23 @@
 //!
 //! - **CREATE-only.** Re-applying a graph with the same `metadata.name`
 //!   errors out.
-//! - **`kind: builtin` tools only.**
+//! - **`kind: builtin` and `kind: mcp` tools.** Both are written as
+//!   graph-scoped tool defs.
 //! - **Signaled, not stored.** `seed.triggers` are consumed at apply
 //!   time and signaled to the targeted agent; not persisted.
 //! - **`policy:` is pass-through.** Stored verbatim into
 //!   `graphs.metadata`; not enforced.
 //! - **Hierarchical YAML only.** Flat `parent:`-ref form not supported.
+//! - **Materializes the FS.** Writes each agent's `mandate.md` (pure
+//!   prose) at `AGENT_FS_ROOT` before dispatch, so the graph's FS is
+//!   inspectable immediately. The root must point at the same volume the
+//!   worker daemon reads.
 //!
 //! # Env vars
 //!
 //! - `DATABASE_URL` — sqlx Postgres URL. Required.
+//! - `AGENT_FS_ROOT` — per-agent FS root (default `./agent-fs`). Must be
+//!   the same volume the worker daemon reads.
 //! - `TEMPORAL_ADDRESS` / `TEMPORAL_NAMESPACE` — Temporal client config,
 //!   defaults `http://localhost:7233` / `default`.
 //! - `TEMPORAL_TASK_QUEUE` — task queue to dispatch onto. Defaults to
@@ -37,6 +44,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use sqlx::postgres::PgPoolOptions;
@@ -48,14 +56,20 @@ use temporalio_sdk_core::Url;
 use tracing::info;
 
 use coral_graph::yaml::{
-    build_workflow_starts, is_multi_agent, parse_and_validate, yaml_seed_triggers, GraphYaml,
+    build_workflow_starts, is_multi_agent, materialize_agent_fs, parse_and_validate,
+    yaml_seed_triggers, GraphYaml,
 };
 use coral_graph::{GraphStore, GraphStoreError, MIGRATOR};
+use coral_node::storage::{AgentStorage, LocalStorage};
 use coral_temporal::worker::DEFAULT_TASK_QUEUE;
 use coral_temporal::workflow::AgentWorkflow;
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
 const DEFAULT_NAMESPACE: &str = "default";
+
+/// Per-agent FS root when `AGENT_FS_ROOT` is unset. Mirrors the worker
+/// daemon's default so a local dev run shares one volume out of the box.
+const DEFAULT_FS_ROOT: &str = "./agent-fs";
 
 const USAGE: &str = "\
 coral-apply — bring a graph into existence from a graph.yaml.
@@ -83,17 +97,24 @@ SCOPE:
       supported.
     - CREATE-only. Re-applying a graph with the same `metadata.name`
       errors out cleanly.
-    - `kind: builtin` tools only. `kind: mcp` is rejected.
+    - `kind: builtin` and `kind: mcp` tools are both written as
+      graph-scoped tool defs.
     - `seed.triggers:` are signaled to the targeted workflow at apply
       time, not persisted anywhere. Any agent in the tree can be a
       seed target (not just the root).
     - `policy:` is pass-through into `graphs.metadata`; not enforced.
+    - Materializes each agent's FS (writes `mandate.md`, pure prose) at
+      AGENT_FS_ROOT before dispatch. Point it at the same volume the
+      worker daemon reads.
 
 ENV:
     DATABASE_URL                           Postgres URL for the structural DB.
                                            Required. Dev stack URL lives in
                                            `.env.example`
                                            (postgres://coral:coral@localhost:5432/coral_structural).
+    AGENT_FS_ROOT                          Per-agent FS root (default `./agent-fs`).
+                                           Must be the same volume the worker
+                                           daemon reads.
     TEMPORAL_ADDRESS / TEMPORAL_NAMESPACE  Temporal Server connection (defaults
                                            localhost:7233 / default).
     TEMPORAL_TASK_QUEUE                    Task queue the worker daemon listens on
@@ -182,6 +203,28 @@ async fn run() -> Result<()> {
     let starts = build_workflow_starts(&graph, &applied);
     let triggers = yaml_seed_triggers(&graph, &applied)
         .context("yaml_seed_triggers (post-validate runtime guard)")?;
+
+    // ---- Materialize each agent's FS (eager bootstrap) ----------------
+    // Stand up the SAME storage backend the worker reads (LocalStorage at
+    // the shared AGENT_FS_ROOT) and write each agent's `mandate.md` now, so
+    // the graph's FS is inspectable immediately rather than only after each
+    // agent first wakes. The worker's lazy first-tick open is the
+    // idempotent fallback for anything this misses. Runs before the
+    // Temporal client connect so a misconfigured FS root fails the
+    // bootstrap without dispatching half a graph.
+    let fs_root = env::var("AGENT_FS_ROOT").unwrap_or_else(|_| DEFAULT_FS_ROOT.into());
+    let storage: Arc<dyn AgentStorage> = Arc::new(
+        LocalStorage::new(&fs_root)
+            .with_context(|| format!("opening LocalStorage at AGENT_FS_ROOT ({fs_root})"))?,
+    );
+    materialize_agent_fs(storage, &starts)
+        .await
+        .context("materializing agent FS (mandate.md per agent)")?;
+    info!(
+        agent_count = starts.len(),
+        fs_root = fs_root.as_str(),
+        "materialized agent FS (mandate.md per agent)"
+    );
 
     let client = build_client().await?;
     info!(
@@ -367,6 +410,18 @@ mod tests {
             USAGE.contains("signaled to the targeted workflow"),
             "USAGE: {USAGE}"
         );
+    }
+
+    #[test]
+    fn usage_documents_fs_materialization() {
+        // Apply now eagerly materializes each agent's FS; an operator must
+        // know it writes to AGENT_FS_ROOT and that the root must match the
+        // worker daemon's volume. Pin both so the help text can't drop them.
+        assert!(
+            USAGE.contains("Materializes each agent's FS"),
+            "USAGE: {USAGE}"
+        );
+        assert!(USAGE.contains("AGENT_FS_ROOT"), "USAGE: {USAGE}");
     }
 
     #[test]
