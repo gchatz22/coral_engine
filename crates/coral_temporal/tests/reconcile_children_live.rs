@@ -419,23 +419,15 @@ async fn run_happy_path() -> Result<()> {
         .await
         .context("plant evidence for child EmitOutput")?;
 
-    // Parent: wait for ChildOutput by spinning on reconcile_placeholder,
-    // then Retire.
-    let parent_script = vec![
-        reconcile_placeholder(),
-        Decision::Retire {
-            reason: "happy: scripted retire".into(),
-        },
-    ];
-    let child_script = vec![
-        Decision::EmitOutput {
-            content: "child output".into(),
-            evidence: vec![planted_id.clone()],
-        },
-        Decision::Retire {
-            reason: "child: scripted retire".into(),
-        },
-    ];
+    // Parent: spin on reconcile_placeholder until the ChildOutput lands,
+    // reconcile, then idle until the `max_ticks` cap stops it (agents
+    // never self-terminate). The cap only bounds the post-reconcile idle
+    // tail, so the synthetic evidence is durable before retirement.
+    let parent_script = vec![reconcile_placeholder()];
+    let child_script = vec![Decision::EmitOutput {
+        content: "child output".into(),
+        evidence: vec![planted_id.clone()],
+    }];
     install_role_scripts(parent_script, child_script);
 
     let runtime = build_runtime()?;
@@ -509,7 +501,7 @@ async fn drive_happy_path(
         },
         parent_handle: None,
         carryover: None,
-        mandate: Mandate::new(PARENT_MANDATE_TEXT, Duration::from_millis(50), None),
+        mandate: Mandate::new(PARENT_MANDATE_TEXT, Duration::from_millis(50), Some(15)),
         graph_id,
         agent_id: parent_agent_id,
         agent_name: "parent".into(),
@@ -534,7 +526,7 @@ async fn drive_happy_path(
             ..ParentRef::default()
         }),
         carryover: None,
-        mandate: Mandate::new(CHILD_MANDATE_TEXT, Duration::from_millis(50), None),
+        mandate: Mandate::new(CHILD_MANDATE_TEXT, Duration::from_millis(50), Some(1)),
         graph_id,
         agent_id: child_agent_id,
         agent_name: "fda_scraper".into(),
@@ -549,23 +541,21 @@ async fn drive_happy_path(
         .context("start_workflow(child)")?;
     eprintln!("happy: child started at {child_workflow_id}");
 
-    // Wait for child to retire. Its EmitOutput -> Retire script
-    // terminates it; the EmitOutput signals the parent before Retire.
+    // Wait for child to retire. It emits once (the EmitOutput signals the
+    // parent), then the `max_ticks=1` cap retires it.
     let _child_result: AgentResult = child_handle
         .get_result(WorkflowGetResultOptions::default())
         .await
         .context("child get_result")?;
     eprintln!("happy: child retired cleanly");
 
-    // Wait for the parent to retire. The parent's script is
-    // `[reconcile_placeholder, Retire]`: while no ChildOutput has
-    // landed the placeholder keeps re-queueing itself, so the
-    // parent loops idle until the signal arrives. Once observed,
-    // `synthesize_reconcile_or_wait` returns a real
-    // `Decision::ReconcileChildren`, the activity writes synthetic
-    // evidence to the parent's `evidence/`, and the next tick pops
-    // Retire from the now-shifted script (we never push the
-    // placeholder back after a successful synthesize).
+    // Wait for the parent to retire. The parent's script is just
+    // `[reconcile_placeholder]`: while no ChildOutput has landed the
+    // placeholder keeps re-queueing itself, so the parent loops idle until
+    // the signal arrives. Once observed, `synthesize_reconcile_or_wait`
+    // returns a real `Decision::ReconcileChildren`, the activity writes
+    // synthetic evidence to the parent's `evidence/`, and the parent then
+    // idles until its `max_ticks` cap stops it (agents never self-terminate).
     let retire_timer = tokio::time::timeout(
         Duration::from_secs(90),
         parent_handle.get_result(WorkflowGetResultOptions::default()),
@@ -677,21 +667,11 @@ async fn run_failure_path() -> Result<()> {
     let bogus_output_id = OutputId::from_hex("de".repeat(32));
     set_pending_reconcile((None, None, Some(bogus_output_id.clone())));
 
-    let parent_script = vec![
-        reconcile_placeholder(),
-        Decision::Retire {
-            reason: "fail: scripted retire after correction".into(),
-        },
-    ];
-    let child_script = vec![
-        Decision::EmitOutput {
-            content: "fail child output".into(),
-            evidence: vec![planted_id.clone()],
-        },
-        Decision::Retire {
-            reason: "fail child: scripted retire".into(),
-        },
-    ];
+    let parent_script = vec![reconcile_placeholder()];
+    let child_script = vec![Decision::EmitOutput {
+        content: "fail child output".into(),
+        evidence: vec![planted_id.clone()],
+    }];
     install_role_scripts(parent_script, child_script);
 
     let runtime = build_runtime()?;
@@ -757,7 +737,7 @@ async fn drive_failure_path(
         },
         parent_handle: None,
         carryover: None,
-        mandate: Mandate::new(PARENT_MANDATE_TEXT, Duration::from_millis(50), None),
+        mandate: Mandate::new(PARENT_MANDATE_TEXT, Duration::from_millis(50), Some(15)),
         graph_id,
         agent_id: parent_agent_id,
         agent_name: "parent".into(),
@@ -782,7 +762,7 @@ async fn drive_failure_path(
             ..ParentRef::default()
         }),
         carryover: None,
-        mandate: Mandate::new(CHILD_MANDATE_TEXT, Duration::from_millis(50), None),
+        mandate: Mandate::new(CHILD_MANDATE_TEXT, Duration::from_millis(50), Some(1)),
         graph_id,
         agent_id: child_agent_id,
         agent_name: "fda_scraper".into(),
@@ -814,9 +794,9 @@ async fn drive_failure_path(
     .map_err(|_| anyhow::anyhow!("parent never retired in 90s (failure-path test)"))?
     .context("parent get_result (fail path)")?;
     let AgentResult::Retired { reason } = parent_result;
-    assert!(
-        reason.contains("scripted retire"),
-        "parent did not reach its scripted Retire arm after reconcile failure: {reason:?}"
+    assert_eq!(
+        reason, "max_ticks (15) reached",
+        "parent did not complete (idle to the cap) after reconcile failure: {reason:?}"
     );
     eprintln!("fail: parent retired normally after staged correction");
     Ok(())
@@ -872,21 +852,11 @@ async fn run_conflict_path() -> Result<()> {
         resolution: None,
     });
 
-    let parent_script = vec![
-        reconcile_placeholder(),
-        Decision::Retire {
-            reason: "conflict: scripted retire".into(),
-        },
-    ];
-    let child_script = vec![
-        Decision::EmitOutput {
-            content: "conflict child output".into(),
-            evidence: vec![planted_id.clone()],
-        },
-        Decision::Retire {
-            reason: "conflict child: scripted retire".into(),
-        },
-    ];
+    let parent_script = vec![reconcile_placeholder()];
+    let child_script = vec![Decision::EmitOutput {
+        content: "conflict child output".into(),
+        evidence: vec![planted_id.clone()],
+    }];
     install_role_scripts(parent_script, child_script);
 
     let runtime = build_runtime()?;
@@ -964,7 +934,7 @@ async fn drive_conflict_path(
         },
         parent_handle: None,
         carryover: None,
-        mandate: Mandate::new(PARENT_MANDATE_TEXT, Duration::from_millis(50), None),
+        mandate: Mandate::new(PARENT_MANDATE_TEXT, Duration::from_millis(50), Some(15)),
         graph_id,
         agent_id: parent_agent_id,
         agent_name: "parent".into(),
@@ -989,7 +959,7 @@ async fn drive_conflict_path(
             ..ParentRef::default()
         }),
         carryover: None,
-        mandate: Mandate::new(CHILD_MANDATE_TEXT, Duration::from_millis(50), None),
+        mandate: Mandate::new(CHILD_MANDATE_TEXT, Duration::from_millis(50), Some(1)),
         graph_id,
         agent_id: child_agent_id,
         agent_name: "fda_scraper".into(),

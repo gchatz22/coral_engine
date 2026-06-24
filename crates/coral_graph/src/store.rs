@@ -572,8 +572,8 @@ fn walk_agent_tree<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), GraphStoreError>> + Send + 'a>> {
     Box::pin(async move {
         // Allocate this agent's UUID + insert its topology row. Config
-        // (persistent/model/cadence) travels via `AgentInput.mandate`, not
-        // the DB, so the row carries only identity.
+        // (model/cadence/tools) travels via `AgentInput.mandate`, not the
+        // DB, so the row carries only identity.
         let agent_uuid = Uuid::new_v4();
         sqlx::query_as!(
             AgentRecord,
@@ -1238,12 +1238,12 @@ seed:
         Ok(())
     }
 
-    /// Config-home invariant: authored config (cadence/model/tools/
-    /// persistence) rides the Temporal durable input, never Postgres. Even
-    /// when the YAML sets `model` / `persistent` / `max_ticks`,
-    /// `create_from_yaml` writes only topology — the `agents` table holds no
-    /// config columns for those values to land in. Guards against a future
-    /// change silently re-introducing a config column on `agents`.
+    /// Config-home invariant: authored config (cadence/model/tools) rides
+    /// the Temporal durable input, never Postgres. Even when the YAML sets
+    /// `model` / `max_ticks`, `create_from_yaml` writes only topology — the
+    /// `agents` table holds no config columns for those values to land in.
+    /// Guards against a future change silently re-introducing a config
+    /// column on `agents` (the list includes the long-gone `persistent`).
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn create_from_yaml_writes_no_config_columns_to_agents(pool: PgPool) -> sqlx::Result<()> {
         const CONFIG_YAML: &str = r#"
@@ -1261,7 +1261,6 @@ agents:
       text: do the thing
       idle_period: 1s
       max_ticks: 4
-      persistent: true
       model: claude-opus-4-8
     tools: [echo]
 seed:

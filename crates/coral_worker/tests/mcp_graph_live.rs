@@ -209,9 +209,6 @@ async fn run_smoke(database_url: &str) -> Result<()> {
             content: "mcp_graph_live: get-sum via server-everything".into(),
             evidence: vec![evidence_id.clone()],
         },
-        Decision::Retire {
-            reason: "mcp_graph_live: scripted retire".into(),
-        },
     ]);
 
     let task_queue = format!("coral-agents-mcp-graph-{suffix}");
@@ -288,6 +285,9 @@ async fn drive(
     // def so the scripted call is allowed. The real `DbToolRegistryProvider`
     // records the advertised-name -> def-id ownership at registry build.
     input.mandate.tools = vec!["everything".to_string()];
+    // The loop runs the 2 scripted decisions, then the cap stops it
+    // (agents never self-terminate).
+    input.mandate.max_ticks = Some(2);
     let handle = client
         .start_workflow(
             AgentWorkflow::run,
@@ -302,8 +302,8 @@ async fn drive(
         .await
         .context("AgentWorkflow.get_result")?;
     let AgentResult::Retired { reason } = result;
-    assert!(
-        reason.contains("scripted retire"),
+    assert_eq!(
+        reason, "max_ticks (2) reached",
         "workflow returned wrong retire reason: {reason:?}"
     );
 

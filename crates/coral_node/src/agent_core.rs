@@ -17,11 +17,9 @@
 //! `FailureKind::ToolCall` slots, one per failed call.
 
 use anyhow::Result;
-use chrono::Utc;
 use futures::future::join_all;
 use tracing::debug;
 
-use crate::agent::RetireReason;
 use crate::decision::{
     assemble_context, ContextBundle, CorrectionContext, Decide, Decision, ToolCall,
 };
@@ -38,11 +36,6 @@ use crate::trigger::Trigger;
 /// * `Continue` — the tick produced no terminal or recoverable-failure
 ///   outcome; the host clears any correction state, marks the tick a
 ///   success, and proceeds to the next iteration.
-/// * `Retired` — the agent emitted `Decision::Retire { reason }`; the
-///   in-process executor has already written `retirement.json` to the FS
-///   (the side-effect lives in `dispatch` because the host needs to exit
-///   *after* the marker lands, not before). The variant carries the
-///   `RetireReason` so the host can return it from `Agent::run`.
 /// * `NeedsCorrection` — the decision parsed but the runtime cannot
 ///   satisfy it. The string is a human-readable failure description the
 ///   host threads into the next tick's `CorrectionContext` (and into the
@@ -56,7 +49,6 @@ use crate::trigger::Trigger;
 #[derive(Debug)]
 pub enum DispatchOutcome {
     Continue,
-    Retired(RetireReason),
     NeedsCorrection(String),
     ToolError {
         /// One entry per failed call in the parallel batch. Order matches
@@ -156,11 +148,6 @@ pub async fn dispatch(
             );
             scheduler.set_next_after(next_after);
             Ok(DispatchOutcome::Continue)
-        }
-        Decision::Retire { reason } => {
-            debug!(%reason, "decision: retire");
-            fs.persist_retirement(&reason, Utc::now()).await?;
-            Ok(DispatchOutcome::Retired(RetireReason(reason)))
         }
         // Parent-child topology variants execute only on the workflow
         // host; reaching them here is a wiring bug.
@@ -465,39 +452,6 @@ mod tests {
         .unwrap();
         assert!(matches!(outcome, DispatchOutcome::Continue));
         assert_eq!(scheduler.next_after(), Duration::from_millis(2500));
-    }
-
-    // ---------- `dispatch` — Retired arm ---------------------------------
-
-    #[tokio::test]
-    async fn dispatch_retire_writes_marker_and_returns_retired() {
-        let (fs, m) = fixture().await;
-        let tools = ToolRegistry::new();
-        let mut scheduler = Scheduler::new(m.idle_period);
-        let outcome = dispatch(
-            &fs,
-            &tools,
-            &mut scheduler,
-            Decision::Retire {
-                reason: "done".into(),
-            },
-        )
-        .await
-        .unwrap();
-        match outcome {
-            DispatchOutcome::Retired(RetireReason(r)) => assert_eq!(r, "done"),
-            other => panic!("expected Retired, got {other:?}"),
-        }
-        // `retirement.json` exists in storage.
-        let marker = fs
-            .storage()
-            .get(&format!("{}retirement.json", fs.prefix()))
-            .await
-            .unwrap();
-        assert!(
-            marker.is_some(),
-            "retirement marker should have been written"
-        );
     }
 
     // ---------- `dispatch` — NeedsCorrection arm -------------------------

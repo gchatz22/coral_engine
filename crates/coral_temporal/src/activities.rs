@@ -1049,8 +1049,9 @@ mod tests {
             Decision::Idle {
                 next_after: Duration::from_millis(100),
             },
-            Decision::Retire {
-                reason: "test".into(),
+            Decision::EmitOutput {
+                content: "test".into(),
+                evidence: vec![],
             },
         ]);
         let first = pop_scripted_decision();
@@ -1061,7 +1062,7 @@ mod tests {
             }) if next_after == Duration::from_millis(100)
         ));
         let second = pop_scripted_decision();
-        assert!(matches!(second, Some(Decision::Retire { reason }) if reason == "test"));
+        assert!(matches!(second, Some(Decision::EmitOutput { content, .. }) if content == "test"));
         // Drained — falls back to None.
         assert!(pop_scripted_decision().is_none());
     }
@@ -1069,8 +1070,9 @@ mod tests {
     #[test]
     fn decision_script_resets_between_tests() {
         let _g = SCRIPT_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-        set_decision_script(vec![Decision::Retire {
-            reason: "first".into(),
+        set_decision_script(vec![Decision::EmitOutput {
+            content: "first".into(),
+            evidence: vec![],
         }]);
         set_decision_script(vec![Decision::Idle {
             next_after: Duration::from_secs(5),

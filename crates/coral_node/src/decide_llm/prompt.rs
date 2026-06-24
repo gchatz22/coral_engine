@@ -23,10 +23,9 @@ use crate::trigger::Trigger;
 
 /// Shared head of the standing invariants (clauses 1–4): provenance,
 /// one-decision-per-turn, parallel `call_tool`, evidence-from-tools. These
-/// hold for every agent regardless of lifecycle. [`render_system`] joins
-/// this head with a lifecycle-specific tail
-/// ([`ONESHOT_INVARIANTS_TAIL`] or [`PERSISTENT_INVARIANTS_TAIL`]) to form
-/// the full block; the snapshot tests pin the joined result.
+/// hold for every agent. [`render_system`] joins this head with the
+/// lifecycle tail ([`INVARIANTS_TAIL`]) to form the full block; the
+/// snapshot tests pin the joined result.
 ///
 /// The list is split into short, single-purpose clauses rather than a few
 /// dense paragraphs: empirically, models would re-emit Outputs across
@@ -38,39 +37,29 @@ use crate::trigger::Trigger;
 /// response — the runtime folds them into a single
 /// `Decision::CallTools` and dispatches them in the same tick, then
 /// stages K paired `tool_result` blocks on the next prompt bundle.
-/// Terminal decision tools (`emit_output`, `rewrite_fs`, `idle`,
-/// `retire`) remain singular: mixing a terminal with `call_tool` or
-/// issuing two terminals in one response is rejected.
+/// Terminal decision tools (`emit_output`, `rewrite_fs`, `idle`) remain
+/// singular: mixing a terminal with `call_tool` or issuing two terminals
+/// in one response is rejected.
 const INVARIANTS_HEAD: &str = "\
 Invariants:
 1. Provenance. Every `emit_output` decision must cite `evidence` ids that resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.
-2. One decision per turn. Reply by calling exactly one terminal decision tool (`emit_output`, `rewrite_fs`, `idle`, `retire`) OR one or more `call_tool` blocks dispatched together as a single parallel batch.
+2. One decision per turn. Reply by calling exactly one terminal decision tool (`emit_output`, `rewrite_fs`, `idle`) OR one or more `call_tool` blocks dispatched together as a single parallel batch.
 3. Parallel call_tool is supported. K `call_tool` `tool_use` blocks in one response run together this tick; the next prompt carries the matching `tool_result` blocks. Do not mix `call_tool` with a terminal decision tool in the same response.
 4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` decisions can cite.";
 
-/// Lifecycle tail for a one-shot agent (the default): emit once, then
-/// retire. Invariant 5's unconditional phrasing and the explicit tagging of
-/// the recent-outputs window as *yours* are load-bearing — without them the
-/// model treats prior Outputs as ambient context and re-emits paraphrased
-/// copies across turns.
-const ONESHOT_INVARIANTS_TAIL: &str = "\
-5. Do not re-emit. Once you have emitted any Output on this run, your next decision must be `retire`. Do not emit a revised, paraphrased, or improved version of a prior Output. Outputs shown in the \"Recent outputs by you on this run\" window were emitted by you and count toward this rule.
-6. Retire is final. After the mandate's required Output has been emitted, `retire` is the only correct decision.";
-
-/// Lifecycle tail for a `persistent` agent — a continuous monitor that
-/// refreshes its work on a cadence instead of retiring after one Output.
-/// Replaces the one-shot "retire after Output / never re-emit" rules with
-/// the refresh contract. The runtime enforces the non-termination (a
-/// model-emitted `Retire` is demoted to `Idle`); this tail aligns the
-/// model's intent so it does useful refresh work between wakes.
+/// Lifecycle tail shared by every agent. Persistence is universal: an
+/// agent produces (refreshes) its Output, idles, and wakes again — it never
+/// self-terminates. Clause 5's unconditional phrasing and the explicit
+/// tagging of the recent-outputs window as *yours* are load-bearing —
+/// without them the model treats prior Outputs as ambient context and
+/// re-emits paraphrased copies across wakes.
 ///
 /// Clause 7 is worded conditionally ("when a child reports an output") so it
-/// stays dormant for a childless persistent leaf — the prompt keys only on
-/// `persistent`, with no "has children" signal in the bundle, and a leaf
-/// never receives a `ChildOutput` trigger.
-const PERSISTENT_INVARIANTS_TAIL: &str = "\
-5. Refresh, don't stop. You are a persistent monitor. After you `emit_output`, choose `idle` to wait for your cadence; on the next scheduled wake, re-research and emit an updated Output that reflects what changed since the last one. The \"Recent outputs by you on this run\" window is your durable memory — build on it rather than re-emitting an unchanged copy.
-6. Do not retire yourself. `retire` is not a valid self-decision for a persistent agent: the runtime stops you only via a retirement signal or your tick budget, and a `retire` decision is treated as `idle`. Keep cycling: research -> emit_output -> idle -> refresh.
+/// stays dormant for a childless leaf — the prompt carries no "has children"
+/// signal, and a leaf never receives a `ChildOutput` trigger.
+const INVARIANTS_TAIL: &str = "\
+5. Refresh, don't stop. After you `emit_output`, choose `idle` to wait for your next wake; on the next wake, re-research and emit an updated Output that reflects what changed since the last one. The \"Recent outputs by you on this run\" window is your durable memory — build on it rather than re-emitting an unchanged copy.
+6. You do not terminate yourself. There is no self-terminate decision: the runtime stops you only via a retirement signal or your budget. Keep cycling: research -> emit_output -> idle -> refresh.
 7. Fold child reports as they arrive. When a child reports an output (a `ChildOutput` trigger), reconcile the cited output, then emit a refreshed consolidated report that incorporates it and cites its evidence. When a child you have already folded reports again, reconcile its newer output rather than re-reconciling the one you already used.";
 
 /// Render a `ContextBundle` into the message list a `ModelClient::complete`
@@ -110,14 +99,9 @@ pub fn render(bundle: &ContextBundle) -> Vec<Message> {
 /// time, not the renderer's — the kernel treats the mandate string as
 /// already-trusted input.
 fn render_system(m: &Mandate) -> String {
-    let tail = if m.persistent {
-        PERSISTENT_INVARIANTS_TAIL
-    } else {
-        ONESHOT_INVARIANTS_TAIL
-    };
     let catalog = render_tool_catalog(&m.tools);
     format!(
-        "You are an agent operating under the following mandate:\n\n{}\n\n{catalog}{INVARIANTS_HEAD}\n{tail}",
+        "You are an agent operating under the following mandate:\n\n{}\n\n{catalog}{INVARIANTS_HEAD}\n{INVARIANTS_TAIL}",
         m.text
     )
 }
@@ -501,55 +485,12 @@ mod tests {
              \n\
              Invariants:\n\
              1. Provenance. Every `emit_output` decision must cite `evidence` ids that resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.\n\
-             2. One decision per turn. Reply by calling exactly one terminal decision tool (`emit_output`, `rewrite_fs`, `idle`, `retire`) OR one or more `call_tool` blocks dispatched together as a single parallel batch.\n\
+             2. One decision per turn. Reply by calling exactly one terminal decision tool (`emit_output`, `rewrite_fs`, `idle`) OR one or more `call_tool` blocks dispatched together as a single parallel batch.\n\
              3. Parallel call_tool is supported. K `call_tool` `tool_use` blocks in one response run together this tick; the next prompt carries the matching `tool_result` blocks. Do not mix `call_tool` with a terminal decision tool in the same response.\n\
              4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` decisions can cite.\n\
-             5. Do not re-emit. Once you have emitted any Output on this run, your next decision must be `retire`. Do not emit a revised, paraphrased, or improved version of a prior Output. Outputs shown in the \"Recent outputs by you on this run\" window were emitted by you and count toward this rule.\n\
-             6. Retire is final. After the mandate's required Output has been emitted, `retire` is the only correct decision."
-        );
-    }
-
-    /// A `persistent` mandate renders the refresh invariant set: clauses 1–4
-    /// match the default verbatim, clauses 5–6 swap the one-shot
-    /// retire-after-Output rules for the refresh contract, and the
-    /// "Do not re-emit" / "Retire is final" wording is gone. `snapshot_empty_bundle`
-    /// guards the non-persistent string byte-for-byte (no regression).
-    #[test]
-    fn snapshot_persistent_mandate_renders_refresh_invariants() {
-        let mut m = mandate();
-        m.persistent = true;
-        let bundle = ContextBundle {
-            mandate: m,
-            ..empty_bundle()
-        };
-        let msgs = render(&bundle);
-        assert_eq!(msgs.len(), 1, "expected system message only");
-        assert_eq!(
-            text(&msgs[0]),
-            "You are an agent operating under the following mandate:\n\
-             \n\
-             Watch the FDA holds list and report drug-program risk.\n\
-             \n\
-             You have no tools assigned; you cannot call any tool.\n\
-             \n\
-             Invariants:\n\
-             1. Provenance. Every `emit_output` decision must cite `evidence` ids that resolve in this agent's evidence store. The runtime will reject outputs whose evidence does not resolve.\n\
-             2. One decision per turn. Reply by calling exactly one terminal decision tool (`emit_output`, `rewrite_fs`, `idle`, `retire`) OR one or more `call_tool` blocks dispatched together as a single parallel batch.\n\
-             3. Parallel call_tool is supported. K `call_tool` `tool_use` blocks in one response run together this tick; the next prompt carries the matching `tool_result` blocks. Do not mix `call_tool` with a terminal decision tool in the same response.\n\
-             4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` decisions can cite.\n\
-             5. Refresh, don't stop. You are a persistent monitor. After you `emit_output`, choose `idle` to wait for your cadence; on the next scheduled wake, re-research and emit an updated Output that reflects what changed since the last one. The \"Recent outputs by you on this run\" window is your durable memory — build on it rather than re-emitting an unchanged copy.\n\
-             6. Do not retire yourself. `retire` is not a valid self-decision for a persistent agent: the runtime stops you only via a retirement signal or your tick budget, and a `retire` decision is treated as `idle`. Keep cycling: research -> emit_output -> idle -> refresh.\n\
+             5. Refresh, don't stop. After you `emit_output`, choose `idle` to wait for your next wake; on the next wake, re-research and emit an updated Output that reflects what changed since the last one. The \"Recent outputs by you on this run\" window is your durable memory — build on it rather than re-emitting an unchanged copy.\n\
+             6. You do not terminate yourself. There is no self-terminate decision: the runtime stops you only via a retirement signal or your budget. Keep cycling: research -> emit_output -> idle -> refresh.\n\
              7. Fold child reports as they arrive. When a child reports an output (a `ChildOutput` trigger), reconcile the cited output, then emit a refreshed consolidated report that incorporates it and cites its evidence. When a child you have already folded reports again, reconcile its newer output rather than re-reconciling the one you already used."
-        );
-
-        let body = text(&msgs[0]);
-        assert!(
-            !body.contains("Do not re-emit."),
-            "persistent invariants must drop the one-shot re-emit rule"
-        );
-        assert!(
-            !body.contains("Retire is final."),
-            "persistent invariants must drop the retire-is-final rule"
         );
     }
 

@@ -2,10 +2,11 @@
 //!
 //! Env-gated behind `TEMPORAL_LIVE_TEST=1`. Spawns a parent that loops
 //! idle capturing every `Trigger` from its `pending_triggers` bucket,
-//! and a child whose scripted `EmitOutput -> Retire` fires a
-//! `Trigger::ChildOutput` at the parent via
-//! `ctx.external_workflow(...).signal(...)`. Asserts on happy path and
-//! on the failure mode where the parent's workflow id does not resolve.
+//! and a child that emits once (firing a `Trigger::ChildOutput` at the
+//! parent via `ctx.external_workflow(...).signal(...)`) then retires on
+//! its `max_ticks=1` cap (firing `Trigger::ChildRetired`). Asserts on the
+//! happy path and on the failure mode where the parent's workflow id does
+//! not resolve.
 
 use std::collections::VecDeque;
 use std::env;
@@ -252,15 +253,10 @@ async fn run_happy_path() -> Result<()> {
     // `RoutingDecide` records. A `retire` signal at the end ends the
     // parent cleanly.
     let parent_script: Vec<Decision> = Vec::new();
-    let child_script = vec![
-        Decision::EmitOutput {
-            content: "child output".into(),
-            evidence: vec![planted_id.clone()],
-        },
-        Decision::Retire {
-            reason: "child: scripted retire".into(),
-        },
-    ];
+    let child_script = vec![Decision::EmitOutput {
+        content: "child output".into(),
+        evidence: vec![planted_id.clone()],
+    }];
     install_role_scripts(parent_script, child_script);
 
     let telemetry_options = TelemetryOptions::builder().build();
@@ -360,7 +356,7 @@ async fn drive_happy_path(
             ..ParentRef::default()
         }),
         carryover: None,
-        mandate: Mandate::new(CHILD_MANDATE_TEXT, Duration::from_millis(50), None),
+        mandate: Mandate::new(CHILD_MANDATE_TEXT, Duration::from_millis(50), Some(1)),
         graph_id: GraphId::new(Uuid::nil()),
         agent_id: child_agent_id,
         agent_name: "fda_scraper".into(),
@@ -375,16 +371,16 @@ async fn drive_happy_path(
         .context("start_workflow(child)")?;
     eprintln!("happy: child started at {child_workflow_id}");
 
-    // Wait for the child to retire. Its scripted sequence terminates
-    // after `EmitOutput -> Retire`; the `Decision::EmitOutput` arm
-    // fires the ChildOutput signal at the parent before the next tick.
+    // Wait for the child to retire. It emits once (the `EmitOutput` arm
+    // fires the ChildOutput signal at the parent), then the `max_ticks=1`
+    // cap retires it (firing the ChildRetired signal).
     let child_result: AgentResult = child_handle
         .get_result(WorkflowGetResultOptions::default())
         .await
         .context("child get_result")?;
     let AgentResult::Retired { reason } = child_result;
-    assert!(
-        reason.contains("scripted retire"),
+    assert_eq!(
+        reason, "max_ticks (1) reached",
         "child workflow returned wrong retire reason: {reason:?}"
     );
     eprintln!("happy: child retired cleanly");
@@ -558,15 +554,10 @@ async fn run_failure_path() -> Result<()> {
         .await
         .context("plant evidence for child EmitOutput (failure path)")?;
 
-    let child_script = vec![
-        Decision::EmitOutput {
-            content: "child (failure path) output".into(),
-            evidence: vec![planted_id.clone()],
-        },
-        Decision::Retire {
-            reason: "failure path: scripted retire".into(),
-        },
-    ];
+    let child_script = vec![Decision::EmitOutput {
+        content: "child (failure path) output".into(),
+        evidence: vec![planted_id.clone()],
+    }];
     install_role_scripts(Vec::new(), child_script);
 
     let telemetry_options = TelemetryOptions::builder().build();
@@ -632,7 +623,7 @@ async fn drive_failure_path(
             ..ParentRef::default()
         }),
         carryover: None,
-        mandate: Mandate::new(CHILD_MANDATE_TEXT, Duration::from_millis(50), None),
+        mandate: Mandate::new(CHILD_MANDATE_TEXT, Duration::from_millis(50), Some(1)),
         graph_id: GraphId::new(Uuid::nil()),
         agent_id: AgentId::new(child_agent_uuid),
         agent_name: "orphan_child".into(),
@@ -652,14 +643,15 @@ async fn drive_failure_path(
 
     // Load-bearing assertion: despite the signal target being a
     // non-existent workflow, the child's workflow body does NOT error
-    // out. It logs the failure and continues to the next tick (Retire).
+    // out. It logs the failure and continues to the next tick (where the
+    // `max_ticks=1` cap retires it).
     let result: AgentResult = child_handle
         .get_result(WorkflowGetResultOptions::default())
         .await
         .context("child get_result (failure path)")?;
     let AgentResult::Retired { reason } = result;
-    assert!(
-        reason.contains("scripted retire"),
+    assert_eq!(
+        reason, "max_ticks (1) reached",
         "child workflow did not complete normally despite signal-to-nonexistent-parent failure; \
          got: {reason:?}"
     );

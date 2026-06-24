@@ -2,9 +2,9 @@
 //!
 //! Exercises the public surface only (`Agent::new`, `Agent::signal`,
 //! `Agent::run`) plus the FS root the agent writes to: signal/deadline
-//! wakeups, `EmitOutput` / `Retire` / `RewriteFs` / `CallTool` arms,
-//! `max_ticks` cap, the apply-time correction loop, tool-failure
-//! correction, health budget exhaustion + recovery.
+//! wakeups, `EmitOutput` / `RewriteFs` / `CallTool` arms, `max_ticks`
+//! cap, the apply-time correction loop, tool-failure correction, health
+//! budget exhaustion + recovery.
 //!
 //! Time-sensitive tests use `#[tokio::test(flavor = "current_thread",
 //! start_paused = true)]` so the runtime auto-advances when the only
@@ -82,12 +82,13 @@ fn agent_record_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn loop_wakes_on_injected_signal_and_retires() {
+async fn loop_wakes_on_injected_signal_and_runs() {
     // Idle period is huge so the test relies on the signal, not the
     // scheduled wake, to drive the first tick.
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_secs(3600)).await;
-    let script = vec![Decision::Retire {
-        reason: "signal-drove-me".into(),
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_secs(3600)).await;
+    mandate.max_ticks = Some(1);
+    let script = vec![Decision::Idle {
+        next_after: Duration::from_secs(3600),
     }];
     let agent = Agent::new(
         mandate,
@@ -115,18 +116,20 @@ async fn loop_wakes_on_injected_signal_and_retires() {
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "signal-drove-me");
+    assert_eq!(reason, "max_ticks (1) reached");
     assert!(tmp.path().join("retirement.json").is_file());
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn loop_wakes_on_deadline_when_no_signal_arrives() {
     // Short idle period so the deadline-arm fires with paused-time auto-
-    // advance. Script retires on the first tick; if it ran, the deadline
-    // fired, we drained a `ScheduledWake`, and decide returned.
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
-    let script = vec![Decision::Retire {
-        reason: "deadline-drove-me".into(),
+    // advance. Script idles on the first tick; if it ran, the deadline
+    // fired, we drained a `ScheduledWake`, and decide returned. The
+    // `max_ticks` cap stops the loop after that single deadline-driven tick.
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.max_ticks = Some(1);
+    let script = vec![Decision::Idle {
+        next_after: Duration::from_millis(50),
     }];
     let agent = Agent::new(
         mandate,
@@ -143,13 +146,14 @@ async fn loop_wakes_on_deadline_when_no_signal_arrives() {
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "deadline-drove-me");
+    assert_eq!(reason, "max_ticks (1) reached");
     assert!(tmp.path().join("retirement.json").is_file());
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn emit_output_with_valid_evidence_writes_file_under_outputs() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.max_ticks = Some(1);
     // Pre-seed an evidence record on disk so the EmitOutput's evidence id
     // resolves. Computing the id here keeps the test independent of how
     // the agent would have produced it.
@@ -161,15 +165,10 @@ async fn emit_output_with_valid_evidence_writes_file_under_outputs() {
     );
     let ev_id: EvidenceId = fs.record_evidence(rec).await.expect("seed evidence");
 
-    let script = vec![
-        Decision::EmitOutput {
-            content: "the answer".into(),
-            evidence: vec![ev_id.clone()],
-        },
-        Decision::Retire {
-            reason: "done".into(),
-        },
-    ];
+    let script = vec![Decision::EmitOutput {
+        content: "the answer".into(),
+        evidence: vec![ev_id.clone()],
+    }];
     let agent = Agent::new(
         mandate,
         fs,
@@ -204,51 +203,15 @@ async fn emit_output_with_valid_evidence_writes_file_under_outputs() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn retire_writes_retirement_json_and_returns_reason() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
-    let script = vec![Decision::Retire {
-        reason: "graceful exit".into(),
-    }];
-    let agent = Agent::new(
-        mandate,
-        fs,
-        MockDecide::new(script),
-        registry_with_echo(),
-        fresh_health(tmp.path()),
-    );
-
-    let handle = tokio::spawn(agent.run());
-    let RetireReason(reason) = timeout(Duration::from_secs(5), handle)
-        .await
-        .expect("agent did not retire in time")
-        .expect("join")
-        .expect("run ok");
-    assert_eq!(reason, "graceful exit");
-
-    let path = tmp.path().join("retirement.json");
-    assert!(path.is_file());
-    let v: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
-    assert_eq!(
-        v.get("reason").and_then(|s| s.as_str()),
-        Some("graceful exit")
-    );
-}
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn rewrite_fs_writes_file_under_notes() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
-    let script = vec![
-        Decision::RewriteFs {
-            ops: vec![FsOp::WriteFile {
-                path: "notes/scratch.md".into(),
-                content: "hello from the loop".into(),
-            }],
-        },
-        Decision::Retire {
-            reason: "done".into(),
-        },
-    ];
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.max_ticks = Some(1);
+    let script = vec![Decision::RewriteFs {
+        ops: vec![FsOp::WriteFile {
+            path: "notes/scratch.md".into(),
+            content: "hello from the loop".into(),
+        }],
+    }];
     let agent = Agent::new(
         mandate,
         fs,
@@ -276,7 +239,8 @@ async fn call_tool_records_evidence_and_emit_output_consumes_it() {
     // Sanity sweep that exercises the CallTool arm end to end: the loop
     // calls echo, the resulting evidence is persisted, and a follow-up
     // EmitOutput with that evidence id succeeds.
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.max_ticks = Some(2);
     // Compute the id we expect echo to produce so we can reference it in
     // the EmitOutput decision.
     let args = json!({"msg": "hi"});
@@ -294,9 +258,6 @@ async fn call_tool_records_evidence_and_emit_output_consumes_it() {
         Decision::EmitOutput {
             content: "echoed".into(),
             evidence: vec![expected_ev.clone()],
-        },
-        Decision::Retire {
-            reason: "done".into(),
         },
     ];
     let agent = Agent::new(
@@ -382,22 +343,20 @@ async fn max_ticks_caps_loop_iterations_and_writes_retirement() {
 /// a valid `Decision` that completes. The agent stays Healthy throughout.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn invalid_call_tool_stages_correction_then_recovers() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.max_ticks = Some(1);
     let script = vec![
         // Tick 1: model picks a tool that is not registered. Apply-time
         // failure → record_failure(Inference) → counter=1 (under default
-        // budget of 1) → pending_correction set for the next tick.
+        // budget of 1) → pending_correction set for the next tick. The
+        // `max_ticks` cap then stops the loop before the correction
+        // continuation can run a recovery decision.
         Decision::CallTools {
             calls: vec![ToolCall::new(
                 "no_such_tool",
                 json!({"x": 1}),
                 ClaimSeed::new("seed-1"),
             )],
-        },
-        // Tick 2: correction continuation; script's next decision is
-        // Retire. dispatch returns Retire → loop exits.
-        Decision::Retire {
-            reason: "recovered".into(),
         },
     ];
     let agent = Agent::new(
@@ -414,7 +373,7 @@ async fn invalid_call_tool_stages_correction_then_recovers() {
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "recovered");
+    assert_eq!(reason, "max_ticks (1) reached");
 
     // Provenance side-effect check: the bad CallTool must not have
     // produced an evidence record. The registry rejected the lookup
@@ -446,16 +405,12 @@ async fn invalid_call_tool_stages_correction_then_recovers() {
 /// correction continuation whose script retires.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn emit_output_with_empty_evidence_stages_correction() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
-    let script = vec![
-        Decision::EmitOutput {
-            content: "no provenance".into(),
-            evidence: vec![],
-        },
-        Decision::Retire {
-            reason: "recovered".into(),
-        },
-    ];
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.max_ticks = Some(1);
+    let script = vec![Decision::EmitOutput {
+        content: "no provenance".into(),
+        evidence: vec![],
+    }];
     let agent = Agent::new(
         mandate,
         fs,
@@ -470,7 +425,7 @@ async fn emit_output_with_empty_evidence_stages_correction() {
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "recovered");
+    assert_eq!(reason, "max_ticks (1) reached");
 
     // `outputs/` materialises on first write; treat absent dir as no
     // output persisted.
@@ -496,17 +451,13 @@ async fn emit_output_with_empty_evidence_stages_correction() {
 /// `FsError` variants the apply-time correction path catches.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn emit_output_with_unknown_evidence_stages_correction() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.max_ticks = Some(1);
     let bogus = EvidenceId::from_hex("deadbeef".repeat(8));
-    let script = vec![
-        Decision::EmitOutput {
-            content: "lying about provenance".into(),
-            evidence: vec![bogus],
-        },
-        Decision::Retire {
-            reason: "recovered".into(),
-        },
-    ];
+    let script = vec![Decision::EmitOutput {
+        content: "lying about provenance".into(),
+        evidence: vec![bogus],
+    }];
     let agent = Agent::new(
         mandate,
         fs,
@@ -521,7 +472,7 @@ async fn emit_output_with_unknown_evidence_stages_correction() {
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "recovered");
+    assert_eq!(reason, "max_ticks (1) reached");
 
     // `outputs/` materialises on first write; treat absent dir as no
     // output persisted.
@@ -548,7 +499,8 @@ async fn emit_output_with_unknown_evidence_stages_correction() {
 /// tracker to `Healthy` while archiving the prior incident.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn persistent_apply_time_failure_exhausts_budget_and_recovers_on_next_success() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.max_ticks = Some(3);
     // Default budget is `RetryBudget::new(1, 3)` → max_inference = 1, so
     // total apply-time attempts before exhaustion = 2 (original + 1
     // retry inside the same fresh-tick window).
@@ -574,13 +526,10 @@ async fn persistent_apply_time_failure_exhausts_budget_and_recovers_on_next_succ
         },
         // Attempt 3 (next deadline-driven fresh tick): valid Idle.
         // dispatch returns Continue → mark_tick_success → archives the
-        // Unhealthy incident and flips back to Healthy.
+        // Unhealthy incident and flips back to Healthy. The `max_ticks`
+        // cap then stops the loop.
         Decision::Idle {
             next_after: Duration::from_millis(50),
-        },
-        // Attempt 4: valid Retire — exits the loop.
-        Decision::Retire {
-            reason: "after-recovery".into(),
         },
     ];
     // Anchor the budget explicitly so a future change to
@@ -600,7 +549,7 @@ async fn persistent_apply_time_failure_exhausts_budget_and_recovers_on_next_succ
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "after-recovery");
+    assert_eq!(reason, "max_ticks (3) reached");
 
     // After recovery: the live `health.json` reflects Healthy state with
     // a `since` timestamp at recovery time (not the agent's open time).
@@ -762,7 +711,8 @@ async fn decide_err_transitions_to_unhealthy_and_keeps_loop_alive() {
 /// failures within one continuous window exhaust.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn apply_failure_correction_budget_is_immune_to_concurrent_external_triggers() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.max_ticks = Some(3);
     let script = vec![
         // Tick 1 (fresh): the wrapper Decide injects an external trigger,
         // then returns this bad CallTool. record_failure ok (counter=1)
@@ -790,10 +740,6 @@ async fn apply_failure_correction_budget_is_immune_to_concurrent_external_trigge
         // incident and flips back to Healthy.
         Decision::Idle {
             next_after: Duration::from_millis(50),
-        },
-        // Tick 4: retire cleanly.
-        Decision::Retire {
-            reason: "post-exhaustion".into(),
         },
     ];
 
@@ -859,7 +805,7 @@ async fn apply_failure_correction_budget_is_immune_to_concurrent_external_trigge
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "post-exhaustion");
+    assert_eq!(reason, "max_ticks (3) reached");
 
     // The archive must hold exactly one Unhealthy incident with a
     // retry_trail of length 2 — proof that the budget exhausted on tick 2
@@ -966,24 +912,21 @@ fn registry_with_flaky(name: &str, fail_count: u32) -> ToolRegistry {
 /// test below.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn tool_call_exhausts_retry_budget_trips_unhealthy() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.max_ticks = Some(1);
     // Tool fails forever within the lifetime of this test.
     let registry = registry_with_flaky("flaky", u32::MAX);
     let script = vec![
         // Tick 1: model calls the flaky tool → tool errors →
         // ApplyOutcome::ToolError → record_failure(ToolCall, _) →
         // budget exhausted (max_tool=0) → transition_to_unhealthy.
-        // Run loop continues.
+        // Run loop continues, then the `max_ticks` cap stops it.
         Decision::CallTools {
             calls: vec![ToolCall::new(
                 "flaky",
                 json!({"x": 1}),
                 ClaimSeed::new("seed-1"),
             )],
-        },
-        // Tick 2: retire so the test terminates.
-        Decision::Retire {
-            reason: "after-tool-exhaustion".into(),
         },
     ];
     // Anchor budget shape explicitly: max_inference=1 keeps inference
@@ -1002,13 +945,12 @@ async fn tool_call_exhausts_retry_budget_trips_unhealthy() {
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "after-tool-exhaustion");
+    assert_eq!(reason, "max_ticks (1) reached");
 
-    // Tick 1 transitioned to Unhealthy; the script's second decision was
-    // a clean Retire which (per dispatch) does not mark a tick success,
-    // so the live health.json should still be Unhealthy when the loop
-    // exited. (Retire is the terminal path; recovery is exercised in the
-    // companion test below.)
+    // Tick 1 transitioned to Unhealthy; the `max_ticks` cap then stops the
+    // loop on the next iteration without running another decision, so the
+    // live health.json should still be Unhealthy when the loop exited.
+    // (Recovery is exercised in the companion test below.)
     let v: serde_json::Value = serde_json::from_slice(
         &std::fs::read(tmp.path().join("health.json")).expect("read health"),
     )
@@ -1058,7 +1000,8 @@ async fn tool_call_exhausts_retry_budget_trips_unhealthy() {
 /// succeeds and the tick is marked successful.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.max_ticks = Some(2);
     // Fail exactly once: tick 1 exhausts (budget=0 trips immediately),
     // tick 2's CallTool succeeds, mark_tick_success archives the
     // Unhealthy incident.
@@ -1084,10 +1027,6 @@ async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
                 ClaimSeed::new("seed-2"),
             )],
         },
-        // Tick 3: retire cleanly.
-        Decision::Retire {
-            reason: "after-recovery".into(),
-        },
     ];
     let agent = Agent::new(
         mandate,
@@ -1103,7 +1042,7 @@ async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "after-recovery");
+    assert_eq!(reason, "max_ticks (2) reached");
 
     // Live health.json now reflects Healthy with `since` at the
     // recovery tick's timestamp.
@@ -1187,7 +1126,8 @@ impl Decide for CapturingDecide {
 /// its last decision failed.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn tool_call_failure_stages_correction_visible_on_next_tick_bundle() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.max_ticks = Some(2);
     // Tool fails twice: tick 1's CallTool errors (after the tool's
     // internal RetryPolicy gives up); tick 2's CallTool also errors but
     // the test exits before exhausting the budget — we only care that
@@ -1203,11 +1143,11 @@ async fn tool_call_failure_stages_correction_visible_on_next_tick_bundle() {
                 ClaimSeed::new("seed-1"),
             )],
         },
-        // Tick 2 (correction continuation): retire so the test
-        // terminates. The bundle this decide() sees must carry the
-        // correction from tick 1.
-        Decision::Retire {
-            reason: "stop-after-seeing-correction".into(),
+        // Tick 2 (correction continuation): idle so the test terminates
+        // via the `max_ticks` cap. The bundle this decide() sees must
+        // carry the correction from tick 1.
+        Decision::Idle {
+            next_after: Duration::from_millis(50),
         },
     ];
     // Anchor budget so tick 1 fits comfortably: max_tool=3 → tick 1's
@@ -1232,7 +1172,7 @@ async fn tool_call_failure_stages_correction_visible_on_next_tick_bundle() {
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "stop-after-seeing-correction");
+    assert_eq!(reason, "max_ticks (2) reached");
 
     let captured = seen.lock().unwrap().clone();
     assert_eq!(
@@ -1300,7 +1240,8 @@ async fn tool_call_failure_stages_correction_visible_on_next_tick_bundle() {
 /// tick saw the correction *and* emitted a different `Decision`.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn tool_call_failure_correction_then_different_decision_recovers_to_healthy() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.max_ticks = Some(3);
     // Two tools: `flaky` fails forever; `echo` always succeeds. The
     // script drives the model to call `flaky` first, see the correction,
     // and then call `echo` on the continuation.
@@ -1333,9 +1274,10 @@ async fn tool_call_failure_correction_then_different_decision_recovers_to_health
                 ClaimSeed::new("seed-echo"),
             )],
         },
-        // Tick 3: retire cleanly.
-        Decision::Retire {
-            reason: "recovered-after-tool-failure".into(),
+        // Tick 3 (fresh — recovery cleared pending_correction): idle so
+        // the test terminates via the `max_ticks` cap.
+        Decision::Idle {
+            next_after: Duration::from_millis(50),
         },
     ];
     let seen: Arc<Mutex<Vec<ContextBundle>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1360,7 +1302,7 @@ async fn tool_call_failure_correction_then_different_decision_recovers_to_health
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "recovered-after-tool-failure");
+    assert_eq!(reason, "max_ticks (3) reached");
 
     let captured = seen.lock().unwrap().clone();
     assert_eq!(captured.len(), 3, "expected three decide() invocations");
@@ -1430,7 +1372,6 @@ async fn per_mandate_recent_outputs_cap_reaches_the_run_loop() {
             recent_evidence: 8,
             open_claims_max: 32,
         },
-        persistent: false,
         model: None,
         tools: Vec::new(),
     };
@@ -1458,12 +1399,12 @@ async fn per_mandate_recent_outputs_cap_reaches_the_run_loop() {
     // Sanity: the FS layer agrees five outputs are on disk.
     assert_eq!(fs.list_recent_outputs(usize::MAX).await.unwrap().len(), 5);
 
-    // Single-tick script: retire on the first decide so we exit immediately
-    // after observing the bundle.
+    // Single-tick script: idle on the first decide so we exit via the
+    // `max_ticks` cap immediately after observing the bundle.
     let seen: Arc<Mutex<Vec<ContextBundle>>> = Arc::new(Mutex::new(Vec::new()));
     let decide = CapturingDecide {
-        inner: MockDecide::new(vec![Decision::Retire {
-            reason: "saw-bundle".into(),
+        inner: MockDecide::new(vec![Decision::Idle {
+            next_after: Duration::from_millis(50),
         }]),
         seen: seen.clone(),
     };
@@ -1481,7 +1422,7 @@ async fn per_mandate_recent_outputs_cap_reaches_the_run_loop() {
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "saw-bundle");
+    assert_eq!(reason, "max_ticks (1) reached");
 
     let captured = seen.lock().unwrap().clone();
     assert_eq!(captured.len(), 1, "expected exactly one decide()");
@@ -1502,7 +1443,8 @@ async fn per_mandate_recent_outputs_cap_reaches_the_run_loop() {
 /// the "synthesize 3 file reads in one tick" path.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn parallel_call_tools_k3_all_succeed_persists_evidence_in_order() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.max_ticks = Some(2);
     // Three distinct evidence ids the EmitOutput will cite. EchoTool
     // produces a content-addressed record per `(name, args, result)`
     // triple, so picking three distinct args guarantees three distinct
@@ -1546,9 +1488,6 @@ async fn parallel_call_tools_k3_all_succeed_persists_evidence_in_order() {
             content: "synthesized from 3 reads".into(),
             evidence: vec![ev_a.clone(), ev_b.clone(), ev_c.clone()],
         },
-        Decision::Retire {
-            reason: "done".into(),
-        },
     ];
     let agent = Agent::new(
         mandate,
@@ -1564,7 +1503,7 @@ async fn parallel_call_tools_k3_all_succeed_persists_evidence_in_order() {
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "done");
+    assert_eq!(reason, "max_ticks (2) reached");
 
     // Three evidence files on disk, one per call.
     let evidence_dir = tmp.path().join("evidence");
@@ -1605,7 +1544,8 @@ async fn parallel_call_tools_k3_all_succeed_persists_evidence_in_order() {
 /// accounting documented in `agent.rs`.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn parallel_call_tools_k3_partial_failure_persists_successes_and_stages_correction() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.max_ticks = Some(2);
     // `echo` always succeeds; `flaky` always errors. Mix them in one
     // batch to exercise the partial-failure dispatch path.
     let mut registry = ToolRegistry::new();
@@ -1641,10 +1581,10 @@ async fn parallel_call_tools_k3_partial_failure_persists_successes_and_stages_co
                 ),
             ],
         },
-        // Tick 2: model sees correction; just retire so the test
-        // terminates with a deterministic reason.
-        Decision::Retire {
-            reason: "after-partial-failure".into(),
+        // Tick 2: model sees correction; idle so the test terminates via
+        // the `max_ticks` cap.
+        Decision::Idle {
+            next_after: Duration::from_millis(50),
         },
     ];
 
@@ -1673,7 +1613,7 @@ async fn parallel_call_tools_k3_partial_failure_persists_successes_and_stages_co
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "after-partial-failure");
+    assert_eq!(reason, "max_ticks (2) reached");
 
     // Successful sibling evidence stays on disk (the load-bearing
     // "don't unwind on partial failure" property the dispatch site
@@ -1736,7 +1676,8 @@ async fn parallel_call_tools_k3_partial_failure_persists_successes_and_stages_co
 /// Pins the documented "K against budget" choice.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn parallel_call_tools_k3_all_fail_consumes_k_budget_slots_and_trips_unhealthy() {
-    let (tmp, fs, mandate) = fresh_fs(Duration::from_millis(50)).await;
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.max_ticks = Some(1);
     let registry = registry_with_flaky("flaky", u32::MAX);
 
     let script = vec![
@@ -1748,9 +1689,6 @@ async fn parallel_call_tools_k3_all_fail_consumes_k_budget_slots_and_trips_unhea
                 ToolCall::new("flaky", json!({"i": 2}), ClaimSeed::new("seed-2")),
                 ToolCall::new("flaky", json!({"i": 3}), ClaimSeed::new("seed-3")),
             ],
-        },
-        Decision::Retire {
-            reason: "after-batch-exhaustion".into(),
         },
     ];
     let agent = Agent::new(
@@ -1767,7 +1705,7 @@ async fn parallel_call_tools_k3_all_fail_consumes_k_budget_slots_and_trips_unhea
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "after-batch-exhaustion");
+    assert_eq!(reason, "max_ticks (1) reached");
 
     // K=3 failures with max_tool=2 trips Unhealthy. The archived
     // incident's retry trail captures all three failures so audit sees

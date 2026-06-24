@@ -1,9 +1,9 @@
-# Reduced persistent-monitor fixture: one parent + two children, all
-# `persistent: true`. Proves the continuous loop end-to-end on the workflow
-# path — agents cycle (emit -> idle -> refresh), the parent re-reconciles
-# newer child outputs into refreshed reports, and the graph stops only via
-# the `max_ticks` guardrail (never a model `Retire`, which is demoted to
-# `Idle` for persistent agents).
+# Reduced continuous-monitor fixture: one parent + two children. Proves the
+# continuous loop end-to-end on the workflow path — agents cycle (emit ->
+# idle -> refresh), the parent re-reconciles newer child outputs into
+# refreshed reports, and the graph stops only via the `max_ticks` guardrail.
+# Persistence is universal: agents never self-terminate (there is no
+# per-agent `persistent` flag).
 #
 # Two run modes share this one file (the graph never picks the `Decide`
 # impl, so the same topology serves both):
@@ -22,9 +22,9 @@ kind: Graph
 metadata:
   name: persistent-monitor
   description: |
-    Continuous-monitor fixture: a persistent parent reconciles two
-    persistent children's refreshed outputs over several cycles, stopping
-    only at the max_ticks guardrail.
+    Continuous-monitor fixture: a parent reconciles two children's
+    refreshed outputs over several cycles, stopping only at the max_ticks
+    guardrail.
 defaults:
   idle_period: 500ms
 tools:
@@ -45,7 +45,6 @@ agents:
         cites the child outputs you folded in. On a later report from a child
         you have already folded, reconcile its newer output. Re-run on your
         schedule to keep the summary current.
-      persistent: true
       max_ticks: 8
     tools: [everything]
     children:
@@ -55,7 +54,6 @@ agents:
             Research topic alpha. On each scheduled wake, compute a fresh
             figure with the get-sum tool and emit an updated finding that
             cites the resulting evidence. Keep refreshing; do not stop.
-          persistent: true
           max_ticks: 4
         tools: [everything]
       - id: researcher-beta
@@ -64,7 +62,6 @@ agents:
             Research topic beta. On each scheduled wake, compute a fresh
             figure with the get-sum tool and emit an updated finding that
             cites the resulting evidence. Keep refreshing; do not stop.
-          persistent: true
           max_ticks: 4
         tools: [everything]
 seed:

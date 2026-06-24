@@ -1,24 +1,23 @@
-//! End-to-end persistent-monitor smoke on the workflow path.
+//! End-to-end continuous-monitor smoke on the workflow path.
 //!
 //! Proves the continuous loop's **runtime contract** end-to-end against a
-//! real Temporal Server + Postgres: a reduced graph of three `persistent`
-//! agents (one parent + two children) cycles, the parent re-reconciles
-//! newer child outputs, and every agent stops only via the `max_ticks`
-//! guardrail — never a model `Retire` (which CM-2 demotes to `Idle` for
-//! persistent agents).
+//! real Temporal Server + Postgres: a reduced graph of three agents (one
+//! parent + two children) cycles, the parent re-reconciles newer child
+//! outputs, and every agent stops only via the `max_ticks` guardrail —
+//! agents never self-terminate (persistence is universal).
 //!
 //! A deterministic [`CyclingDecide`] drives the loop and the children cite
 //! planted evidence, so this needs **no model key and no Node** — only the
 //! `TEMPORAL_LIVE_TEST=1` + `DATABASE_URL` gates. That keeps the three
 //! assertions (≥2 distinct outputs each, ≥1 re-reconciliation, max_ticks
-//! stop) deterministic: they are properties of the loop machinery
-//! (CM-2/CM-3/CM-4), not of model behaviour.
+//! stop) deterministic: they are properties of the loop machinery, not of
+//! model behaviour.
 //!
-//! What this does NOT cover: the persistent **prompt** clauses (CM-3/CM-4
-//! text, exercised only by a real model — already snapshot-covered) and the
-//! open "can a small model actually drive this loop" question. That
-//! loop-viability run is documented in `examples/persistent_monitor/README.md`
-//! for a manual run with a vendor key.
+//! What this does NOT cover: the lifecycle **prompt** clauses (exercised
+//! only by a real model — already snapshot-covered) and the open "can a
+//! small model actually drive this loop" question. That loop-viability run
+//! is documented in `examples/persistent_monitor/README.md` for a manual
+//! run with a vendor key.
 //!
 //! Run it:
 //! ```bash
@@ -179,27 +178,20 @@ async fn build_client() -> Result<Client> {
         .context("building Temporal client")
 }
 
-/// Hermetic (no live deps): the example graph parses and validates as a
-/// reduced all-persistent monitor — the apply-time gate `coral apply` runs
-/// before touching the DB. The always-on guard that the fixture stays
-/// applyable and clears the CM-4 degenerate-combo validation.
+/// Hermetic (no live deps): the example monitor graph parses and validates
+/// — the apply-time gate `coral apply` runs before touching the DB. The
+/// always-on guard that the fixture stays applyable.
 #[test]
-fn example_graph_parses_and_validates_as_all_persistent_monitor() {
+fn example_graph_parses_and_validates() {
     let yaml = std::fs::read_to_string(example_graph_path())
         .expect("read examples/persistent_monitor/graph.yaml");
     let graph = parse_and_validate(&yaml).expect("example graph validates");
 
-    // One parent + two children, every one persistent. A persistent parent
-    // with all-one-shot children is rejected by CM-4's validator; this
-    // fixture's children are persistent, so it must clear that gate.
+    // One parent + two children (persistence is universal — there is no
+    // per-agent flag to assert).
     assert_eq!(graph.agents.len(), 1, "single root");
     let analyst = &graph.agents[0];
-    assert!(analyst.mandate.persistent, "analyst persistent");
     assert_eq!(analyst.children.len(), 2, "two researchers");
-    assert!(
-        analyst.children.iter().all(|c| c.mandate.persistent),
-        "both researchers persistent (not the degenerate combo CM-4 rejects)"
-    );
     // Seeds kick off all three so they begin cycling immediately.
     assert_eq!(graph.seed.triggers.len(), 3, "three seed kickoffs");
 }
@@ -363,9 +355,9 @@ async fn drive(
             .with_context(|| format!("signal seed {}", seed.workflow_id))?;
     }
 
-    // Wait for every agent to stop. Each is persistent, so the only stop is
-    // the max_ticks guardrail — assert the reason verbatim (proves the stop
-    // contract: no model Retire ended a persistent agent).
+    // Wait for every agent to stop. Agents never self-terminate, so the only
+    // stop is the max_ticks guardrail — assert the reason verbatim (proves
+    // the stop contract: no agent ended itself).
     let max_ticks_by_agent = |name: &str| -> u64 {
         if name == "analyst" {
             8
@@ -384,7 +376,7 @@ async fn drive(
         let expected = format!("max_ticks ({}) reached", max_ticks_by_agent(&agent_name));
         assert_eq!(
             reason, expected,
-            "{agent_name} must stop via the guardrail, not a model Retire"
+            "{agent_name} must stop via the guardrail (agents never self-terminate)"
         );
     }
 

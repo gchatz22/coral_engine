@@ -245,7 +245,8 @@ impl AgentInput {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum AgentResult {
     /// The workflow's loop body completed because the agent retired (the
-    /// `retire` signal fired or `Decision::Retire { reason }` was emitted).
+    /// `retire` signal fired or the `max_ticks` safety cap was hit). The
+    /// agent never self-terminates — termination is a kernel/human op.
     Retired { reason: String },
 }
 
@@ -439,9 +440,8 @@ impl AgentWorkflow {
     ///    `ctx.continue_as_new(&next_input, opts)`.
     ///
     /// Retirement structurally cannot trigger CAN: both retirement paths
-    /// (`drained.retirement` short-circuit at the top, and
-    /// `Decision::Retire { reason }` at the bottom of the `match`) return
-    /// before the CAN check.
+    /// (the `max_ticks` cap and the `drained.retirement` short-circuit, both
+    /// at the top of the loop) return before the CAN check.
     #[run]
     pub async fn run(
         ctx: &mut WorkflowContext<Self>,
@@ -479,11 +479,8 @@ impl AgentWorkflow {
             // activity errors out and short-circuits the workflow. The
             // activity sources its timestamp from
             // `ctx.info().scheduled_time` so Temporal retries write
-            // byte-identical bytes. The model's actual decision is logged
-            // here even when the next line demotes a persistent agent's
-            // `Retire`, so the artifact preserves what the model chose.
+            // byte-identical bytes.
             log_decision(ctx, &input.fs_handle, tick, &decision).await?;
-            let decision = demote_retire_if_persistent(decision, &input.mandate);
             match decision {
                 Decision::CallTools { calls } => dispatch_call_tools(ctx, &input, calls).await?,
                 Decision::EmitOutput { content, evidence } => {
@@ -498,12 +495,6 @@ impl AgentWorkflow {
                     s.next_wake = Some(next_after);
                     s.staged_correction = None;
                 }),
-                Decision::Retire { reason } => {
-                    // The Retire arm short-circuits before the tick-bump
-                    // below, so the decision-log entry just written above
-                    // is the last artifact this run produces.
-                    return retire(ctx, &input, reason).await;
-                }
                 // `staged_correction` is NOT cleared on SpawnChild: a
                 // successful spawn does not satisfy a previously-staged
                 // tool-failure correction (the correction is about the
@@ -626,27 +617,6 @@ fn max_ticks_retire_reason(tick: u64, max_ticks: Option<u64>) -> Option<String> 
     max_ticks
         .filter(|&max| tick >= max)
         .map(|max| format!("max_ticks ({max}) reached"))
-}
-
-/// Enforce the persistent-agent stop contract on a fresh decision. A
-/// `persistent` agent may not self-terminate, so a model-emitted
-/// `Decision::Retire` is demoted to an `Idle` for one `idle_period`; only a
-/// retire signal or `max_ticks` may stop it. Every other decision, and every
-/// decision from a non-persistent agent, passes through unchanged.
-fn demote_retire_if_persistent(decision: Decision, mandate: &Mandate) -> Decision {
-    match decision {
-        Decision::Retire { reason } if mandate.persistent => {
-            tracing::info!(
-                demoted_reason = %reason,
-                idle_period_ms = mandate.idle_period.as_millis() as u64,
-                "persistent agent: demoting model Retire to Idle (stop contract)"
-            );
-            Decision::Idle {
-                next_after: mandate.idle_period,
-            }
-        }
-        other => other,
-    }
 }
 
 /// Give a pure idle-timer wake an explicit "you woke on schedule" signal.
@@ -849,7 +819,6 @@ fn decision_summary(decision: &Decision) -> String {
         Decision::Idle { next_after } => {
             format!("Idle {{ next_after_ms: {} }}", next_after.as_millis())
         }
-        Decision::Retire { reason } => format!("Retire {{ reason: {reason:?} }}"),
         Decision::SpawnChild { agent_name, .. } => {
             format!("SpawnChild {{ agent_name: {agent_name:?} }}")
         }
@@ -869,8 +838,7 @@ fn decision_summary(decision: &Decision) -> String {
 }
 
 /// Invoke the `persist_retirement` activity and return the workflow result.
-/// Shared between the retire-signal short-circuit and the `Decision::Retire`
-/// arm.
+/// Shared between the retire-signal short-circuit and the `max_ticks` cap.
 ///
 /// After `persist_retirement` returns and before the workflow exits, if
 /// `input.parent_handle.is_some()` the workflow body fires one final
@@ -1932,12 +1900,6 @@ mod tests {
         assert!(s.starts_with("Idle"), "got: {s}");
         assert!(s.contains("250"), "got: {s}");
 
-        let s = decision_summary(&Decision::Retire {
-            reason: "max_ticks".into(),
-        });
-        assert!(s.starts_with("Retire"), "got: {s}");
-        assert!(s.contains("max_ticks"), "got: {s}");
-
         let s = decision_summary(&Decision::CallTools {
             calls: vec![
                 coral_node::decision::ToolCall::new(
@@ -2008,53 +1970,6 @@ mod tests {
         assert_eq!(max_ticks_retire_reason(0, Some(1)), None);
         // No cap: never retires on this axis.
         assert_eq!(max_ticks_retire_reason(u64::MAX, None), None);
-    }
-
-    #[test]
-    fn demote_retire_if_persistent_only_demotes_a_persistent_retire() {
-        let idle = Duration::from_millis(500);
-        let mut persistent = Mandate::new("monitor", idle, None);
-        persistent.persistent = true;
-        let one_shot = Mandate::new("one-shot", idle, None);
-
-        // Persistent + Retire → Idle for one idle_period.
-        let demoted = demote_retire_if_persistent(
-            Decision::Retire {
-                reason: "model wants out".into(),
-            },
-            &persistent,
-        );
-        assert_eq!(demoted, Decision::Idle { next_after: idle });
-
-        // Non-persistent + Retire → unchanged (today's stop-on-decision).
-        let kept = demote_retire_if_persistent(
-            Decision::Retire {
-                reason: "done".into(),
-            },
-            &one_shot,
-        );
-        assert_eq!(
-            kept,
-            Decision::Retire {
-                reason: "done".into()
-            }
-        );
-
-        // Persistent + non-Retire → passes through untouched.
-        let passthrough = demote_retire_if_persistent(
-            Decision::EmitOutput {
-                content: "refreshed report".into(),
-                evidence: vec![],
-            },
-            &persistent,
-        );
-        assert_eq!(
-            passthrough,
-            Decision::EmitOutput {
-                content: "refreshed report".into(),
-                evidence: vec![],
-            }
-        );
     }
 
     fn empty_drained() -> DrainedBuckets {
