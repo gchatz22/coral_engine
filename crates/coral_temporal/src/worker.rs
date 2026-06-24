@@ -26,14 +26,14 @@ use coral_node::model_client::cohere::CohereClient;
 use coral_node::model_client::CompleteOptions;
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 use coral_node::model_client::ModelClient;
+#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
+use coral_node::model_client::ModelRegistry;
 use coral_node::storage::AgentStorage;
 use coral_node::tools::ToolRegistry;
 use temporalio_client::Client;
 use temporalio_sdk::{Worker, WorkerOptions};
 use temporalio_sdk_core::CoreRuntime;
 
-#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
-const VENDOR_ENV: &str = "CORAL_MODEL_VENDOR";
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
@@ -221,58 +221,74 @@ pub fn build_worker(runtime: &CoreRuntime, client: Client, task_queue: &str) -> 
     Worker::new(runtime, client, opts).map_err(|e| anyhow::anyhow!("Worker::new failed: {e}"))
 }
 
-/// Pick the LLM vendor from env and build the [`Decide`] implementation
-/// the `decide_next_action` activity body will call. Returns the vendor
-/// tag alongside the trait object so the caller can log it.
+/// Build the [`ModelRegistry`]-backed [`Decide`] the `decide_next_action`
+/// activity body will call, populated from every provider compiled into
+/// this binary whose API key is set. Any agent's `provider/model` then
+/// resolves to its own client. Returns a human-readable provider summary
+/// alongside the trait object so the caller can log what was wired.
 ///
-/// Selection precedence:
-/// 1. `CORAL_MODEL_VENDOR` set + that vendor compiled in → use it.
-/// 2. `CORAL_MODEL_VENDOR` set + vendor NOT compiled in → error.
-/// 3. `CORAL_MODEL_VENDOR` unset → pick the first compiled-in vendor
-///    (in preference order `anthropic`, `cohere`) whose API key is set.
-/// 4. Nothing usable → error with a "rebuild with --features" hint.
+/// The first available provider (preference order `anthropic`, `cohere`)
+/// is the registry default — it serves agents whose model is `None` or
+/// written without a `provider/` prefix. With no usable provider, returns
+/// an error listing the keys that would enable one.
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
-pub fn build_decide_from_env() -> Result<(&'static str, Arc<dyn Decide>)> {
-    let vendor = resolve_vendor()?;
-    let model_client: Arc<dyn ModelClient> = match vendor {
-        "anthropic" => build_anthropic_client()?,
-        "cohere" => build_cohere_client()?,
-        other => return Err(anyhow!("internal: resolve_vendor returned `{other}`")),
-    };
-    let options = CompleteOptions::default();
-    let decide: Arc<dyn Decide> = Arc::new(LlmDecide::new(model_client, options));
-    Ok((vendor, decide))
+pub fn build_decide_from_env() -> Result<(String, Arc<dyn Decide>)> {
+    let available = available_providers(compiled_providers(), |k| {
+        env::var(k).map(|v| !v.is_empty()).unwrap_or(false)
+    });
+    if available.is_empty() {
+        let usable_keys: Vec<&str> = PROVIDER_KEY_ENVS
+            .iter()
+            .filter(|(p, _)| compiled_providers().contains(p))
+            .map(|(_, k)| *k)
+            .collect();
+        return Err(anyhow!(
+            "no model provider available: set one of [{keys}]",
+            keys = usable_keys.join(", ")
+        ));
+    }
+
+    let default = available[0].to_string();
+    let mut clients: Vec<(String, Arc<dyn ModelClient>)> = Vec::with_capacity(available.len());
+    for provider in &available {
+        let client: Arc<dyn ModelClient> = match *provider {
+            "anthropic" => build_anthropic_client()?,
+            "cohere" => build_cohere_client()?,
+            other => return Err(anyhow!("internal: available_providers returned `{other}`")),
+        };
+        clients.push((provider.to_string(), client));
+    }
+
+    let registry = ModelRegistry::new(clients, default.clone()).map_err(|e| anyhow!(e))?;
+    let summary = format!("{} (default: {default})", available.join(", "));
+    let decide: Arc<dyn Decide> = Arc::new(LlmDecide::with_registry(
+        registry,
+        CompleteOptions::default(),
+    ));
+    Ok((summary, decide))
 }
 
 /// Zero-vendor stub so the library still compiles in a feature-less
-/// build; callers get an early error when no vendor is compiled in.
+/// build; callers get an early error when no provider is compiled in.
 #[cfg(not(any(feature = "llm-anthropic", feature = "llm-cohere")))]
-pub fn build_decide_from_env() -> Result<(&'static str, Arc<dyn Decide>)> {
+pub fn build_decide_from_env() -> Result<(String, Arc<dyn Decide>)> {
     Err(anyhow!(
-        "no LLM vendor compiled in; rebuild with --features llm-anthropic and/or --features llm-cohere"
+        "no LLM provider compiled in; rebuild with --features llm-anthropic and/or --features llm-cohere"
     ))
 }
 
+/// Provider + its required-key env var, in preference order. The first
+/// available provider becomes the registry default.
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
-fn resolve_vendor() -> Result<&'static str> {
-    resolve_vendor_inner(
-        env::var(VENDOR_ENV).ok().as_deref(),
-        |k| env::var(k).map(|v| !v.is_empty()).unwrap_or(false),
-        compiled_vendors(),
-    )
-}
-
-/// Vendor + its required-key env var, in preference order.
-#[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
-const VENDOR_KEY_ENVS: &[(&str, &str)] = &[
+const PROVIDER_KEY_ENVS: &[(&str, &str)] = &[
     ("anthropic", ANTHROPIC_API_KEY_ENV),
     ("cohere", COHERE_API_KEY_ENV),
 ];
 
-/// Compile-time list of vendors built into this binary, in the same
-/// preference order `VENDOR_KEY_ENVS` defines.
+/// Compile-time list of providers built into this binary, in the same
+/// preference order `PROVIDER_KEY_ENVS` defines.
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
-fn compiled_vendors() -> &'static [&'static str] {
+fn compiled_providers() -> &'static [&'static str] {
     #[cfg(all(feature = "llm-anthropic", feature = "llm-cohere"))]
     {
         &["anthropic", "cohere"]
@@ -287,55 +303,20 @@ fn compiled_vendors() -> &'static [&'static str] {
     }
 }
 
-/// Pure, env-injected core of `resolve_vendor` — broken out so the
-/// table-driven test below can exercise the full matrix without
-/// mutating process env. `compiled` is the list of vendors built into
-/// this binary in preference order.
+/// Pure, env-injected core of provider selection — broken out so the
+/// table-driven test below can exercise the matrix without mutating
+/// process env. Returns every provider that is both compiled in and has
+/// its key set, in preference order; the first is the registry default.
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
-fn resolve_vendor_inner(
-    vendor_env: Option<&str>,
-    key_set: impl Fn(&str) -> bool,
+fn available_providers(
     compiled: &[&'static str],
-) -> Result<&'static str> {
-    if let Some(v) = vendor_env {
-        return match v {
-            "anthropic" => {
-                if compiled.contains(&"anthropic") {
-                    Ok("anthropic")
-                } else {
-                    Err(anyhow!(
-                        "vendor `anthropic` requested but not compiled in; rebuild with --features llm-anthropic"
-                    ))
-                }
-            }
-            "cohere" => {
-                if compiled.contains(&"cohere") {
-                    Ok("cohere")
-                } else {
-                    Err(anyhow!(
-                        "vendor `cohere` requested but not compiled in; rebuild with --features llm-cohere"
-                    ))
-                }
-            }
-            other => Err(anyhow!(
-                "{VENDOR_ENV}=`{other}` is not a known vendor (expected `anthropic` or `cohere`)"
-            )),
-        };
-    }
-    for (vendor, key_env) in VENDOR_KEY_ENVS {
-        if compiled.contains(vendor) && key_set(key_env) {
-            return Ok(*vendor);
-        }
-    }
-    let usable_keys: Vec<&str> = VENDOR_KEY_ENVS
+    key_set: impl Fn(&str) -> bool,
+) -> Vec<&'static str> {
+    PROVIDER_KEY_ENVS
         .iter()
-        .filter(|(v, _)| compiled.contains(v))
-        .map(|(_, k)| *k)
-        .collect();
-    Err(anyhow!(
-        "no vendor selected: set {VENDOR_ENV}, or one of [{keys}]",
-        keys = usable_keys.join(", ")
-    ))
+        .filter(|(provider, key_env)| compiled.contains(provider) && key_set(key_env))
+        .map(|(provider, _)| *provider)
+        .collect()
 }
 
 #[cfg(feature = "llm-anthropic")]
@@ -534,95 +515,56 @@ mod tests {
         );
     }
 
-    /// `resolve_vendor_inner` precedence matrix.
+    /// `available_providers` selection matrix.
     ///
-    /// Hermetic: env is injected via the `key_set` callback and the
-    /// explicit `vendor_env` argument, so no process env mutation
-    /// happens. Covers the cross product of `compiled` × `keys` ×
-    /// `vendor_env` against the precedence rule: `CORAL_MODEL_VENDOR`
-    /// honored only if compiled in (else feature-rebuild error);
-    /// otherwise pick the first compiled-in vendor whose key is set.
+    /// Hermetic: key presence is injected via the `key_set` callback, so no
+    /// process env mutation happens. Covers the cross product of `compiled`
+    /// × `keys` against the rule: register every provider that is both
+    /// compiled in and has its key set, in preference order (the first is
+    /// the registry default); none usable → empty (the caller errors).
     #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
     #[test]
-    fn resolve_vendor_inner_precedence_matrix() {
+    fn available_providers_selects_compiled_and_keyed_in_preference_order() {
         use std::collections::HashSet;
 
         const ANTHROPIC: &[&str] = &["anthropic"];
         const COHERE: &[&str] = &["cohere"];
         const BOTH: &[&str] = &["anthropic", "cohere"];
 
-        // (compiled, vendor_env, keys_set, expected)
-        //   expected = Ok("anthropic"/"cohere") | Err(substring)
-        type Expected = Result<&'static str, &'static str>;
+        // (compiled, keys_set, expected providers in order)
         type Case = (
             &'static [&'static str],
-            Option<&'static str>,
             &'static [&'static str],
-            Expected,
+            Vec<&'static str>,
         );
-        let cases: &[Case] = &[
-            // explicit CORAL_MODEL_VENDOR honored when compiled in
-            (BOTH, Some("anthropic"), &[], Ok("anthropic")),
-            (BOTH, Some("cohere"), &[], Ok("cohere")),
-            (ANTHROPIC, Some("anthropic"), &[], Ok("anthropic")),
-            (COHERE, Some("cohere"), &[], Ok("cohere")),
-            // explicit but not compiled in -> error
-            (
-                ANTHROPIC,
-                Some("cohere"),
-                &["COHERE_API_KEY"],
-                Err("cohere"),
-            ),
-            (
-                COHERE,
-                Some("anthropic"),
-                &["ANTHROPIC_API_KEY"],
-                Err("anthropic"),
-            ),
-            // unknown vendor name -> error
-            (BOTH, Some("openai"), &["ANTHROPIC_API_KEY"], Err("openai")),
-            // env unset, fallback by key + compiled-in
-            (BOTH, None, &["ANTHROPIC_API_KEY"], Ok("anthropic")),
-            (BOTH, None, &["COHERE_API_KEY"], Ok("cohere")),
+        let cases: Vec<Case> = vec![
+            (BOTH, &["ANTHROPIC_API_KEY"], vec!["anthropic"]),
+            (BOTH, &["COHERE_API_KEY"], vec!["cohere"]),
+            // both keys → both registered, anthropic first (= default)
             (
                 BOTH,
-                None,
                 &["ANTHROPIC_API_KEY", "COHERE_API_KEY"],
-                Ok("anthropic"),
+                vec!["anthropic", "cohere"],
             ),
-            (ANTHROPIC, None, &["ANTHROPIC_API_KEY"], Ok("anthropic")),
-            (ANTHROPIC, None, &["COHERE_API_KEY"], Err("no vendor")),
-            (COHERE, None, &["COHERE_API_KEY"], Ok("cohere")),
+            (ANTHROPIC, &["ANTHROPIC_API_KEY"], vec!["anthropic"]),
+            // compiled but unkeyed, or keyed but not compiled → dropped
+            (ANTHROPIC, &["COHERE_API_KEY"], vec![]),
+            (COHERE, &["COHERE_API_KEY"], vec!["cohere"]),
             (
                 COHERE,
-                None,
                 &["ANTHROPIC_API_KEY", "COHERE_API_KEY"],
-                Ok("cohere"),
+                vec!["cohere"],
             ),
-            (BOTH, None, &[], Err("no vendor")),
-            (ANTHROPIC, None, &[], Err("no vendor")),
-            (COHERE, None, &[], Err("no vendor")),
+            (BOTH, &[], vec![]),
         ];
 
-        for (i, (compiled, vendor_env, keys, expected)) in cases.iter().enumerate() {
+        for (i, (compiled, keys, expected)) in cases.iter().enumerate() {
             let set: HashSet<&str> = keys.iter().copied().collect();
-            let got = resolve_vendor_inner(*vendor_env, |k| set.contains(k), compiled);
-            match (got, expected) {
-                (Ok(g), Ok(e)) => assert_eq!(
-                    g, *e,
-                    "case {i} (compiled={compiled:?}, vendor_env={vendor_env:?}, keys={keys:?}): expected Ok({e}), got Ok({g})"
-                ),
-                (Err(e), Err(needle)) => {
-                    let msg = format!("{e}");
-                    assert!(
-                        msg.contains(needle),
-                        "case {i} (compiled={compiled:?}, vendor_env={vendor_env:?}, keys={keys:?}): expected error containing {needle:?}, got `{msg}`"
-                    );
-                }
-                (g, e) => panic!(
-                    "case {i} (compiled={compiled:?}, vendor_env={vendor_env:?}, keys={keys:?}): expected {e:?}, got {g:?}"
-                ),
-            }
+            let got = available_providers(compiled, |k| set.contains(k));
+            assert_eq!(
+                &got, expected,
+                "case {i} (compiled={compiled:?}, keys={keys:?})"
+            );
         }
     }
 }

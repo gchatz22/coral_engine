@@ -99,12 +99,15 @@ pub struct Mandate {
     /// to `ContextPolicy::default()`.
     #[serde(default)]
     pub context_policy: ContextPolicy,
-    /// Per-agent model override. `None` (the default and the serialized
-    /// shape when absent) falls back to the worker's configured model. When
-    /// set, the `decide` path sends this model id to the worker's configured
-    /// vendor — a stronger model for a reconciling parent than its children,
-    /// say. A model id the vendor doesn't recognize is an operator misconfig
-    /// that surfaces as a runtime vendor error.
+    /// Per-agent model, as a qualified `provider/model` name (e.g.
+    /// `anthropic/claude-opus-4-8`, `cohere/command-a`). The `decide` path
+    /// resolves the `provider` prefix against the registry of clients booted
+    /// from available keys, so a reconciling parent can run on a different
+    /// provider than its children. A bare name without a prefix routes to the
+    /// registry's default provider. `None` (the default and the serialized
+    /// shape when absent) uses the default provider's default model. A
+    /// provider the registry doesn't carry is an operator misconfig that
+    /// surfaces as a runtime error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// The tools this agent is assigned, by definition id (a subset of the

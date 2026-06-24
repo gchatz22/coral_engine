@@ -15,11 +15,10 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml ./
 COPY crates ./crates
 
-# Compile both LLM vendors in so the container can install a `Decide`
-# backend at runtime; the active vendor is picked from `CORAL_MODEL_VENDOR`
-# / whichever API key is set (see
-# `coral_temporal::worker::build_decide_from_env`). A no-vendor build still
-# compiles but exits at boot when it tries to install a `Decide` impl.
+# Compile both LLM providers in so the container can install a `Decide`
+# backend at runtime; the registry boots from whichever API keys are set
+# (see `coral_temporal::worker::build_decide_from_env`). A no-provider build
+# still compiles but exits at boot when it tries to install a `Decide` impl.
 RUN cargo build --release -p coral_worker --bin worker --features llm-anthropic,llm-cohere
 
 # ---- Runtime stage ------------------------------------------------------

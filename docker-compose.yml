@@ -113,11 +113,11 @@ services:
       TEMPORAL_NAMESPACE: default
       AGENT_FS_ROOT: /agent-fs
       RUST_LOG: info
-      # The image compiles both LLM vendors; pick one at runtime by supplying
-      # its API key (and optionally CORAL_MODEL_VENDOR). Without a key the
-      # worker exits at boot on Decide setup.
-      # CORAL_MODEL_VENDOR: anthropic
+      # The image compiles both LLM providers; the registry boots from
+      # whichever API keys are supplied here. Without any key the worker
+      # exits at boot on Decide setup.
       # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # COHERE_API_KEY: ${COHERE_API_KEY:-}
     volumes:
       - ./agent-fs:/agent-fs
     networks:
