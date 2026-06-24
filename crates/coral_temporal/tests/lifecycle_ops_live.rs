@@ -64,7 +64,6 @@ const PARENT_MANDATE_TEXT: &str = "lifecycle-parent";
 struct RecordedAgent {
     graph_id: GraphId,
     name: String,
-    mandate_ref: Option<String>,
     allocated_id: AgentId,
 }
 
@@ -93,12 +92,7 @@ impl MemoryStructuralDb {
 
 #[async_trait]
 impl StructuralDbStore for MemoryStructuralDb {
-    async fn add_agent(
-        &self,
-        graph_id: GraphId,
-        name: &str,
-        mandate_ref: Option<&str>,
-    ) -> anyhow::Result<AgentId> {
+    async fn add_agent(&self, graph_id: GraphId, name: &str) -> anyhow::Result<AgentId> {
         let mut next = self.next_id.lock().unwrap();
         let id = AgentId::new(Uuid::from_u128(*next));
         *next += 1;
@@ -106,7 +100,6 @@ impl StructuralDbStore for MemoryStructuralDb {
         self.agents.lock().unwrap().push(RecordedAgent {
             graph_id,
             name: name.to_string(),
-            mandate_ref: mandate_ref.map(str::to_string),
             allocated_id: id,
         });
         Ok(id)

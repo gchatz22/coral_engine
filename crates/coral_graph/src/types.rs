@@ -23,27 +23,15 @@ pub struct Graph {
     pub created_at: DateTime<Utc>,
 }
 
-/// An agent within a graph. Mirrors the `agents` table.
-///
-/// `mandate_ref` is an opaque text handle to the authored mandate
-/// (see the schema decision in `migrations/0001_initial.sql`).
-/// Authored mandates live outside this DB (git-versioned
-/// `graph.yaml`), so there's no FK target — applications choose the
-/// convention.
+/// An agent within a graph. Mirrors the `agents` table — identity and
+/// topology only. Authored config (cadence, model, tool assignments)
+/// reaches the runtime through the agent's durable workflow input, not
+/// this row; the parent->child relation lives in `edges`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, FromRow)]
 pub struct AgentRecord {
     pub id: Uuid,
     pub graph_id: Uuid,
     pub name: String,
-    pub mandate_ref: Option<String>,
-    /// Whether this agent must persist and refresh rather than terminate
-    /// itself. Defaults to `false` at the schema level; see
-    /// `migrations/0003_agents_persistent.sql`.
-    pub persistent: bool,
-    /// Optional per-agent model override. `None` (the schema default) means
-    /// the worker's configured default model; see
-    /// `migrations/0004_agents_model.sql`.
-    pub model: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -130,38 +118,16 @@ mod tests {
     }
 
     #[test]
-    fn agent_record_serde_round_trip_with_mandate_ref() {
+    fn agent_record_serde_round_trip() {
         let a = AgentRecord {
             id: Uuid::new_v4(),
             graph_id: Uuid::new_v4(),
             name: "worker".into(),
-            mandate_ref: Some("v1".into()),
-            persistent: true,
-            model: Some("claude-opus-4-8".into()),
             created_at: ts(),
         };
         let s = serde_json::to_string(&a).unwrap();
         let back: AgentRecord = serde_json::from_str(&s).unwrap();
         assert_eq!(a, back);
-        assert!(back.persistent);
-        assert_eq!(back.model.as_deref(), Some("claude-opus-4-8"));
-    }
-
-    #[test]
-    fn agent_record_serde_round_trip_without_mandate_ref() {
-        let a = AgentRecord {
-            id: Uuid::new_v4(),
-            graph_id: Uuid::new_v4(),
-            name: "leaf".into(),
-            mandate_ref: None,
-            persistent: false,
-            model: None,
-            created_at: ts(),
-        };
-        let s = serde_json::to_string(&a).unwrap();
-        let back: AgentRecord = serde_json::from_str(&s).unwrap();
-        assert_eq!(a, back);
-        assert!(back.mandate_ref.is_none());
     }
 
     #[test]

@@ -170,15 +170,9 @@ pub fn tool_registry_provider() -> Arc<dyn ToolRegistryProvider> {
 #[async_trait]
 pub trait StructuralDbStore: Send + Sync {
     /// Insert an agent row into a graph and return the freshly-allocated
-    /// `AgentId`. `mandate_ref` is the opaque text handle from the
-    /// initial schema; the runtime spawn path passes `None` (the child's
-    /// mandate travels via `AgentInput.mandate`).
-    async fn add_agent(
-        &self,
-        graph_id: GraphId,
-        name: &str,
-        mandate_ref: Option<&str>,
-    ) -> anyhow::Result<AgentId>;
+    /// `AgentId`. The row is identity + topology only; the child's config
+    /// travels via `AgentInput.mandate`, not the DB.
+    async fn add_agent(&self, graph_id: GraphId, name: &str) -> anyhow::Result<AgentId>;
 
     /// Insert a parent → child edge. Returns an error on UNIQUE
     /// violation so the workflow's retry / correction path takes over
@@ -391,12 +385,7 @@ mod tests {
 
         #[async_trait]
         impl StructuralDbStore for PanicStructuralDbStore {
-            async fn add_agent(
-                &self,
-                _graph_id: GraphId,
-                _name: &str,
-                _mandate_ref: Option<&str>,
-            ) -> anyhow::Result<AgentId> {
+            async fn add_agent(&self, _graph_id: GraphId, _name: &str) -> anyhow::Result<AgentId> {
                 panic!("PanicStructuralDbStore::add_agent must not be called from this test")
             }
 

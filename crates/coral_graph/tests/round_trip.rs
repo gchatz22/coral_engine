@@ -21,14 +21,9 @@ async fn applies_a_simple_parent_child_graph_and_reads_it_back(pool: PgPool) -> 
         .create_graph("smoke", serde_json::json!({"source": "round_trip.rs"}))
         .await?;
 
-    // Step 3: add the two agents. The parent gets a mandate_ref pointing
-    // at a YAML key the operator authored; the child is mandate-less in
-    // this fixture (a plausible shape for a leaf agent spawned without
-    // a pre-authored mandate).
-    let parent = store
-        .add_agent(graph.id, "parent", Some("parent_v1"))
-        .await?;
-    let child = store.add_agent(graph.id, "child", None).await?;
+    // Step 3: add the two agents (identity + topology only).
+    let parent = store.add_agent(graph.id, "parent").await?;
+    let child = store.add_agent(graph.id, "child").await?;
 
     // Step 4: wire the parent->child edge. The schema's UNIQUE
     // constraint means a duplicate `add_edge` would fail — `coral
@@ -88,7 +83,7 @@ async fn applies_a_simple_parent_child_graph_and_reads_it_back(pool: PgPool) -> 
     // Step 11 (negative): a parent agent with no edges has no children.
     // Catches a regression where `list_children` mistakenly returns
     // every child in the graph.
-    let stranger = store.add_agent(graph.id, "stranger", None).await?;
+    let stranger = store.add_agent(graph.id, "stranger").await?;
     let stranger_children = store.list_children(stranger.id).await?;
     assert!(
         stranger_children.is_empty(),
