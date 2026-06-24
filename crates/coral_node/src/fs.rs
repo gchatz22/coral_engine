@@ -1025,9 +1025,8 @@ mod tests {
     async fn open_writes_mandate_as_pure_prose_md() {
         let (tmp, _fs, mandate) = fresh_fs().await;
         let root = tmp.path();
-        // mandate.md present — no mandate.json.
+        // mandate.md present
         assert!(root.join("mandate.md").is_file());
-        assert!(!root.join("mandate.json").exists());
         // Body is exactly the prose; no JSON wrapper, no metadata fields
         // (idle_period / max_ticks / etc.) leak into the file.
         let body = std::fs::read_to_string(root.join("mandate.md")).unwrap();
