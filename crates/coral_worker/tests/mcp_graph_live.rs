@@ -283,6 +283,11 @@ async fn drive(
     input.fs_handle = FsHandle {
         prefix: agent_prefix.to_string(),
     };
+    // Dispatch is scoped per agent. The fixture assigns the MCP def `everything`
+    // to `root` (`tools: [everything]`), which advertises `get-sum`; grant that
+    // def so the scripted call is allowed. The real `DbToolRegistryProvider`
+    // records the advertised-name -> def-id ownership at registry build.
+    input.mandate.tools = vec!["everything".to_string()];
     let handle = client
         .start_workflow(
             AgentWorkflow::run,
