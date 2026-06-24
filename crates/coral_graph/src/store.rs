@@ -138,11 +138,12 @@ impl GraphStore {
         Ok(row)
     }
 
-    /// Insert a tool registration. `args` / `env_refs` default to empty
-    /// JSON arrays in the schema; callers can pass `serde_json::json!([])`
+    /// Insert a graph-scoped tool definition. `args` / `env_refs` default to
+    /// empty JSON arrays in the schema; callers can pass `serde_json::json!([])`
     /// explicitly for clarity.
     pub async fn register_tool(
         &self,
+        graph_id: Uuid,
         kind: &str,
         command: Option<&str>,
         args: serde_json::Value,
@@ -152,11 +153,12 @@ impl GraphStore {
         let row = sqlx::query_as!(
             ToolRecord,
             r#"
-            INSERT INTO tools (id, kind, command, args, env_refs)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id, kind, command, args as "args!: serde_json::Value", env_refs as "env_refs!: serde_json::Value", created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            INSERT INTO tools (id, graph_id, kind, command, args, env_refs)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, graph_id, kind, command, args as "args!: serde_json::Value", env_refs as "env_refs!: serde_json::Value", created_at as "created_at!: chrono::DateTime<chrono::Utc>"
             "#,
             id,
+            graph_id,
             kind,
             command,
             args,
@@ -165,23 +167,6 @@ impl GraphStore {
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
-    }
-
-    /// Attach a tool to an agent via the `agent_tools` M:N junction.
-    /// Idempotent in spirit (a re-attach is the same edge) but enforced
-    /// by the composite PK at the DB level — callers see a unique
-    /// violation on re-insert. We intentionally don't `ON CONFLICT DO
-    /// NOTHING`; visible failures are the cheap signal that something
-    /// upstream is over-eager.
-    pub async fn attach_tool_to_agent(&self, agent_id: Uuid, tool_id: Uuid) -> sqlx::Result<()> {
-        sqlx::query!(
-            "INSERT INTO agent_tools (agent_id, tool_id) VALUES ($1, $2)",
-            agent_id,
-            tool_id,
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 
     // --- reference graph + file index -------------------------------
@@ -407,8 +392,9 @@ impl GraphStore {
 
     /// Transactional wrapper: in one DB transaction, CREATE the graph
     /// row, every agent row (DFS parents-first across the whole forest),
-    /// every parent→child `edges` row, every tool row, and every
-    /// `agent_tools` attachment.
+    /// every parent→child `edges` row, and every graph-scoped tool
+    /// definition. Per-agent tool assignment is not written — it rides
+    /// each agent's `Mandate.tools`.
     ///
     /// Returns [`AppliedGraph`] carrying the freshly-allocated
     /// `graph_id`, a parents-first list of [`ResolvedAgent`]s, and the
@@ -487,9 +473,8 @@ impl GraphStore {
         };
 
         // --- tool rows -------------------------------------------------
-        // Tools are graph-scoped. Indexed by operator id so each agent's
-        // `tools[]` reference can resolve to a UUID.
-        let mut tool_uuid_by_id: HashMap<&str, Uuid> = HashMap::with_capacity(graph.tools.len());
+        // Graph-scoped tool definitions. Per-agent assignment is not
+        // written here — it rides each agent's `Mandate.tools`.
         for tool in &graph.tools {
             let tool_uuid = Uuid::new_v4();
             let (kind_text, command_text, args_json, env_json): (
@@ -518,11 +503,12 @@ impl GraphStore {
             sqlx::query_as!(
                 ToolRecord,
                 r#"
-                INSERT INTO tools (id, kind, command, args, env_refs)
-                VALUES ($1, $2, $3, $4, $5)
-                RETURNING id, kind, command, args as "args!: serde_json::Value", env_refs as "env_refs!: serde_json::Value", created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+                INSERT INTO tools (id, graph_id, kind, command, args, env_refs)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id, graph_id, kind, command, args as "args!: serde_json::Value", env_refs as "env_refs!: serde_json::Value", created_at as "created_at!: chrono::DateTime<chrono::Utc>"
                 "#,
                 tool_uuid,
+                graph_id,
                 kind_text,
                 command_text,
                 args_json,
@@ -530,13 +516,11 @@ impl GraphStore {
             )
             .fetch_one(&mut *tx)
             .await?;
-            tool_uuid_by_id.insert(tool.id.as_str(), tool_uuid);
         }
 
-        // --- agent rows + edges + agent_tools (DFS parents-first) ------
-        // The walker emits one row per agent (parents before children),
-        // one `edges` row per parent→child pair, and one `agent_tools`
-        // attachment per tool reference. The accumulator
+        // --- agent rows + edges (DFS parents-first) --------------------
+        // The walker emits one row per agent (parents before children) and
+        // one `edges` row per parent→child pair. The accumulator
         // (`resolved_agents`) carries the (operator_id, db_agent_id,
         // parent_db_id) triples downstream into [`AppliedGraph`].
         let mut resolved_agents: Vec<ResolvedAgent> = Vec::new();
@@ -547,7 +531,6 @@ impl GraphStore {
                 graph_id,
                 root_yaml,
                 None,
-                &tool_uuid_by_id,
                 &mut resolved_agents,
                 &mut id_map,
             )
@@ -569,8 +552,9 @@ impl GraphStore {
 }
 
 /// Recursive DFS walker for `create_from_yaml`. Writes one `agents`
-/// row, optionally one `edges` row (when `parent_db_id` is `Some`),
-/// every `agent_tools` join, then recurses into children.
+/// row, optionally one `edges` row (when `parent_db_id` is `Some`), then
+/// recurses into children. Tool assignment is not written here — it
+/// rides each agent's `Mandate.tools` on the workflow input.
 ///
 /// Recursive `async fn` requires boxing on the recursive call (the
 /// future's size would otherwise be unbounded); the function returns a
@@ -580,7 +564,6 @@ fn walk_agent_tree<'a>(
     graph_id: Uuid,
     yaml_agent: &'a crate::yaml::Agent,
     parent_db_id: Option<AgentId>,
-    tool_uuid_by_id: &'a HashMap<&'a str, Uuid>,
     resolved_agents: &'a mut Vec<ResolvedAgent>,
     id_map: &'a mut HashMap<String, ResolvedAgentWorkflow>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), GraphStoreError>> + Send + 'a>> {
@@ -617,26 +600,6 @@ fn walk_agent_tree<'a>(
             .await?;
         }
 
-        // Agent-tool attachments.
-        for tool_ref in &yaml_agent.tools {
-            let tool_uuid = tool_uuid_by_id
-                .get(tool_ref.as_str())
-                .copied()
-                .ok_or_else(|| {
-                    GraphStoreError::Sqlx(sqlx::Error::Protocol(format!(
-                        "internal: create_from_yaml could not resolve tool ref {tool_ref:?}; \
-                     validator should have caught this"
-                    )))
-                })?;
-            sqlx::query!(
-                "INSERT INTO agent_tools (agent_id, tool_id) VALUES ($1, $2)",
-                agent_uuid,
-                tool_uuid,
-            )
-            .execute(&mut **tx)
-            .await?;
-        }
-
         // The workflow id is the UUID-shaped flat form:
         // cross-agent FS reads look agents up by UUID, so the
         // `FsHandle::for_agent` prefix must match the workflow id format.
@@ -655,15 +618,13 @@ fn walk_agent_tree<'a>(
         });
 
         // Recurse into children (parents-first DFS order: this agent's
-        // row + edge + tool rows are already written before any child
-        // row).
+        // row + edge are already written before any child row).
         for child in &yaml_agent.children {
             walk_agent_tree(
                 tx,
                 graph_id,
                 child,
                 Some(db_agent_id),
-                tool_uuid_by_id,
                 resolved_agents,
                 id_map,
             )
@@ -754,45 +715,22 @@ impl GraphStore {
         Ok(rows)
     }
 
-    /// Every distinct tool attached to any agent in a graph, resolved
-    /// through `agent_tools` → `agents`. The worker reads this to build a
-    /// graph's tool registry; a tool shared by several agents appears once.
+    /// Every tool definition in a graph. The worker reads this to build a
+    /// graph's tool registry; per-agent scoping is enforced at dispatch from
+    /// each agent's `Mandate.tools`, not here.
     pub async fn list_tools_for_graph(&self, graph_id: Uuid) -> sqlx::Result<Vec<ToolRecord>> {
         let rows = sqlx::query_as!(
             ToolRecord,
             r#"
-            SELECT DISTINCT t.id, t.kind, t.command,
-                   t.args as "args!: serde_json::Value",
-                   t.env_refs as "env_refs!: serde_json::Value",
-                   t.created_at as "created_at!: chrono::DateTime<chrono::Utc>"
-            FROM tools t
-            JOIN agent_tools at ON at.tool_id = t.id
-            JOIN agents a ON a.id = at.agent_id
-            WHERE a.graph_id = $1
-            ORDER BY t.created_at ASC
+            SELECT id, graph_id, kind, command,
+                   args as "args!: serde_json::Value",
+                   env_refs as "env_refs!: serde_json::Value",
+                   created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            FROM tools
+            WHERE graph_id = $1
+            ORDER BY created_at ASC
             "#,
             graph_id,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
-    }
-
-    /// All tools attached to an agent via `agent_tools`.
-    pub async fn list_tools_for_agent(&self, agent_id: Uuid) -> sqlx::Result<Vec<ToolRecord>> {
-        let rows = sqlx::query_as!(
-            ToolRecord,
-            r#"
-            SELECT t.id, t.kind, t.command,
-                   t.args as "args!: serde_json::Value",
-                   t.env_refs as "env_refs!: serde_json::Value",
-                   t.created_at as "created_at!: chrono::DateTime<chrono::Utc>"
-            FROM tools t
-            JOIN agent_tools at ON at.tool_id = t.id
-            WHERE at.agent_id = $1
-            ORDER BY t.created_at ASC
-            "#,
-            agent_id,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -928,45 +866,34 @@ mod tests {
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn register_tool_happy_path(pool: PgPool) -> sqlx::Result<()> {
         let store = GraphStore::new(pool);
+        let graph = seed_graph(&store).await;
         let tool = store
             .register_tool(
+                graph.id,
                 "echo",
                 Some("/bin/echo"),
                 serde_json::json!(["hello"]),
                 serde_json::json!([]),
             )
             .await?;
+        assert_eq!(tool.graph_id, graph.id);
         assert_eq!(tool.kind, "echo");
         assert_eq!(tool.command.as_deref(), Some("/bin/echo"));
         assert_eq!(tool.args, serde_json::json!(["hello"]));
         Ok(())
     }
 
-    // --- attach_tool_to_agent ---
-
     #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn attach_tool_to_agent_happy_path(pool: PgPool) -> sqlx::Result<()> {
+    async fn register_tool_rejects_unknown_graph(pool: PgPool) -> sqlx::Result<()> {
         let store = GraphStore::new(pool);
-        let graph = seed_graph(&store).await;
-        let agent = seed_agent(&store, graph.id, "a").await;
-        let tool = store
-            .register_tool("echo", None, serde_json::json!([]), serde_json::json!([]))
-            .await?;
-        store.attach_tool_to_agent(agent.id, tool.id).await?;
-        let tools = store.list_tools_for_agent(agent.id).await?;
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].id, tool.id);
-        Ok(())
-    }
-
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn attach_tool_to_agent_rejects_unknown_agent(pool: PgPool) -> sqlx::Result<()> {
-        let store = GraphStore::new(pool);
-        let tool = store
-            .register_tool("echo", None, serde_json::json!([]), serde_json::json!([]))
-            .await?;
         let err = store
-            .attach_tool_to_agent(Uuid::new_v4(), tool.id)
+            .register_tool(
+                Uuid::new_v4(),
+                "echo",
+                None,
+                serde_json::json!([]),
+                serde_json::json!([]),
+            )
             .await
             .expect_err("FK violation expected");
         assert_eq!(
@@ -1065,22 +992,10 @@ mod tests {
         Ok(())
     }
 
-    // --- list_tools_for_agent ---
-
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn list_tools_for_agent_is_empty_with_no_attachments(pool: PgPool) -> sqlx::Result<()> {
-        let store = GraphStore::new(pool);
-        let graph = seed_graph(&store).await;
-        let agent = seed_agent(&store, graph.id, "a").await;
-        let tools = store.list_tools_for_agent(agent.id).await?;
-        assert!(tools.is_empty());
-        Ok(())
-    }
-
     // --- list_tools_for_graph ---
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn list_tools_for_graph_dedups_shared_tools_and_spans_agents(
+    async fn list_tools_for_graph_returns_graph_defs_scoped_per_graph(
         pool: PgPool,
     ) -> sqlx::Result<()> {
         const YAML: &str = r#"
@@ -1124,7 +1039,8 @@ seed:
             .list_tools_for_graph(applied.graph_id.into_uuid())
             .await?;
 
-        // `echo` is attached to both parent and child but must appear once.
+        // Both graph-scoped defs are returned (assignment lives on the
+        // agents' mandates, not here).
         assert_eq!(
             tools.len(),
             2,
@@ -1247,7 +1163,9 @@ seed:
         assert_eq!(agents[0].name, "root");
         assert_eq!(AgentId::new(agents[0].id), applied.agents[0].db_agent_id);
 
-        let tools = store.list_tools_for_agent(agents[0].id).await?;
+        let tools = store
+            .list_tools_for_graph(applied.graph_id.into_uuid())
+            .await?;
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].kind, "builtin");
         assert_eq!(tools[0].command.as_deref(), Some("echo"));
@@ -1288,10 +1206,9 @@ seed:
         let g = crate::yaml::parse_and_validate(MCP_YAML).expect("validator green on mcp fixture");
         let applied = store.create_from_yaml(&g).await.expect("create_from_yaml");
 
-        let agents = store
-            .list_agents_in_graph(applied.graph_id.into_uuid())
+        let tools = store
+            .list_tools_for_graph(applied.graph_id.into_uuid())
             .await?;
-        let tools = store.list_tools_for_agent(agents[0].id).await?;
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].kind, "mcp");
         assert_eq!(tools[0].command.as_deref(), Some("mcp-web-search"));
@@ -1307,7 +1224,7 @@ seed:
     /// ephemeral Postgres. Verifies:
     ///   1. `agents` has 3 rows in the same graph
     ///   2. `edges` has 2 parent→child rows
-    ///   3. `agent_tools` joins each agent to its declared tools
+    ///   3. tool defs are graph-scoped (assignment rides the mandate)
     ///   4. `AppliedGraph.id_map` contains all 3 operator ids mapped to
     ///      matching UUIDs (operator-authored ids resolve to the same
     ///      UUIDs `agents.id` holds)
@@ -1377,22 +1294,13 @@ seed:
             .iter()
             .all(|e| AgentId::new(e.parent_agent_id) == parent_db_id));
 
-        // agent_tools joins: parent + child-a each have echo; child-b has none.
-        let parent_resolved = applied.id_map.get("parent").unwrap();
-        let parent_tools = store
-            .list_tools_for_agent(parent_resolved.db_agent_id.into_uuid())
+        // Tool defs are graph-scoped (one `echo` def for the graph);
+        // per-agent assignment now rides each agent's Mandate, not the DB.
+        let tools = store
+            .list_tools_for_graph(applied.graph_id.into_uuid())
             .await?;
-        assert_eq!(parent_tools.len(), 1);
-        let child_a_resolved = applied.id_map.get("child-a").unwrap();
-        let child_a_tools = store
-            .list_tools_for_agent(child_a_resolved.db_agent_id.into_uuid())
-            .await?;
-        assert_eq!(child_a_tools.len(), 1);
-        let child_b_resolved = applied.id_map.get("child-b").unwrap();
-        let child_b_tools = store
-            .list_tools_for_agent(child_b_resolved.db_agent_id.into_uuid())
-            .await?;
-        assert_eq!(child_b_tools.len(), 0);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].kind, "builtin");
 
         // id_map UUIDs match agents.id UUIDs verbatim.
         for resolved in &applied.agents {

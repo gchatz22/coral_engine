@@ -1432,6 +1432,7 @@ async fn per_mandate_recent_outputs_cap_reaches_the_run_loop() {
         },
         persistent: false,
         model: None,
+        tools: Vec::new(),
     };
     let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
         .await

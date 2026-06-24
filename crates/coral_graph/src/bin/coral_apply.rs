@@ -139,8 +139,8 @@ async fn run() -> Result<()> {
     // ---- Structural DB write ------------------------------------------
     // Done *before* the Temporal client connect so a collision (CREATE-
     // only) fails fast without a wasted Temporal round-trip. The walk
-    // is DFS parents-first across the agent forest; tools + agent_tools
-    // attach in the same transaction.
+    // is DFS parents-first across the agent forest; graph-scoped tool
+    // defs are written in the same transaction.
     let database_url = env::var("DATABASE_URL")
         .map_err(|_| anyhow!("DATABASE_URL must be set (see coral-apply --help)"))?;
     let pool = PgPoolOptions::new()

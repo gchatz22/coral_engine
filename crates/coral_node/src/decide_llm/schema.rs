@@ -150,7 +150,9 @@ pub fn decision_tools() -> Vec<ToolSpec> {
                  allocates the child's agent_id deterministically and \
                  instantiates a child workflow under \
                  graphs/<graph_id>/agents/<new_agent_id>. The variant \
-                 carries only the agent's logical name + mandate."
+                 carries the agent's logical name + mandate. The mandate's \
+                 `tools` list is the child's assigned tools (definition ids \
+                 from this graph's tools)."
                 .into(),
             input_schema: json!({
                 "type": "object",

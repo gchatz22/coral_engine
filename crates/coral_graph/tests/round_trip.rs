@@ -30,18 +30,19 @@ async fn applies_a_simple_parent_child_graph_and_reads_it_back(pool: PgPool) -> 
     // apply` is responsible for idempotency at the operator level.
     let edge = store.add_edge(parent.id, child.id).await?;
 
-    // Step 5: register a tool and attach it to the child. The tool kind
+    // Step 5: register a graph-scoped tool definition. The tool kind
     // matches an operator-recognized name (`echo` here); `args` /
-    // `env_refs` are JSONB blobs the worker interprets per kind.
+    // `env_refs` are JSONB blobs the worker interprets per kind. Per-agent
+    // assignment is no longer a DB row — it rides each agent's mandate.
     let tool = store
         .register_tool(
+            graph.id,
             "echo",
             Some("/bin/echo"),
             serde_json::json!(["hello", "from", "round_trip"]),
             serde_json::json!([]),
         )
         .await?;
-    store.attach_tool_to_agent(child.id, tool.id).await?;
 
     // --- read-back -------------------------------------------------
 
@@ -65,12 +66,12 @@ async fn applies_a_simple_parent_child_graph_and_reads_it_back(pool: PgPool) -> 
         "list_children(parent_id) must equal [child_id]"
     );
 
-    // Step 9: walk agent -> tools.
-    let tools_for_child = store.list_tools_for_agent(child.id).await?;
+    // Step 9: the graph-scoped tool def is listed for the graph.
+    let tools_for_graph = store.list_tools_for_graph(graph.id).await?;
     assert_eq!(
-        tools_for_child.iter().map(|t| t.id).collect::<Vec<_>>(),
+        tools_for_graph.iter().map(|t| t.id).collect::<Vec<_>>(),
         vec![tool.id],
-        "list_tools_for_agent(child_id) must equal [tool_id]"
+        "list_tools_for_graph(graph_id) must equal [tool_id]"
     );
 
     // Step 10: spot-check a `get_agent` round-trip. This is the API a

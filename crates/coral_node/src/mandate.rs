@@ -95,12 +95,19 @@ pub struct Mandate {
     /// that surfaces as a runtime vendor error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The tools this agent is assigned, by definition id (a subset of the
+    /// graph's tool defs). Tool definitions are graph-scoped; assignment is
+    /// per-agent config that rides this durable input. Surfaced to the model
+    /// as its tool catalog. Empty (the default) means no tools assigned.
+    #[serde(default)]
+    pub tools: Vec<String>,
 }
 
 impl Mandate {
     /// Convenience constructor. Retry policy defaults to `None` (uses
     /// `RetryPolicy::default()` at tool-construction time) and context
-    /// policy defaults to `ContextPolicy::default()`.
+    /// policy defaults to `ContextPolicy::default()`. `tools` defaults to
+    /// empty — set it explicitly for an agent that calls tools.
     pub fn new(text: impl Into<String>, idle_period: Duration, max_ticks: Option<u64>) -> Self {
         Self {
             text: text.into(),
@@ -110,6 +117,7 @@ impl Mandate {
             context_policy: ContextPolicy::default(),
             persistent: false,
             model: None,
+            tools: Vec::new(),
         }
     }
 }
@@ -312,6 +320,7 @@ mod tests {
             context_policy: ContextPolicy::default(),
             persistent: false,
             model: None,
+            tools: Vec::new(),
         };
         let s = serde_json::to_string(&m).unwrap();
         // Verify both subfields land on the wire under stable names.
@@ -358,6 +367,7 @@ mod tests {
             context_policy: ContextPolicy::default(),
             persistent: true,
             model: None,
+            tools: Vec::new(),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(
@@ -472,6 +482,7 @@ mod tests {
             },
             persistent: false,
             model: None,
+            tools: Vec::new(),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(

@@ -1044,6 +1044,7 @@ mod tests {
             },
             persistent: false,
             model: None,
+            tools: Vec::new(),
         };
         let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
             .await
@@ -1087,6 +1088,7 @@ mod tests {
             },
             persistent: false,
             model: None,
+            tools: Vec::new(),
         };
         let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
             .await
@@ -1121,6 +1123,7 @@ mod tests {
             },
             persistent: false,
             model: None,
+            tools: Vec::new(),
         };
         let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
             .await
