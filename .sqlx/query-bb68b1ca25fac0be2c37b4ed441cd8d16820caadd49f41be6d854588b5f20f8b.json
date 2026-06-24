@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, citing_agent_id, citing_filepath, citing_blob_sha,\n                   cited_agent_id, cited_filepath, cited_blob_sha,\n                   created_at as \"created_at!: chrono::DateTime<chrono::Utc>\"\n            FROM citations\n            WHERE cited_agent_id = $1 AND cited_filepath = $2\n            ORDER BY created_at, id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "citing_agent_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "citing_filepath",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "citing_blob_sha",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "cited_agent_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "cited_filepath",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "cited_blob_sha",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at!: chrono::DateTime<chrono::Utc>",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "bb68b1ca25fac0be2c37b4ed441cd8d16820caadd49f41be6d854588b5f20f8b"
+}

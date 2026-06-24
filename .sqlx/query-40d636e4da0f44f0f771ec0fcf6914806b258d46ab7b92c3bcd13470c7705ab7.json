@@ -1,0 +1,70 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO citations\n                (id, citing_agent_id, citing_filepath, citing_blob_sha,\n                 cited_agent_id, cited_filepath, cited_blob_sha)\n            VALUES ($1, $2, $3, $4, $5, $6, $7)\n            ON CONFLICT (citing_agent_id, citing_filepath, citing_blob_sha,\n                         cited_agent_id, cited_filepath, cited_blob_sha)\n            DO UPDATE SET created_at = citations.created_at\n            RETURNING id, citing_agent_id, citing_filepath, citing_blob_sha,\n                      cited_agent_id, cited_filepath, cited_blob_sha,\n                      created_at as \"created_at!: chrono::DateTime<chrono::Utc>\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "citing_agent_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "citing_filepath",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "citing_blob_sha",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "cited_agent_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "cited_filepath",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "cited_blob_sha",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at!: chrono::DateTime<chrono::Utc>",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "40d636e4da0f44f0f771ec0fcf6914806b258d46ab7b92c3bcd13470c7705ab7"
+}
