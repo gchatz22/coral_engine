@@ -5,8 +5,12 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use std::io;
 use thiserror::Error;
+
+pub mod git;
+pub use git::GitStorage;
 
 pub mod local;
 pub use local::LocalStorage;
@@ -143,6 +147,59 @@ pub trait AgentStorage: Send + Sync + 'static {
         after: Option<&str>,
         limit: usize,
     ) -> StorageResult<ListPage>;
+}
+
+/// Git's content address for a file's bytes — the 40-char hex `sha1` of
+/// `"blob <len>\0<content>"`. Content-deterministic: identical bytes always
+/// hash to the same `BlobSha`. That determinism is what makes it safe to
+/// pin in a reference (a Temporal retry recomputes the same sha) and to use
+/// as a dedup key (`hash → filepath`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BlobSha(String);
+
+impl BlobSha {
+    /// The 40-char lowercase hex digest.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for BlobSha {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Versioning layered on [`AgentStorage`]: a content-addressed,
+/// commit-per-tick history scoped to exactly two operations. There is
+/// deliberately no branch / checkout / merge / rebase / history-rewrite
+/// surface — the working tree always reflects HEAD, and historical reads
+/// resolve a blob sha directly without ever moving HEAD.
+///
+/// As a supertrait, one `dyn VersionedStorage` handle exposes both the data
+/// plane (put/get/list) and versioning (commit/read-at-sha), which the
+/// write-path consistency activity needs together. Git is the local
+/// implementation ([`GitStorage`]); keeping the surface on the trait — not
+/// the impl — is the long-term commitment so an object-store backend can
+/// offer the same two operations later.
+#[async_trait]
+pub trait VersionedStorage: AgentStorage {
+    /// Commit the current working tree as one tick and return the
+    /// `(path, blob_sha)` manifest of every file in the committed tree.
+    ///
+    /// Idempotent: a clean tree (identical to HEAD) is a no-op that still
+    /// returns the current manifest, so a Temporal retry of an already-
+    /// committed tick converges without creating a divergent commit. Every
+    /// returned sha names a durably committed object, resolvable by
+    /// [`VersionedStorage::read_at`] across restarts — so a caller can pin a
+    /// returned sha knowing it will always read back.
+    async fn commit(&self, message: &str) -> StorageResult<Vec<(String, BlobSha)>>;
+
+    /// Resolve a blob sha to its bytes. Path-independent — the sha *is* the
+    /// content address — and read-only: it never mutates HEAD or the working
+    /// tree. Returns `Ok(None)` when no such blob exists in the object
+    /// database (or the sha is malformed).
+    async fn read_at(&self, sha: &BlobSha) -> StorageResult<Option<Bytes>>;
 }
 
 #[cfg(test)]
