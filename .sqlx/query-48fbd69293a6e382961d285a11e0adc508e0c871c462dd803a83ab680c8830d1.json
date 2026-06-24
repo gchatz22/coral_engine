@@ -1,0 +1,48 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO file_index (agent_id, filepath, blob_sha)\n            VALUES ($1, $2, $3)\n            ON CONFLICT (agent_id, filepath)\n            DO UPDATE SET blob_sha = EXCLUDED.blob_sha, updated_at = now()\n            RETURNING agent_id, filepath, blob_sha,\n                      created_at as \"created_at!: chrono::DateTime<chrono::Utc>\",\n                      updated_at as \"updated_at!: chrono::DateTime<chrono::Utc>\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "agent_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "filepath",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "blob_sha",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at!: chrono::DateTime<chrono::Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "updated_at!: chrono::DateTime<chrono::Utc>",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "48fbd69293a6e382961d285a11e0adc508e0c871c462dd803a83ab680c8830d1"
+}

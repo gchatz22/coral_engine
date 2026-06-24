@@ -76,6 +76,36 @@ pub struct ToolRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// One row of the `file_index` table — the current `filepath → blob_sha`
+/// binding for a file. `blob_sha` is the 40-hex git blob sha as stored
+/// (`String` rather than [`coral_node::storage::BlobSha`] so `sqlx::FromRow`
+/// decodes the `TEXT` column directly; the store API takes/returns `BlobSha`
+/// at its boundary). Per-file history lives in git, not here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, FromRow)]
+pub struct FileIndexEntry {
+    pub agent_id: Uuid,
+    pub filepath: String,
+    pub blob_sha: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// One row of the `citations` table — a single version-pinned reference
+/// edge. Both ends carry a pinned blob sha so provenance is time-scrubbable
+/// (an old citing version stays bound to the exact cited version). `*_sha`
+/// columns are `String` for the same `FromRow` reason as [`FileIndexEntry`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, FromRow)]
+pub struct Citation {
+    pub id: Uuid,
+    pub citing_agent_id: Uuid,
+    pub citing_filepath: String,
+    pub citing_blob_sha: String,
+    pub cited_agent_id: Uuid,
+    pub cited_filepath: String,
+    pub cited_blob_sha: String,
+    pub created_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +190,36 @@ mod tests {
         let s = serde_json::to_string(&t).unwrap();
         let back: ToolRecord = serde_json::from_str(&s).unwrap();
         assert_eq!(t, back);
+    }
+
+    #[test]
+    fn file_index_entry_serde_round_trip() {
+        let f = FileIndexEntry {
+            agent_id: Uuid::new_v4(),
+            filepath: "outputs/tsmc-cowos-capacity.md".into(),
+            blob_sha: "b49d959381fbab4b3324a4c36e07829509a68880".into(),
+            created_at: ts(),
+            updated_at: ts(),
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        let back: FileIndexEntry = serde_json::from_str(&s).unwrap();
+        assert_eq!(f, back);
+    }
+
+    #[test]
+    fn citation_serde_round_trip() {
+        let c = Citation {
+            id: Uuid::new_v4(),
+            citing_agent_id: Uuid::new_v4(),
+            citing_filepath: "outputs/summary.md".into(),
+            citing_blob_sha: "1111111111111111111111111111111111111111".into(),
+            cited_agent_id: Uuid::new_v4(),
+            cited_filepath: "evidence/tsmc-q3.md".into(),
+            cited_blob_sha: "2222222222222222222222222222222222222222".into(),
+            created_at: ts(),
+        };
+        let s = serde_json::to_string(&c).unwrap();
+        let back: Citation = serde_json::from_str(&s).unwrap();
+        assert_eq!(c, back);
     }
 }

@@ -4,10 +4,11 @@
 //! / `sqlx::query_as!` macros backed by the workspace `.sqlx/` offline
 //! cache, so `cargo build` succeeds without a live DB.
 
-use crate::types::{AgentRecord, Edge, Graph, ToolRecord};
+use crate::types::{AgentRecord, Citation, Edge, FileIndexEntry, Graph, ToolRecord};
 use crate::yaml::{AppliedGraph, GraphYaml, ResolvedAgent, ResolvedAgentWorkflow, ToolKind};
 use async_trait::async_trait;
 use coral_node::agent_ref::{AgentId, GraphId};
+use coral_node::storage::BlobSha;
 use coral_temporal::worker::StructuralDbStore;
 use coral_temporal::workflow::agent_workflow_id;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -189,6 +190,227 @@ impl GraphStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    // --- reference graph + file index -------------------------------
+
+    /// Set the current `filepath → blob_sha` binding for a file, inserting
+    /// the row or moving the pointer in place. This is a **version
+    /// update**, not slug-collision detection: re-writing the same path
+    /// repoints it at the new content. Disambiguating two *different* files
+    /// that want the same slug is the writer's job — existence-check via
+    /// [`get_file_blob_sha`](Self::get_file_blob_sha) before allocating.
+    pub async fn set_file_version(
+        &self,
+        agent_id: Uuid,
+        filepath: &str,
+        blob_sha: &BlobSha,
+    ) -> sqlx::Result<FileIndexEntry> {
+        let row = sqlx::query_as!(
+            FileIndexEntry,
+            r#"
+            INSERT INTO file_index (agent_id, filepath, blob_sha)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (agent_id, filepath)
+            DO UPDATE SET blob_sha = EXCLUDED.blob_sha, updated_at = now()
+            RETURNING agent_id, filepath, blob_sha,
+                      created_at as "created_at!: chrono::DateTime<chrono::Utc>",
+                      updated_at as "updated_at!: chrono::DateTime<chrono::Utc>"
+            "#,
+            agent_id,
+            filepath,
+            blob_sha.as_str(),
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Integrity lookup: the current blob sha bound to a path, if tracked.
+    pub async fn get_file_blob_sha(
+        &self,
+        agent_id: Uuid,
+        filepath: &str,
+    ) -> sqlx::Result<Option<BlobSha>> {
+        let sha: Option<String> = sqlx::query_scalar!(
+            "SELECT blob_sha FROM file_index WHERE agent_id = $1 AND filepath = $2",
+            agent_id,
+            filepath,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(sha.map(BlobSha::from_hex))
+    }
+
+    /// Dedup / reverse lookup: every file currently holding this content.
+    /// One-to-many — identical bytes across paths share a blob sha.
+    pub async fn find_paths_by_blob_sha(
+        &self,
+        blob_sha: &BlobSha,
+    ) -> sqlx::Result<Vec<FileIndexEntry>> {
+        let rows = sqlx::query_as!(
+            FileIndexEntry,
+            r#"
+            SELECT agent_id, filepath, blob_sha,
+                   created_at as "created_at!: chrono::DateTime<chrono::Utc>",
+                   updated_at as "updated_at!: chrono::DateTime<chrono::Utc>"
+            FROM file_index
+            WHERE blob_sha = $1
+            ORDER BY agent_id, filepath
+            "#,
+            blob_sha.as_str(),
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Enumerate every file currently tracked for an agent, by path.
+    pub async fn list_files_for_agent(&self, agent_id: Uuid) -> sqlx::Result<Vec<FileIndexEntry>> {
+        let rows = sqlx::query_as!(
+            FileIndexEntry,
+            r#"
+            SELECT agent_id, filepath, blob_sha,
+                   created_at as "created_at!: chrono::DateTime<chrono::Utc>",
+                   updated_at as "updated_at!: chrono::DateTime<chrono::Utc>"
+            FROM file_index
+            WHERE agent_id = $1
+            ORDER BY filepath
+            "#,
+            agent_id,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// The `limit` most-recently-written files under a path prefix (e.g.
+    /// `"outputs/"`), newest first. Replaces the per-prefix `_tail.json`
+    /// recent-window index. `filepath` is the deterministic tiebreaker for
+    /// rows that share an `updated_at`.
+    pub async fn recent_files(
+        &self,
+        agent_id: Uuid,
+        prefix: &str,
+        limit: i64,
+    ) -> sqlx::Result<Vec<FileIndexEntry>> {
+        let pattern = format!("{prefix}%");
+        let rows = sqlx::query_as!(
+            FileIndexEntry,
+            r#"
+            SELECT agent_id, filepath, blob_sha,
+                   created_at as "created_at!: chrono::DateTime<chrono::Utc>",
+                   updated_at as "updated_at!: chrono::DateTime<chrono::Utc>"
+            FROM file_index
+            WHERE agent_id = $1 AND filepath LIKE $2
+            ORDER BY updated_at DESC, filepath
+            LIMIT $3
+            "#,
+            agent_id,
+            pattern,
+            limit,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Insert one version-pinned citation edge, returning the row.
+    /// **Idempotent**: an identical edge (same six pinned ends) returns the
+    /// existing row instead of inserting a duplicate, so a retried write
+    /// activity converges to one citation. Append-only otherwise —
+    /// superseded citations are retained (never updated/deleted) so
+    /// provenance stays time-scrubbable.
+    pub async fn add_citation(
+        &self,
+        citing_agent_id: Uuid,
+        citing_filepath: &str,
+        citing_blob_sha: &BlobSha,
+        cited_agent_id: Uuid,
+        cited_filepath: &str,
+        cited_blob_sha: &BlobSha,
+    ) -> sqlx::Result<Citation> {
+        let id = Uuid::new_v4();
+        // The no-op `DO UPDATE` (rather than `DO NOTHING`) makes `RETURNING`
+        // yield the existing row on conflict; its original `id` is preserved.
+        let row = sqlx::query_as!(
+            Citation,
+            r#"
+            INSERT INTO citations
+                (id, citing_agent_id, citing_filepath, citing_blob_sha,
+                 cited_agent_id, cited_filepath, cited_blob_sha)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (citing_agent_id, citing_filepath, citing_blob_sha,
+                         cited_agent_id, cited_filepath, cited_blob_sha)
+            DO UPDATE SET created_at = citations.created_at
+            RETURNING id, citing_agent_id, citing_filepath, citing_blob_sha,
+                      cited_agent_id, cited_filepath, cited_blob_sha,
+                      created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            "#,
+            id,
+            citing_agent_id,
+            citing_filepath,
+            citing_blob_sha.as_str(),
+            cited_agent_id,
+            cited_filepath,
+            cited_blob_sha.as_str(),
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Resolve what a specific output *version* cites.
+    pub async fn citations_from(
+        &self,
+        citing_agent_id: Uuid,
+        citing_filepath: &str,
+        citing_blob_sha: &BlobSha,
+    ) -> sqlx::Result<Vec<Citation>> {
+        let rows = sqlx::query_as!(
+            Citation,
+            r#"
+            SELECT id, citing_agent_id, citing_filepath, citing_blob_sha,
+                   cited_agent_id, cited_filepath, cited_blob_sha,
+                   created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            FROM citations
+            WHERE citing_agent_id = $1 AND citing_filepath = $2 AND citing_blob_sha = $3
+            ORDER BY created_at, id
+            "#,
+            citing_agent_id,
+            citing_filepath,
+            citing_blob_sha.as_str(),
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// All citations that pin a given file (any version) — the read the
+    /// staleness reactor uses to find dependents to wake when the file
+    /// changes. Compare each row's `cited_blob_sha` against the current sha
+    /// to find stale pins.
+    pub async fn citations_to(
+        &self,
+        cited_agent_id: Uuid,
+        cited_filepath: &str,
+    ) -> sqlx::Result<Vec<Citation>> {
+        let rows = sqlx::query_as!(
+            Citation,
+            r#"
+            SELECT id, citing_agent_id, citing_filepath, citing_blob_sha,
+                   cited_agent_id, cited_filepath, cited_blob_sha,
+                   created_at as "created_at!: chrono::DateTime<chrono::Utc>"
+            FROM citations
+            WHERE cited_agent_id = $1 AND cited_filepath = $2
+            ORDER BY created_at, id
+            "#,
+            cited_agent_id,
+            cited_filepath,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     /// Transactional wrapper: in one DB transaction, CREATE the graph
@@ -1581,6 +1803,250 @@ policy:
         assert_eq!(children.len(), 1);
         assert_eq!(AgentId::new(children[0].id), child_id);
         assert_eq!(children[0].name, "child");
+        Ok(())
+    }
+
+    // --- file_index ---
+
+    fn sha(hex_seed: char) -> BlobSha {
+        BlobSha::from_hex(hex_seed.to_string().repeat(40))
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn file_index_set_and_get_integrity(pool: PgPool) -> sqlx::Result<()> {
+        let store = GraphStore::new(pool);
+        let graph = seed_graph(&store).await;
+        let agent = seed_agent(&store, graph.id, "a").await;
+
+        assert!(store
+            .get_file_blob_sha(agent.id, "outputs/x.md")
+            .await?
+            .is_none());
+
+        let entry = store
+            .set_file_version(agent.id, "outputs/x.md", &sha('a'))
+            .await?;
+        assert_eq!(entry.filepath, "outputs/x.md");
+        assert_eq!(entry.blob_sha, sha('a').as_str());
+
+        let got = store.get_file_blob_sha(agent.id, "outputs/x.md").await?;
+        assert_eq!(got, Some(sha('a')));
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn file_index_upsert_updates_in_place(pool: PgPool) -> sqlx::Result<()> {
+        let store = GraphStore::new(pool);
+        let graph = seed_graph(&store).await;
+        let agent = seed_agent(&store, graph.id, "a").await;
+
+        let v1 = store
+            .set_file_version(agent.id, "notes/n.md", &sha('a'))
+            .await?;
+        let v2 = store
+            .set_file_version(agent.id, "notes/n.md", &sha('b'))
+            .await?;
+
+        // Same path => one row; pointer moved to the new content.
+        assert_eq!(store.list_files_for_agent(agent.id).await?.len(), 1);
+        assert_eq!(
+            store.get_file_blob_sha(agent.id, "notes/n.md").await?,
+            Some(sha('b'))
+        );
+        assert_eq!(
+            v1.created_at, v2.created_at,
+            "created_at preserved on update"
+        );
+        assert!(v2.updated_at >= v1.updated_at, "updated_at advances");
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn file_index_dedup_by_blob_sha(pool: PgPool) -> sqlx::Result<()> {
+        let store = GraphStore::new(pool);
+        let graph = seed_graph(&store).await;
+        let agent = seed_agent(&store, graph.id, "a").await;
+
+        // Identical content written to two paths shares one blob sha.
+        store
+            .set_file_version(agent.id, "notes/one.md", &sha('c'))
+            .await?;
+        store
+            .set_file_version(agent.id, "notes/two.md", &sha('c'))
+            .await?;
+        store
+            .set_file_version(agent.id, "notes/other.md", &sha('d'))
+            .await?;
+
+        let hits = store.find_paths_by_blob_sha(&sha('c')).await?;
+        let paths: Vec<&str> = hits.iter().map(|e| e.filepath.as_str()).collect();
+        assert_eq!(paths, vec!["notes/one.md", "notes/two.md"]);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn file_index_recent_n_under_prefix(pool: PgPool) -> sqlx::Result<()> {
+        let store = GraphStore::new(pool);
+        let graph = seed_graph(&store).await;
+        let agent = seed_agent(&store, graph.id, "a").await;
+
+        store
+            .set_file_version(agent.id, "outputs/first.md", &sha('a'))
+            .await?;
+        store
+            .set_file_version(agent.id, "outputs/second.md", &sha('b'))
+            .await?;
+        store
+            .set_file_version(agent.id, "evidence/e.md", &sha('c'))
+            .await?;
+        // Re-write first so it is unambiguously the most recently updated.
+        store
+            .set_file_version(agent.id, "outputs/first.md", &sha('d'))
+            .await?;
+
+        let recent = store.recent_files(agent.id, "outputs/", 10).await?;
+        let paths: Vec<&str> = recent.iter().map(|e| e.filepath.as_str()).collect();
+        assert_eq!(paths, vec!["outputs/first.md", "outputs/second.md"]);
+
+        let top1 = store.recent_files(agent.id, "outputs/", 1).await?;
+        assert_eq!(top1.len(), 1);
+        assert_eq!(top1[0].filepath, "outputs/first.md");
+        Ok(())
+    }
+
+    // --- citations (reference graph) ---
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn citation_insert_and_resolve_from(pool: PgPool) -> sqlx::Result<()> {
+        let store = GraphStore::new(pool);
+        let graph = seed_graph(&store).await;
+        let parent = seed_agent(&store, graph.id, "parent").await;
+        let child = seed_agent(&store, graph.id, "child").await;
+
+        let c = store
+            .add_citation(
+                parent.id,
+                "outputs/summary.md",
+                &sha('a'),
+                child.id,
+                "evidence/finding.md",
+                &sha('b'),
+            )
+            .await?;
+        assert_eq!(c.cited_blob_sha, sha('b').as_str());
+
+        let from = store
+            .citations_from(parent.id, "outputs/summary.md", &sha('a'))
+            .await?;
+        assert_eq!(from.len(), 1);
+        assert_eq!(from[0].cited_agent_id, child.id);
+        assert_eq!(from[0].cited_filepath, "evidence/finding.md");
+
+        // A different citing version cites nothing yet.
+        assert!(store
+            .citations_from(parent.id, "outputs/summary.md", &sha('z'))
+            .await?
+            .is_empty());
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn citations_to_retains_historical_pins(pool: PgPool) -> sqlx::Result<()> {
+        let store = GraphStore::new(pool);
+        let graph = seed_graph(&store).await;
+        let parent = seed_agent(&store, graph.id, "parent").await;
+        let child = seed_agent(&store, graph.id, "child").await;
+
+        // Two output versions pin two different versions of the same file.
+        store
+            .add_citation(
+                parent.id,
+                "outputs/o.md",
+                &sha('a'),
+                child.id,
+                "evidence/e.md",
+                &sha('1'),
+            )
+            .await?;
+        store
+            .add_citation(
+                parent.id,
+                "outputs/o.md",
+                &sha('b'),
+                child.id,
+                "evidence/e.md",
+                &sha('2'),
+            )
+            .await?;
+
+        // Both pins are retained, so the reactor can find every dependent.
+        let to = store.citations_to(child.id, "evidence/e.md").await?;
+        assert_eq!(to.len(), 2);
+        let pinned: Vec<&str> = to.iter().map(|c| c.cited_blob_sha.as_str()).collect();
+        assert!(pinned.contains(&sha('1').as_str()));
+        assert!(pinned.contains(&sha('2').as_str()));
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn add_citation_is_idempotent(pool: PgPool) -> sqlx::Result<()> {
+        let store = GraphStore::new(pool);
+        let graph = seed_graph(&store).await;
+        let parent = seed_agent(&store, graph.id, "parent").await;
+        let child = seed_agent(&store, graph.id, "child").await;
+
+        // The same edge inserted twice (a retried write) converges to one row
+        // with a stable id — no duplicate that would double-count dependents.
+        let first = store
+            .add_citation(
+                parent.id,
+                "outputs/o.md",
+                &sha('a'),
+                child.id,
+                "evidence/e.md",
+                &sha('b'),
+            )
+            .await?;
+        let again = store
+            .add_citation(
+                parent.id,
+                "outputs/o.md",
+                &sha('a'),
+                child.id,
+                "evidence/e.md",
+                &sha('b'),
+            )
+            .await?;
+
+        assert_eq!(first.id, again.id, "retry returns the same row id");
+        assert_eq!(
+            store.citations_to(child.id, "evidence/e.md").await?.len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn citation_fk_violation_on_unknown_agent(pool: PgPool) -> sqlx::Result<()> {
+        let store = GraphStore::new(pool);
+        let graph = seed_graph(&store).await;
+        let real = seed_agent(&store, graph.id, "real").await;
+
+        let err = store
+            .add_citation(
+                Uuid::new_v4(),
+                "outputs/o.md",
+                &sha('a'),
+                real.id,
+                "evidence/e.md",
+                &sha('b'),
+            )
+            .await
+            .expect_err("FK violation expected for unknown citing agent");
+        assert_eq!(
+            err.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("23503")
+        );
         Ok(())
     }
 }
