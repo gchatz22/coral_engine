@@ -40,6 +40,10 @@ async-trait = "0.1"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 futures = { version = "0.3", default-features = false, features = ["std"] }
+# `default-features = false` drops libgit2's ssh/https network transports —
+# `GitStorage` only needs the local object database, keeping the build lean
+# and the test default network-free.
+git2 = { version = "0.19", default-features = false }
 hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 rmcp = { version = "1.6.0", optional = true, features = ["client", "server", "transport-child-process"] }
