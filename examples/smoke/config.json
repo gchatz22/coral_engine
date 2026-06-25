@@ -1,5 +1,5 @@
 {
   "text": "smoke test",
   "idle_period": 100,
-  "step_cap": 3
+  "step_cap": 1
 }
