@@ -38,7 +38,7 @@ agents pick a provider per their `provider/model` config.
 | `TEMPORAL_NAMESPACE` | no | Temporal namespace (default `default`). |
 | `TEMPORAL_TASK_QUEUE` | no | Queue to listen on (default `coral-agents`). |
 | `AGENT_FS_ROOT` | no | Per-agent FS root (default `./agent-fs`). |
-| `ANTHROPIC_API_KEY` / `COHERE_API_KEY` | no | Boot the model registry: each key registers its provider, the first available (anthropic, then cohere) is the default. Agents select a provider via their `provider/model` config. See `coral_temporal::worker::build_decide_from_env`. |
+| `ANTHROPIC_API_KEY` / `COHERE_API_KEY` | no | Boot the model registry: each key registers its provider, the first available (cohere, then anthropic) is the default. Agents select a provider via their `provider/model` config. See `coral_temporal::worker::build_decide_from_env`. |
 | `ANTHROPIC_MODEL` / `COHERE_MODEL` | no | Per-provider default model id, used when an agent's model is `None` or names that provider without a specific model. |
 
 The worker does **not** run schema migrations — apply the structural-DB

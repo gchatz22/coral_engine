@@ -227,7 +227,7 @@ pub fn build_worker(runtime: &CoreRuntime, client: Client, task_queue: &str) -> 
 /// resolves to its own client. Returns a human-readable provider summary
 /// alongside the trait object so the caller can log what was wired.
 ///
-/// The first available provider (preference order `anthropic`, `cohere`)
+/// The first available provider (preference order `cohere`, `anthropic`)
 /// is the registry default — it serves agents whose model is `None` or
 /// written without a `provider/` prefix. With no usable provider, returns
 /// an error listing the keys that would enable one.
@@ -278,11 +278,12 @@ pub fn build_decide_from_env() -> Result<(String, Arc<dyn Decide>)> {
 }
 
 /// Provider + its required-key env var, in preference order. The first
-/// available provider becomes the registry default.
+/// available provider becomes the registry default; `cohere` leads so a
+/// deployment with both keys defaults to it.
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 const PROVIDER_KEY_ENVS: &[(&str, &str)] = &[
-    ("anthropic", ANTHROPIC_API_KEY_ENV),
     ("cohere", COHERE_API_KEY_ENV),
+    ("anthropic", ANTHROPIC_API_KEY_ENV),
 ];
 
 /// Compile-time list of providers built into this binary, in the same
@@ -291,7 +292,7 @@ const PROVIDER_KEY_ENVS: &[(&str, &str)] = &[
 fn compiled_providers() -> &'static [&'static str] {
     #[cfg(all(feature = "llm-anthropic", feature = "llm-cohere"))]
     {
-        &["anthropic", "cohere"]
+        &["cohere", "anthropic"]
     }
     #[cfg(all(feature = "llm-anthropic", not(feature = "llm-cohere")))]
     {
@@ -540,11 +541,11 @@ mod tests {
         let cases: Vec<Case> = vec![
             (BOTH, &["ANTHROPIC_API_KEY"], vec!["anthropic"]),
             (BOTH, &["COHERE_API_KEY"], vec!["cohere"]),
-            // both keys → both registered, anthropic first (= default)
+            // both keys → both registered, cohere first (= default)
             (
                 BOTH,
                 &["ANTHROPIC_API_KEY", "COHERE_API_KEY"],
-                vec!["anthropic", "cohere"],
+                vec!["cohere", "anthropic"],
             ),
             (ANTHROPIC, &["ANTHROPIC_API_KEY"], vec!["anthropic"]),
             // compiled but unkeyed, or keyed but not compiled → dropped
