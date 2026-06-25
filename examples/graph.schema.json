@@ -138,7 +138,7 @@
           ]
         },
         "model": {
-          "description": "Optional per-agent model override (e.g. `claude-opus-4-8` for a\nreconciling parent). Absent ⇒ the worker's configured default model.\nInterpreted within the worker's configured vendor; a model id that\nvendor doesn't recognize is an operator misconfig surfacing as a\nruntime error.",
+          "description": "Optional per-agent model as a qualified `provider/model` name (e.g.\n`anthropic/claude-opus-4-8`, `cohere/command-a`). The provider prefix\nselects the client, so a reconciling parent can run on a different\nprovider than its children. A bare name without a prefix routes to the\nworker's default provider; absent ⇒ the default provider's default\nmodel. A provider the worker didn't boot is an operator misconfig\nsurfacing as a runtime error.",
           "type": [
             "string",
             "null"

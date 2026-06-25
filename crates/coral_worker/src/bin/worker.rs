@@ -12,12 +12,13 @@
 //! migrations; apply the schema via `coral apply` first.
 //!
 //! Optional env: `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`,
-//! `TEMPORAL_TASK_QUEUE`, `AGENT_FS_ROOT`, `CORAL_MODEL_VENDOR`,
-//! `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`, `COHERE_API_KEY` /
-//! `COHERE_MODEL`. Vendor-specific `Decide` construction is `#[cfg]`-gated
-//! behind this crate's `llm-anthropic` / `llm-cohere` features; a build with
-//! no vendor compiles but errors at boot when no `Decide` impl can be
-//! installed.
+//! `TEMPORAL_TASK_QUEUE`, `AGENT_FS_ROOT`, `ANTHROPIC_API_KEY` /
+//! `ANTHROPIC_MODEL`, `COHERE_API_KEY` / `COHERE_MODEL`. The model registry
+//! is booted from every provider compiled in whose key is set, so agents
+//! select a provider per their `provider/model` config. Provider `Decide`
+//! construction is `#[cfg]`-gated behind this crate's `llm-anthropic` /
+//! `llm-cohere` features; a build with no provider compiles but errors at
+//! boot when no `Decide` impl can be installed.
 
 use std::env;
 use std::path::PathBuf;
@@ -93,9 +94,9 @@ async fn main() -> Result<()> {
     install_agent_storage(storage);
     info!(fs_root = fs_root.as_str(), "installed AgentStorage backend");
 
-    let (vendor_tag, decide) = build_decide_from_env()?;
+    let (providers, decide) = build_decide_from_env()?;
     install_decide(decide);
-    info!(vendor = vendor_tag, "installed Decide backend");
+    info!(providers = providers.as_str(), "installed Decide backend");
 
     // Structural-DB store: installed before the worker serves any task so
     // `register_child_in_structural_db` always finds a real `GraphStore`.
@@ -142,7 +143,7 @@ async fn main() -> Result<()> {
 
     info!(
         task_queue = task_queue.as_str(),
-        vendor = vendor_tag,
+        providers = providers.as_str(),
         "coral worker starting; registered: AgentWorkflow + AgentActivities"
     );
     worker

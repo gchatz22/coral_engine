@@ -142,11 +142,13 @@ pub struct Mandate {
     #[serde(default, deserialize_with = "deserialize_cadence_opt")]
     #[schemars(with = "Option<String>")]
     pub idle_period: Option<Cadence>,
-    /// Optional per-agent model override (e.g. `claude-opus-4-8` for a
-    /// reconciling parent). Absent ⇒ the worker's configured default model.
-    /// Interpreted within the worker's configured vendor; a model id that
-    /// vendor doesn't recognize is an operator misconfig surfacing as a
-    /// runtime error.
+    /// Optional per-agent model as a qualified `provider/model` name (e.g.
+    /// `anthropic/claude-opus-4-8`, `cohere/command-a`). The provider prefix
+    /// selects the client, so a reconciling parent can run on a different
+    /// provider than its children. A bare name without a prefix routes to the
+    /// worker's default provider; absent ⇒ the default provider's default
+    /// model. A provider the worker didn't boot is an operator misconfig
+    /// surfacing as a runtime error.
     #[serde(default)]
     pub model: Option<String>,
 }
@@ -1434,7 +1436,7 @@ seed:
         // `step_cap` is the harness-only runaway backstop; YAML never
         // authors it, so the resolved mandate leaves it `None`.
         assert!(input.mandate.step_cap.is_none());
-        // Absent `model:` ⇒ None (worker's configured default model).
+        // Absent `model:` ⇒ None (the default provider's default model).
         assert!(input.mandate.model.is_none());
 
         assert!(input.mandate.retry_policy.is_none());
@@ -1480,22 +1482,24 @@ seed:
     }
 
     #[test]
-    fn model_override_in_mandate_reaches_agent_input() {
+    fn qualified_model_in_mandate_reaches_agent_input() {
+        // The provider/model name rides opaquely to the durable input; the
+        // worker's registry resolves the prefix at decide time.
         let yaml = HAPPY_YAML.replace(
             "      idle_period: 1s\n",
-            "      idle_period: 1s\n      model: claude-opus-4-8\n",
+            "      idle_period: 1s\n      model: anthropic/claude-opus-4-8\n",
         );
         let g = parse_and_validate(&yaml).expect("model graph validates");
         assert_eq!(
             g.agents[0].mandate.model.as_deref(),
-            Some("claude-opus-4-8")
+            Some("anthropic/claude-opus-4-8")
         );
         let graph_id = coral_node::agent_ref::GraphId::new(uuid::Uuid::new_v4());
         let agent_id = coral_node::agent_ref::AgentId::new(uuid::Uuid::new_v4());
         let input = super::into_agent_input(&g, graph_id, agent_id);
         assert_eq!(
             input.mandate.model.as_deref(),
-            Some("claude-opus-4-8"),
+            Some("anthropic/claude-opus-4-8"),
             "model: must reach the workflow input mandate"
         );
     }

@@ -23,7 +23,7 @@ use crate::decide_llm::schema::{decision_tools, parse_decision, DecisionParseErr
 use crate::decision::{ContextBundle, Decide, Decision};
 use crate::model_client::{
     CallStats, CompleteOptions, CompleteRequest, ContentBlock, Message, ModelClient, ModelError,
-    Role,
+    ModelRegistry, Role,
 };
 
 /// Number of corrective re-asks performed after the first attempt fails to
@@ -31,32 +31,42 @@ use crate::model_client::{
 /// `1 + MAX_DECISION_RETRIES`.
 pub const MAX_DECISION_RETRIES: usize = 1;
 
-/// `Decide` impl that asks a `ModelClient` what to do next.
+/// `Decide` impl that asks a model what to do next.
 ///
-/// `client` is behind `Arc` so callers can share one HTTP-backed instance
-/// across many agents. `tick_stats` is the per-tick cost/latency
-/// accumulator: one `decide()` call may issue multiple
-/// `ModelClient::complete` calls (parse-retry / corrective re-ask), and
-/// the accumulator captures every call within that tick and resets at the
-/// start of the next `decide`. `Decide::decide` takes `&self`, so storage
-/// uses interior mutability via `Mutex` — the lock is held only for
-/// `push`/`clear`, never across an `await`. The accumulator is wrapped in
-/// an `Arc<Mutex<...>>` so callers can capture a cheap read-only handle
-/// (via [`LlmDecide::stats_handle`]) before construction and survive
+/// `registry` resolves each agent's `Mandate.model` (a `provider/model`
+/// name) to the [`ModelClient`] that serves it, so one `LlmDecide` shared
+/// across a graph can drive an Anthropic parent over Cohere children.
+/// `tick_stats` is the per-tick cost/latency accumulator: one `decide()`
+/// call may issue multiple `ModelClient::complete` calls (parse-retry /
+/// corrective re-ask), and the accumulator captures every call within that
+/// tick and resets at the start of the next `decide`. `Decide::decide` takes
+/// `&self`, so storage uses interior mutability via `Mutex` — the lock is
+/// held only for `push`/`clear`, never across an `await`. The accumulator is
+/// wrapped in an `Arc<Mutex<...>>` so callers can capture a cheap read-only
+/// handle (via [`LlmDecide::stats_handle`]) before construction and survive
 /// `Agent::run` consuming the `LlmDecide`.
 pub struct LlmDecide {
-    client: Arc<dyn ModelClient>,
+    registry: ModelRegistry,
     options: CompleteOptions,
     tick_stats: Arc<Mutex<Vec<CallStats>>>,
 }
 
 impl LlmDecide {
-    /// Wire an `LlmDecide` against the supplied client and sampling
-    /// options. The options are reused verbatim for both the initial
-    /// attempt and the corrective retry.
+    /// Wire a single-vendor `LlmDecide` against one client and sampling
+    /// options. Every agent's model resolves to `client`, ignoring any
+    /// provider prefix — the in-process CLI and tests use this. The
+    /// multi-provider worker path uses [`LlmDecide::with_registry`]. The
+    /// options are reused verbatim for both the initial attempt and the
+    /// corrective retry.
     pub fn new(client: Arc<dyn ModelClient>, options: CompleteOptions) -> Self {
+        Self::with_registry(ModelRegistry::single(client), options)
+    }
+
+    /// Wire an `LlmDecide` against a populated [`ModelRegistry`] so each
+    /// agent's `provider/model` resolves to its own client.
+    pub fn with_registry(registry: ModelRegistry, options: CompleteOptions) -> Self {
         Self {
-            client,
+            registry,
             options,
             tick_stats: Arc::new(Mutex::new(Vec::new())),
         }
@@ -99,8 +109,8 @@ impl LlmDecide {
 /// Sum of one tick's worth of `CallStats`. Tokens accumulate, latency
 /// sums (wall-clock budget, not max or mean), and `calls` is the count of
 /// upstream `complete` invocations the tick issued. Vendor/model are
-/// deliberately not aggregated here — a single `Decide` instance only
-/// talks to one client.
+/// deliberately not aggregated here — one tick resolves to a single client,
+/// so they are constant across the tick and live on the per-call `CallStats`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TickTotals {
     pub input_tokens: u32,
@@ -126,10 +136,14 @@ impl TickTotals {
 impl Decide for LlmDecide {
     async fn decide(&self, ctx: ContextBundle) -> Result<Decision> {
         let tools = decision_tools();
-        // Per-agent model override (from `Mandate.model`) rides through to
-        // the vendor adapter on every attempt, including the corrective
-        // retry. `None` ⇒ the adapter's configured default.
-        let model = ctx.mandate.model.clone();
+        // Resolve the agent's `provider/model` to its client and a bare
+        // model id. The pair rides every attempt this tick, including the
+        // corrective retry. An unregistered provider is an operator
+        // misconfig surfacing here; the run loop escalates it to Unhealthy.
+        let (client, model) = self
+            .registry
+            .resolve(ctx.mandate.model.as_deref())
+            .map_err(|e| anyhow!("resolving model {:?}: {e}", ctx.mandate.model))?;
         // Conversation grows across attempts: original prompt, then for
         // each parse failure an assistant-echo of the bad turn followed by
         // a system-role corrective. The model sees its full failure
@@ -144,8 +158,7 @@ impl Decide for LlmDecide {
             .clear();
 
         for attempt in 0..total_attempts {
-            let resp = self
-                .client
+            let resp = client
                 .complete(CompleteRequest {
                     messages: messages.clone(),
                     tools: tools.clone(),
@@ -507,6 +520,68 @@ mod tests {
                 req.model
             );
         }
+    }
+
+    #[tokio::test]
+    async fn decide_routes_qualified_model_to_its_provider_client() {
+        let anthropic = MockModelClient::new(vec![MockOutcome::Resp(resp_with_tool_calls(vec![
+            good_idle_call(),
+        ]))]);
+        let cohere = MockModelClient::new(vec![MockOutcome::Resp(resp_with_tool_calls(vec![
+            good_idle_call(),
+        ]))]);
+        let registry = ModelRegistry::new(
+            [
+                (
+                    "anthropic".to_string(),
+                    anthropic.clone() as Arc<dyn ModelClient>,
+                ),
+                ("cohere".to_string(), cohere.clone() as Arc<dyn ModelClient>),
+            ],
+            "anthropic",
+        )
+        .unwrap();
+        let decide = LlmDecide::with_registry(registry, CompleteOptions::default());
+
+        let mut bundle = empty_bundle();
+        bundle.mandate.model = Some("cohere/command-a".into());
+        decide.decide(bundle).await.unwrap();
+
+        // The cohere prefix routes to the cohere client, carrying the bare
+        // model id; the anthropic client is never touched.
+        assert_eq!(anthropic.seen().len(), 0, "anthropic must not be called");
+        let seen = cohere.seen();
+        assert_eq!(seen.len(), 1, "cohere client should serve the request");
+        assert_eq!(seen[0].model.as_deref(), Some("command-a"));
+    }
+
+    #[tokio::test]
+    async fn decide_errors_on_unknown_provider() {
+        let anthropic = MockModelClient::new(vec![MockOutcome::Resp(resp_with_tool_calls(vec![
+            good_idle_call(),
+        ]))]);
+        let registry = ModelRegistry::new(
+            [(
+                "anthropic".to_string(),
+                anthropic.clone() as Arc<dyn ModelClient>,
+            )],
+            "anthropic",
+        )
+        .unwrap();
+        let decide = LlmDecide::with_registry(registry, CompleteOptions::default());
+
+        let mut bundle = empty_bundle();
+        bundle.mandate.model = Some("local/llama-3".into());
+        let err = decide.decide(bundle).await.unwrap_err();
+        assert!(
+            err.to_string().contains("unknown provider `local`"),
+            "expected unknown-provider error, got: {err}"
+        );
+        assert_eq!(
+            anthropic.seen().len(),
+            0,
+            "no client should be called when resolution fails"
+        );
     }
 
     #[tokio::test]

@@ -25,8 +25,9 @@ cargo run -p coral_worker --bin worker --features llm-anthropic
 
 Or as a container: `make worker` (or
 `docker compose --profile container-worker up worker`). The image compiles
-both vendors in; supply an API key (and optionally `CORAL_MODEL_VENDOR`)
-via the `worker` service env in `docker-compose.yml` to pick one at runtime.
+both providers in; supply one or both API keys via the `worker` service env
+in `docker-compose.yml`. The registry boots from whichever keys are set, so
+agents pick a provider per their `provider/model` config.
 
 ## Environment
 
@@ -37,7 +38,8 @@ via the `worker` service env in `docker-compose.yml` to pick one at runtime.
 | `TEMPORAL_NAMESPACE` | no | Temporal namespace (default `default`). |
 | `TEMPORAL_TASK_QUEUE` | no | Queue to listen on (default `coral-agents`). |
 | `AGENT_FS_ROOT` | no | Per-agent FS root (default `./agent-fs`). |
-| `CORAL_MODEL_VENDOR` / `ANTHROPIC_API_KEY` / `COHERE_API_KEY` | no | LLM vendor selection for the `Decide` backend; see `coral_temporal::worker::build_decide_from_env`. |
+| `ANTHROPIC_API_KEY` / `COHERE_API_KEY` | no | Boot the model registry: each key registers its provider, the first available (cohere, then anthropic) is the default. Agents select a provider via their `provider/model` config. See `coral_temporal::worker::build_decide_from_env`. |
+| `ANTHROPIC_MODEL` / `COHERE_MODEL` | no | Per-provider default model id, used when an agent's model is `None` or names that provider without a specific model. |
 
 The worker does **not** run schema migrations — apply the structural-DB
 schema via `coral apply` (it runs `coral_graph::MIGRATOR`) before pointing
