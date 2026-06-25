@@ -57,7 +57,7 @@ use coral_graph::yaml::parse_and_validate;
 use coral_node::agent_ref::{AgentId, AgentRef, GraphId};
 use coral_node::conflict::ConflictKind;
 use coral_node::decision::{
-    ConflictAlternative, ConflictRecordIntent, ContextBundle, Decide, Decision, ReconcileSource,
+    ConflictAlternative, ConflictRecordIntent, Decide, Decision, ReconcileSource, Session,
 };
 use coral_node::evidence::{EvidenceId, EvidenceRecord};
 use coral_node::fs::AgentFs;
@@ -92,6 +92,12 @@ const GRAPH_YAML_REL: &str = "../../examples/smoke_multi_agent/graph.yaml";
 const CHILD_A_CONTENT: &str = "claim-A says X";
 const CHILD_B_CONTENT: &str = "claim-B says NOT-X";
 const PARENT_OUTPUT_CONTENT: &str = "reconciled: held open";
+
+/// The parent's `evidence/` directory, listed between the reconcile and
+/// emit steps so the synthetic evidence ids can be recovered for the
+/// `EmitOutput` citation. Used both in the parent script's `List` step and
+/// in the matcher that recovers the ids from that step's observation.
+const EVIDENCE_DIR: &str = "evidence/";
 
 /// Shared in-memory storage backend: parent + child workflows all run
 /// their activities against this. The test driver also opens views
@@ -149,15 +155,15 @@ fn ensure_installed() -> Arc<MemoryStorage> {
     SHARED_STORAGE.get().cloned().expect("storage installed")
 }
 
-/// `Decide` that routes per `bundle.mandate.text`:
+/// `Decide` that routes per `session.seed.mandate.text`:
 ///
-/// - Parent (`PARENT_MANDATE_TEXT`): records every trigger the bundle
-///   carries; synthesizes a `Decision::ReconcileChildren` from the
-///   first observed `ChildOutput` triggers (one per child) when the
-///   script pops the `reconcile_placeholder` sentinel; synthesizes a
-///   `Decision::EmitOutput` citing the synthetic evidence ids from
-///   `bundle.recent_evidence` (filtered to `tool == "reconcile"`)
-///   when the script pops the `emit_with_synthetic_placeholder`
+/// - Parent (`PARENT_MANDATE_TEXT`): records every trigger the seed
+///   carries (once per cycle); synthesizes a `Decision::ReconcileChildren`
+///   from the first observed `ChildOutput` triggers (one per child) when
+///   the script pops the `reconcile_placeholder` sentinel; synthesizes a
+///   `Decision::EmitOutput` citing the synthetic evidence ids recovered
+///   from a prior `List { path: "evidence/" }` step in this cycle's
+///   session when the script pops the `emit_with_synthetic_placeholder`
 ///   sentinel.
 /// - Children A / B: pop from their own per-role script FIFO. Empty
 ///   script defaults to a short idle so a misconfigured test loops
@@ -166,9 +172,9 @@ struct RoutingDecide;
 
 #[async_trait]
 impl Decide for RoutingDecide {
-    async fn decide(&self, bundle: ContextBundle) -> anyhow::Result<Decision> {
-        match bundle.mandate.text.as_str() {
-            PARENT_MANDATE_TEXT => decide_parent(&bundle),
+    async fn decide(&self, session: &Session) -> anyhow::Result<Decision> {
+        match session.seed.mandate.text.as_str() {
+            PARENT_MANDATE_TEXT => decide_parent(session),
             CHILD_A_MANDATE_TEXT => decide_child(CHILD_A_SCRIPT.get().expect("CHILD_A_SCRIPT")),
             CHILD_B_MANDATE_TEXT => decide_child(CHILD_B_SCRIPT.get().expect("CHILD_B_SCRIPT")),
             other => panic!(
@@ -179,17 +185,18 @@ impl Decide for RoutingDecide {
     }
 }
 
-/// Parent-side decide body. Records observed triggers, then either
-/// returns the next scripted decision verbatim or synthesizes one of
-/// the placeholder sentinels.
-fn decide_parent(bundle: &ContextBundle) -> anyhow::Result<Decision> {
-    if !bundle.triggers.is_empty() {
+/// Parent-side decide body. Records observed triggers (once per cycle,
+/// since the seed's triggers are constant across the cycle's steps), then
+/// either returns the next scripted decision verbatim or synthesizes one
+/// of the placeholder sentinels.
+fn decide_parent(session: &Session) -> anyhow::Result<Decision> {
+    if session.is_empty() && !session.seed.triggers.is_empty() {
         let log = PARENT_OBSERVED_TRIGGERS
             .get()
             .expect("PARENT_OBSERVED_TRIGGERS installed")
             .clone();
         let mut guard = log.lock().expect("trigger log mutex poisoned");
-        for t in &bundle.triggers {
+        for t in &session.seed.triggers {
             guard.push(t.clone());
         }
     }
@@ -203,7 +210,7 @@ fn decide_parent(bundle: &ContextBundle) -> anyhow::Result<Decision> {
     };
     match popped {
         Some(d) if is_reconcile_placeholder(&d) => synthesize_reconcile_or_wait(),
-        Some(d) if is_emit_placeholder(&d) => synthesize_emit_or_wait(bundle),
+        Some(d) if is_emit_placeholder(&d) => synthesize_emit_or_wait(session),
         Some(d) => Ok(d),
         None => Ok(Decision::Idle {
             next_after: Duration::from_millis(50),
@@ -335,17 +342,30 @@ fn synthesize_reconcile_or_wait() -> anyhow::Result<Decision> {
 }
 
 /// Synthesize `Decision::EmitOutput { content, evidence }` from the
-/// synthetic evidence records the reconcile activity just wrote into
-/// the parent's `evidence/` directory. The records surface in this
-/// tick's `bundle.recent_evidence` (no workflow-state slot). If
-/// they're missing, push the placeholder back and idle so the next
-/// tick sees the freshly-written records.
-fn synthesize_emit_or_wait(bundle: &ContextBundle) -> anyhow::Result<Decision> {
-    let synthetic_ids: Vec<EvidenceId> = bundle
-        .recent_evidence
+/// synthetic evidence records the reconcile activity wrote into the
+/// parent's `evidence/` directory earlier in this same cycle. The
+/// reconcile activity's observation does not carry the minted
+/// `EvidenceId`s, so the script interposes a `List { path: "evidence/" }`
+/// step between reconcile and emit; this synthesizer recovers the ids by
+/// parsing that step's observation (one `<evidence_id>.json` per line).
+/// The parent calls no tools, so every file under `evidence/` is a
+/// reconcile record. If the `List` step hasn't run yet in this cycle (or
+/// returned fewer than 2 ids), push the placeholder back and idle so a
+/// later cycle retries.
+fn synthesize_emit_or_wait(session: &Session) -> anyhow::Result<Decision> {
+    let listing = session
+        .steps
         .iter()
-        .filter(|e| e.tool == "reconcile")
-        .map(|e| e.id.clone())
+        .rev()
+        .find_map(|s| match &s.action {
+            Decision::List { path } if path == EVIDENCE_DIR => Some(s.observation.content.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let synthetic_ids: Vec<EvidenceId> = listing
+        .lines()
+        .filter_map(|line| line.trim().strip_suffix(".json"))
+        .map(EvidenceId::from_hex)
         .collect();
     // Need exactly 2 — one per source. Tolerate "not yet" (0 or 1) by
     // putting the placeholder back; intolerable > 2 panics rather
@@ -561,16 +581,19 @@ async fn run_end_to_end() -> Result<()> {
 
     // ---- 3. Scripts ---------------------------------------------------
     //
-    // Children: plain Idle → EmitOutput, then the `step_cap=2` cap stops
-    // each (agents never self-terminate). Each EmitOutput cites its planted
+    // Children: each runs an Idle cycle, then an EmitOutput cycle (the
+    // EmitOutput signals the parent), then the `step_cap=2` cap stops each
+    // (agents never self-terminate). Each EmitOutput cites its planted
     // evidence id (one per child) so `persist_output`'s provenance contract
     // is satisfied.
     //
-    // Parent: reconcile (via sentinel; pushes itself back until both
-    // ChildOutput signals land) → emit with synthetic (via sentinel; pushes
-    // itself back until 2 reconcile-evidence records appear in
-    // recent_evidence) → then idle until its generous `step_cap` cap stops
-    // it. The cap only bounds the post-emit idle tail.
+    // Parent script (one cycle, three repertoire steps + a terminal idle):
+    // reconcile (via sentinel; pushes itself back + ends the cycle with Idle
+    // until both ChildOutput signals land) → List the parent's evidence/ so
+    // the synthetic ids minted by reconcile become observable → emit with
+    // synthetic (via sentinel; recovers the 2 ids from the List observation;
+    // pushes itself back if fewer than 2 surfaced) → then idle (no script
+    // left) until its generous `step_cap` cap stops it.
     let child_a_script = vec![
         Decision::Idle {
             next_after: Duration::from_millis(50),
@@ -589,7 +612,13 @@ async fn run_end_to_end() -> Result<()> {
             evidence: vec![planted_b_id.clone()],
         },
     ];
-    let parent_script = vec![reconcile_placeholder(), emit_with_synthetic_placeholder()];
+    let parent_script = vec![
+        reconcile_placeholder(),
+        Decision::List {
+            path: EVIDENCE_DIR.into(),
+        },
+        emit_with_synthetic_placeholder(),
+    ];
     install_role_scripts(parent_script, child_a_script, child_b_script);
 
     // ---- 4. Worker + driver ------------------------------------------
@@ -747,7 +776,7 @@ async fn drive(
     eprintln!("child-b started at {child_b_workflow_id}");
 
     // Wait for each child to retire (EmitOutput, then the step_cap cap).
-    // Each signals the parent on its EmitOutput tick before the cap stops
+    // Each signals the parent on its EmitOutput cycle before the cap stops
     // it. The cap-driven retirement also fires `Trigger::ChildRetired` at
     // the parent — orthogonal to the reconcile assertion but exercises the
     // lifecycle-signal path as a side effect.
@@ -762,12 +791,11 @@ async fn drive(
         .context("child-b get_result")?;
     eprintln!("child-b retired cleanly");
 
-    // Parent loops on the reconcile_placeholder until both
-    // ChildOutput triggers land, then synthesizes the reconcile
-    // decision, then loops on the emit-with-synthetic placeholder
-    // until the 2 synthetic evidence records surface in
-    // recent_evidence, then emits the reconciled output, then
-    // retires.
+    // Parent loops on the reconcile_placeholder (one idle cycle per wait)
+    // until both ChildOutput triggers land, then in a single cycle
+    // synthesizes the reconcile decision, lists its evidence/ directory to
+    // observe the synthetic ids, emits the reconciled output citing them,
+    // and finally retires when the step_cap cap is reached.
     let retire_timer = tokio::time::timeout(
         Duration::from_secs(120),
         parent_handle.get_result(WorkflowGetResultOptions::default()),

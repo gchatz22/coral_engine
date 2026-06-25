@@ -87,6 +87,12 @@ pub enum FsError {
     /// correction context without losing the id.
     #[error("output {0} not found on disk")]
     OutputNotFound(OutputId),
+    /// [`AgentFs::read_file`] was asked for a path that resolves to no
+    /// file. The model picked a filename that does not exist; surfaced as
+    /// a typed error so the cycle can fold it into a failure observation
+    /// the next step adapts to.
+    #[error("file {0} not found")]
+    FileNotFound(String),
     /// [`AgentFs::write_conflict`] was called with fewer than two
     /// alternatives — a single-alternative conflict carries no
     /// information so the writer rejects it as a structural error.
@@ -728,6 +734,186 @@ impl AgentFs {
         let prefix = self.key("conflicts/");
         self.read_recent_json::<ConflictRecord>(&prefix, usize::MAX)
             .await
+    }
+
+    // ---- read-only navigation (pull surface) ---------------------------
+    //
+    // `read_file` / `list_dir` / `search` are the model's pull-navigation
+    // primitives — the read half of the `Read`/`List`/`Search` actions.
+    // They are always read-only and scoped to this `AgentFs`'s root via
+    // `clean_relpath` (no `..`/absolute escape). A descendant-subtree read
+    // is the same primitive called on an `AgentFs` opened at the child's
+    // prefix (`open_for_agent`); the subtree *authorization* — which
+    // descendants a parent may read — lives in the workflow layer where
+    // topology is known, not here.
+
+    /// Read the full UTF-8 contents of one file under the agent root.
+    ///
+    /// Read scope is the whole FS (`notes/`, `outputs/`, `evidence/`,
+    /// `claims/`, `conflicts/`, `mandate.md`), unlike the write path which
+    /// is confined to `notes/`. Returns [`FsError::FileNotFound`] when the
+    /// path resolves to nothing. Bodies are decoded lossily — the FS only
+    /// ever stores text/JSON the kernel wrote.
+    pub async fn read_file(&self, path: &str) -> anyhow::Result<String> {
+        let rel = self.clean_relpath(path)?;
+        let key = self.key(&rel);
+        let got = self
+            .storage
+            .get(&key)
+            .await
+            .map_err(|e| FsError::storage(&key, e))?;
+        match got {
+            Some(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+            None => Err(FsError::FileNotFound(path.to_string()).into()),
+        }
+    }
+
+    /// List the entries directly under a directory in the agent root,
+    /// ascending. Files appear as bare names; nested directories appear as
+    /// a single `name/` marker (storage is flat, so this is derived from
+    /// key prefixes). The `_tail.json` recency sidecar is filtered out. A
+    /// directory with no entries lists empty rather than erroring — the
+    /// model may probe a dir before anything is written to it.
+    pub async fn list_dir(&self, path: &str) -> anyhow::Result<Vec<String>> {
+        let rel = self.clean_relpath(path)?;
+        let dir = if rel.ends_with('/') {
+            rel
+        } else {
+            format!("{rel}/")
+        };
+        let prefix = self.key(&dir);
+        let page = self
+            .storage
+            .list(&prefix, None, usize::MAX)
+            .await
+            .map_err(|e| FsError::storage(&prefix, e))?;
+        let mut names = std::collections::BTreeSet::new();
+        for k in page.keys {
+            let Some(rest) = k.strip_prefix(&prefix) else {
+                continue;
+            };
+            if rest.is_empty() || rest == "_tail.json" {
+                continue;
+            }
+            match rest.split_once('/') {
+                Some((subdir, _)) => {
+                    names.insert(format!("{subdir}/"));
+                }
+                None => {
+                    names.insert(rest.to_string());
+                }
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
+
+    /// Substring-search file contents under `path` (or the whole agent
+    /// root when `None`), returning `(relative_path, first_matching_line)`
+    /// per file that contains `query`. Recursive within the scope,
+    /// read-only, case-sensitive. A cheap navigation aid, not a full-text
+    /// index — one LIST plus one batched read of the scope.
+    pub async fn search(
+        &self,
+        query: &str,
+        path: Option<&str>,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let prefix = match path {
+            Some(p) => {
+                let rel = self.clean_relpath(p)?;
+                let dir = if rel.ends_with('/') {
+                    rel
+                } else {
+                    format!("{rel}/")
+                };
+                self.key(&dir)
+            }
+            None => self.prefix.clone(),
+        };
+        let page = self
+            .storage
+            .list(&prefix, None, usize::MAX)
+            .await
+            .map_err(|e| FsError::storage(&prefix, e))?;
+        let keys: Vec<String> = page
+            .keys
+            .into_iter()
+            .filter(|k| !k.ends_with("/_tail.json"))
+            .collect();
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let blobs = self
+            .storage
+            .get_many(&refs)
+            .await
+            .map_err(|e| FsError::storage(&prefix, e))?;
+        let mut hits = Vec::new();
+        for (key, blob) in keys.iter().zip(blobs) {
+            let Some(bytes) = blob else { continue };
+            let text = String::from_utf8_lossy(&bytes);
+            if let Some(line) = text.lines().find(|l| l.contains(query)) {
+                let rel = key.strip_prefix(&self.prefix).unwrap_or(key).to_string();
+                hits.push((rel, line.trim().to_string()));
+            }
+        }
+        hits.sort();
+        Ok(hits)
+    }
+
+    /// Filenames in `outputs/`, most-recent-first, capped at `n`. Recency
+    /// comes from the `_tail.json` sidecar; a missing or torn tail falls
+    /// back to a lexicographic LIST — which loses strict recency but never
+    /// the set. Used to build the cycle seed's output index.
+    pub async fn recent_output_filenames(&self, n: usize) -> anyhow::Result<Vec<String>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let tail_key = self.key(OUTPUTS_TAIL_SUFFIX);
+        let tail_bytes = self
+            .storage
+            .get(&tail_key)
+            .await
+            .map_err(|e| FsError::storage(&tail_key, e))?;
+        if let Some(bytes) = tail_bytes {
+            if let Ok(tail) = serde_json::from_slice::<TailObject>(&bytes) {
+                let take = tail.entries.len().min(n);
+                return Ok(tail.entries[..take]
+                    .iter()
+                    .map(|e| e.filename.clone())
+                    .collect());
+            }
+        }
+        let mut all = self.list_dir("outputs/").await?;
+        let start = all.len().saturating_sub(n);
+        all.drain(..start);
+        Ok(all)
+    }
+
+    /// Validate `raw` as a read target relative to the agent root and
+    /// return the cleaned, `/`-joined relative path (no storage prefix
+    /// applied). Rejects any component that could escape the root (`..`,
+    /// an absolute root, a Windows prefix). Read-only ops, so there is no
+    /// write surface to confine beyond traversal safety.
+    fn clean_relpath(&self, raw: &str) -> anyhow::Result<String> {
+        let candidate = Path::new(raw);
+        let mut parts: Vec<String> = Vec::new();
+        for comp in candidate.components() {
+            match comp {
+                Component::Normal(part) => match part.to_str() {
+                    Some(s) => parts.push(s.to_string()),
+                    None => return Err(FsError::PathTraversal(raw.to_string()).into()),
+                },
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(FsError::PathTraversal(raw.to_string()).into());
+                }
+            }
+        }
+        if parts.is_empty() {
+            return Err(FsError::PathTraversal(raw.to_string()).into());
+        }
+        Ok(parts.join("/"))
     }
 
     // ---- key construction ----------------------------------------------
@@ -1658,7 +1844,7 @@ mod tests {
     // ---- claim_seed persistence -------------------------------
 
     use crate::decision::{
-        ClaimSeed, ContextBundle, Decide, Decision, ToolCall as DecisionToolCall,
+        ClaimSeed, Decide, Decision, FsIndex, Seed, Session, ToolCall as DecisionToolCall,
     };
 
     fn now() -> DateTime<Utc> {
@@ -1784,7 +1970,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Decide for ClaimAwareMock {
-        async fn decide(&self, _ctx: ContextBundle) -> anyhow::Result<Decision> {
+        async fn decide(&self, _session: &Session) -> anyhow::Result<Decision> {
             // Reuse a seed if a claim already exists for this topic.
             let claims = self.fs.list_claims().await?;
             let existing = claims.into_iter().find(|c| c.description == self.topic);
@@ -1813,15 +1999,8 @@ mod tests {
         }
     }
 
-    fn empty_bundle(mandate: Mandate) -> ContextBundle {
-        ContextBundle {
-            mandate,
-            triggers: vec![],
-            recent_outputs: vec![],
-            recent_evidence: vec![],
-            open_claims: vec![],
-            correction: None,
-        }
+    fn empty_session(mandate: Mandate) -> Session {
+        Session::new(Seed::new(mandate, vec![], FsIndex::default()))
     }
 
     #[tokio::test]
@@ -1844,7 +2023,7 @@ mod tests {
             new_seed: "should-not-be-minted".into(),
         };
 
-        let decision = mock.decide(empty_bundle(mandate)).await.unwrap();
+        let decision = mock.decide(&empty_session(mandate)).await.unwrap();
         match decision {
             Decision::CallTools { calls } => {
                 assert_eq!(calls.len(), 1);
@@ -1870,7 +2049,7 @@ mod tests {
             new_seed: "phase-2-clearance".into(),
         };
 
-        let decision = mock.decide(empty_bundle(mandate)).await.unwrap();
+        let decision = mock.decide(&empty_session(mandate)).await.unwrap();
         match decision {
             Decision::CallTools { calls } => {
                 assert_eq!(calls.len(), 1);

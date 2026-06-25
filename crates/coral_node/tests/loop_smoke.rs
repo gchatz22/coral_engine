@@ -2,9 +2,15 @@
 //!
 //! Exercises the public surface only (`Agent::new`, `Agent::signal`,
 //! `Agent::run`) plus the FS root the agent writes to: signal/deadline
-//! wakeups, `EmitOutput` / `RewriteFs` / `CallTool` arms, `step_cap`
-//! cap, the apply-time correction loop, tool-failure correction, health
-//! budget exhaustion + recovery.
+//! wakeups; the `Read`/`List`/`Search`/`EmitOutput`/`RewriteFs`/`CallTool`
+//! repertoire steps; the inner ReAct cycle (multiple steps, terminated by
+//! `Idle`); `step_cap` (now counted in *cycles*); in-cycle failure
+//! adaptation; health budget exhaustion + recovery across cycles.
+//!
+//! Cycle model: each `Agent::run` outer iteration is one *cycle*. The model
+//! drives an inner loop of steps via `MockDecide` until it returns `Idle`
+//! (the sole terminal). So a MockDecide script is a sequence of *steps*,
+//! and a multi-step cycle ends at the next `Idle`. `step_cap` bounds cycles.
 //!
 //! Time-sensitive tests use `#[tokio::test(flavor = "current_thread",
 //! start_paused = true)]` so the runtime auto-advances when the only
@@ -22,16 +28,13 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 
 use coral_node::agent::{Agent, RetireReason};
-use coral_node::decision::{
-    ClaimSeed, ContextBundle, Decide, Decision, FsOp, MockDecide, ToolCall,
-};
+use coral_node::decision::{ClaimSeed, Decide, Decision, FsOp, MockDecide, Session, ToolCall};
 use coral_node::evidence::{EvidenceId, EvidenceRecord};
 use coral_node::fs::AgentFs;
 use coral_node::health::{HealthTracker, RetryBudget};
-use coral_node::mandate::{ContextPolicy, Mandate};
+use coral_node::mandate::Mandate;
 use coral_node::tools::{EchoTool, Tool, ToolRegistry};
 use coral_node::trigger::Trigger;
-use coral_node::trigger_queue::SignalSink;
 
 async fn fresh_fs(idle_period: Duration) -> (TempDir, AgentFs, Mandate) {
     let tmp = TempDir::new().expect("tempdir");
@@ -59,6 +62,14 @@ fn registry_with_echo() -> ToolRegistry {
     r
 }
 
+/// A short idle so paused-time auto-advance drives the deadline arm, and a
+/// terminal `Idle` step the model returns to end a cycle.
+fn idle() -> Decision {
+    Decision::Idle {
+        next_after: Duration::from_millis(50),
+    }
+}
+
 /// Read `dir` and return the files that are *agent record files* —
 /// excluding the tail-index sidecar (`_tail.json`). Returns an empty
 /// Vec for a missing dir to match `AgentFs::open`'s lazy
@@ -84,7 +95,7 @@ fn agent_record_files(dir: &Path) -> Vec<PathBuf> {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn loop_wakes_on_injected_signal_and_runs() {
     // Idle period is huge so the test relies on the signal, not the
-    // scheduled wake, to drive the first tick.
+    // scheduled wake, to drive the first cycle.
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_secs(3600)).await;
     mandate.step_cap = Some(1);
     let script = vec![Decision::Idle {
@@ -123,14 +134,12 @@ async fn loop_wakes_on_injected_signal_and_runs() {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn loop_wakes_on_deadline_when_no_signal_arrives() {
     // Short idle period so the deadline-arm fires with paused-time auto-
-    // advance. Script idles on the first tick; if it ran, the deadline
-    // fired, we drained a `ScheduledWake`, and decide returned. The
-    // `step_cap` cap stops the loop after that single deadline-driven tick.
+    // advance. The cycle idles immediately; if it ran, the deadline fired,
+    // we drained a `ScheduledWake`, and decide returned. The `step_cap`
+    // cap stops the loop after that single deadline-driven cycle.
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
     mandate.step_cap = Some(1);
-    let script = vec![Decision::Idle {
-        next_after: Duration::from_millis(50),
-    }];
+    let script = vec![idle()];
     let agent = Agent::new(
         mandate,
         fs,
@@ -165,10 +174,14 @@ async fn emit_output_with_valid_evidence_writes_file_under_outputs() {
     );
     let ev_id: EvidenceId = fs.record_evidence(rec).await.expect("seed evidence");
 
-    let script = vec![Decision::EmitOutput {
-        content: "the answer".into(),
-        evidence: vec![ev_id.clone()],
-    }];
+    // One cycle: emit, then idle (the terminal step).
+    let script = vec![
+        Decision::EmitOutput {
+            content: "the answer".into(),
+            evidence: vec![ev_id.clone()],
+        },
+        idle(),
+    ];
     let agent = Agent::new(
         mandate,
         fs,
@@ -202,17 +215,17 @@ async fn emit_output_with_valid_evidence_writes_file_under_outputs() {
     assert_eq!(ev_arr[0].as_str(), Some(ev_id.as_str()));
 }
 
-/// A `never`-cadence agent self-wakes only its *first* cycle: it emits once
+/// A `never`-cadence agent self-wakes only its *first* cycle: it runs once
 /// with no inbound trigger, then blocks on the trigger queue with no
 /// self-wake timer armed. A recurring agent would instead fire a second
-/// deadline-driven tick. This pins the invariant that an all-`never` graph
+/// deadline-driven cycle. This pins the invariant that an all-`never` graph
 /// still produces (leaves fire once) but never spins on a self-clock.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn never_cadence_fires_first_cycle_then_waits_for_triggers() {
     let tmp = TempDir::new().expect("tempdir");
     // `never` cadence (no recurring self-wake); a generous step_cap that a
     // correct `never` node never reaches because it blocks first.
-    let mandate = Mandate::new_never("never leaf", Some(2));
+    let mandate = Mandate::new_never("never leaf", Some(3));
     let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
         .await
         .expect("open fs");
@@ -225,18 +238,20 @@ async fn never_cadence_fires_first_cycle_then_waits_for_triggers() {
         ))
         .await
         .expect("seed evidence");
-    // Two scripted emits; a correct `never` node reaches only the first
-    // (it blocks before a second self-wake). A self-wake regression would
-    // consume the second and leave two outputs.
+    // Two scripted cycles, each an emit + idle. A correct `never` node
+    // reaches only the first (it blocks before a second self-wake). A
+    // self-wake regression would run the second cycle and leave two outputs.
     let script = vec![
         Decision::EmitOutput {
             content: "finding 1".into(),
             evidence: vec![ev_id.clone()],
         },
+        idle(),
         Decision::EmitOutput {
             content: "finding 2".into(),
             evidence: vec![ev_id],
         },
+        idle(),
     ];
     let agent = Agent::new(
         mandate,
@@ -255,7 +270,7 @@ async fn never_cadence_fires_first_cycle_then_waits_for_triggers() {
         "never node must not self-wake past its first cycle (expected block, got {result:?})"
     );
 
-    // Exactly the first cycle's output landed; the second emit was unreached.
+    // Exactly the first cycle's output landed; the second cycle was unreached.
     let entries = agent_record_files(&tmp.path().join("outputs"));
     assert_eq!(
         entries.len(),
@@ -268,12 +283,15 @@ async fn never_cadence_fires_first_cycle_then_waits_for_triggers() {
 async fn rewrite_fs_writes_file_under_notes() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
     mandate.step_cap = Some(1);
-    let script = vec![Decision::RewriteFs {
-        ops: vec![FsOp::WriteFile {
-            path: "notes/scratch.md".into(),
-            content: "hello from the loop".into(),
-        }],
-    }];
+    let script = vec![
+        Decision::RewriteFs {
+            ops: vec![FsOp::WriteFile {
+                path: "notes/scratch.md".into(),
+                content: "hello from the loop".into(),
+            }],
+        },
+        idle(),
+    ];
     let agent = Agent::new(
         mandate,
         fs,
@@ -296,15 +314,16 @@ async fn rewrite_fs_writes_file_under_notes() {
     );
 }
 
+/// One cycle, multiple steps: the model calls echo, reads the resulting
+/// note... actually it emits an output citing the evidence echo produced,
+/// then idles. Exercises that `CallTools` and `EmitOutput` compose inside a
+/// single cycle (what used to be two ticks is now two steps of one cycle).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn call_tool_records_evidence_and_emit_output_consumes_it() {
-    // Sanity sweep that exercises the CallTool arm end to end: the loop
-    // calls echo, the resulting evidence is persisted, and a follow-up
-    // EmitOutput with that evidence id succeeds.
+async fn call_tool_records_evidence_and_emit_output_consumes_it_in_one_cycle() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
-    mandate.step_cap = Some(2);
+    mandate.step_cap = Some(1);
     // Compute the id we expect echo to produce so we can reference it in
-    // the EmitOutput decision.
+    // the EmitOutput step.
     let args = json!({"msg": "hi"});
     let result = json!({"echoed": {"msg": "hi"}});
     let expected_ev = EvidenceId::new("echo", &args, &result);
@@ -321,6 +340,7 @@ async fn call_tool_records_evidence_and_emit_output_consumes_it() {
             content: "echoed".into(),
             evidence: vec![expected_ev.clone()],
         },
+        idle(),
     ];
     let agent = Agent::new(
         mandate,
@@ -337,42 +357,92 @@ async fn call_tool_records_evidence_and_emit_output_consumes_it() {
         .expect("join")
         .expect("run ok");
 
-    // Evidence file written by the CallTool arm.
+    // Evidence file written by the CallTool step.
     let ev_path = tmp
         .path()
         .join("evidence")
         .join(format!("{}.json", expected_ev));
     assert!(ev_path.is_file(), "expected evidence file at {ev_path:?}");
 
-    // Output file written by the EmitOutput arm references that evidence.
+    // Output file written by the EmitOutput step references that evidence.
     let outputs_dir = tmp.path().join("outputs");
     let entries = agent_record_files(&outputs_dir);
     assert_eq!(entries.len(), 1);
 }
 
+/// A multi-step cycle (read → call_tool → emit → idle) runs as exactly ONE
+/// cycle. `step_cap = 1` then retires after it. Confirms `step_cap` counts
+/// cycles, not steps, and that a `Read` step feeds a note body back as an
+/// observation the cycle proceeds from.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn step_cap_caps_loop_iterations_and_writes_retirement() {
-    // Mandate caps the loop at exactly 2 ticks. Idle period is small so
-    // paused-time auto-advance drives both ticks via the deadline arm —
-    // no signals needed. The script holds exactly 2 Idle decisions and
-    // nothing else: if the cap fails to fire, the loop attempts a third
-    // tick, MockDecide returns "script exhausted", and run() bubbles an
-    // Err. So both behaviours are covered: the cap firing produces
-    // Ok(retired); the cap not firing produces Err.
+async fn multi_step_cycle_counts_as_one_cycle() {
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.step_cap = Some(1);
+    // Pre-seed a note the Read step pulls.
+    fs.apply_ops(vec![FsOp::WriteFile {
+        path: "notes/plan.md".into(),
+        content: "the standing plan".into(),
+    }])
+    .await
+    .expect("seed note");
+    let args = json!({"msg": "go"});
+    let expected_ev = EvidenceId::new("echo", &args, &json!({"echoed": {"msg": "go"}}));
+
+    let script = vec![
+        Decision::Read {
+            path: "notes/plan.md".into(),
+        },
+        Decision::CallTools {
+            calls: vec![ToolCall::new("echo", args, ClaimSeed::new("s"))],
+        },
+        Decision::EmitOutput {
+            content: "did the work".into(),
+            evidence: vec![expected_ev],
+        },
+        idle(),
+    ];
+    let agent = Agent::new(
+        mandate,
+        fs,
+        MockDecide::new(script),
+        registry_with_echo(),
+        fresh_health(tmp.path()),
+    );
+
+    let handle = tokio::spawn(agent.run());
+    let RetireReason(reason) = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("agent did not retire in time")
+        .expect("join")
+        .expect("run ok");
+    // Four steps, one Idle → ONE cycle. step_cap=1 retires right after.
+    assert_eq!(reason, "step_cap (1) reached");
+    // The work products of the single cycle are all on disk.
+    assert_eq!(agent_record_files(&tmp.path().join("outputs")).len(), 1);
+    assert_eq!(agent_record_files(&tmp.path().join("evidence")).len(), 1);
+    // Stayed Healthy — no failing steps.
+    let v: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(tmp.path().join("health.json")).expect("read health"),
+    )
+    .expect("parse health");
+    assert_eq!(v.get("state").and_then(|x| x.as_str()), Some("Healthy"));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn step_cap_caps_cycles_and_writes_retirement() {
+    // Mandate caps the loop at exactly 2 cycles. Idle period is small so
+    // paused-time auto-advance drives both cycles via the deadline arm —
+    // no signals needed. The script holds exactly 2 Idle steps (= 2
+    // single-step cycles) and nothing else: if the cap fails to fire, the
+    // loop attempts a third cycle, MockDecide returns "script exhausted",
+    // and the cycle goes Unhealthy. So both behaviours are covered.
     let tmp = TempDir::new().expect("tempdir");
-    let mandate = Mandate::new("max-ticks-test", Duration::from_millis(50), Some(2));
+    let mandate = Mandate::new("max-cycles-test", Duration::from_millis(50), Some(2));
     let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
         .await
         .expect("open fs");
 
-    let script = vec![
-        Decision::Idle {
-            next_after: Duration::from_millis(50),
-        },
-        Decision::Idle {
-            next_after: Duration::from_millis(50),
-        },
-    ];
+    let script = vec![idle(), idle()];
     let agent = Agent::new(
         mandate,
         fs,
@@ -399,20 +469,18 @@ async fn step_cap_caps_loop_iterations_and_writes_retirement() {
     assert!(tmp.path().join("retirement.json").is_file());
 }
 
-/// Model emits an unsatisfiable `Decision` (`CallTool` for an
-/// unregistered tool); the runtime must catch the apply-time failure,
-/// stage a correction for the next tick, and the next tick must produce
-/// a valid `Decision` that completes. The agent stays Healthy throughout.
+/// Model emits an unsatisfiable step (`CallTool` for an unregistered tool);
+/// the runtime catches the apply-time failure, folds it into the session as
+/// a failure observation, and the model adapts *within the same cycle* by
+/// idling. The agent stays Healthy (one failure under the default budget).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn invalid_call_tool_stages_correction_then_recovers() {
+async fn invalid_call_tool_is_recoverable_in_cycle_failure() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
     mandate.step_cap = Some(1);
     let script = vec![
-        // Tick 1: model picks a tool that is not registered. Apply-time
+        // Step 1: model picks a tool that is not registered. Apply-time
         // failure → record_failure(Inference) → counter=1 (under default
-        // budget of 1) → pending_correction set for the next tick. The
-        // `step_cap` cap then stops the loop before the correction
-        // continuation can run a recovery decision.
+        // budget of 1) → failure observation appended; the model adapts.
         Decision::CallTools {
             calls: vec![ToolCall::new(
                 "no_such_tool",
@@ -420,6 +488,9 @@ async fn invalid_call_tool_stages_correction_then_recovers() {
                 ClaimSeed::new("seed-1"),
             )],
         },
+        // Step 2: the model adapts to the failure and idles, ending the
+        // cycle cleanly.
+        idle(),
     ];
     let agent = Agent::new(
         mandate,
@@ -447,8 +518,8 @@ async fn invalid_call_tool_stages_correction_then_recovers() {
         "no evidence should have been recorded for an unregistered tool"
     );
 
-    // Health stays Healthy across the correction cycle — budget was
-    // consumed (counter=1) but never exhausted.
+    // Health stays Healthy across the cycle — budget was consumed
+    // (counter=1) but never exhausted.
     let health_path = tmp.path().join("health.json");
     let v: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&health_path).expect("read health"))
@@ -462,17 +533,20 @@ async fn invalid_call_tool_stages_correction_then_recovers() {
 }
 
 /// `EmitOutput` with an *empty* evidence list is rejected by
-/// `AgentFs::persist_output` with `FsError::EmptyEvidence`; that maps
-/// to `ApplyOutcome::NeedsCorrection` and the next iteration runs as a
-/// correction continuation whose script retires.
+/// `AgentFs::persist_output` with `FsError::EmptyEvidence`; that maps to a
+/// recoverable in-cycle failure observation the model adapts to (here by
+/// idling). Stays Healthy under the default budget.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn emit_output_with_empty_evidence_stages_correction() {
+async fn emit_output_with_empty_evidence_is_recoverable_in_cycle() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
     mandate.step_cap = Some(1);
-    let script = vec![Decision::EmitOutput {
-        content: "no provenance".into(),
-        evidence: vec![],
-    }];
+    let script = vec![
+        Decision::EmitOutput {
+            content: "no provenance".into(),
+            evidence: vec![],
+        },
+        idle(),
+    ];
     let agent = Agent::new(
         mandate,
         fs,
@@ -507,19 +581,22 @@ async fn emit_output_with_empty_evidence_stages_correction() {
     assert_eq!(v.get("state").and_then(|x| x.as_str()), Some("Healthy"));
 }
 
-/// Same shape of failure driven through the `EmitOutput` arm with a
+/// Same shape of failure driven through the `EmitOutput` step with a
 /// well-formed-but-not-on-disk evidence id (`FsError::EvidenceNotFound`).
 /// Mirrors the empty-evidence test above; the two cover the two distinct
-/// `FsError` variants the apply-time correction path catches.
+/// `FsError` variants the in-cycle failure path catches.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn emit_output_with_unknown_evidence_stages_correction() {
+async fn emit_output_with_unknown_evidence_is_recoverable_in_cycle() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
     mandate.step_cap = Some(1);
     let bogus = EvidenceId::from_hex("deadbeef".repeat(8));
-    let script = vec![Decision::EmitOutput {
-        content: "lying about provenance".into(),
-        evidence: vec![bogus],
-    }];
+    let script = vec![
+        Decision::EmitOutput {
+            content: "lying about provenance".into(),
+            evidence: vec![bogus],
+        },
+        idle(),
+    ];
     let agent = Agent::new(
         mandate,
         fs,
@@ -536,8 +613,6 @@ async fn emit_output_with_unknown_evidence_stages_correction() {
         .expect("run ok");
     assert_eq!(reason, "step_cap (1) reached");
 
-    // `outputs/` materialises on first write; treat absent dir as no
-    // output persisted.
     let outputs_dir = tmp.path().join("outputs");
     if outputs_dir.exists() {
         assert!(std::fs::read_dir(&outputs_dir)
@@ -546,7 +621,6 @@ async fn emit_output_with_unknown_evidence_stages_correction() {
             .is_none());
     }
 
-    // Stayed Healthy — single failure under the default budget.
     let v: serde_json::Value = serde_json::from_slice(
         &std::fs::read(tmp.path().join("health.json")).expect("read health"),
     )
@@ -554,21 +628,19 @@ async fn emit_output_with_unknown_evidence_stages_correction() {
     assert_eq!(v.get("state").and_then(|x| x.as_str()), Some("Healthy"));
 }
 
-/// Persistent apply-time failure exhausts the per-tick inference budget
-/// across the original attempt + one correction continuation. The agent
-/// transitions to `Unhealthy`, the run loop **does not halt**, and a
-/// subsequent successful tick (here, an `Idle` decision) recovers the
-/// tracker to `Healthy` while archiving the prior incident.
+/// Persistent in-cycle failure exhausts the per-cycle inference budget
+/// across two failing steps of the *same* cycle. The agent transitions to
+/// `Unhealthy` and the cycle ends; the run loop **does not halt**, and the
+/// next cycle (here, an `Idle`) recovers the tracker to `Healthy` while
+/// archiving the prior incident.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn persistent_apply_time_failure_exhausts_budget_and_recovers_on_next_success() {
+async fn persistent_in_cycle_failure_exhausts_budget_and_recovers_next_cycle() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
-    mandate.step_cap = Some(3);
-    // Default budget is `RetryBudget::new(1, 3)` → max_inference = 1, so
-    // total apply-time attempts before exhaustion = 2 (original + 1
-    // retry inside the same fresh-tick window).
+    mandate.step_cap = Some(2);
+    // Budget `RetryBudget::new(1, 3)` → max_inference = 1, so the second
+    // failing step in a cycle exhausts (counter 2 > 1).
     let script = vec![
-        // Attempt 1 (fresh tick): bad CallTool → record_failure ok →
-        // synthetic correction injected.
+        // Cycle 1, step 1: bad CallTool → record_failure ok (counter=1).
         Decision::CallTools {
             calls: vec![ToolCall::new(
                 "no_such_tool",
@@ -576,9 +648,9 @@ async fn persistent_apply_time_failure_exhausts_budget_and_recovers_on_next_succ
                 ClaimSeed::new("seed-1"),
             )],
         },
-        // Attempt 2 (correction continuation tick — begin_tick skipped):
-        // bad CallTool → counter=2 > max_inference=1 → BudgetExhausted →
-        // transition_to_unhealthy. Run loop does NOT exit.
+        // Cycle 1, step 2: bad CallTool again → counter=2 > max=1 →
+        // BudgetExhausted → transition_to_unhealthy, cycle ends. Run loop
+        // does NOT exit.
         Decision::CallTools {
             calls: vec![ToolCall::new(
                 "no_such_tool",
@@ -586,17 +658,11 @@ async fn persistent_apply_time_failure_exhausts_budget_and_recovers_on_next_succ
                 ClaimSeed::new("seed-1"),
             )],
         },
-        // Attempt 3 (next deadline-driven fresh tick): valid Idle.
-        // dispatch returns Continue → mark_tick_success → archives the
-        // Unhealthy incident and flips back to Healthy. The `step_cap`
-        // cap then stops the loop.
-        Decision::Idle {
-            next_after: Duration::from_millis(50),
-        },
+        // Cycle 2: valid Idle → mark_tick_success → archives the Unhealthy
+        // incident and flips back to Healthy. The step_cap cap then stops
+        // the loop.
+        idle(),
     ];
-    // Anchor the budget explicitly so a future change to
-    // `RetryBudget::default()` does not silently invalidate the
-    // arithmetic in this test's commentary.
     let agent = Agent::new(
         mandate,
         fs,
@@ -611,10 +677,9 @@ async fn persistent_apply_time_failure_exhausts_budget_and_recovers_on_next_succ
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "step_cap (3) reached");
+    assert_eq!(reason, "step_cap (2) reached");
 
-    // After recovery: the live `health.json` reflects Healthy state with
-    // a `since` timestamp at recovery time (not the agent's open time).
+    // After recovery: the live `health.json` reflects Healthy state.
     let v: serde_json::Value = serde_json::from_slice(
         &std::fs::read(tmp.path().join("health.json")).expect("read health"),
     )
@@ -622,9 +687,8 @@ async fn persistent_apply_time_failure_exhausts_budget_and_recovers_on_next_succ
     assert_eq!(
         v.get("state").and_then(|x| x.as_str()),
         Some("Healthy"),
-        "agent must recover to Healthy after the next successful tick"
+        "agent must recover to Healthy after the next successful cycle"
     );
-    // `incident` is dropped on the Healthy record.
     assert!(v.get("incident").is_none() || v.get("incident").unwrap().is_null());
 
     // The prior Unhealthy incident must have been archived by recovery.
@@ -669,23 +733,16 @@ async fn persistent_apply_time_failure_exhausts_budget_and_recovers_on_next_succ
     assert_eq!(
         retry_trail.len(),
         2,
-        "retry trail should record both attempts before exhaustion"
+        "retry trail should record both failing steps before exhaustion"
     );
 }
 
-/// Decide-side `Err` (model adapter could not produce a `Decision`) is
-/// the inference-retry-exhaustion signal at the run loop boundary: it
-/// transitions the tracker to `Unhealthy` directly, without spending
-/// another budget slot. We verify the transition + persistence; the
-/// rehydrate-then-recover half of the cycle is exercised by the
-/// `persistent_apply_time_failure_*` test above.
+/// Decide-side `Err` (model adapter could not produce a `Decision`) is the
+/// inference-retry-exhaustion signal at the cycle boundary: it transitions
+/// the tracker to `Unhealthy` directly, without spending a budget slot, and
+/// ends the cycle. The run loop keeps going; `step_cap` then retires.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn decide_err_transitions_to_unhealthy_and_keeps_loop_alive() {
-    // Mandate caps at 1 tick so the test terminates: tick body runs once
-    // (decide errors → transition_to_unhealthy → Continue), then iteration
-    // 2 hits `tick >= step_cap` and retires via the safety cap. That is
-    // the cleanest way to verify the run loop **does not halt** on
-    // Decide-Err while still bounding the test.
     let tmp = TempDir::new().expect("tempdir");
     let mandate = Mandate::new("decide-err", Duration::from_millis(50), Some(1));
     let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
@@ -693,7 +750,7 @@ async fn decide_err_transitions_to_unhealthy_and_keeps_loop_alive() {
         .expect("open fs");
 
     // Empty script → `MockDecide::decide` returns `Err("script exhausted")`
-    // on the first call. That is the Decide-Err we exercise here.
+    // on the first call of cycle 1. That is the Decide-Err we exercise.
     let agent = Agent::new(
         mandate,
         fs,
@@ -707,15 +764,11 @@ async fn decide_err_transitions_to_unhealthy_and_keeps_loop_alive() {
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    // step_cap fired *after* the Decide-Err was caught and the tracker
-    // transitioned — that's the property under test.
     assert!(
         reason.contains("step_cap"),
         "expected step_cap retirement, got: {reason}"
     );
 
-    // The Decide-Err must have transitioned the tracker to Unhealthy
-    // and the run loop kept going long enough for step_cap to fire.
     let v: serde_json::Value = serde_json::from_slice(
         &std::fs::read(tmp.path().join("health.json")).expect("read health"),
     )
@@ -744,184 +797,12 @@ async fn decide_err_transitions_to_unhealthy_and_keeps_loop_alive() {
     );
 }
 
-/// Regression test for the bug that motivated moving correction state off
-/// the trigger queue: an external trigger landing in the queue between an
-/// apply-time failure and the correction-continuation tick must NOT reset
-/// the per-tick retry budget.
-///
-/// Before this fix, mid-correction continuation was signaled by a
-/// self-injected synthetic trigger; the next tick classified itself as
-/// "correction-only" by inspecting drained triggers. A racing external
-/// trigger arriving in the same window made `is_correction_only` false,
-/// which called `begin_tick` and reset the budget — so a noisy producer
-/// could grant unlimited correction attempts. With `pending_correction`
-/// stored on the agent, the classification is a stored fact; this
-/// scenario must still exhaust the budget after the configured number of
-/// failures.
-///
-/// Timing reproduction: tick 1's `Decide::decide` injects an external
-/// trigger via a captured `SignalSink` *before* returning the bad
-/// `CallTool`. By the time tick 1's dispatch sets `pending_correction`,
-/// the external is buffered. Tick 2's drain sees `[External]`. Under the
-/// old design, that drain (one external, zero synthetic-correction-kind
-/// triggers) would have flipped `is_correction_only` to false and reset
-/// the budget. Under the new design, `pending_correction.is_some()`
-/// short-circuits the `begin_tick` call and the budget accumulates,
-/// exhausting on tick 2's failure as required.
-///
-/// budget = `RetryBudget::new(1, 3)` → max_inference = 1 → two apply-time
-/// failures within one continuous window exhaust.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn apply_failure_correction_budget_is_immune_to_concurrent_external_triggers() {
-    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
-    mandate.step_cap = Some(3);
-    let script = vec![
-        // Tick 1 (fresh): the wrapper Decide injects an external trigger,
-        // then returns this bad CallTool. record_failure ok (counter=1)
-        // → pending_correction set.
-        Decision::CallTools {
-            calls: vec![ToolCall::new(
-                "no_such_tool",
-                json!({}),
-                ClaimSeed::new("seed-1"),
-            )],
-        },
-        // Tick 2 (correction continuation; drain pulls the racing
-        // external trigger, but pending_correction.is_some() so
-        // begin_tick is skipped): bad CallTool again → counter=2 >
-        // max=1 → BudgetExhausted → Unhealthy.
-        Decision::CallTools {
-            calls: vec![ToolCall::new(
-                "no_such_tool",
-                json!({}),
-                ClaimSeed::new("seed-1"),
-            )],
-        },
-        // Tick 3 (fresh — pending_correction cleared on the Unhealthy
-        // transition): valid Idle → mark_tick_success → archives the
-        // incident and flips back to Healthy.
-        Decision::Idle {
-            next_after: Duration::from_millis(50),
-        },
-    ];
-
-    // The wrapper Decide needs a `SignalSink` for the same `TriggerQueue`
-    // the agent runs against, but the agent owns its queue and only
-    // exposes a sink via `signal()` — which we can't call until after
-    // `Agent::new` consumes the Decide. Resolve the cycle with a deferred
-    // slot: the wrapper holds `Arc<Mutex<Option<SignalSink>>>`, we move
-    // the wrapper into the agent, then fill the slot with the agent's
-    // sink before spawning `run()`.
-    let pending_sink: Arc<Mutex<Option<SignalSink>>> = Arc::new(Mutex::new(None));
-
-    struct DeferredSinkDecide {
-        inner: MockDecide,
-        sink_slot: Arc<Mutex<Option<SignalSink>>>,
-        inject_on_call: u32,
-        calls: Mutex<u32>,
-    }
-    #[async_trait]
-    impl Decide for DeferredSinkDecide {
-        async fn decide(&self, ctx: ContextBundle) -> anyhow::Result<Decision> {
-            let n = {
-                let mut c = self.calls.lock().unwrap();
-                let n = *c;
-                *c += 1;
-                n
-            };
-            if n == self.inject_on_call {
-                let guard = self.sink_slot.lock().unwrap();
-                guard
-                    .as_ref()
-                    .expect("sink must be installed before run starts")
-                    .send(coral_node::trigger::Trigger::External {
-                        kind: "interfering_producer".into(),
-                        payload: json!({"noise": true}),
-                    })
-                    .expect("inject");
-            }
-            self.inner.decide(ctx).await
-        }
-    }
-
-    let decide = DeferredSinkDecide {
-        inner: MockDecide::new(script),
-        sink_slot: pending_sink.clone(),
-        inject_on_call: 0,
-        calls: Mutex::new(0),
-    };
-
-    let agent = Agent::new(
-        mandate,
-        fs,
-        decide,
-        registry_with_echo(),
-        fresh_health_with(tmp.path(), RetryBudget::new(1, 3)),
-    );
-    *pending_sink.lock().unwrap() = Some(agent.signal());
-
-    let handle = tokio::spawn(agent.run());
-
-    let RetireReason(reason) = timeout(Duration::from_secs(5), handle)
-        .await
-        .expect("agent did not retire in time")
-        .expect("join")
-        .expect("run ok");
-    assert_eq!(reason, "step_cap (3) reached");
-
-    // The archive must hold exactly one Unhealthy incident with a
-    // retry_trail of length 2 — proof that the budget exhausted on tick 2
-    // despite the racing trigger landing in tick 2's drain. Under the old
-    // design, the racing trigger would have caused tick 2 to call
-    // begin_tick, the test would never archive an incident, and this
-    // assertion would fail.
-    let archive_dir = tmp.path().join("health");
-    assert!(
-        archive_dir.is_dir(),
-        "archive dir should be created on recovery — \
-         absence means the budget was reset by the racing external trigger"
-    );
-    let archived: Vec<_> = std::fs::read_dir(&archive_dir)
-        .expect("read archive")
-        .map(|e| e.expect("dirent").path())
-        .collect();
-    assert_eq!(
-        archived.len(),
-        1,
-        "exactly one archived incident expected (budget exhausted), got: {archived:?}"
-    );
-
-    let inc: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&archived[0]).expect("read archive"))
-            .expect("parse archive");
-    let retry_trail = inc
-        .get("incident")
-        .and_then(|i| i.get("retry_trail"))
-        .and_then(|x| x.as_array())
-        .expect("retry_trail");
-    assert_eq!(
-        retry_trail.len(),
-        2,
-        "retry trail should accumulate both apply-time attempts despite the race"
-    );
-}
-
 /// Test-only `Tool` impl: fails its first `fail_count` calls with a
 /// caller-supplied `anyhow::Error`, then succeeds. Used to exercise the
-/// agent-side `ApplyOutcome::ToolError` path without standing up an MCP
-/// server in tests. We pass an `anyhow::Error` as the failure mode rather
-/// than going through `McpTool`'s `RetryPolicy` because:
-///
-/// 1. The unit tests in `src/mcp/tool.rs` already cover the
-///    `RetryPolicy` mechanics — first-try success, second-try success
-///    after a transient failure, exhaustion after the configured number
-///    of attempts.
-/// 2. From the agent run loop's perspective, "the tool errored" is the
-///    only observable signal — by the time `tools.call(...)` returns
-///    `Err`, the tool has already exhausted whatever retry policy it was
-///    configured with. The integration tests below assert the run-loop
-///    wiring (budget accounting + `Unhealthy` transition + recovery)
-///    given that surface.
+/// agent-side tool-failure path without standing up an MCP server. By the
+/// time `tools.call(...)` returns `Err`, the tool has already exhausted
+/// whatever retry policy it was configured with — "the tool errored" is the
+/// only observable signal at the run-loop boundary.
 struct FlakyTool {
     name: String,
     /// Remaining failures before the tool starts succeeding. Decremented
@@ -964,25 +845,19 @@ fn registry_with_flaky(name: &str, fail_count: u32) -> ToolRegistry {
     r
 }
 
-/// A tool that fails persistently exhausts the per-tick
+/// A tool that fails persistently exhausts the per-cycle
 /// `FailureKind::ToolCall` budget and trips the tracker to `Unhealthy`.
-/// We pin `max_tool = 0` so a single exhausted call exhausts the budget
-/// — each exhausted tool call counts as one tick-level slot, and with
-/// budget = 0 the first one trips it. The run loop must **not** halt —
-/// verified by the fact that the script
-/// then runs a successful `Idle` and a `Retire` decision in the recovery
-/// test below.
+/// We pin `max_tool = 0` so a single exhausted call exhausts the budget,
+/// ending the cycle. The run loop must **not** halt.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn tool_call_exhausts_retry_budget_trips_unhealthy() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
     mandate.step_cap = Some(1);
-    // Tool fails forever within the lifetime of this test.
     let registry = registry_with_flaky("flaky", u32::MAX);
     let script = vec![
-        // Tick 1: model calls the flaky tool → tool errors →
-        // ApplyOutcome::ToolError → record_failure(ToolCall, _) →
-        // budget exhausted (max_tool=0) → transition_to_unhealthy.
-        // Run loop continues, then the `step_cap` cap stops it.
+        // Cycle 1, step 1: model calls the flaky tool → tool errors →
+        // ToolError → record_failure(ToolCall) → budget exhausted
+        // (max_tool=0) → transition_to_unhealthy, cycle ends.
         Decision::CallTools {
             calls: vec![ToolCall::new(
                 "flaky",
@@ -991,8 +866,6 @@ async fn tool_call_exhausts_retry_budget_trips_unhealthy() {
             )],
         },
     ];
-    // Anchor budget shape explicitly: max_inference=1 keeps inference
-    // path healthy, max_tool=0 trips on the first exhausted tool call.
     let agent = Agent::new(
         mandate,
         fs,
@@ -1009,10 +882,6 @@ async fn tool_call_exhausts_retry_budget_trips_unhealthy() {
         .expect("run ok");
     assert_eq!(reason, "step_cap (1) reached");
 
-    // Tick 1 transitioned to Unhealthy; the `step_cap` cap then stops the
-    // loop on the next iteration without running another decision, so the
-    // live health.json should still be Unhealthy when the loop exited.
-    // (Recovery is exercised in the companion test below.)
     let v: serde_json::Value = serde_json::from_slice(
         &std::fs::read(tmp.path().join("health.json")).expect("read health"),
     )
@@ -1045,7 +914,6 @@ async fn tool_call_exhausts_retry_budget_trips_unhealthy() {
             .contains("flaky tool"),
         "incident details should preserve the underlying error message"
     );
-    // No evidence record was persisted for the failed call.
     let evidence_dir = tmp.path().join("evidence");
     assert!(
         agent_record_files(&evidence_dir).is_empty(),
@@ -1054,22 +922,18 @@ async fn tool_call_exhausts_retry_budget_trips_unhealthy() {
     );
 }
 
-/// After the per-tick tool-call budget exhausts and trips `Unhealthy`,
-/// the very next successful tick must recover the tracker to `Healthy`
-/// and archive the prior incident — the same recovery contract
-/// `src/health.rs` defines for the inference path. We reuse the same
-/// flaky tool but only fail it once, so the next tick's `CallTool`
-/// succeeds and the tick is marked successful.
+/// After the per-cycle tool-call budget exhausts and trips `Unhealthy`, the
+/// very next successful cycle must recover the tracker to `Healthy` and
+/// archive the prior incident. We reuse the flaky tool but fail it only
+/// once, so cycle 2's `CallTool` succeeds and that cycle's `Idle` marks
+/// success.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
+async fn tool_call_exhaustion_recovers_on_next_successful_cycle() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
     mandate.step_cap = Some(2);
-    // Fail exactly once: tick 1 exhausts (budget=0 trips immediately),
-    // tick 2's CallTool succeeds, mark_tick_success archives the
-    // Unhealthy incident.
     let registry = registry_with_flaky("flaky", 1);
     let script = vec![
-        // Tick 1: tool errors → Unhealthy.
+        // Cycle 1: tool errors → budget=0 trips → Unhealthy, cycle ends.
         Decision::CallTools {
             calls: vec![ToolCall::new(
                 "flaky",
@@ -1077,11 +941,8 @@ async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
                 ClaimSeed::new("seed-1"),
             )],
         },
-        // Tick 2 (fresh — tick 1's BudgetExhausted with max_tool=0
-        // cleared pending_correction in the Unhealthy transition, so
-        // begin_tick runs again): tool succeeds → ApplyOutcome::Continue
-        // → mark_tick_success → archive incident and flip back to
-        // Healthy.
+        // Cycle 2: tool succeeds → observation appended → idle →
+        // mark_tick_success → archive incident and flip back to Healthy.
         Decision::CallTools {
             calls: vec![ToolCall::new(
                 "flaky",
@@ -1089,6 +950,7 @@ async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
                 ClaimSeed::new("seed-2"),
             )],
         },
+        idle(),
     ];
     let agent = Agent::new(
         mandate,
@@ -1106,8 +968,6 @@ async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
         .expect("run ok");
     assert_eq!(reason, "step_cap (2) reached");
 
-    // Live health.json now reflects Healthy with `since` at the
-    // recovery tick's timestamp.
     let v: serde_json::Value = serde_json::from_slice(
         &std::fs::read(tmp.path().join("health.json")).expect("read health"),
     )
@@ -1115,11 +975,10 @@ async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
     assert_eq!(
         v.get("state").and_then(|x| x.as_str()),
         Some("Healthy"),
-        "next successful tick must recover the tracker to Healthy"
+        "next successful cycle must recover the tracker to Healthy"
     );
     assert!(v.get("incident").is_none() || v.get("incident").unwrap().is_null());
 
-    // Prior Unhealthy incident archived under health/<transitioned_at>.
     let archive_dir = tmp.path().join("health");
     assert!(
         archive_dir.is_dir(),
@@ -1146,7 +1005,6 @@ async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
         "archived incident must preserve the tool-call kind"
     );
 
-    // Recovery tick's successful CallTool must have persisted evidence.
     let evidence_dir = tmp.path().join("evidence");
     assert!(
         evidence_dir.is_dir(),
@@ -1156,48 +1014,41 @@ async fn tool_call_exhaustion_recovers_on_next_successful_tick() {
     assert_eq!(
         evs.len(),
         1,
-        "exactly one evidence record expected from the recovery tick"
+        "exactly one evidence record expected from the recovery cycle"
     );
 }
 
-/// Capturing `Decide` wrapper that snapshots every `ContextBundle` it
-/// sees and defers to a `MockDecide` script. Used by the tool-failure
-/// correction tests to assert on the bundle the run loop hands the
-/// model on the post-tool-failure tick — that's the surface the
-/// corrective signal rides on.
+/// Capturing `Decide` wrapper that snapshots every `Session` it sees and
+/// defers to a `MockDecide` script. Used to assert on the session the run
+/// loop hands the model on a post-failure step — that's the surface the
+/// in-cycle corrective signal rides on (replacing the old cross-tick
+/// `ContextBundle.correction`).
 struct CapturingDecide {
     inner: MockDecide,
-    seen: Arc<Mutex<Vec<ContextBundle>>>,
+    seen: Arc<Mutex<Vec<Session>>>,
 }
 
 #[async_trait]
 impl Decide for CapturingDecide {
-    async fn decide(&self, ctx: ContextBundle) -> anyhow::Result<Decision> {
-        self.seen.lock().unwrap().push(ctx.clone());
-        self.inner.decide(ctx).await
+    async fn decide(&self, session: &Session) -> anyhow::Result<Decision> {
+        self.seen.lock().unwrap().push(session.clone());
+        self.inner.decide(session).await
     }
 }
 
-/// When a `CallTool` exhausts its retry budget inside the tool
-/// (surfaces as `Err` from `tools.call`) and the per-tick
-/// `FailureKind::ToolCall` budget still has room, the run loop must
-/// stage a `CorrectionContext` so the next tick's `ContextBundle`
-/// carries a corrective signal describing the failure (tool name, args,
-/// error). This mirrors the apply-time correction loop: the model gets
-/// a chance to self-correct rather than rediscovering from scratch why
-/// its last decision failed.
+/// When a `CallTool` exhausts its retry budget inside the tool (surfaces as
+/// `Err` from `tools.call`) and the per-cycle `FailureKind::ToolCall` budget
+/// still has room, the failure is folded into the session as a failure
+/// observation the *next step of the same cycle* reasons over. This replaces
+/// the old cross-tick correction: the model self-corrects inline.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn tool_call_failure_stages_correction_visible_on_next_tick_bundle() {
+async fn tool_call_failure_is_visible_as_in_cycle_observation() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
-    mandate.step_cap = Some(2);
-    // Tool fails twice: tick 1's CallTool errors (after the tool's
-    // internal RetryPolicy gives up); tick 2's CallTool also errors but
-    // the test exits before exhausting the budget — we only care that
-    // tick 2 saw a correction in its bundle.
+    mandate.step_cap = Some(1);
     let registry = registry_with_flaky("flaky", u32::MAX);
     let script = vec![
-        // Tick 1: bad CallTool → tool errors → record_failure ok (budget
-        // has room) → pending_correction set.
+        // Step 1: bad CallTool → tool errors → record_failure ok (budget
+        // has room) → failure observation appended to the session.
         Decision::CallTools {
             calls: vec![ToolCall::new(
                 "flaky",
@@ -1205,17 +1056,11 @@ async fn tool_call_failure_stages_correction_visible_on_next_tick_bundle() {
                 ClaimSeed::new("seed-1"),
             )],
         },
-        // Tick 2 (correction continuation): idle so the test terminates
-        // via the `step_cap` cap. The bundle this decide() sees must
-        // carry the correction from tick 1.
-        Decision::Idle {
-            next_after: Duration::from_millis(50),
-        },
+        // Step 2: idle so the cycle terminates. The session this decide()
+        // sees must carry the failure observation from step 1.
+        idle(),
     ];
-    // Anchor budget so tick 1 fits comfortably: max_tool=3 → tick 1's
-    // single failure stays under the cap, and pending_correction is
-    // staged rather than the tracker tripping to Unhealthy.
-    let seen: Arc<Mutex<Vec<ContextBundle>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen: Arc<Mutex<Vec<Session>>> = Arc::new(Mutex::new(Vec::new()));
     let decide = CapturingDecide {
         inner: MockDecide::new(script),
         seen: seen.clone(),
@@ -1234,53 +1079,53 @@ async fn tool_call_failure_stages_correction_visible_on_next_tick_bundle() {
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "step_cap (2) reached");
+    assert_eq!(reason, "step_cap (1) reached");
 
     let captured = seen.lock().unwrap().clone();
     assert_eq!(
         captured.len(),
         2,
-        "expected exactly two decide() invocations, got {}",
+        "expected exactly two decide() invocations (two steps), got {}",
         captured.len()
     );
 
-    // Tick 1's bundle: no correction (this is the failure-generating
-    // tick, not the continuation).
+    // Step 1's session: empty — this is the failure-generating step.
     assert!(
-        captured[0].correction.is_none(),
-        "tick 1 must not carry a correction: it generates the failure"
+        captured[0].steps.is_empty(),
+        "step 1 must see an empty session: it generates the failure"
     );
 
-    // Tick 2's bundle: a correction describing the tool failure.
-    let correction = captured[1]
-        .correction
-        .as_ref()
-        .expect("tick 2 must carry a correction staged by tick 1");
-    let failure = &correction.failure;
-    // Tool name surfaced (quoted, per the helper's contract).
-    assert!(
-        failure.contains("\"flaky\""),
-        "correction should name the failed tool, got: {failure}"
+    // Step 2's session: one step whose observation describes the tool
+    // failure (tool name, args, error, next-step cue).
+    assert_eq!(
+        captured[1].steps.len(),
+        1,
+        "step 2 must see the failed step"
     );
-    // Args surfaced verbatim — model sees what it sent.
+    let obs = &captured[1].steps[0].observation;
+    assert!(!obs.ok, "the recorded step's observation must be a failure");
     assert!(
-        failure.contains("{\"n\":3,\"q\":\"what\"}"),
-        "correction should include args summary, got: {failure}"
+        obs.content.contains("\"flaky\""),
+        "observation should name the failed tool, got: {}",
+        obs.content
     );
-    // Error string preserved so the model can diagnose.
     assert!(
-        failure.contains("flaky tool"),
-        "correction should preserve underlying error message, got: {failure}"
+        obs.content.contains("{\"n\":3,\"q\":\"what\"}"),
+        "observation should include args summary, got: {}",
+        obs.content
     );
-    // Concrete next-step instruction.
     assert!(
-        failure.contains("different decision"),
-        "correction should end with a next-step cue, got: {failure}"
+        obs.content.contains("flaky tool"),
+        "observation should preserve underlying error message, got: {}",
+        obs.content
+    );
+    assert!(
+        obs.content.contains("different decision"),
+        "observation should end with a next-step cue, got: {}",
+        obs.content
     );
 
-    // Sanity: the agent stayed Healthy because the per-tick tool-call
-    // budget had room (max_tool=3, only one failure recorded before
-    // retire). No archive directory should have been created.
+    // Sanity: the agent stayed Healthy — one failure under a 3-slot budget.
     let v: serde_json::Value = serde_json::from_slice(
         &std::fs::read(tmp.path().join("health.json")).expect("read health"),
     )
@@ -1292,21 +1137,15 @@ async fn tool_call_failure_stages_correction_visible_on_next_tick_bundle() {
     );
 }
 
-/// After a tool failure stages a correction, the next tick uses the
-/// corrective context to emit a *different* decision (here, a different
-/// tool call that succeeds), the tick completes via
-/// `ApplyOutcome::Continue`, and the agent stays / returns to `Healthy`.
-/// Symmetric to `invalid_call_tool_stages_correction_then_recovers`.
-///
-/// We assert against a `CapturingDecide` again so we can show the second
-/// tick saw the correction *and* emitted a different `Decision`.
+/// After a tool failure becomes an in-cycle observation, the model uses it
+/// to take a *different* step (here, a different tool that succeeds) within
+/// the same cycle, then idles. The agent stays `Healthy`. Symmetric to
+/// `invalid_call_tool_is_recoverable_in_cycle_failure`, asserting via a
+/// `CapturingDecide` that the second step saw the failure observation.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn tool_call_failure_correction_then_different_decision_recovers_to_healthy() {
+async fn tool_call_failure_then_different_step_recovers_within_cycle() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
-    mandate.step_cap = Some(3);
-    // Two tools: `flaky` fails forever; `echo` always succeeds. The
-    // script drives the model to call `flaky` first, see the correction,
-    // and then call `echo` on the continuation.
+    mandate.step_cap = Some(1);
     let mut registry = ToolRegistry::new();
     registry
         .register(Arc::new(FlakyTool::new("flaky", u32::MAX)))
@@ -1316,7 +1155,7 @@ async fn tool_call_failure_correction_then_different_decision_recovers_to_health
         .expect("register echo");
 
     let script = vec![
-        // Tick 1: CallTool flaky → errors → pending_correction set.
+        // Step 1: CallTool flaky → errors → failure observation appended.
         Decision::CallTools {
             calls: vec![ToolCall::new(
                 "flaky",
@@ -1324,11 +1163,8 @@ async fn tool_call_failure_correction_then_different_decision_recovers_to_health
                 ClaimSeed::new("seed-flaky"),
             )],
         },
-        // Tick 2 (correction continuation): the model sees the
-        // correction in the bundle and emits a *different* decision
-        // (calls echo instead). That succeeds → ApplyOutcome::Continue
-        // → mark_tick_success → pending_correction cleared, tracker
-        // stays Healthy.
+        // Step 2: model sees the failure observation and takes a different
+        // step (echo) which succeeds.
         Decision::CallTools {
             calls: vec![ToolCall::new(
                 "echo",
@@ -1336,20 +1172,14 @@ async fn tool_call_failure_correction_then_different_decision_recovers_to_health
                 ClaimSeed::new("seed-echo"),
             )],
         },
-        // Tick 3 (fresh — recovery cleared pending_correction): idle so
-        // the test terminates via the `step_cap` cap.
-        Decision::Idle {
-            next_after: Duration::from_millis(50),
-        },
+        // Step 3: idle, ending the cycle.
+        idle(),
     ];
-    let seen: Arc<Mutex<Vec<ContextBundle>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen: Arc<Mutex<Vec<Session>>> = Arc::new(Mutex::new(Vec::new()));
     let decide = CapturingDecide {
         inner: MockDecide::new(script),
         seen: seen.clone(),
     };
-    // Budget with enough rope: max_tool=3 so the single failure on tick
-    // 1 stays under cap. The point of this test is the recovery happens
-    // before exhaustion ever fires.
     let agent = Agent::new(
         mandate,
         fs,
@@ -1364,32 +1194,25 @@ async fn tool_call_failure_correction_then_different_decision_recovers_to_health
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "step_cap (3) reached");
+    assert_eq!(reason, "step_cap (1) reached");
 
     let captured = seen.lock().unwrap().clone();
     assert_eq!(captured.len(), 3, "expected three decide() invocations");
 
-    // Tick 2 saw the correction — that's how it "knew" to choose a
-    // different tool. This pins the correction-was-visible property.
-    let correction = captured[1]
-        .correction
-        .as_ref()
-        .expect("tick 2 must see the correction staged by tick 1's tool failure");
+    // Step 2 saw the flaky failure observation — that's how it "knew" to
+    // choose a different tool.
+    assert_eq!(captured[1].steps.len(), 1);
     assert!(
-        correction.failure.contains("\"flaky\""),
-        "correction should name the failed tool, got: {}",
-        correction.failure
+        captured[1].steps[0]
+            .observation
+            .content
+            .contains("\"flaky\""),
+        "step 2 must see the failure observation from step 1's tool failure, got: {}",
+        captured[1].steps[0].observation.content
     );
 
-    // Tick 3 is a fresh tick (recovery cleared pending_correction), so
-    // it carries no correction.
-    assert!(
-        captured[2].correction.is_none(),
-        "tick 3 must not carry a correction: tick 2 succeeded and cleared it"
-    );
-
-    // Health stays Healthy across the whole cycle: single failure under
-    // the per-tick budget, then a success, then retire.
+    // Health stays Healthy across the cycle: one failure under the
+    // per-cycle budget, then a success, then idle.
     let v: serde_json::Value = serde_json::from_slice(
         &std::fs::read(tmp.path().join("health.json")).expect("read health"),
     )
@@ -1397,16 +1220,15 @@ async fn tool_call_failure_correction_then_different_decision_recovers_to_health
     assert_eq!(
         v.get("state").and_then(|x| x.as_str()),
         Some("Healthy"),
-        "agent must stay Healthy: failure was absorbed by the correction loop"
+        "agent must stay Healthy: failure was absorbed within the cycle"
     );
-    // No archive directory: tracker never transitioned to Unhealthy.
     assert!(
         !tmp.path().join("health").exists(),
         "no archive directory should exist when the agent never tripped Unhealthy"
     );
 
-    // Recovery tick's successful CallTool must have persisted exactly
-    // one evidence record (from echo). The flaky tool produced none.
+    // The recovery step's successful echo persisted exactly one evidence
+    // record (the flaky tool produced none).
     let evidence_dir = tmp.path().join("evidence");
     let evs = agent_record_files(&evidence_dir);
     assert_eq!(
@@ -1416,34 +1238,22 @@ async fn tool_call_failure_correction_then_different_decision_recovers_to_health
     );
 }
 
-/// Per-mandate `recent_outputs` cap reaches the run loop end-to-end.
-///
-/// Pre-seed 5 outputs on disk, then run an agent whose mandate's
-/// `ContextPolicy::recent_outputs = 2`. The bundle the run loop hands
-/// `Decide::decide` on the first tick must carry at most 2 outputs.
+/// The cycle seed's FS index reaches the run loop. Pre-seed notes + outputs
+/// on disk, then run an agent whose first step is `Idle`; the captured
+/// session's seed must carry pointers (filenames) to those files — the
+/// pull-navigation surface the model reads from, not file bodies.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn per_mandate_recent_outputs_cap_reaches_the_run_loop() {
-    let tmp = TempDir::new().expect("tempdir");
-    let mandate = Mandate {
-        text: "tiny window".into(),
-        idle_period: Some(Duration::from_millis(50)),
-        step_cap: Some(1),
-        retry_policy: None,
-        context_policy: ContextPolicy {
-            recent_outputs: 2,
-            recent_evidence: 8,
-            open_claims_max: 32,
-        },
-        model: None,
-        tools: Vec::new(),
-    };
-    let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
-        .await
-        .expect("open fs");
+async fn seed_index_reaches_the_run_loop() {
+    let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
+    mandate.step_cap = Some(1);
 
-    // Seed 5 outputs by going through the FS directly (the production
-    // path); each cites the same evidence record so the provenance contract
-    // is satisfied.
+    // Seed a note + an output via the production FS path.
+    fs.apply_ops(vec![FsOp::WriteFile {
+        path: "notes/plan.md".into(),
+        content: "the plan".into(),
+    }])
+    .await
+    .expect("seed note");
     let ev_id = fs
         .record_evidence(EvidenceRecord::new(
             "echo",
@@ -1453,21 +1263,14 @@ async fn per_mandate_recent_outputs_cap_reaches_the_run_loop() {
         ))
         .await
         .expect("record evidence");
-    for i in 0..5 {
-        fs.persist_output(&format!("seed-output-{i}"), &[ev_id.clone()])
-            .await
-            .expect("persist output");
-    }
-    // Sanity: the FS layer agrees five outputs are on disk.
-    assert_eq!(fs.list_recent_outputs(usize::MAX).await.unwrap().len(), 5);
+    let out = fs
+        .persist_output("a finding", &[ev_id])
+        .await
+        .expect("persist output");
 
-    // Single-tick script: idle on the first decide so we exit via the
-    // `step_cap` cap immediately after observing the bundle.
-    let seen: Arc<Mutex<Vec<ContextBundle>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen: Arc<Mutex<Vec<Session>>> = Arc::new(Mutex::new(Vec::new()));
     let decide = CapturingDecide {
-        inner: MockDecide::new(vec![Decision::Idle {
-            next_after: Duration::from_millis(50),
-        }]),
+        inner: MockDecide::new(vec![idle()]),
         seen: seen.clone(),
     };
     let agent = Agent::new(
@@ -1488,41 +1291,36 @@ async fn per_mandate_recent_outputs_cap_reaches_the_run_loop() {
 
     let captured = seen.lock().unwrap().clone();
     assert_eq!(captured.len(), 1, "expected exactly one decide()");
-    let bundle = &captured[0];
+    let seed = &captured[0].seed;
     assert_eq!(
-        bundle.recent_outputs.len(),
-        2,
-        "per-mandate recent_outputs cap should have shrunk the bundle from 5 to 2"
+        seed.index.notes,
+        vec!["plan.md".to_string()],
+        "seed index must point at the note filename"
     );
-    // The cap is also reflected on the bundle's mandate snapshot (the
-    // bundle clones the mandate verbatim).
-    assert_eq!(bundle.mandate.context_policy.recent_outputs, 2);
+    assert_eq!(
+        seed.index.outputs,
+        vec![format!("{}.json", out.id)],
+        "seed index must point at the output filename"
+    );
 }
 
-/// K=3 parallel tool calls in a single tick. All three succeed; the
-/// agent loop must persist three distinct evidence records in input
-/// order and continue cleanly to the next tick's `EmitOutput`. Models
-/// the "synthesize 3 file reads in one tick" path.
+/// K=3 parallel tool calls in a single step. All three succeed; the agent
+/// loop must persist three distinct evidence records and the cycle proceeds
+/// to `EmitOutput` then `Idle`. Models the "synthesize 3 file reads in one
+/// step" path.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn parallel_call_tools_k3_all_succeed_persists_evidence_in_order() {
+async fn parallel_call_tools_k3_all_succeed_persists_evidence() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
-    mandate.step_cap = Some(2);
-    // Three distinct evidence ids the EmitOutput will cite. EchoTool
-    // produces a content-addressed record per `(name, args, result)`
-    // triple, so picking three distinct args guarantees three distinct
-    // ids.
+    mandate.step_cap = Some(1);
     let args_a = json!({"path": "a.md"});
     let args_b = json!({"path": "b.md"});
     let args_c = json!({"path": "c.md"});
-    let result_a = json!({"echoed": args_a});
-    let result_b = json!({"echoed": args_b});
-    let result_c = json!({"echoed": args_c});
-    let ev_a = EvidenceId::new("echo", &args_a, &result_a);
-    let ev_b = EvidenceId::new("echo", &args_b, &result_b);
-    let ev_c = EvidenceId::new("echo", &args_c, &result_c);
+    let ev_a = EvidenceId::new("echo", &args_a, &json!({"echoed": args_a}));
+    let ev_b = EvidenceId::new("echo", &args_b, &json!({"echoed": args_b}));
+    let ev_c = EvidenceId::new("echo", &args_c, &json!({"echoed": args_c}));
 
     let script = vec![
-        // Tick 1: K=3 parallel call_tool batch — all echo, distinct args.
+        // Step 1: K=3 parallel call_tool batch — all echo, distinct args.
         Decision::CallTools {
             calls: vec![
                 ToolCall::with_tool_use_id(
@@ -1545,11 +1343,12 @@ async fn parallel_call_tools_k3_all_succeed_persists_evidence_in_order() {
                 ),
             ],
         },
-        // Tick 2: cite all three.
+        // Step 2: cite all three.
         Decision::EmitOutput {
             content: "synthesized from 3 reads".into(),
             evidence: vec![ev_a.clone(), ev_b.clone(), ev_c.clone()],
         },
+        idle(),
     ];
     let agent = Agent::new(
         mandate,
@@ -1565,7 +1364,7 @@ async fn parallel_call_tools_k3_all_succeed_persists_evidence_in_order() {
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "step_cap (2) reached");
+    assert_eq!(reason, "step_cap (1) reached");
 
     // Three evidence files on disk, one per call.
     let evidence_dir = tmp.path().join("evidence");
@@ -1590,7 +1389,6 @@ async fn parallel_call_tools_k3_all_succeed_persists_evidence_in_order() {
     let ev_arr = v["evidence"].as_array().expect("evidence array");
     assert_eq!(ev_arr.len(), 3);
 
-    // Health stayed Healthy across the parallel-dispatch tick.
     let v: serde_json::Value = serde_json::from_slice(
         &std::fs::read(tmp.path().join("health.json")).expect("read health"),
     )
@@ -1598,18 +1396,15 @@ async fn parallel_call_tools_k3_all_succeed_persists_evidence_in_order() {
     assert_eq!(v["state"].as_str(), Some("Healthy"));
 }
 
-/// Partial failure: K=3 parallel tool calls where the middle call
-/// fails. Successful siblings must persist their evidence (the model
-/// can cite them next tick), the failure stages a correction describing
-/// only the failed call, and the per-tick `ToolCall` budget is
-/// decremented by exactly one slot — pinning the "K against budget"
-/// accounting documented in `agent.rs`.
+/// Partial failure: K=3 parallel tool calls where the middle call fails.
+/// Successful siblings persist their evidence (the model can cite them on a
+/// later step), and the failure becomes an in-cycle observation describing
+/// only the failed call. The per-cycle `ToolCall` budget is decremented by
+/// exactly one slot — pinning the "K against budget" accounting.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn parallel_call_tools_k3_partial_failure_persists_successes_and_stages_correction() {
+async fn parallel_call_tools_k3_partial_failure_persists_successes_and_observes_failure() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
-    mandate.step_cap = Some(2);
-    // `echo` always succeeds; `flaky` always errors. Mix them in one
-    // batch to exercise the partial-failure dispatch path.
+    mandate.step_cap = Some(1);
     let mut registry = ToolRegistry::new();
     registry
         .register(Arc::new(EchoTool))
@@ -1619,7 +1414,7 @@ async fn parallel_call_tools_k3_partial_failure_persists_successes_and_stages_co
         .expect("register flaky");
 
     let script = vec![
-        // Tick 1: parallel batch — echo, flaky, echo. Two successes
+        // Step 1: parallel batch — echo, flaky, echo. Two successes
         // sandwich one persistent failure.
         Decision::CallTools {
             calls: vec![
@@ -1643,24 +1438,15 @@ async fn parallel_call_tools_k3_partial_failure_persists_successes_and_stages_co
                 ),
             ],
         },
-        // Tick 2: model sees correction; idle so the test terminates via
-        // the `step_cap` cap.
-        Decision::Idle {
-            next_after: Duration::from_millis(50),
-        },
+        // Step 2: model sees the failure observation; idle to end the cycle.
+        idle(),
     ];
 
-    // Capture the bundle on tick 2 so we can confirm the correction
-    // describes only the failed call.
-    let seen: Arc<Mutex<Vec<ContextBundle>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen: Arc<Mutex<Vec<Session>>> = Arc::new(Mutex::new(Vec::new()));
     let decide = CapturingDecide {
         inner: MockDecide::new(script),
         seen: seen.clone(),
     };
-
-    // Generous budget so the single tool failure stages a correction
-    // without exhausting (the test asserts on correction shape, not on
-    // exhaustion).
     let agent = Agent::new(
         mandate,
         fs,
@@ -1675,13 +1461,10 @@ async fn parallel_call_tools_k3_partial_failure_persists_successes_and_stages_co
         .expect("agent did not retire in time")
         .expect("join")
         .expect("run ok");
-    assert_eq!(reason, "step_cap (2) reached");
+    assert_eq!(reason, "step_cap (1) reached");
 
     // Successful sibling evidence stays on disk (the load-bearing
-    // "don't unwind on partial failure" property the dispatch site
-    // documents). The two persisted records correspond to the two
-    // echo siblings — assert by content-addressed id so the test
-    // pins *which* evidence survived, not just that two files exist.
+    // "don't unwind on partial failure" property).
     let echo_a_id = EvidenceId::new("echo", &json!({"k": "a"}), &json!({"echoed": {"k": "a"}}));
     let echo_c_id = EvidenceId::new("echo", &json!({"k": "c"}), &json!({"echoed": {"k": "c"}}));
     let evidence_dir = tmp.path().join("evidence");
@@ -1703,28 +1486,24 @@ async fn parallel_call_tools_k3_partial_failure_persists_successes_and_stages_co
         "evidence for echo(k=c) missing; got: {evs:?}"
     );
 
-    // The next tick's bundle carries the corrective signal naming the
-    // failed tool/args.
+    // The next step's session carries the in-cycle failure observation
+    // naming only the failed tool.
     let captured = seen.lock().unwrap().clone();
     assert_eq!(captured.len(), 2);
-    let correction = captured[1]
-        .correction
-        .as_ref()
-        .expect("tick 2 must see a correction from the partial-batch failure");
+    assert_eq!(captured[1].steps.len(), 1);
+    let obs = &captured[1].steps[0].observation;
+    assert!(!obs.ok);
     assert!(
-        correction.failure.contains("\"flaky\""),
-        "correction must name the failed tool: {}",
-        correction.failure
+        obs.content.contains("\"flaky\""),
+        "observation must name the failed tool: {}",
+        obs.content
     );
-    // No mention of echo, which succeeded — the correction should
-    // describe only what the model needs to fix.
     assert!(
-        !correction.failure.contains("\"echo\""),
-        "correction must not name successful siblings, got: {}",
-        correction.failure
+        !obs.content.contains("\"echo\""),
+        "observation must not name successful siblings, got: {}",
+        obs.content
     );
 
-    // Health stayed Healthy: one tool failure under a 3-slot budget.
     let v: serde_json::Value = serde_json::from_slice(
         &std::fs::read(tmp.path().join("health.json")).expect("read health"),
     )
@@ -1732,10 +1511,10 @@ async fn parallel_call_tools_k3_partial_failure_persists_successes_and_stages_co
     assert_eq!(v["state"].as_str(), Some("Healthy"));
 }
 
-/// K parallel failures must consume K slots in the `FailureKind::ToolCall`
-/// budget. With `max_tool = 2` and a K=3 batch of all-failing calls,
-/// the budget exhausts and the tracker transitions to `Unhealthy`.
-/// Pins the documented "K against budget" choice.
+/// K parallel failures consume K slots in the `FailureKind::ToolCall`
+/// budget. With `max_tool = 2` and a K=3 batch of all-failing calls, the
+/// budget exhausts on the third slot and the cycle ends `Unhealthy`. Pins
+/// the documented "K against budget" choice.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn parallel_call_tools_k3_all_fail_consumes_k_budget_slots_and_trips_unhealthy() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
@@ -1743,8 +1522,8 @@ async fn parallel_call_tools_k3_all_fail_consumes_k_budget_slots_and_trips_unhea
     let registry = registry_with_flaky("flaky", u32::MAX);
 
     let script = vec![
-        // K=3 all-failing batch. With max_tool=2, three failures
-        // exceed the budget on the third recorded slot.
+        // K=3 all-failing batch. With max_tool=2, three failures exceed the
+        // budget on the third recorded slot → Unhealthy, cycle ends.
         Decision::CallTools {
             calls: vec![
                 ToolCall::new("flaky", json!({"i": 1}), ClaimSeed::new("seed-1")),
@@ -1769,10 +1548,6 @@ async fn parallel_call_tools_k3_all_fail_consumes_k_budget_slots_and_trips_unhea
         .expect("run ok");
     assert_eq!(reason, "step_cap (1) reached");
 
-    // K=3 failures with max_tool=2 trips Unhealthy. The archived
-    // incident's retry trail captures all three failures so audit sees
-    // the whole batch even though only the third one tripped the
-    // budget.
     let v: serde_json::Value = serde_json::from_slice(
         &std::fs::read(tmp.path().join("health.json")).expect("read health"),
     )

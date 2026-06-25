@@ -25,7 +25,7 @@ use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 use uuid::Uuid;
 
 use coral_node::agent_ref::{AgentId, GraphId};
-use coral_node::decision::{ContextBundle, Decide, Decision};
+use coral_node::decision::{Decide, Decision, Session};
 use coral_node::evidence::EvidenceRecord;
 use coral_node::fs::AgentFs;
 use coral_node::mandate::Mandate;
@@ -91,23 +91,24 @@ fn ensure_installed() -> Arc<MemoryStorage> {
     SHARED_STORAGE.get().cloned().expect("storage installed")
 }
 
-/// Routes decisions by `bundle.mandate.text` and records every trigger
-/// the parent observes. Falls back to a short `Idle` when a script is
-/// empty so a misconfigured test loops politely rather than panicking.
+/// Routes decisions by `session.seed.mandate.text` and records every
+/// trigger the parent observes. Falls back to a short `Idle` when a
+/// script is empty so a misconfigured test loops politely rather than
+/// panicking.
 struct RoutingDecide;
 
 #[async_trait]
 impl Decide for RoutingDecide {
-    async fn decide(&self, bundle: ContextBundle) -> anyhow::Result<Decision> {
-        let script = match bundle.mandate.text.as_str() {
+    async fn decide(&self, session: &Session) -> anyhow::Result<Decision> {
+        let script = match session.seed.mandate.text.as_str() {
             PARENT_MANDATE_TEXT => {
-                if !bundle.triggers.is_empty() {
+                if !session.seed.triggers.is_empty() {
                     let log = PARENT_OBSERVED_TRIGGERS
                         .get()
                         .expect("PARENT_OBSERVED_TRIGGERS installed")
                         .clone();
                     let mut guard = log.lock().expect("trigger log mutex poisoned");
-                    for t in &bundle.triggers {
+                    for t in &session.seed.triggers {
                         guard.push(t.clone());
                     }
                 }

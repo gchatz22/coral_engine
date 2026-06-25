@@ -1,6 +1,6 @@
 //! `LlmDecide` — `Decide` impl backed by a `ModelClient`.
 //!
-//! Per `decide` call: render the bundle to messages, call
+//! Per `decide` call: render the session to messages, call
 //! `ModelClient::complete` with the decision-tool list, parse the response.
 //! On parse failure: append the bad turn plus a corrective `system` message
 //! and retry up to [`MAX_DECISION_RETRIES`] times; if every attempt fails,
@@ -20,7 +20,7 @@ use tracing::debug;
 
 use crate::decide_llm::prompt;
 use crate::decide_llm::schema::{decision_tools, parse_decision, DecisionParseError};
-use crate::decision::{ContextBundle, Decide, Decision};
+use crate::decision::{Decide, Decision, Session};
 use crate::model_client::{
     CallStats, CompleteOptions, CompleteRequest, ContentBlock, Message, ModelClient, ModelError,
     ModelRegistry, Role,
@@ -134,21 +134,22 @@ impl TickTotals {
 
 #[async_trait]
 impl Decide for LlmDecide {
-    async fn decide(&self, ctx: ContextBundle) -> Result<Decision> {
+    async fn decide(&self, session: &Session) -> Result<Decision> {
         let tools = decision_tools();
         // Resolve the agent's `provider/model` to its client and a bare
-        // model id. The pair rides every attempt this tick, including the
+        // model id. The pair rides every attempt this step, including the
         // corrective retry. An unregistered provider is an operator
         // misconfig surfacing here; the run loop escalates it to Unhealthy.
+        let model_name = session.seed.mandate.model.as_deref();
         let (client, model) = self
             .registry
-            .resolve(ctx.mandate.model.as_deref())
-            .map_err(|e| anyhow!("resolving model {:?}: {e}", ctx.mandate.model))?;
+            .resolve(model_name)
+            .map_err(|e| anyhow!("resolving model {model_name:?}: {e}"))?;
         // Conversation grows across attempts: original prompt, then for
         // each parse failure an assistant-echo of the bad turn followed by
         // a system-role corrective. The model sees its full failure
         // history, not just the most recent miss.
-        let mut messages = prompt::render(&ctx);
+        let mut messages = prompt::render(session);
         let mut errors: Vec<DecisionParseError> = Vec::new();
         let total_attempts = MAX_DECISION_RETRIES + 1;
 
@@ -312,11 +313,11 @@ fn synthesized_tool_results(ids: &[String]) -> Message {
 fn corrective_system_text(err: &DecisionParseError) -> String {
     format!(
         "Your previous tool-use response could not be parsed into a Decision: {err}. \
-         Reply by calling exactly one terminal decision tool \
-         (`emit_output`, `rewrite_fs`, `idle`, `retire`) \
+         Reply by calling exactly one decision tool \
+         (`read`, `list`, `search`, `emit_output`, `rewrite_fs`, `idle`) \
          OR one or more `call_tool` blocks dispatched together as a single \
          parallel batch, with schema-correct arguments. Do not mix `call_tool` \
-         with a terminal decision tool in the same response."
+         with another decision tool in the same response."
     )
 }
 
@@ -333,7 +334,7 @@ mod tests {
     //! no live HTTP traffic.
 
     use super::*;
-    use crate::decision::{ClaimSeed, ContextBundle, ToolCall as DecisionToolCall};
+    use crate::decision::{ClaimSeed, FsIndex, Seed, ToolCall as DecisionToolCall};
     use crate::evidence::EvidenceId;
     use crate::mandate::Mandate;
     use crate::model_client::{CompleteResponse, ToolCall, Usage, Vendor};
@@ -466,15 +467,12 @@ mod tests {
         }
     }
 
-    fn empty_bundle() -> ContextBundle {
-        ContextBundle {
-            mandate: Mandate::new("test", Duration::from_secs(1), Some(1)),
-            triggers: vec![],
-            recent_outputs: vec![],
-            recent_evidence: vec![],
-            open_claims: vec![],
-            correction: None,
-        }
+    fn empty_session() -> Session {
+        Session::new(Seed::new(
+            Mandate::new("test", Duration::from_secs(1), Some(1)),
+            vec![],
+            FsIndex::default(),
+        ))
     }
 
     #[tokio::test]
@@ -484,7 +482,7 @@ mod tests {
         ]))]);
         let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
 
-        let dec = decide.decide(empty_bundle()).await.unwrap();
+        let dec = decide.decide(&empty_session()).await.unwrap();
         assert_eq!(
             dec,
             Decision::Idle {
@@ -506,9 +504,9 @@ mod tests {
         ]);
         let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
 
-        let mut bundle = empty_bundle();
-        bundle.mandate.model = Some("claude-opus-4-8".into());
-        decide.decide(bundle).await.unwrap();
+        let mut session = empty_session();
+        session.seed.mandate.model = Some("claude-opus-4-8".into());
+        decide.decide(&session).await.unwrap();
 
         let seen = mock.seen();
         assert_eq!(seen.len(), 2, "expected initial + corrective request");
@@ -543,9 +541,9 @@ mod tests {
         .unwrap();
         let decide = LlmDecide::with_registry(registry, CompleteOptions::default());
 
-        let mut bundle = empty_bundle();
-        bundle.mandate.model = Some("cohere/command-a".into());
-        decide.decide(bundle).await.unwrap();
+        let mut session = empty_session();
+        session.seed.mandate.model = Some("cohere/command-a".into());
+        decide.decide(&session).await.unwrap();
 
         // The cohere prefix routes to the cohere client, carrying the bare
         // model id; the anthropic client is never touched.
@@ -570,9 +568,9 @@ mod tests {
         .unwrap();
         let decide = LlmDecide::with_registry(registry, CompleteOptions::default());
 
-        let mut bundle = empty_bundle();
-        bundle.mandate.model = Some("local/llama-3".into());
-        let err = decide.decide(bundle).await.unwrap_err();
+        let mut session = empty_session();
+        session.seed.mandate.model = Some("local/llama-3".into());
+        let err = decide.decide(&session).await.unwrap_err();
         assert!(
             err.to_string().contains("unknown provider `local`"),
             "expected unknown-provider error, got: {err}"
@@ -592,7 +590,7 @@ mod tests {
             good_idle_call(),
         ]))]);
         let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
-        decide.decide(empty_bundle()).await.unwrap();
+        decide.decide(&empty_session()).await.unwrap();
         assert_eq!(mock.seen()[0].model, None);
     }
 
@@ -606,7 +604,7 @@ mod tests {
         ]);
         let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
 
-        let dec = decide.decide(empty_bundle()).await.unwrap();
+        let dec = decide.decide(&empty_session()).await.unwrap();
         assert_eq!(
             dec,
             Decision::CallTools {
@@ -688,7 +686,7 @@ mod tests {
             MockOutcome::Resp(resp_with_tool_calls(vec![good_idle_call()])),
         ]);
         let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
-        decide.decide(empty_bundle()).await.unwrap();
+        decide.decide(&empty_session()).await.unwrap();
 
         let seen = mock.seen();
         assert_eq!(seen.len(), 2);
@@ -727,7 +725,7 @@ mod tests {
         ]);
         let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
 
-        let err = decide.decide(empty_bundle()).await.unwrap_err();
+        let err = decide.decide(&empty_session()).await.unwrap_err();
         let s = err.to_string();
         // The message must enumerate every attempt so an operator reading
         // a log can see how the model failed at each step. We pin the
@@ -764,7 +762,7 @@ mod tests {
         ]);
         let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
 
-        let dec = decide.decide(empty_bundle()).await.unwrap();
+        let dec = decide.decide(&empty_session()).await.unwrap();
         assert_eq!(
             dec,
             Decision::Idle {
@@ -781,7 +779,7 @@ mod tests {
         ))]);
         let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
 
-        let err = decide.decide(empty_bundle()).await.unwrap_err();
+        let err = decide.decide(&empty_session()).await.unwrap_err();
         // Source chain must preserve the `ModelError` for callers that
         // want to discriminate by category.
         let model_err = err
@@ -802,7 +800,7 @@ mod tests {
         ]);
         let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
 
-        let err = decide.decide(empty_bundle()).await.unwrap_err();
+        let err = decide.decide(&empty_session()).await.unwrap_err();
         let model_err = err
             .downcast_ref::<ModelError>()
             .expect("ModelError preserved");
@@ -816,7 +814,7 @@ mod tests {
             good_idle_call(),
         ]))]);
         let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
-        let _ = decide.decide(empty_bundle()).await.unwrap();
+        let _ = decide.decide(&empty_session()).await.unwrap();
 
         let seen = mock.seen();
         let req = &seen[0];
@@ -832,14 +830,14 @@ mod tests {
 
     #[tokio::test]
     async fn first_attempt_request_messages_match_prompt_render() {
-        let bundle = empty_bundle();
-        let expected_messages = prompt::render(&bundle);
+        let session = empty_session();
+        let expected_messages = prompt::render(&session);
 
         let mock = MockModelClient::new(vec![MockOutcome::Resp(resp_with_tool_calls(vec![
             good_idle_call(),
         ]))]);
         let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
-        let _ = decide.decide(bundle).await.unwrap();
+        let _ = decide.decide(&session).await.unwrap();
 
         let seen = mock.seen();
         assert_eq!(seen[0].messages, expected_messages);
@@ -867,7 +865,7 @@ mod tests {
         ]);
         let decide = LlmDecide::new(mock, CompleteOptions::default());
 
-        let dec = decide.decide(empty_bundle()).await.unwrap();
+        let dec = decide.decide(&empty_session()).await.unwrap();
         match dec {
             Decision::EmitOutput { content, evidence } => {
                 assert_eq!(content, "the answer");
@@ -919,7 +917,7 @@ mod tests {
             stats.clone(),
         ))]);
         let decide = LlmDecide::new(mock, CompleteOptions::default());
-        decide.decide(empty_bundle()).await.unwrap();
+        decide.decide(&empty_session()).await.unwrap();
 
         let totals = decide.last_tick_totals();
         assert_eq!(totals.calls, 1);
@@ -943,7 +941,7 @@ mod tests {
             MockOutcome::Resp(resp_with_stats(vec![good_idle_call()], s2.clone())),
         ]);
         let decide = LlmDecide::new(mock, CompleteOptions::default());
-        decide.decide(empty_bundle()).await.unwrap();
+        decide.decide(&empty_session()).await.unwrap();
 
         let totals = decide.last_tick_totals();
         assert_eq!(totals.calls, 2);
@@ -968,12 +966,12 @@ mod tests {
         ]);
         let decide = LlmDecide::new(mock, CompleteOptions::default());
 
-        decide.decide(empty_bundle()).await.unwrap();
+        decide.decide(&empty_session()).await.unwrap();
         let after_first = decide.last_tick_totals();
         assert_eq!(after_first.calls, 1);
         assert_eq!(after_first.input_tokens, s1.usage.input_tokens);
 
-        decide.decide(empty_bundle()).await.unwrap();
+        decide.decide(&empty_session()).await.unwrap();
         let after_second = decide.last_tick_totals();
         assert_eq!(after_second.calls, 1, "totals reset between ticks");
         assert_eq!(after_second.input_tokens, s2.usage.input_tokens);
@@ -1000,7 +998,7 @@ mod tests {
             )),
         ]);
         let decide = LlmDecide::new(mock, CompleteOptions::default());
-        let err = decide.decide(empty_bundle()).await.unwrap_err();
+        let err = decide.decide(&empty_session()).await.unwrap_err();
         assert!(err.to_string().contains("parse failed"));
 
         let totals = decide.last_tick_totals();
@@ -1021,7 +1019,7 @@ mod tests {
                 stats.clone(),
             ))]);
             let decide = LlmDecide::new(mock, CompleteOptions::default());
-            decide.decide(empty_bundle()).await.unwrap();
+            decide.decide(&empty_session()).await.unwrap();
             let calls = decide.last_tick_calls();
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].vendor, stats.vendor);

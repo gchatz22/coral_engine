@@ -32,7 +32,7 @@ use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
 use coral_graph::{GraphStore, MIGRATOR};
 use coral_node::agent_ref::{AgentId, GraphId};
-use coral_node::decision::{ContextBundle, Decide, Decision};
+use coral_node::decision::{Decide, Decision, Session};
 use coral_node::mandate::Mandate;
 use coral_node::storage::{AgentStorage, MemoryStorage};
 use coral_node::tools::{EchoTool, ToolRegistry};
@@ -49,15 +49,16 @@ const DEFAULT_ADDRESS: &str = "http://localhost:7233";
 const DEFAULT_NAMESPACE: &str = "default";
 
 /// Fallback `Decide` for the child workflow, which shares this worker's
-/// `decide_next_action` activity and would otherwise race the parent for
-/// the scripted decisions. A long `Idle` keeps the child alive without
-/// polling — matching the `Abandon` semantics (the child outlives parent
-/// retirement). Same rationale as the fake-backed test's `LongIdleDecide`.
+/// `decide_step` activity and would otherwise race the parent for the
+/// scripted decisions. A long `Idle` keeps the child alive without polling
+/// — the child outlives parent retirement. It also catches the parent once
+/// its scripted decisions drain: the empty-script `decide_step` falls back
+/// here and returns `Idle`, ending the parent's cycle without a panic.
 struct LongIdleDecide;
 
 #[async_trait]
 impl Decide for LongIdleDecide {
-    async fn decide(&self, _ctx: ContextBundle) -> anyhow::Result<Decision> {
+    async fn decide(&self, _session: &Session) -> anyhow::Result<Decision> {
         Ok(Decision::Idle {
             next_after: Duration::from_secs(60),
         })
@@ -154,18 +155,17 @@ async fn run_smoke(database_url: &str) -> Result<()> {
         Duration::from_millis(500),
         Some(2),
     );
-    // Parent's two scripted decisions; the third tick is driven by the
-    // `retire` signal post-spawn (not a scripted Retire) to avoid the
-    // shared-`DECISION_SCRIPT` race with the child workflow.
-    set_decision_script(vec![
-        Decision::Idle {
-            next_after: Duration::from_millis(50),
-        },
-        Decision::SpawnChild {
-            agent_name: "fetcher".into(),
-            mandate: child_mandate,
-        },
-    ]);
+    // One scripted decision for the parent's first cycle: SpawnChild runs
+    // as the cycle's step 0, then the empty-script `decide_step` falls back
+    // to `LongIdleDecide` (Idle), ending the cycle. Only the parent exists
+    // when the script is installed — the child is spawned by this decision —
+    // so the parent wins this single FIFO entry without racing the child.
+    // Retirement is driven by the post-spawn `retire` signal, not a scripted
+    // decision, to avoid the shared-script race once the child is alive.
+    set_decision_script(vec![Decision::SpawnChild {
+        agent_name: "fetcher".into(),
+        mandate: child_mandate,
+    }]);
 
     let telemetry_options = TelemetryOptions::builder().build();
     let runtime = CoreRuntime::new_assume_tokio(

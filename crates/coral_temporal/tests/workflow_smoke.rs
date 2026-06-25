@@ -3,7 +3,7 @@
 //!
 //! - `<prefix>/outputs/<ulid>.json` — a provenance-grounded `EmitOutput`.
 //! - `<prefix>/retirement.json` — the retirement marker.
-//! - `<prefix>/decisions/<tick>.jsonl` — one-line JSONL entry per tick.
+//! - `<prefix>/decisions/<tick>-<step>.jsonl` — one-line JSONL entry per step.
 //!
 //! Env-gated behind `TEMPORAL_LIVE_TEST=1`. Uses a scripted `Decide` and
 //! a planted evidence id so `EmitOutput`'s content-addressed provenance
@@ -108,8 +108,8 @@ async fn build_client() -> Result<Client> {
     Ok(client)
 }
 
-/// Scripts a three-decision run (Idle → CallTools → EmitOutput) capped by
-/// `step_cap=3`, drives it via Temporal, and asserts the three durable
+/// Scripts a single cycle (CallTools → EmitOutput → Idle) capped by
+/// `step_cap=1`, drives it via Temporal, and asserts the three durable
 /// artifacts land. The agent never self-terminates; the cap stops the loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Lock is held across `await` because the scripted decision queue + the
@@ -153,14 +153,12 @@ async fn run_smoke() -> Result<()> {
         .await
         .context("plant evidence for EmitOutput")?;
 
-    // Scripted sequence: Idle (tick 0) → CallTools(echo) (tick 1) →
-    // EmitOutput citing the planted id (tick 2), then the `step_cap=3`
-    // cap stops the loop. Three decisions, three decision-log files (the
-    // cap-driven retirement is not itself a logged decision).
+    // Scripted cycle: CallTools(echo) (step 0) → EmitOutput citing the
+    // planted id (step 1) → Idle (step 2, the sole terminal that ends the
+    // cycle), then the `step_cap=1` cap stops the loop at the top of cycle
+    // 1. Three steps, three decision-log files (the cap-driven retirement
+    // is not itself a logged decision).
     set_decision_script(vec![
-        Decision::Idle {
-            next_after: Duration::from_millis(50),
-        },
         Decision::CallTools {
             calls: vec![ToolCall::new(
                 TOOL_NAME,
@@ -171,6 +169,9 @@ async fn run_smoke() -> Result<()> {
         Decision::EmitOutput {
             content: "workflow_smoke: echo result observed".into(),
             evidence: vec![planted_id.clone()],
+        },
+        Decision::Idle {
+            next_after: Duration::from_millis(50),
         },
     ]);
 
@@ -241,8 +242,8 @@ async fn drive(
         prefix: agent_prefix.into(),
     };
     input.mandate.tools = vec![TOOL_NAME.to_string()];
-    // The loop runs the 3 scripted decisions, then the cap stops it.
-    input.mandate.step_cap = Some(3);
+    // The loop runs the one scripted cycle (3 steps), then the cap stops it.
+    input.mandate.step_cap = Some(1);
     let handle = client
         .start_workflow(
             AgentWorkflow::run,
@@ -258,7 +259,7 @@ async fn drive(
         .context("AgentWorkflow.get_result")?;
     let AgentResult::Retired { reason } = result;
     assert_eq!(
-        reason, "step_cap (3) reached",
+        reason, "step_cap (1) reached",
         "workflow returned wrong retire reason: {reason:?}"
     );
 
@@ -276,7 +277,7 @@ async fn drive(
         .and_then(|x| x.as_str())
         .ok_or_else(|| anyhow::anyhow!("retirement.json missing reason"))?;
     assert_eq!(
-        reason_on_disk, "step_cap (3) reached",
+        reason_on_disk, "step_cap (1) reached",
         "retirement.json carries wrong reason: {reason_on_disk:?}"
     );
 
@@ -315,11 +316,11 @@ async fn drive(
         on_disk.evidence.len()
     );
 
-    // ---- Artifact 3: `<prefix>/decisions/<tick>.jsonl` --------------------
-    // One entry per logged decision. The scripted sequence produces three
-    // decisions (Idle, CallTools, EmitOutput) at `decisions/{0,1,2}.jsonl`.
-    // The `step_cap` cap retires at the top of the loop without logging a
-    // decision, so it adds no fourth entry.
+    // ---- Artifact 3: `<prefix>/decisions/<tick>-<step>.jsonl` -------------
+    // One entry per logged step. The scripted cycle produces three steps
+    // (CallTools, EmitOutput, Idle) at `decisions/{0-0,0-1,0-2}.jsonl`.
+    // The `step_cap` cap retires at the top of the next cycle without
+    // logging a decision, so it adds no fourth entry.
     let page = storage
         .list(&format!("{agent_prefix}/decisions/"), None, usize::MAX)
         .await
@@ -331,12 +332,12 @@ async fn drive(
     assert_eq!(
         decision_keys.len(),
         3,
-        "expected 3 decision-log entries (Idle, CallTools, EmitOutput); got {decision_keys:?}"
+        "expected 3 decision-log entries (CallTools, EmitOutput, Idle); got {decision_keys:?}"
     );
 
     // Each file is a single JSONL line that deserializes back to a
-    // typed `DecisionLogEntry`. Pin the per-tick decision_summary
-    // contract: the three entries match the three scripted decisions.
+    // typed `DecisionLogEntry`. Pin the per-step decision_summary
+    // contract: the three entries match the three scripted steps.
     let mut summaries: Vec<String> = Vec::with_capacity(3);
     for k in &decision_keys {
         let bytes = storage
@@ -351,22 +352,22 @@ async fn drive(
             .with_context(|| format!("{k} is not a DecisionLogEntry: {line}"))?;
         summaries.push(entry.decision_summary);
     }
-    // The three logged decisions match the three scripted ticks. Pin a
+    // The three logged decisions match the three scripted steps. Pin a
     // loose starts-with check on each so the formatter is free to evolve
     // without breaking this assertion's intent.
     assert!(
-        summaries[0].starts_with("Idle"),
-        "tick 0 summary: {:?}",
+        summaries[0].starts_with("CallTools"),
+        "step 0 summary: {:?}",
         summaries[0]
     );
     assert!(
-        summaries[1].starts_with("CallTools"),
-        "tick 1 summary: {:?}",
+        summaries[1].starts_with("EmitOutput"),
+        "step 1 summary: {:?}",
         summaries[1]
     );
     assert!(
-        summaries[2].starts_with("EmitOutput"),
-        "tick 2 summary: {:?}",
+        summaries[2].starts_with("Idle"),
+        "step 2 summary: {:?}",
         summaries[2]
     );
 

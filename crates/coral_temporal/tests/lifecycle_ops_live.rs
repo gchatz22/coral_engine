@@ -16,15 +16,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use temporalio_client::{
-    Client, ClientOptions, Connection, ConnectionOptions, WorkflowExecuteUpdateOptions,
-    WorkflowGetResultOptions, WorkflowSignalOptions, WorkflowStartOptions,
+    Client, ClientOptions, Connection, ConnectionOptions, WorkflowGetResultOptions,
+    WorkflowSignalOptions, WorkflowStartOptions,
 };
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 use uuid::Uuid;
 
 use coral_node::agent_ref::{AgentId, GraphId};
-use coral_node::decision::{ContextBundle, Decide, Decision};
+use coral_node::decision::{Decide, Decision, Session};
 use coral_node::mandate::Mandate;
 use coral_node::storage::{AgentStorage, MemoryStorage};
 use coral_node::tools::{EchoTool, ToolRegistry};
@@ -53,9 +53,9 @@ static LIVE_TEST_GUARD: Mutex<()> = Mutex::new(());
 /// `Decide` impl can route the parent vs. spawned children separately.
 static PARENT_SCRIPT: OnceLock<Mutex<VecDeque<Decision>>> = OnceLock::new();
 
-/// Every `Trigger` the parent observed in its `ContextBundle`. Read by
+/// Every `Trigger` the parent observed in its `Session` seed. Read by
 /// the post-retire assertions to confirm the `ChildRetired` signal
-/// landed on the parent and was drained into a per-tick bundle.
+/// landed on the parent and was drained into a per-cycle seed.
 static PARENT_OBSERVED_TRIGGERS: OnceLock<Arc<Mutex<Vec<Trigger>>>> = OnceLock::new();
 
 const PARENT_MANDATE_TEXT: &str = "lifecycle-parent";
@@ -129,18 +129,18 @@ struct RoutingDecide;
 
 #[async_trait]
 impl Decide for RoutingDecide {
-    async fn decide(&self, bundle: ContextBundle) -> anyhow::Result<Decision> {
-        if bundle.mandate.text == PARENT_MANDATE_TEXT {
+    async fn decide(&self, session: &Session) -> anyhow::Result<Decision> {
+        if session.seed.mandate.text == PARENT_MANDATE_TEXT {
             // Record every trigger the parent observes so the
             // post-lifecycle assertions can verify a
             // `Trigger::ChildRetired` actually landed.
-            if !bundle.triggers.is_empty() {
+            if !session.seed.triggers.is_empty() {
                 let log = PARENT_OBSERVED_TRIGGERS
                     .get()
                     .expect("PARENT_OBSERVED_TRIGGERS installed")
                     .clone();
                 let mut guard = log.lock().expect("trigger log mutex poisoned");
-                for t in &bundle.triggers {
+                for t in &session.seed.triggers {
                     guard.push(t.clone());
                 }
             }
@@ -416,42 +416,31 @@ async fn drive_retire(
     );
     eprintln!("retire: child exited with reason={reason:?}");
 
-    // The child's `retire()` helper fires a `Trigger::ChildRetired`
-    // back at the parent before exit. Poll `inspect_state` until that
-    // trigger lands on workflow state, the load-bearing acceptance
-    // criterion here.
+    // The child's `retire()` helper fires a `Trigger::ChildRetired` back
+    // at the parent before exit. Poll the parent's decide-time capture log
+    // until that trigger has actually been seen by a `decide_step` — NOT
+    // the signal-receipt counter: the retirement short-circuit drains
+    // pending triggers without building a seed, so gating on receipt and
+    // retiring immediately could drain-and-discard the `ChildRetired`
+    // before any decide sees it, racing the assertion below.
     let poll_start = std::time::Instant::now();
     let poll_budget = Duration::from_secs(30);
-    let mut last_err: Option<anyhow::Error> = None;
     let mut observed = false;
     while poll_start.elapsed() < poll_budget {
-        match parent_handle
-            .execute_update(
-                AgentWorkflow::inspect_state,
-                (),
-                WorkflowExecuteUpdateOptions::default(),
-            )
-            .await
+        if parent_observed_triggers_snapshot()
+            .iter()
+            .any(|t| matches!(t, Trigger::ChildRetired { .. }))
         {
-            Ok(snap) => {
-                if snap.cumulative_triggers_observed >= 1 {
-                    observed = true;
-                    break;
-                }
-            }
-            Err(e) => {
-                last_err = Some(anyhow::anyhow!("inspect_state error: {e}"));
-            }
+            observed = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     if !observed {
-        return Err(last_err.unwrap_or_else(|| {
-            anyhow::anyhow!(
-                "parent's cumulative_triggers_observed stayed at 0 across 30s poll budget; \
-                 the child's ChildRetired signal never landed"
-            )
-        }));
+        return Err(anyhow::anyhow!(
+            "parent's RoutingDecide never recorded a ChildRetired across the 30s poll budget; \
+             the child's ChildRetired signal never reached a parent cycle's seed"
+        ));
     }
 
     // Now retire the parent so the worker can drain.
@@ -697,40 +686,33 @@ async fn drive_replace(
     // `wait_for_agent_count(2)` already.
     let _new_handle = client.get_workflow_handle::<AgentWorkflow>(new_child_workflow_id.clone());
 
-    // Wait for the parent to observe the old child's `ChildRetired`
-    // signal before tearing it down.
+    // Wait until the parent's RoutingDecide has actually RECORDED the old
+    // child's `ChildRetired` in a cycle's seed before tearing the parent
+    // down. We poll the decide-time capture log, NOT the signal-receipt
+    // counter: `cumulative_triggers_observed` bumps when the signal handler
+    // receives the trigger, but the retirement short-circuit drains pending
+    // triggers WITHOUT building a seed — so retiring the instant receipt is
+    // confirmed could drain-and-discard the `ChildRetired` before any
+    // `decide_step` sees it, racing the assertion below. Polling the
+    // decide-time log closes the race deterministically.
     let poll_start = std::time::Instant::now();
     let poll_budget = Duration::from_secs(30);
-    let mut last_err: Option<anyhow::Error> = None;
     let mut observed = false;
     while poll_start.elapsed() < poll_budget {
-        match parent_handle
-            .execute_update(
-                AgentWorkflow::inspect_state,
-                (),
-                WorkflowExecuteUpdateOptions::default(),
-            )
-            .await
+        if parent_observed_triggers_snapshot()
+            .iter()
+            .any(|t| matches!(t, Trigger::ChildRetired { .. }))
         {
-            Ok(snap) => {
-                if snap.cumulative_triggers_observed >= 1 {
-                    observed = true;
-                    break;
-                }
-            }
-            Err(e) => {
-                last_err = Some(anyhow::anyhow!("inspect_state error: {e}"));
-            }
+            observed = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     if !observed {
-        return Err(last_err.unwrap_or_else(|| {
-            anyhow::anyhow!(
-                "parent's cumulative_triggers_observed stayed at 0 across 30s poll budget; \
-                 the old child's ChildRetired signal never landed"
-            )
-        }));
+        return Err(anyhow::anyhow!(
+            "parent's RoutingDecide never recorded a ChildRetired across the 30s poll budget; \
+             the old child's ChildRetired signal never reached a parent cycle's seed"
+        ));
     }
 
     // Now retire the parent.

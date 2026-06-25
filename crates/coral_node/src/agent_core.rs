@@ -1,74 +1,128 @@
-//! Pure per-tick logic shared between the in-process `Agent::run` loop
-//! and the workflow host. Three free functions, no internal async-runtime
-//! concerns (no `tokio::select!`, channels, or `sleep`):
-//! [`drain_triggers`] packages a drained `Vec<Trigger>` + FS reads into a
-//! `ContextBundle`; [`decide`] calls into a `&dyn Decide`; [`dispatch`]
-//! applies a `Decision` against the FS, tool registry, and scheduler and
-//! returns a typed [`DispatchOutcome`]. The workflow host matches on
-//! `Decision` directly and orchestrates activities itself, but its per-tick
-//! result is isomorphic to `DispatchOutcome` so the shared post-dispatch
-//! state machine (correction staging, budget accounting, health
-//! transitions) can branch on the same enum.
+//! Per-cycle execution primitives shared between the in-process
+//! `Agent::run` loop and the workflow host: [`build_seed`] (read FS state
+//! into a thin orienting [`Seed`]), [`decide`] (call a `&dyn Decide` with
+//! the accumulating [`Session`]), and [`execute_step`] (run one repertoire
+//! [`Decision`] against the FS + tools and return a typed [`StepOutcome`]
+//! carrying the observation to feed back into the session).
 //!
-//! The four `DispatchOutcome` variants mirror the host's
-//! `ApplyOutcome` shape and are kept distinct because budget accounting
-//! depends on the distinction: `NeedsCorrection` consumes one
-//! `FailureKind::Inference` slot; `ToolError { failures }` consumes K
-//! `FailureKind::ToolCall` slots, one per failed call.
+//! These are the *substance* of one inner-loop step; the loop skeleton
+//! itself — seed once, then `decide → execute → observe` until the model
+//! chooses `Idle` — lives in each host (`agent.rs` for in-process, the
+//! workflow body for Temporal) because the two genuinely differ: the
+//! in-process host calls these directly, while the Temporal host wraps each
+//! in a journaled activity and bounds history with continue-as-new. The
+//! shared pieces (session accumulation, terminal detection via
+//! [`Decision::idle_after`], the [`CYCLE_RUNAWAY_FUSE`]) keep the two
+//! skeletons from drifting.
+//!
+//! `Idle` is never executed here — it is the sole terminal step the host
+//! detects and acts on (set cadence, end the cycle). Parent-child topology
+//! variants execute only on the workflow host; reaching them in-process is
+//! a wiring bug.
+//!
+//! A [`StepOutcome`] carries both the observation (always — success or
+//! failure — so the next step can adapt within the same cycle) and an
+//! optional [`StepFailure`] the host accounts against the per-cycle retry
+//! budget: `NeedsCorrection` is one `FailureKind::Inference` slot;
+//! `ToolError` is K `FailureKind::ToolCall` slots, one per failed call.
 
 use anyhow::Result;
 use futures::future::join_all;
 use tracing::debug;
 
-use crate::decision::{
-    assemble_context, ContextBundle, CorrectionContext, Decide, Decision, ToolCall,
-};
-use crate::evidence::EvidenceId;
+use crate::decision::{Decide, Decision, FsIndex, Observation, Seed, Session, ToolCall};
 use crate::fs::{AgentFs, FsError};
 use crate::mandate::Mandate;
-use crate::scheduler::Scheduler;
 use crate::tools::ToolRegistry;
 use crate::trigger::Trigger;
 
-/// Outcome of [`dispatch`] — a typed description of "what should the host
-/// do next?" the in-process loop or the workflow can branch on.
+/// Runaway fuse for one cycle's inner loop, counted in repertoire steps
+/// across any continue-as-new rollovers within the same logical cycle. Set
+/// far above any real task — a multi-thousand-step cycle stays well under —
+/// so it never bites legitimate work; it exists only to stop a model that
+/// never chooses `Idle` from looping forever. On hit the host force-idles
+/// the cycle and logs loudly: a mandate that never converges should be
+/// decomposed. Superseded by the per-cycle token budget when that lands.
+pub const CYCLE_RUNAWAY_FUSE: usize = 50_000;
+
+/// Number of recent output filenames to surface in the cycle seed's index.
+/// Pointers only — the model reads the bodies it wants via `Read`.
+const SEED_INDEX_OUTPUTS: usize = 32;
+
+/// Cap on note filenames in the seed index. `notes/` has no recency sidecar,
+/// so this is a lexicographic tail — the bound is what matters: a thin seed
+/// must stay a small constant even for an agent with thousands of notes. The
+/// model can always `list notes/` for the full set.
+const SEED_INDEX_NOTES: usize = 32;
+
+/// The result of executing one repertoire [`Decision`].
 ///
-/// * `Continue` — the tick produced no terminal or recoverable-failure
-///   outcome; the host clears any correction state, marks the tick a
-///   success, and proceeds to the next iteration.
-/// * `NeedsCorrection` — the decision parsed but the runtime cannot
-///   satisfy it. The string is a human-readable failure description the
-///   host threads into the next tick's `CorrectionContext` (and into the
-///   `HealthIncident` retry trail on budget exhaustion).
-/// * `ToolError { failures }` — the tool's internal retry policy
-///   exhausted on one or more of K parallel calls. Successful sibling
-///   calls in the same batch already had their evidence persisted before
-///   this variant is constructed; the host does **not** unwind on
-///   partial failure. Per-call accounting (K against budget) lives in
-///   the host, not here.
+/// `observation` is always present and is what the next step reasons over —
+/// on success it's the action's product (a file body, a listing, "output
+/// persisted"); on a recoverable failure it's the error rendered for the
+/// model to adapt to *within the same cycle*. There is no cross-cycle
+/// correction state: the failure is just an observation.
+///
+/// `failure` is `Some` when the step failed recoverably and the host should
+/// account it against the per-cycle retry budget. `None` is a clean step.
 #[derive(Debug)]
-pub enum DispatchOutcome {
-    Continue,
+pub struct StepOutcome {
+    pub observation: Observation,
+    pub failure: Option<StepFailure>,
+}
+
+/// A recoverable step failure the host accounts against the retry budget.
+///
+/// * `NeedsCorrection` — the decision parsed but the runtime cannot satisfy
+///   it (an unknown tool, an unresolvable evidence id, a missing file). One
+///   `FailureKind::Inference` slot.
+/// * `ToolError` — the tool's internal retry policy exhausted on one or more
+///   of K parallel calls. Successful sibling calls in the same batch already
+///   had their evidence persisted; the host does **not** unwind on partial
+///   failure. K `FailureKind::ToolCall` slots, one per failed call.
+#[derive(Debug)]
+pub enum StepFailure {
     NeedsCorrection(String),
-    ToolError {
-        /// One entry per failed call in the parallel batch. Order matches
-        /// the original `Decision::CallTools` vec — i.e. the deterministic
-        /// per-call-index order the dispatch site relies on for both
-        /// evidence persistence and per-failure budget accounting.
-        failures: Vec<ToolFailure>,
-    },
+    ToolError(Vec<ToolFailure>),
+}
+
+impl StepOutcome {
+    /// A clean step whose observation is `content`.
+    fn ok(content: impl Into<String>) -> Self {
+        Self {
+            observation: Observation::ok(content),
+            failure: None,
+        }
+    }
+
+    /// A recoverable `NeedsCorrection` failure: the same message is both the
+    /// model-facing observation and the budget-accounted failure.
+    fn needs_correction(msg: impl Into<String>) -> Self {
+        let msg = msg.into();
+        Self {
+            observation: Observation::err(msg.clone()),
+            failure: Some(StepFailure::NeedsCorrection(msg)),
+        }
+    }
+
+    /// A tool-call batch failure: the observation is the enumerated
+    /// failure text the model adapts to; the failures ride the budget.
+    fn tool_error(failures: Vec<ToolFailure>) -> Self {
+        let text = tool_failure_correction_text(&failures);
+        Self {
+            observation: Observation::err(text),
+            failure: Some(StepFailure::ToolError(failures)),
+        }
+    }
 }
 
 /// One failed call in a `Decision::CallTools` batch. `tool` and `args`
-/// echo what the model asked for so the corrective message can tell the
+/// echo what the model asked for so the failure observation can tell the
 /// model exactly what failed; `error` is the underlying error string from
 /// `ToolRegistry::call`.
 ///
-/// `pub` because it leaks through [`DispatchOutcome::ToolError`], which
-/// must be `pub` for the workflow host to branch on the shared seam.
-/// Both the in-process host and the workflow host read these fields
-/// when staging the correction context and constructing the
-/// `HealthIncident` retry trail.
+/// `pub` because it leaks through [`StepFailure::ToolError`], which the
+/// host reads when constructing the `HealthIncident` retry trail.
 #[derive(Debug, Clone)]
 pub struct ToolFailure {
     pub tool: String,
@@ -76,97 +130,129 @@ pub struct ToolFailure {
     pub error: String,
 }
 
-/// Drain the already-collected triggers into a `ContextBundle` for the
-/// current tick. In the in-process host the `Vec<Trigger>` comes from
+/// Build the thin orienting [`Seed`] for a fresh cycle: the mandate, the
+/// triggers that woke the agent, and a pointers-only index of `notes/` and
+/// recent `outputs/`. File *contents* are pulled on demand via the FS-nav
+/// steps, so the seed stays a small constant rather than a tuned window.
+///
+/// In the in-process host the `Vec<Trigger>` comes from
 /// `TriggerQueue::drain_ordered`; in the workflow host it comes from a
-/// workflow-state buffer. Per-tick semantics are identical.
-pub async fn drain_triggers(
-    triggers: Vec<Trigger>,
-    fs: &AgentFs,
-    cfg: &Mandate,
-    prior_correction: Option<CorrectionContext>,
-) -> Result<ContextBundle> {
-    assemble_context(fs, &triggers, cfg, prior_correction).await
+/// workflow-state buffer. Per-cycle semantics are identical.
+pub async fn build_seed(fs: &AgentFs, triggers: Vec<Trigger>, cfg: &Mandate) -> Result<Seed> {
+    let mut notes = fs.list_dir("notes/").await?;
+    if notes.len() > SEED_INDEX_NOTES {
+        let start = notes.len() - SEED_INDEX_NOTES;
+        notes.drain(..start);
+    }
+    let outputs = fs.recent_output_filenames(SEED_INDEX_OUTPUTS).await?;
+    debug!(
+        notes = notes.len(),
+        outputs = outputs.len(),
+        triggers = triggers.len(),
+        "build_seed index sizes"
+    );
+    Ok(Seed::new(cfg.clone(), triggers, FsIndex { notes, outputs }))
 }
 
-/// Ask the [`Decide`] impl what to do this tick. Single shared call site
-/// for the in-process loop and the workflow host's `decide_next_action`
-/// activity.
-pub async fn decide<D: Decide + ?Sized>(bundle: ContextBundle, d: &D) -> Result<Decision> {
-    d.decide(bundle).await
+/// Ask the [`Decide`] impl for the next step given the accumulating
+/// `session`. Single shared call site for the in-process loop and the
+/// workflow host's `decide_step` activity.
+pub async fn decide<D: Decide + ?Sized>(session: &Session, d: &D) -> Result<Decision> {
+    d.decide(session).await
 }
 
-/// Apply a single `Decision` against the FS, tools, and scheduler;
-/// return a typed [`DispatchOutcome`].
+/// Execute one **repertoire** `Decision` against the FS + tools and return
+/// a typed [`StepOutcome`] (the observation to feed back into the session,
+/// plus any budget-accounted failure).
 ///
-/// Recoverable apply-time failures (empty/unresolvable evidence, unknown
-/// tool name, exhausted tool retries) surface as
-/// [`DispatchOutcome::NeedsCorrection`] or
-/// [`DispatchOutcome::ToolError`]; everything else either continues,
-/// retires, or bubbles via `?`.
+/// `Idle` is the terminal step and is never passed here — the host detects
+/// it via [`Decision::idle_after`] and ends the cycle. Recoverable failures
+/// (empty/unresolvable evidence, unknown tool, missing file, exhausted tool
+/// retries) come back as a `StepOutcome` with `failure: Some(..)`;
+/// everything else either succeeds or bubbles a real error via `?`.
 ///
-/// **Side-effect semantics.** In the in-process host this is the
-/// executor — it calls `fs.persist_output`, `tools.call`,
-/// `fs.record_evidence`, etc. The workflow host matches on `Decision`
-/// directly and orchestrates activities, so it does not call this
-/// function; the shared piece is the returned `DispatchOutcome` shape.
-pub async fn dispatch(
+/// **Side-effect semantics.** In the in-process host this is the executor —
+/// it calls `fs.persist_output`, `tools.call`, `fs.read_file`, etc. The
+/// workflow host wraps the same primitive in a journaled activity; the
+/// shared piece is the returned `StepOutcome` shape.
+pub async fn execute_step(
     fs: &AgentFs,
     tools: &ToolRegistry,
-    scheduler: &mut Scheduler,
-    decision: Decision,
-) -> Result<DispatchOutcome> {
-    match decision {
-        Decision::CallTools { calls } => dispatch_call_tools(fs, tools, calls).await,
+    action: &Decision,
+) -> Result<StepOutcome> {
+    match action {
+        Decision::CallTools { calls } => execute_call_tools(fs, tools, calls).await,
         Decision::EmitOutput { content, evidence } => {
-            debug!(evidence_count = evidence.len(), "decision: emit_output");
-            match fs.persist_output(&content, &evidence).await {
-                Ok(_) => Ok(DispatchOutcome::Continue),
+            debug!(evidence_count = evidence.len(), "step: emit_output");
+            match fs.persist_output(content, evidence).await {
+                Ok(_) => Ok(StepOutcome::ok("output persisted")),
                 Err(e) => match e.downcast_ref::<FsError>() {
-                    Some(FsError::EmptyEvidence) => Ok(DispatchOutcome::NeedsCorrection(
-                        "emit_output: evidence list is empty (provenance contract)".into(),
+                    Some(FsError::EmptyEvidence) => Ok(StepOutcome::needs_correction(
+                        "emit_output: evidence list is empty (provenance contract)",
                     )),
-                    Some(FsError::EvidenceNotFound(id)) => {
-                        let id: EvidenceId = id.clone();
-                        Ok(DispatchOutcome::NeedsCorrection(format!(
-                            "emit_output: evidence {id} not found on disk"
-                        )))
-                    }
+                    Some(FsError::EvidenceNotFound(id)) => Ok(StepOutcome::needs_correction(
+                        format!("emit_output: evidence {id} not found on disk"),
+                    )),
                     _ => Err(e),
                 },
             }
         }
         Decision::RewriteFs { ops } => {
-            debug!(op_count = ops.len(), "decision: rewrite_fs");
-            fs.apply_ops(ops).await?;
-            Ok(DispatchOutcome::Continue)
+            debug!(op_count = ops.len(), "step: rewrite_fs");
+            fs.apply_ops(ops.clone()).await?;
+            Ok(StepOutcome::ok("notes updated"))
         }
-        Decision::Idle { next_after } => {
-            debug!(
-                next_after_ms = next_after.as_millis() as u64,
-                "decision: idle"
-            );
-            scheduler.set_next_after(next_after);
-            Ok(DispatchOutcome::Continue)
+        Decision::Read { path } => {
+            debug!(path = path.as_str(), "step: read");
+            match fs.read_file(path).await {
+                Ok(body) => Ok(StepOutcome::ok(body)),
+                Err(e) => match e.downcast_ref::<FsError>() {
+                    Some(FsError::FileNotFound(_)) => {
+                        Ok(StepOutcome::needs_correction(format!("read: {e:#}")))
+                    }
+                    _ => Err(e),
+                },
+            }
+        }
+        Decision::List { path } => {
+            debug!(path = path.as_str(), "step: list");
+            let names = fs.list_dir(path).await?;
+            let body = if names.is_empty() {
+                format!("(empty: {path})")
+            } else {
+                names.join("\n")
+            };
+            Ok(StepOutcome::ok(body))
+        }
+        Decision::Search { query, path } => {
+            debug!(query = query.as_str(), "step: search");
+            let hits = fs.search(query, path.as_deref()).await?;
+            let body = if hits.is_empty() {
+                format!("(no matches for {query:?})")
+            } else {
+                hits.into_iter()
+                    .map(|(file, line)| format!("{file}: {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            Ok(StepOutcome::ok(body))
+        }
+        // Terminal — handled by the cycle driver, never executed here.
+        Decision::Idle { .. } => {
+            unreachable!("Idle is terminal; the host detects it before calling execute_step")
         }
         // Parent-child topology variants execute only on the workflow
         // host; reaching them here is a wiring bug.
-        Decision::SpawnChild { .. } => {
-            unimplemented!("in-process dispatch for parent-child decisions is not wired")
-        }
-        Decision::ReconcileChildren { .. } => {
-            unimplemented!("in-process dispatch for parent-child decisions is not wired")
-        }
-        Decision::RetireChild { .. } => {
-            unimplemented!("in-process dispatch for parent-child decisions is not wired")
-        }
-        Decision::ReplaceChild { .. } => {
-            unimplemented!("in-process dispatch for parent-child decisions is not wired")
+        Decision::SpawnChild { .. }
+        | Decision::ReconcileChildren { .. }
+        | Decision::RetireChild { .. }
+        | Decision::ReplaceChild { .. } => {
+            unimplemented!("in-process execution for parent-child topology is not wired")
         }
     }
 }
 
-/// Dispatch the K calls in a `Decision::CallTools` together.
+/// Execute the K calls in a `Decision::CallTools` together.
 ///
 /// Order of operations matters for both correctness and determinism:
 ///
@@ -178,7 +264,7 @@ pub async fn dispatch(
 ///    consistent with the rejection.
 /// 2. **Dispatch all K concurrently** via `futures::future::join_all`,
 ///    capturing every result rather than short-circuiting on the first
-///    error. The agent loop's K-against-budget accounting needs every
+///    error. The per-cycle K-against-budget accounting needs every
 ///    failure, not just the first one.
 /// 3. **Persist successful evidence in input order.** `join_all` resolves
 ///    futures concurrently but `into_iter().enumerate()` over the result
@@ -190,27 +276,27 @@ pub async fn dispatch(
 ///    records in hash order rather than dispatch order — that's a
 ///    separate ordering domain from the one this step pins.
 /// 4. **Successful evidence is kept even when some sibling calls fail.**
-///    The model can cite a partial-success evidence id on a later tick;
+///    The model can cite a partial-success evidence id on a later step;
 ///    rolling back would discard load-bearing observations of the world.
-///    The corrective context describes only the failures so the model
+///    The failure observation describes only the failures so the model
 ///    knows what to retry.
-async fn dispatch_call_tools(
+async fn execute_call_tools(
     fs: &AgentFs,
     tools: &ToolRegistry,
-    calls: Vec<ToolCall>,
-) -> Result<DispatchOutcome> {
-    debug!(count = calls.len(), "decision: call_tools");
+    calls: &[ToolCall],
+) -> Result<StepOutcome> {
+    debug!(count = calls.len(), "step: call_tools");
 
     // Step 1: pre-check tool-name registration for every call. A single
     // unknown name takes the whole batch through the inference
-    // correction loop.
+    // correction path.
     let unknown: Vec<&str> = calls
         .iter()
         .filter(|c| !tools.contains(&c.name))
         .map(|c| c.name.as_str())
         .collect();
     if !unknown.is_empty() {
-        return Ok(DispatchOutcome::NeedsCorrection(format!(
+        return Ok(StepOutcome::needs_correction(format!(
             "call_tools: no tool registered under name(s) {unknown:?}"
         )));
     }
@@ -227,13 +313,16 @@ async fn dispatch_call_tools(
     let results = join_all(futures).await;
 
     // Step 3+4: classify each result, persist successful evidence in
-    // input order, collect failures into a batch outcome.
+    // input order, collect failures into a batch outcome. The observation
+    // summarises both: what succeeded and what failed.
     let mut failures: Vec<ToolFailure> = Vec::new();
+    let mut succeeded = 0usize;
     for (i, result) in results.into_iter().enumerate() {
         let call = &calls[i];
         match result {
             Ok(ev) => {
                 fs.record_evidence(ev).await?;
+                succeeded += 1;
             }
             Err(e) => {
                 failures.push(ToolFailure {
@@ -246,22 +335,21 @@ async fn dispatch_call_tools(
     }
 
     if failures.is_empty() {
-        Ok(DispatchOutcome::Continue)
+        Ok(StepOutcome::ok(format!(
+            "{succeeded} tool call(s) succeeded; evidence recorded"
+        )))
     } else {
-        Ok(DispatchOutcome::ToolError { failures })
+        Ok(StepOutcome::tool_error(failures))
     }
 }
 
-/// Build the human-readable failure description for the
-/// `CorrectionContext` staged after a tool-call exhaustion.
+/// Build the human-readable failure observation appended to the session
+/// after a tool-call exhaustion — the in-cycle signal the model adapts to.
 ///
 /// Accepts a batch of failed calls. For K=1 the wording is single-tool;
 /// for K>1 the message lists every failed call so the model sees what
 /// each sibling did and failed with.
-///
-/// `pub(crate)` because the in-process host (`Agent::run`) calls this
-/// to stage the `CorrectionContext` after a `DispatchOutcome::ToolError`.
-pub(crate) fn tool_failure_correction_text(failures: &[ToolFailure]) -> String {
+fn tool_failure_correction_text(failures: &[ToolFailure]) -> String {
     if failures.len() == 1 {
         let f = &failures[0];
         let args_text =
@@ -296,29 +384,19 @@ pub(crate) fn tool_failure_correction_text(failures: &[ToolFailure]) -> String {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for the seam itself.
+    //! Unit tests for the per-cycle execution primitives.
     //!
-    //! The four `DispatchOutcome` arms each get a focused, hermetic test
-    //! against [`crate::storage::MemoryStorage`] (wired through
-    //! [`AgentFs::new_with_storage`] so the seam exercises the same
+    //! Each runs against [`crate::storage::MemoryStorage`] (wired through
+    //! [`AgentFs::new_with_storage`] so the primitive exercises the same
     //! facade the in-process loop uses — only the backend is swapped).
     //!
-    //! The adversarial test (`dispatch_idle_does_not_touch_outputs_or_evidence_or_retirement`)
-    //! exercises the "no spurious side effects" property: an Idle decision
-    //! must not write anything to disk, and the scheduler must take the
-    //! requested cadence. It uses a scripted `MockDecide` reached via the
-    //! exported [`decide`] free function rather than the in-process loop,
-    //! confirming the seam is callable without the signal source / async
-    //! runtime concerns the loop currently owns.
-    //!
-    //! End-to-end coverage of the budget-accounting state machine that
-    //! sits *on top of* these outcomes lives in
+    //! End-to-end coverage of the cycle loop and the budget-accounting
+    //! state machine that sits *on top of* these primitives lives in
     //! `crates/coral_node/tests/loop_smoke.rs` — those tests exercise the
-    //! refactored `Agent::run` and stay green by virtue of this refactor
-    //! being a strict no-behavior-change move.
+    //! reshaped `Agent::run`.
 
     use super::*;
-    use crate::decision::{ClaimSeed, MockDecide};
+    use crate::decision::{ClaimSeed, FsOp, MockDecide};
     use crate::evidence::{EvidenceId, EvidenceRecord};
     use crate::fs::AgentFs;
     use crate::storage::{AgentStorage, MemoryStorage};
@@ -339,8 +417,8 @@ mod tests {
     }
 
     /// Build an `AgentFs` backed by an in-memory storage backend so the
-    /// AgentCore seam tests stay hermetic, fast, and deterministic
-    /// without touching the real filesystem.
+    /// primitive tests stay hermetic, fast, and deterministic without
+    /// touching the real filesystem.
     async fn fixture() -> (AgentFs, Mandate) {
         let m = mandate();
         let storage: Arc<dyn AgentStorage> = Arc::new(MemoryStorage::new());
@@ -348,15 +426,20 @@ mod tests {
         (fs, m)
     }
 
-    fn empty_bundle(m: &Mandate) -> ContextBundle {
-        ContextBundle {
-            mandate: m.clone(),
-            triggers: vec![],
-            recent_outputs: vec![],
-            recent_evidence: vec![],
-            open_claims: vec![],
-            correction: None,
-        }
+    /// Seed one evidence record + one output so output-index / cite tests
+    /// have something to read. Returns the output's on-disk filename.
+    async fn seed_one_output(fs: &AgentFs) -> String {
+        let ev = fs
+            .record_evidence(EvidenceRecord::new(
+                "echo",
+                json!({"k": 1}),
+                json!({"v": 1}),
+                ts(),
+            ))
+            .await
+            .unwrap();
+        let out = fs.persist_output("a claim", &[ev]).await.unwrap();
+        format!("{}.json", out.id)
     }
 
     // ---------- `decide` --------------------------------------------------
@@ -365,11 +448,12 @@ mod tests {
     async fn decide_returns_scripted_decision() {
         // The free function is a thin wrapper; the test locks the
         // call-site shape the workflow activity mirrors.
-        let m = mandate();
         let mock = MockDecide::new(vec![Decision::Idle {
             next_after: Duration::from_millis(7),
         }]);
-        let got = decide(empty_bundle(&m), &mock).await.unwrap();
+        let seed = Seed::new(mandate(), vec![], FsIndex::default());
+        let session = Session::new(seed);
+        let got = decide(&session, &mock).await.unwrap();
         assert_eq!(
             got,
             Decision::Idle {
@@ -378,39 +462,53 @@ mod tests {
         );
     }
 
-    // ---------- `drain_triggers` -----------------------------------------
+    // ---------- `build_seed` ---------------------------------------------
 
     #[tokio::test]
-    async fn drain_triggers_packages_input_into_bundle() {
-        // Today this is a passthrough to `assemble_context`. Locking the
-        // call shape and the field-routing is enough — the deeper bundle
-        // semantics are tested in `decision::tests`.
+    async fn build_seed_is_thin_and_indexes_notes_and_outputs() {
         let (fs, m) = fixture().await;
+        fs.apply_ops(vec![FsOp::WriteFile {
+            path: "notes/plan.md".into(),
+            content: "the plan".into(),
+        }])
+        .await
+        .unwrap();
+        let out_file = seed_one_output(&fs).await;
+
         let triggers = vec![Trigger::ScheduledWake];
-        let bundle = drain_triggers(triggers.clone(), &fs, &m, None)
-            .await
-            .unwrap();
-        assert_eq!(bundle.triggers, triggers);
-        assert_eq!(bundle.mandate, m);
-        assert!(bundle.correction.is_none());
+        let seed = build_seed(&fs, triggers.clone(), &m).await.unwrap();
+        assert_eq!(seed.triggers, triggers);
+        assert_eq!(seed.mandate, m);
+        // Index carries pointers (filenames), never bodies.
+        assert_eq!(seed.index.notes, vec!["plan.md".to_string()]);
+        assert_eq!(seed.index.outputs, vec![out_file]);
     }
 
     #[tokio::test]
-    async fn drain_triggers_threads_correction_through() {
+    async fn build_seed_caps_notes_index_to_keep_the_seed_thin() {
         let (fs, m) = fixture().await;
-        let corr = CorrectionContext::new("prior tick rejected: example");
-        let bundle = drain_triggers(vec![], &fs, &m, Some(corr.clone()))
+        // Write more notes than the cap so the thin-seed bound bites.
+        for i in 0..(SEED_INDEX_NOTES + 10) {
+            fs.apply_ops(vec![FsOp::WriteFile {
+                path: format!("notes/n-{i:03}.md"),
+                content: "x".into(),
+            }])
             .await
             .unwrap();
-        assert_eq!(bundle.correction.as_ref(), Some(&corr));
+        }
+        let seed = build_seed(&fs, vec![], &m).await.unwrap();
+        assert_eq!(
+            seed.index.notes.len(),
+            SEED_INDEX_NOTES,
+            "notes index must be capped so the seed stays a small constant"
+        );
     }
 
-    // ---------- `dispatch` — Continue arm --------------------------------
+    // ---------- `execute_step` — clean steps -----------------------------
 
     #[tokio::test]
-    async fn dispatch_emit_output_with_resolvable_evidence_returns_continue() {
-        let (fs, m) = fixture().await;
-        // Seed one evidence record so the persist passes provenance.
+    async fn execute_emit_output_with_resolvable_evidence_succeeds() {
+        let (fs, _m) = fixture().await;
         let ev_id = fs
             .record_evidence(EvidenceRecord::new(
                 "echo",
@@ -420,60 +518,147 @@ mod tests {
             ))
             .await
             .unwrap();
-        let decision = Decision::EmitOutput {
-            content: "claim".into(),
-            evidence: vec![ev_id],
-        };
         let tools = ToolRegistry::new();
-        let mut scheduler = Scheduler::new(m.idle_period.unwrap_or_default());
-        let outcome = dispatch(&fs, &tools, &mut scheduler, decision)
-            .await
-            .unwrap();
-        assert!(matches!(outcome, DispatchOutcome::Continue));
-        // Side effect happened (one output landed on disk).
+        let outcome = execute_step(
+            &fs,
+            &tools,
+            &Decision::EmitOutput {
+                content: "claim".into(),
+                evidence: vec![ev_id],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(outcome.failure.is_none());
+        assert!(outcome.observation.ok);
         let outs = fs.list_recent_outputs(8).await.unwrap();
         assert_eq!(outs.len(), 1, "EmitOutput should have persisted an output");
     }
 
     #[tokio::test]
-    async fn dispatch_idle_sets_scheduler_cadence_and_continues() {
-        let (fs, m) = fixture().await;
+    async fn execute_read_returns_file_body_as_observation() {
+        let (fs, _m) = fixture().await;
+        fs.apply_ops(vec![FsOp::WriteFile {
+            path: "notes/a.md".into(),
+            content: "hello body".into(),
+        }])
+        .await
+        .unwrap();
         let tools = ToolRegistry::new();
-        let mut scheduler = Scheduler::new(m.idle_period.unwrap_or_default());
-        let outcome = dispatch(
+        let outcome = execute_step(
             &fs,
             &tools,
-            &mut scheduler,
-            Decision::Idle {
-                next_after: Duration::from_millis(2500),
+            &Decision::Read {
+                path: "notes/a.md".into(),
             },
         )
         .await
         .unwrap();
-        assert!(matches!(outcome, DispatchOutcome::Continue));
-        assert_eq!(scheduler.next_after(), Duration::from_millis(2500));
+        assert!(outcome.failure.is_none());
+        assert_eq!(outcome.observation.content, "hello body");
     }
 
-    // ---------- `dispatch` — NeedsCorrection arm -------------------------
-
     #[tokio::test]
-    async fn dispatch_emit_output_with_empty_evidence_returns_needs_correction() {
-        let (fs, m) = fixture().await;
+    async fn execute_read_missing_file_is_a_recoverable_correction() {
+        let (fs, _m) = fixture().await;
         let tools = ToolRegistry::new();
-        let mut scheduler = Scheduler::new(m.idle_period.unwrap_or_default());
-        let outcome = dispatch(
+        let outcome = execute_step(
             &fs,
             &tools,
-            &mut scheduler,
-            Decision::EmitOutput {
+            &Decision::Read {
+                path: "notes/nope.md".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.observation.ok);
+        assert!(matches!(
+            outcome.failure,
+            Some(StepFailure::NeedsCorrection(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_list_lists_directory_entries() {
+        let (fs, _m) = fixture().await;
+        for f in ["a.md", "b.md"] {
+            fs.apply_ops(vec![FsOp::WriteFile {
+                path: format!("notes/{f}"),
+                content: "x".into(),
+            }])
+            .await
+            .unwrap();
+        }
+        let tools = ToolRegistry::new();
+        let outcome = execute_step(
+            &fs,
+            &tools,
+            &Decision::List {
+                path: "notes/".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(outcome.failure.is_none());
+        assert!(outcome.observation.content.contains("a.md"));
+        assert!(outcome.observation.content.contains("b.md"));
+    }
+
+    #[tokio::test]
+    async fn execute_search_finds_matching_content() {
+        let (fs, _m) = fixture().await;
+        fs.apply_ops(vec![FsOp::WriteFile {
+            path: "notes/find.md".into(),
+            content: "the answer is tsmc capacity".into(),
+        }])
+        .await
+        .unwrap();
+        let tools = ToolRegistry::new();
+        let hit = execute_step(
+            &fs,
+            &tools,
+            &Decision::Search {
+                query: "tsmc".into(),
+                path: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(hit.failure.is_none());
+        assert!(hit.observation.content.contains("notes/find.md"));
+
+        let miss = execute_step(
+            &fs,
+            &tools,
+            &Decision::Search {
+                query: "no-such-token".into(),
+                path: Some("notes/".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(miss.failure.is_none());
+        assert!(miss.observation.content.contains("no matches"));
+    }
+
+    // ---------- `execute_step` — recoverable failures --------------------
+
+    #[tokio::test]
+    async fn execute_emit_output_with_empty_evidence_needs_correction() {
+        let (fs, _m) = fixture().await;
+        let tools = ToolRegistry::new();
+        let outcome = execute_step(
+            &fs,
+            &tools,
+            &Decision::EmitOutput {
                 content: "no evidence".into(),
                 evidence: vec![],
             },
         )
         .await
         .unwrap();
-        match outcome {
-            DispatchOutcome::NeedsCorrection(desc) => {
+        match outcome.failure {
+            Some(StepFailure::NeedsCorrection(desc)) => {
                 assert!(
                     desc.contains("evidence list is empty"),
                     "unexpected description: {desc}"
@@ -481,24 +666,20 @@ mod tests {
             }
             other => panic!("expected NeedsCorrection, got {other:?}"),
         }
+        // The failure is also the observation so the model adapts in-cycle.
+        assert!(!outcome.observation.ok);
         // Provenance violation must NOT have produced an output on disk.
-        let outs = fs.list_recent_outputs(8).await.unwrap();
-        assert!(
-            outs.is_empty(),
-            "empty-evidence EmitOutput should not persist"
-        );
+        assert!(fs.list_recent_outputs(8).await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn dispatch_call_tools_with_unknown_name_returns_needs_correction() {
-        let (fs, m) = fixture().await;
+    async fn execute_call_tools_with_unknown_name_needs_correction() {
+        let (fs, _m) = fixture().await;
         let tools = ToolRegistry::new(); // empty registry — every name unknown
-        let mut scheduler = Scheduler::new(m.idle_period.unwrap_or_default());
-        let outcome = dispatch(
+        let outcome = execute_step(
             &fs,
             &tools,
-            &mut scheduler,
-            Decision::CallTools {
+            &Decision::CallTools {
                 calls: vec![ToolCall::new(
                     "never_registered",
                     json!({}),
@@ -508,8 +689,8 @@ mod tests {
         )
         .await
         .unwrap();
-        match outcome {
-            DispatchOutcome::NeedsCorrection(desc) => {
+        match outcome.failure {
+            Some(StepFailure::NeedsCorrection(desc)) => {
                 assert!(desc.contains("never_registered"), "got: {desc}");
             }
             other => panic!("expected NeedsCorrection, got {other:?}"),
@@ -517,31 +698,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_emit_output_with_unresolved_evidence_returns_needs_correction() {
-        let (fs, m) = fixture().await;
+    async fn execute_emit_output_with_unresolved_evidence_needs_correction() {
+        let (fs, _m) = fixture().await;
         let tools = ToolRegistry::new();
-        let mut scheduler = Scheduler::new(m.idle_period.unwrap_or_default());
-        // Construct a bogus evidence id that is not on disk.
         let bogus = EvidenceId::new("echo", &json!({"never": "written"}), &json!({"x": 0}));
-        let outcome = dispatch(
+        let outcome = execute_step(
             &fs,
             &tools,
-            &mut scheduler,
-            Decision::EmitOutput {
+            &Decision::EmitOutput {
                 content: "claim".into(),
                 evidence: vec![bogus],
             },
         )
         .await
         .unwrap();
-        assert!(matches!(outcome, DispatchOutcome::NeedsCorrection(_)));
+        assert!(matches!(
+            outcome.failure,
+            Some(StepFailure::NeedsCorrection(_))
+        ));
     }
 
-    // ---------- `dispatch` — ToolError arm -------------------------------
-
     /// Tool that always errors. Mirrors the spirit of the in-tree
-    /// `FlakyTool` in `loop_smoke.rs` but inlined here so the AgentCore
-    /// tests don't depend on the integration-test crate.
+    /// `FlakyTool` in `loop_smoke.rs` but inlined here so these tests
+    /// don't depend on the integration-test crate.
     struct ErroringTool {
         name: String,
     }
@@ -561,20 +740,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_call_tools_collects_per_call_failures() {
-        let (fs, m) = fixture().await;
+    async fn execute_call_tools_collects_per_call_failures() {
+        let (fs, _m) = fixture().await;
         let mut tools = ToolRegistry::new();
         tools
             .register(std::sync::Arc::new(ErroringTool {
                 name: "errbomb".into(),
             }))
             .unwrap();
-        let mut scheduler = Scheduler::new(m.idle_period.unwrap_or_default());
-        let outcome = dispatch(
+        let outcome = execute_step(
             &fs,
             &tools,
-            &mut scheduler,
-            Decision::CallTools {
+            &Decision::CallTools {
                 calls: vec![
                     ToolCall::new("errbomb", json!({"i": 1}), ClaimSeed::new("a")),
                     ToolCall::new("errbomb", json!({"i": 2}), ClaimSeed::new("b")),
@@ -583,8 +760,8 @@ mod tests {
         )
         .await
         .unwrap();
-        match outcome {
-            DispatchOutcome::ToolError { failures } => {
+        match outcome.failure {
+            Some(StepFailure::ToolError(failures)) => {
                 assert_eq!(failures.len(), 2);
                 assert_eq!(failures[0].tool, "errbomb");
                 assert!(failures[0].error.contains("synthetic"));
@@ -594,45 +771,9 @@ mod tests {
             }
             other => panic!("expected ToolError, got {other:?}"),
         }
-    }
-
-    // ---------- Adversarial: no spurious side effects --------------------
-
-    #[tokio::test]
-    async fn dispatch_idle_does_not_touch_outputs_or_evidence_or_retirement() {
-        // An Idle decision dispatched via `AgentCore::dispatch` must not
-        // write any of the three FS surfaces a host would expect to
-        // remain untouched. The signal source (mpsc), the async runtime
-        // race (`tokio::select!`), and the in-process loop's
-        // correction/health state are *not* exercised here — only
-        // `decide` + `dispatch` from the seam, via a scripted
-        // `MockDecide`.
-        let (fs, m) = fixture().await;
-        let mock = MockDecide::new(vec![Decision::Idle {
-            next_after: Duration::from_millis(50),
-        }]);
-        let bundle = drain_triggers(vec![Trigger::ScheduledWake], &fs, &m, None)
-            .await
-            .unwrap();
-        let decision = decide(bundle, &mock).await.unwrap();
-        let tools = ToolRegistry::new();
-        let mut scheduler = Scheduler::new(m.idle_period.unwrap_or_default());
-        let outcome = dispatch(&fs, &tools, &mut scheduler, decision)
-            .await
-            .unwrap();
-        assert!(matches!(outcome, DispatchOutcome::Continue));
-        // FS surfaces untouched.
-        assert!(fs.list_recent_outputs(8).await.unwrap().is_empty());
-        assert!(fs.list_recent_evidence(8).await.unwrap().is_empty());
-        let retirement = fs
-            .storage()
-            .get(&format!("{}retirement.json", fs.prefix()))
-            .await
-            .unwrap();
-        assert!(
-            retirement.is_none(),
-            "idle decision must not write retirement marker"
-        );
+        // The failure observation enumerates the failures for the model.
+        assert!(!outcome.observation.ok);
+        assert!(outcome.observation.content.contains("errbomb"));
     }
 
     // ---------- `tool_failure_correction_text` ---------------------------

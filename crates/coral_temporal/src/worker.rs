@@ -71,7 +71,7 @@ pub fn agent_storage() -> Arc<dyn AgentStorage> {
 }
 
 /// Process-wide [`Decide`] implementation used by the
-/// `decide_next_action` activity body. Installed via [`install_decide`]
+/// `decide_step` activity body. Installed via [`install_decide`]
 /// and accessed via [`decide_impl`].
 ///
 /// The trait object is `Arc<dyn Decide>` so hermetic tests can install a
@@ -221,7 +221,7 @@ pub fn build_worker(runtime: &CoreRuntime, client: Client, task_queue: &str) -> 
     Worker::new(runtime, client, opts).map_err(|e| anyhow::anyhow!("Worker::new failed: {e}"))
 }
 
-/// Build the [`ModelRegistry`]-backed [`Decide`] the `decide_next_action`
+/// Build the [`ModelRegistry`]-backed [`Decide`] the `decide_step`
 /// activity body will call, populated from every provider compiled into
 /// this binary whose API key is set. Any agent's `provider/model` then
 /// resolves to its own client. Returns a human-readable provider summary
