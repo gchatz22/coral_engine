@@ -547,6 +547,18 @@ impl AgentWorkflow {
                 if let Some(next_after) = action.idle_after() {
                     // `Idle` is the sole terminal: pin the next cadence and
                     // end the cycle.
+                    //
+                    // Status-note telemetry, guarded by `is_replaying` so a
+                    // workflow-task replay (cache eviction / worker restart)
+                    // does not double-count this per-cycle metric.
+                    if !ctx.is_replaying() {
+                        tracing::info!(
+                            steps = session.len(),
+                            status_note_written =
+                                coral_node::agent_core::status_note_written(&session),
+                            "cycle complete: status-note telemetry"
+                        );
+                    }
                     ctx.state_mut(|s| s.next_wake = Some(next_after));
                     break;
                 }
