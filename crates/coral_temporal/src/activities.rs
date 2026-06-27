@@ -2,7 +2,7 @@
 //! `async fn` taking `ActivityContext` and a typed input; the
 //! `#[activities]` macro registers them on a value-typed
 //! `AgentActivities`. Test-side decision injection lives in
-//! [`set_decision_script`] — `decide_next_action` consults the static
+//! [`set_decision_script`] — `decide_step` consults the static
 //! script before reaching for the installed [`Decide`].
 
 use std::collections::VecDeque;
@@ -14,8 +14,8 @@ use coral_node::agent_core;
 use coral_node::agent_ref::{AgentId, GraphId};
 use coral_node::conflict::ConflictRecord;
 use coral_node::decision::{
-    ConflictId, ConflictRecordIntent, ContextBundle, CorrectionContext, Decide, Decision, FsOp,
-    ReconcileSource, ToolCall,
+    ConflictId, ConflictRecordIntent, Decide, Decision, FsOp, Observation, ReconcileSource, Seed,
+    Session, ToolCall,
 };
 use coral_node::evidence::{EvidenceId, EvidenceRecord};
 use coral_node::fs::{AgentFs, FsError};
@@ -31,12 +31,12 @@ use temporalio_sdk::ApplicationFailure;
 use crate::worker::{agent_storage, structural_db_store};
 use crate::workflow::{AgentConfig, FsHandle};
 
-/// Input to [`AgentActivities::assemble_context`]. Carries the per-tick
-/// drained signal buckets (`triggers`, `human_ops`, `mandate_patches`)
-/// plus the resolved [`Mandate`] + FS handle + prior-tick correction so
-/// the activity can call into [`coral_node::agent_core::drain_triggers`].
+/// Input to [`AgentActivities::build_seed`]. Carries the per-cycle drained
+/// signal buckets (`triggers`, `human_ops`, `mandate_patches`) plus the
+/// resolved [`Mandate`] + FS handle so the activity can call into
+/// [`coral_node::agent_core::build_seed`] for the thin orienting seed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AssembleContextInput {
+pub struct BuildSeedInput {
     pub mandate: Mandate,
     pub fs_handle: FsHandle,
     pub triggers: Vec<Trigger>,
@@ -49,24 +49,68 @@ pub struct AssembleContextInput {
     /// `pending_mandate_patches` bucket. The activity records the count
     /// today; consumption is unwired.
     pub mandate_patches: Vec<MandatePatch>,
-    /// Correction context staged by the previous tick — `Some` when the
-    /// previous `DispatchOutcome` was `NeedsCorrection` or `ToolError`.
-    /// `None` on the first tick of a run.
-    pub prior_correction: Option<CorrectionContext>,
 }
 
-/// Output of [`AgentActivities::assemble_context`]. Carries the
-/// fully-populated [`ContextBundle`] from `agent_core::drain_triggers`.
+/// Output of [`AgentActivities::build_seed`]. Carries the thin orienting
+/// [`Seed`] from `agent_core::build_seed`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AssembleContextOutput {
-    pub bundle: ContextBundle,
+pub struct BuildSeedOutput {
+    pub seed: Seed,
 }
 
-/// Input to [`AgentActivities::decide_next_action`]. Wraps
-/// `LlmDecide::decide(bundle)` after consulting the test script.
+/// Input to [`AgentActivities::decide_step`]. Wraps `LlmDecide::decide(&session)`
+/// after consulting the test script. The session is rebuilt by the workflow
+/// body from prior journaled activity results, so each step's decide sees the
+/// full in-cycle history.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DecideInput {
-    pub bundle: ContextBundle,
+pub struct DecideStepInput {
+    pub session: Session,
+}
+
+/// Input to [`AgentActivities::read_fs`] — one read-only FS-navigation step
+/// (`Read`/`List`/`Search`) against the agent's own filesystem.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReadFsInput {
+    pub fs_handle: FsHandle,
+    pub op: FsNavOp,
+}
+
+/// The read-only navigation op a [`ReadFsInput`] carries. Mirrors the
+/// `Read`/`List`/`Search` repertoire steps.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum FsNavOp {
+    Read {
+        path: String,
+    },
+    List {
+        path: String,
+    },
+    Search {
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+}
+
+impl FsNavOp {
+    /// Rebuild the equivalent [`Decision`] so the activity can reuse
+    /// [`agent_core::execute_step`]'s rendering for byte-identical
+    /// observations with the in-process path.
+    fn into_decision(self) -> Decision {
+        match self {
+            FsNavOp::Read { path } => Decision::Read { path },
+            FsNavOp::List { path } => Decision::List { path },
+            FsNavOp::Search { query, path } => Decision::Search { query, path },
+        }
+    }
+}
+
+/// Output of [`AgentActivities::read_fs`] — the observation the workflow
+/// pushes into the session for the next step to reason over.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReadFsOutput {
+    pub observation: Observation,
 }
 
 /// Input to [`AgentActivities::execute_tool`]. One activity invocation
@@ -130,7 +174,7 @@ pub struct PersistOutputInput {
 /// an `AgentFs` against the shared storage. The mandate is decorative
 /// for this call path — `AgentFs::new_with_storage` only writes
 /// `mandate.md` when absent, and `apply_fs_ops` runs only against
-/// agents that have already gone through `assemble_context` at least
+/// agents that have already gone through `build_seed` at least
 /// once (so `mandate.md` already exists on disk). Carrying the real
 /// mandate rather than fishing it out of disk keeps the activity body
 /// single-storage-roundtrip.
@@ -164,6 +208,9 @@ pub struct PersistRetirementInput {
 pub struct AppendDecisionLogInput {
     pub fs_handle: FsHandle,
     pub tick: u64,
+    /// Step index within the cycle (a cycle takes multiple inner-loop
+    /// steps). Each step lands at its own `decisions/<tick>-<step>.jsonl`.
+    pub step: u64,
     pub decision_summary: String,
 }
 
@@ -224,9 +271,9 @@ pub struct ReconcileChildrenInput {
 ///
 /// `synthetic_evidence[i]` is the freshly-minted `EvidenceId` for the
 /// `sources[i]` cross-agent fold (written into the parent's
-/// `evidence/<id>.json`). The parent's next-tick `assemble_context`
-/// picks these up via the existing `list_recent_evidence` window with
-/// no workflow-state slot involved.
+/// `evidence/<id>.json`). The parent pulls these on a later step via
+/// `List`/`Read` of `evidence/` to cite them in a subsequent
+/// `EmitOutput` — no workflow-state slot involved.
 ///
 /// `conflict_id` is `Some` iff `input.conflict.is_some()` and the
 /// activity wrote the conflict record successfully.
@@ -240,8 +287,8 @@ pub struct ReconcileChildrenOutput {
 /// Typed reconciliation errors. The `reconcile_children` activity
 /// wraps these as `ApplicationFailure::non_retryable` so Temporal's
 /// outer retry loop doesn't churn through them; the workflow body
-/// catches the failure and stages a `CorrectionContext` for the next
-/// tick.
+/// catches the failure and folds it into a session observation the
+/// model adapts to on its next step.
 #[derive(Debug, thiserror::Error)]
 pub enum ReconciliationError {
     /// A `sources[i].output_id` did not resolve in the named child's
@@ -277,15 +324,19 @@ pub enum ReconciliationError {
 #[non_exhaustive]
 pub struct DecisionLogEntry {
     pub tick: u64,
+    /// Step index within the cycle. A cycle takes multiple inner-loop steps;
+    /// each lands at its own `decisions/<tick>-<step>.jsonl`.
+    pub step: u64,
     pub decision_summary: String,
     pub ts: DateTime<Utc>,
 }
 
 impl DecisionLogEntry {
     /// Convenience constructor for the workflow body call site.
-    pub fn new(tick: u64, decision_summary: String, ts: DateTime<Utc>) -> Self {
+    pub fn new(tick: u64, step: u64, decision_summary: String, ts: DateTime<Utc>) -> Self {
         Self {
             tick,
+            step,
             decision_summary,
             ts,
         }
@@ -304,7 +355,7 @@ fn script_handle() -> &'static Mutex<VecDeque<Decision>> {
     DECISION_SCRIPT.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-/// Install a script of decisions the [`AgentActivities::decide_next_action`]
+/// Install a script of decisions the [`AgentActivities::decide_step`]
 /// stub returns, in order. Tests call this *before* starting the workflow.
 ///
 /// When the script is empty, the activity falls back to its canned
@@ -359,7 +410,11 @@ pub(crate) async fn append_decision_log_impl(
 ) -> anyhow::Result<()> {
     let fs = AgentFs::attach(storage, prefix);
     let prefix = fs.prefix();
-    let key = format!("{prefix}decisions/{tick}.jsonl", tick = entry.tick);
+    let key = format!(
+        "{prefix}decisions/{tick}-{step}.jsonl",
+        tick = entry.tick,
+        step = entry.step
+    );
     let line = serde_json::to_string(entry)?;
     fs.storage()
         .put(&key, bytes::Bytes::from(line.into_bytes()))
@@ -375,7 +430,7 @@ pub(crate) async fn persist_output_impl(
 ) -> anyhow::Result<OutputId> {
     // Placeholder mandate: `AgentFs` only writes `mandate.md` when
     // absent, so the real mandate persisted by an earlier
-    // `assemble_context` (or prior agent boot) is not clobbered.
+    // `build_seed` (or prior agent boot) is not clobbered.
     let mandate = Mandate::new("", Duration::ZERO, None);
     let fs = AgentFs::new_with_storage(storage, prefix, &mandate).await?;
     let output = fs.persist_output(content, evidence).await?;
@@ -390,21 +445,21 @@ pub struct AgentActivities;
 
 #[activities]
 impl AgentActivities {
-    /// Build a per-tick [`AgentFs`] over the worker-shared
-    /// `AgentStorage` at the input's prefix, fold drained `human_ops`
-    /// into the `Trigger::HumanOverride` taxonomy, then delegate to
-    /// [`agent_core::drain_triggers`] for the FS-assemble that yields
-    /// the warm `ContextBundle`.
+    /// Build a per-cycle [`AgentFs`] over the worker-shared `AgentStorage`
+    /// at the input's prefix, fold drained `human_ops` into the
+    /// `Trigger::HumanOverride` taxonomy, then delegate to
+    /// [`agent_core::build_seed`] for the thin orienting seed (mandate +
+    /// triggers + pointers-only FS index).
     ///
     /// FS open is idempotent — `AgentFs::new_with_storage` only writes
     /// `mandate.md` when absent, so passing the workflow's mandate
-    /// through on every tick is correct. The cost is one storage `get`
-    /// per tick + a one-time put on first open per agent.
+    /// through on every cycle is correct. The cost is one storage `get`
+    /// per cycle + a one-time put on first open per agent.
     #[activity]
-    pub async fn assemble_context(
+    pub async fn build_seed(
         _ctx: ActivityContext,
-        input: AssembleContextInput,
-    ) -> Result<AssembleContextOutput, ActivityError> {
+        input: BuildSeedInput,
+    ) -> Result<BuildSeedOutput, ActivityError> {
         let storage = crate::worker::agent_storage();
         let fs = AgentFs::new_with_storage(storage, input.fs_handle.prefix.clone(), &input.mandate)
             .await?;
@@ -422,14 +477,12 @@ impl AgentActivities {
         if !input.mandate_patches.is_empty() {
             tracing::debug!(
                 count = input.mandate_patches.len(),
-                "assemble_context: dropping mandate_patches (unwired)"
+                "build_seed: dropping mandate_patches (unwired)"
             );
         }
 
-        let bundle =
-            agent_core::drain_triggers(triggers, &fs, &input.mandate, input.prior_correction)
-                .await?;
-        Ok(AssembleContextOutput { bundle })
+        let seed = agent_core::build_seed(&fs, triggers, &input.mandate).await?;
+        Ok(BuildSeedOutput { seed })
     }
 
     /// Wrap the process-wide [`Decide`] impl installed via
@@ -460,9 +513,9 @@ impl AgentActivities {
     /// (`workflow::ACTIVITY_TIMEOUT`) comfortably brackets a normal
     /// LLM call, and the batch-shape `ModelClient` doesn't stream.
     #[activity]
-    pub async fn decide_next_action(
+    pub async fn decide_step(
         _ctx: ActivityContext,
-        input: DecideInput,
+        input: DecideStepInput,
     ) -> Result<Decision, ActivityError> {
         // Script-first: scripted decisions short-circuit the installed
         // `Decide` so tests never hit a real LLM.
@@ -476,6 +529,32 @@ impl AgentActivities {
             .map_err(classify_decide_error)
     }
 
+    /// Execute one read-only FS-navigation step (`Read`/`List`/`Search`)
+    /// against the agent's own filesystem and return the observation the
+    /// workflow pushes into the session.
+    ///
+    /// Reuses [`agent_core::execute_step`] so the observation rendering is
+    /// byte-identical to the in-process path. The empty `ToolRegistry` is
+    /// never consulted — FS-nav variants don't dispatch tools. `attach`
+    /// (not `new_with_storage`) because read-only nav needs neither the
+    /// `mandate.md` write nor the tail reconcile.
+    ///
+    /// A `Read` of a missing file comes back as a failure `Observation`
+    /// (the model adapts in-cycle), not an `ActivityError`.
+    #[activity]
+    pub async fn read_fs(
+        _ctx: ActivityContext,
+        input: ReadFsInput,
+    ) -> Result<ReadFsOutput, ActivityError> {
+        let storage = crate::worker::agent_storage();
+        let fs = AgentFs::attach(storage, input.fs_handle.prefix.clone());
+        let registry = coral_node::tools::ToolRegistry::new();
+        let outcome = agent_core::execute_step(&fs, &registry, &input.op.into_decision()).await?;
+        Ok(ReadFsOutput {
+            observation: outcome.observation,
+        })
+    }
+
     /// Dispatch one `ToolCall` through the process-wide
     /// [`ToolRegistry`] (installed via
     /// [`crate::worker::install_tool_registry`]) and, on success,
@@ -483,9 +562,9 @@ impl AgentActivities {
     /// `AgentFs` facade backed by [`crate::worker::agent_storage`].
     ///
     /// One activity invocation per `ToolCall`; the workflow body fans
-    /// out N calls via `workflows::join_all` and stages a
-    /// `CorrectionContext` for next tick when any surface as
-    /// `Failure`.
+    /// out N calls via `workflows::join_all` and summarizes the batch
+    /// into a session observation (a failure observation when any
+    /// surface as `Failure`) the model adapts to on its next step.
     ///
     /// Retry layering: tool calls are dispatched single-shot from this
     /// activity — `McpTool` already runs its own `RetryPolicy` loop
@@ -500,7 +579,7 @@ impl AgentActivities {
     /// rather than `ActivityError`: the inner retry already gave up,
     /// and surfacing as `ActivityError` would trip Temporal's outer
     /// retry pointlessly. The workflow body folds the failure into a
-    /// `CorrectionContext` for the next tick. Unknown tool names take
+    /// session observation the model adapts to. Unknown tool names take
     /// the same path — at per-call granularity they're
     /// observationally identical to any call-time error.
     ///
@@ -673,7 +752,7 @@ impl AgentActivities {
     /// Append a one-line JSONL entry describing the decision the
     /// workflow just took to `<prefix>/decisions/<tick>.jsonl`. One
     /// activity invocation per tick, called from the workflow body
-    /// after `decide_next_action` returns. Idempotent: `<tick>.jsonl`
+    /// after `decide_step` returns. Idempotent: `<tick>.jsonl`
     /// is a per-tick file containing exactly one line, and the
     /// timestamp is sourced from `ctx.info().scheduled_time` so
     /// retries PUT byte-identical bytes.
@@ -691,7 +770,7 @@ impl AgentActivities {
             .scheduled_time
             .map(DateTime::<Utc>::from)
             .unwrap_or_else(Utc::now);
-        let entry = DecisionLogEntry::new(input.tick, input.decision_summary, ts);
+        let entry = DecisionLogEntry::new(input.tick, input.step, input.decision_summary, ts);
         append_decision_log_impl(agent_storage(), &input.fs_handle.prefix, &entry).await?;
         Ok(())
     }
@@ -703,7 +782,7 @@ impl AgentActivities {
     /// via [`crate::worker::install_structural_db_store`]).
     ///
     /// The activity does **not** write `mandate.md` to the child's
-    /// FS — that's the child workflow's first-run `assemble_context`
+    /// FS — that's the child workflow's first-run `build_seed`
     /// job. Scope is structural state only.
     ///
     /// Idempotency: not provided. Both writes are FK-bound — a
@@ -727,9 +806,8 @@ impl AgentActivities {
     /// directory as synthetic evidence records. One activity
     /// invocation per `Decision::ReconcileChildren`; the workflow body
     /// does NOT push the resulting evidence into any workflow-state
-    /// slot — the parent's next-tick `assemble_context` picks the
-    /// synthetic records up via the existing `list_recent_evidence`
-    /// window.
+    /// slot — the parent pulls the synthetic records on a later step via
+    /// `List`/`Read` of `evidence/`.
     ///
     /// When `input.conflict.is_some()`, the activity persists a
     /// `ConflictRecord` under the parent's `conflicts/<id>.json` and
@@ -740,8 +818,8 @@ impl AgentActivities {
     ///
     /// Error mapping: only typed [`ReconciliationError`]s surface as
     /// `ActivityError::Application(non_retryable)` — the workflow body
-    /// catches the failure and stages a `CorrectionContext` for the
-    /// next tick. Non-retryable because `ChildOutputNotFound` is
+    /// catches the failure and folds it into a session observation the
+    /// model adapts to. Non-retryable because `ChildOutputNotFound` is
     /// structural; re-running with the same id won't make it resolve.
     ///
     /// Every other error (storage, serde, `record_evidence` write
@@ -862,7 +940,7 @@ pub async fn reconcile_children_impl(
 ) -> anyhow::Result<ReconcileChildrenOutput> {
     // Parent FS — write target. `open_for_agent` uses `attach`
     // semantics (no mandate read, no tail reconcile); the parent's
-    // `assemble_context` has already written `mandate.md` on its
+    // `build_seed` has already written `mandate.md` on its
     // first tick, and `record_evidence` doesn't need it.
     let parent_fs = AgentFs::open_for_agent(
         storage.clone(),
@@ -968,16 +1046,16 @@ pub async fn persist_retirement_inner(
 }
 
 /// Call the supplied [`Decide`] with the activity's input. Separated
-/// from [`AgentActivities::decide_next_action`] so hermetic tests can
+/// from [`AgentActivities::decide_step`] so hermetic tests can
 /// inject an arbitrary `Decide` without going through the
 /// `worker::decide_impl()` static.
-async fn decide_with(decide: &dyn Decide, input: DecideInput) -> anyhow::Result<Decision> {
-    decide.decide(input.bundle).await
+async fn decide_with(decide: &dyn Decide, input: DecideStepInput) -> anyhow::Result<Decision> {
+    decide.decide(&input.session).await
 }
 
 /// Map an `anyhow::Error` from `Decide::decide` to a Temporal
 /// [`ActivityError`] with retryability flagged per the categorization
-/// rules in [`AgentActivities::decide_next_action`].
+/// rules in [`AgentActivities::decide_step`].
 ///
 /// Downcasts to `&ModelError` to extract the category; `LlmDecide`
 /// wraps typed `ModelError` via `anyhow::Error::new` so the source
@@ -1024,19 +1102,15 @@ mod tests {
     // default parallel runner.
     static SCRIPT_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Build an empty `ContextBundle` for tests that exercise the
-    /// activity body. `Mandate::new("", Duration::ZERO, None)` is the
-    /// cheapest valid construction (mirrors the stub fallback in
-    /// `assemble_context`).
-    fn empty_bundle() -> ContextBundle {
-        ContextBundle {
-            mandate: Mandate::new("", Duration::ZERO, None),
-            triggers: Vec::new(),
-            recent_outputs: Vec::new(),
-            recent_evidence: Vec::new(),
-            open_claims: Vec::new(),
-            correction: None,
-        }
+    /// Build an empty `Session` for tests that exercise the activity
+    /// body. `Mandate::new("", Duration::ZERO, None)` is the cheapest
+    /// valid construction.
+    fn empty_session() -> Session {
+        Session::new(coral_node::decision::Seed::new(
+            Mandate::new("", Duration::ZERO, None),
+            Vec::new(),
+            coral_node::decision::FsIndex::default(),
+        ))
     }
 
     #[test]
@@ -1086,27 +1160,25 @@ mod tests {
     }
 
     #[test]
-    fn assemble_context_input_empty_buckets_pin_shape() {
+    fn build_seed_input_empty_buckets_pin_shape() {
         // No `Default` derive (real `Mandate` has none). Explicit
         // construction so future non-`Default` fields force the same
         // bucket-init discipline.
-        let i = AssembleContextInput {
+        let i = BuildSeedInput {
             mandate: Mandate::new("", Duration::ZERO, None),
             fs_handle: FsHandle::default(),
             triggers: Vec::new(),
             human_ops: Vec::new(),
             mandate_patches: Vec::new(),
-            prior_correction: None,
         };
         assert!(i.triggers.is_empty());
         assert!(i.human_ops.is_empty());
         assert!(i.mandate_patches.is_empty());
-        assert!(i.prior_correction.is_none());
     }
 
     #[test]
-    fn assemble_context_input_round_trips_through_json() {
-        let i = AssembleContextInput {
+    fn build_seed_input_round_trips_through_json() {
+        let i = BuildSeedInput {
             mandate: Mandate::new("test", Duration::from_millis(100), Some(4)),
             fs_handle: FsHandle {
                 prefix: "g1/a1".into(),
@@ -1114,11 +1186,26 @@ mod tests {
             triggers: vec![Trigger::ScheduledWake],
             human_ops: vec![HumanOp::new(json!({"action": "pause"}))],
             mandate_patches: vec![MandatePatch::new(json!({"model": "x"}))],
-            prior_correction: Some(CorrectionContext::new("prior failure")),
         };
         let s = serde_json::to_string(&i).unwrap();
-        let back: AssembleContextInput = serde_json::from_str(&s).unwrap();
+        let back: BuildSeedInput = serde_json::from_str(&s).unwrap();
         assert_eq!(i, back);
+    }
+
+    #[test]
+    fn read_fs_input_round_trips_through_json() {
+        let i = ReadFsInput {
+            fs_handle: FsHandle {
+                prefix: "g1/a1".into(),
+            },
+            op: FsNavOp::Search {
+                query: "tsmc".into(),
+                path: Some("notes/".into()),
+            },
+        };
+        let s = serde_json::to_string(&i).unwrap();
+        let back: ReadFsInput = serde_json::from_str(&s).unwrap();
+        assert_eq!(i.op, back.op);
     }
 
     #[test]
@@ -1213,7 +1300,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Decide for ErrDecide {
-        async fn decide(&self, _ctx: ContextBundle) -> anyhow::Result<Decision> {
+        async fn decide(&self, _session: &Session) -> anyhow::Result<Decision> {
             Err((self.make_err)())
         }
     }
@@ -1226,8 +1313,8 @@ mod tests {
             next_after: Duration::from_millis(250),
         };
         let decide: Arc<dyn Decide> = Arc::new(MockDecide::new(vec![want.clone()]));
-        let input = DecideInput {
-            bundle: empty_bundle(),
+        let input = DecideStepInput {
+            session: empty_session(),
         };
         let got = decide_with(decide.as_ref(), input).await.unwrap();
         assert_eq!(got, want);
@@ -1432,8 +1519,8 @@ mod tests {
         let decide: Arc<dyn Decide> = Arc::new(ErrDecide {
             make_err: || anyhow::Error::new(ModelError::Transport("downstream 503".into())),
         });
-        let input = DecideInput {
-            bundle: empty_bundle(),
+        let input = DecideStepInput {
+            session: empty_session(),
         };
         let raw = decide_with(decide.as_ref(), input).await.unwrap_err();
         let activity_err = classify_decide_error(raw);
@@ -1452,8 +1539,8 @@ mod tests {
         let decide: Arc<dyn Decide> = Arc::new(ErrDecide {
             make_err: || anyhow::anyhow!("LlmDecide: parse failed on all 2 attempts"),
         });
-        let input = DecideInput {
-            bundle: empty_bundle(),
+        let input = DecideStepInput {
+            session: empty_session(),
         };
         let raw = decide_with(decide.as_ref(), input).await.unwrap_err();
         let activity_err = classify_decide_error(raw);
@@ -1656,14 +1743,14 @@ mod tests {
         let ts = DateTime::parse_from_rfc3339("2026-05-25T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let entry = DecisionLogEntry::new(7, "Idle { 50ms }".into(), ts);
+        let entry = DecisionLogEntry::new(7, 2, "Idle { 50ms }".into(), ts);
         append_decision_log_impl(storage.clone(), prefix, &entry)
             .await
             .expect("append_decision_log_impl ok");
 
-        // File lands at `<prefix>/decisions/<tick>.jsonl` with the
+        // File lands at `<prefix>/decisions/<tick>-<step>.jsonl` with the
         // single JSON line we wrote.
-        let key = "graphs/g/agents/a/decisions/7.jsonl";
+        let key = "graphs/g/agents/a/decisions/7-2.jsonl";
         let bytes = storage
             .get(key)
             .await
@@ -1690,12 +1777,12 @@ mod tests {
         let ts = DateTime::parse_from_rfc3339("2026-05-25T13:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let entry = DecisionLogEntry::new(0, "Retire { 'done' }".into(), ts);
+        let entry = DecisionLogEntry::new(0, 0, "Retire { 'done' }".into(), ts);
         append_decision_log_impl(storage.clone(), prefix, &entry)
             .await
             .unwrap();
         let first = storage
-            .get("graphs/g/agents/replay/decisions/0.jsonl")
+            .get("graphs/g/agents/replay/decisions/0-0.jsonl")
             .await
             .unwrap()
             .unwrap();
@@ -1703,7 +1790,7 @@ mod tests {
             .await
             .unwrap();
         let second = storage
-            .get("graphs/g/agents/replay/decisions/0.jsonl")
+            .get("graphs/g/agents/replay/decisions/0-0.jsonl")
             .await
             .unwrap()
             .unwrap();
@@ -1925,6 +2012,7 @@ mod tests {
                 prefix: "g/a".into(),
             },
             tick: 42,
+            step: 1,
             decision_summary: "CallTools { 3 calls }".into(),
         };
         let s = serde_json::to_string(&i).unwrap();
@@ -1934,7 +2022,7 @@ mod tests {
         let ts = DateTime::parse_from_rfc3339("2026-05-25T14:30:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let e = DecisionLogEntry::new(42, "EmitOutput { evidence: 1 }".into(), ts);
+        let e = DecisionLogEntry::new(42, 1, "EmitOutput { evidence: 1 }".into(), ts);
         let s2 = serde_json::to_string(&e).unwrap();
         let back2: DecisionLogEntry = serde_json::from_str(&s2).unwrap();
         assert_eq!(e, back2);

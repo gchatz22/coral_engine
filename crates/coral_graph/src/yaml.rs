@@ -1440,10 +1440,6 @@ seed:
         assert!(input.mandate.model.is_none());
 
         assert!(input.mandate.retry_policy.is_none());
-        assert_eq!(
-            input.mandate.context_policy,
-            coral_node::mandate::ContextPolicy::default(),
-        );
 
         // FS handle prefix is derived from the GraphStore-allocated
         // UUIDs (not the operator-authored name) so cross-agent FS

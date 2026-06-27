@@ -19,7 +19,7 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 
 use coral_node::agent::{Agent, RetireReason};
-use coral_node::decision::{ContextBundle, Decide, Decision};
+use coral_node::decision::{Decide, Decision, FsIndex, Seed, Session};
 use coral_node::fs::AgentFs;
 use coral_node::health::{HealthTracker, RetryBudget};
 use coral_node::mandate::Mandate;
@@ -47,15 +47,12 @@ fn ensure_dummy_api_key() {
     }
 }
 
-fn empty_bundle() -> ContextBundle {
-    ContextBundle {
-        mandate: Mandate::new("cohere fixture", Duration::from_secs(60), Some(8)),
-        triggers: vec![],
-        recent_outputs: vec![],
-        recent_evidence: vec![],
-        open_claims: vec![],
-        correction: None,
-    }
+fn empty_session() -> Session {
+    Session::new(Seed::new(
+        Mandate::new("cohere fixture", Duration::from_secs(60), Some(8)),
+        vec![],
+        FsIndex::default(),
+    ))
 }
 
 fn build_client(base_url: String) -> CohereClient {
@@ -78,7 +75,10 @@ async fn happy_path_tick_drives_call_tool_then_emit_output() {
     let decide = LlmDecide::new(client.clone(), CompleteOptions::default());
 
     // Tick 1: model emits CallTools(vec![echo, ...]).
-    let dec_1 = decide.decide(empty_bundle()).await.expect("tick 1 decide");
+    let dec_1 = decide
+        .decide(&empty_session())
+        .await
+        .expect("tick 1 decide");
     match &dec_1 {
         Decision::CallTools { calls } => {
             assert_eq!(calls.len(), 1, "single-call happy path");
@@ -101,7 +101,10 @@ async fn happy_path_tick_drives_call_tool_then_emit_output() {
     );
 
     // Tick 2: model emits EmitOutput.
-    let dec_2 = decide.decide(empty_bundle()).await.expect("tick 2 decide");
+    let dec_2 = decide
+        .decide(&empty_session())
+        .await
+        .expect("tick 2 decide");
     match &dec_2 {
         Decision::EmitOutput { content, evidence } => {
             assert_eq!(content, "the echo tool returned hello coral");
@@ -157,7 +160,7 @@ async fn parse_retry_recovers_after_malformed_tool_use() {
     let decide = LlmDecide::new(client.clone(), CompleteOptions::default());
 
     let dec = decide
-        .decide(empty_bundle())
+        .decide(&empty_session())
         .await
         .expect("decide should recover");
     match &dec {
@@ -422,7 +425,7 @@ async fn parallel_tool_calls_k3_folds_into_single_call_tools_decision() {
     let decide = LlmDecide::new(client.clone(), CompleteOptions::default());
 
     let dec = decide
-        .decide(empty_bundle())
+        .decide(&empty_session())
         .await
         .expect("parallel decide");
     match dec {
@@ -466,20 +469,17 @@ async fn happy_path_tick_live_smoke() {
     // Cohere rejects requests whose `messages[]` carries only a system
     // turn ("invalid request: message must be at least 1 token long");
     // seed one trigger so the prompt renderer emits a user message too.
-    let bundle = ContextBundle {
-        mandate: Mandate::new(
+    let session = Session::new(Seed::new(
+        Mandate::new(
             "Reply with idle for at least 1000ms.",
             Duration::from_secs(60),
             Some(1),
         ),
-        triggers: vec![coral_node::trigger::Trigger::ScheduledWake],
-        recent_outputs: vec![],
-        recent_evidence: vec![],
-        open_claims: vec![],
-        correction: None,
-    };
+        vec![coral_node::trigger::Trigger::ScheduledWake],
+        FsIndex::default(),
+    ));
     let dec = decide
-        .decide(bundle)
+        .decide(&session)
         .await
         .expect("live cohere decide should succeed");
     let calls = decide.last_tick_calls();

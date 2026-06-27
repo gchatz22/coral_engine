@@ -149,9 +149,9 @@ async fn build_client() -> Result<Client> {
     Ok(client)
 }
 
-/// Live test: scripts the decide_next_action activity through Idle →
-/// CallTools(3) → Retire, then asserts the workflow history shows the
-/// expected parallel tool dispatch + persist_retirement.
+/// Live test: scripts a single cycle of CallTools(3) → EmitOutput →
+/// RewriteFs → Idle (capped at `step_cap=1`), then asserts the workflow
+/// history shows the expected parallel tool dispatch + persist_retirement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // The `LIVE_TEST_GUARD` lock is held across `await`s on purpose: it
 // serializes two live tests that both mutate process-wide state
@@ -207,13 +207,11 @@ async fn run_live_test() -> Result<()> {
         .await
         .context("plant evidence for EmitOutput")?;
 
-    // Install the scripted decision sequence BEFORE the worker starts.
-    // Sequence: Idle → CallTools(3 parallel) → EmitOutput → RewriteFs, then
-    // the `step_cap=4` cap stops the loop (agents never self-terminate).
+    // Install the scripted cycle BEFORE the worker starts. One cycle of
+    // four steps: CallTools(3 parallel) → EmitOutput → RewriteFs → Idle
+    // (the sole terminal that ends the cycle), then the `step_cap=1` cap
+    // stops the loop at the top of cycle 1 (agents never self-terminate).
     set_decision_script(vec![
-        Decision::Idle {
-            next_after: Duration::from_millis(50),
-        },
         Decision::CallTools {
             calls: vec![
                 ToolCall::new("tool_a", serde_json::json!({"i": 1}), ClaimSeed::new("s-a")),
@@ -230,6 +228,9 @@ async fn run_live_test() -> Result<()> {
                 path: "notes/loop-test.md".into(),
                 content: "from workflow_loop live test".into(),
             }],
+        },
+        Decision::Idle {
+            next_after: Duration::from_millis(50),
         },
     ]);
 
@@ -310,8 +311,8 @@ async fn drive(
         prefix: agent_prefix.into(),
     };
     input.mandate.tools = assigned_tools();
-    // The loop runs the 4 scripted decisions, then the cap stops it.
-    input.mandate.step_cap = Some(4);
+    // The loop runs the one scripted cycle (4 steps), then the cap stops it.
+    input.mandate.step_cap = Some(1);
     let handle = client
         .start_workflow(
             AgentWorkflow::run,
@@ -321,10 +322,10 @@ async fn drive(
         .await
         .context("start_workflow(AgentWorkflow)")?;
 
-    // Workflow runs through the scripted Idle → CallTools(3) → EmitOutput
-    // → RewriteFs sequence on its own, then the step_cap cap stops it; no
-    // client-side signals needed. Each tick calls `decide_next_action`
-    // which pops the next scripted decision.
+    // Workflow runs the scripted CallTools(3) → EmitOutput → RewriteFs →
+    // Idle cycle on its own, then the step_cap cap stops it; no
+    // client-side signals needed. Each step calls `decide_step` which pops
+    // the next scripted decision.
     let result: AgentResult = handle
         .get_result(WorkflowGetResultOptions::default())
         .await
@@ -332,7 +333,7 @@ async fn drive(
     eprintln!("workflow_loop: workflow returned {result:?}");
     let AgentResult::Retired { reason } = result;
     assert_eq!(
-        reason, "step_cap (4) reached",
+        reason, "step_cap (1) reached",
         "workflow returned wrong retire reason: {reason:?}"
     );
 
@@ -435,8 +436,8 @@ async fn drive(
         .get("reason")
         .and_then(|x| x.as_str())
         .ok_or_else(|| anyhow::anyhow!("retirement.json missing reason"))?;
-    assert!(
-        reason_on_disk.contains("scripted retire"),
+    assert_eq!(
+        reason_on_disk, "step_cap (1) reached",
         "retirement.json carries wrong reason: {reason_on_disk:?}"
     );
     let retired_at = v
@@ -572,15 +573,12 @@ async fn run_partial_failure_test() -> Result<()> {
         .filter(|k| k.ends_with(".json") && !k.ends_with("/_tail.json"))
         .count();
 
-    // Script: Idle → CallTools(one failing + two distinct succeeding
-    // calls), then the `step_cap=2` cap stops the loop. The succeeding
-    // calls use args distinct from run_live_test's so their EvidenceIds
-    // (content-addressed on (tool, args, result)) don't collide with the
-    // pre-run records.
+    // Script: one cycle of CallTools(one failing + two distinct succeeding
+    // calls) → Idle, then the `step_cap=1` cap stops the loop. The
+    // succeeding calls use args distinct from run_live_test's so their
+    // EvidenceIds (content-addressed on (tool, args, result)) don't collide
+    // with the pre-run records.
     set_decision_script(vec![
-        Decision::Idle {
-            next_after: Duration::from_millis(50),
-        },
         Decision::CallTools {
             calls: vec![
                 ToolCall::new(
@@ -599,6 +597,9 @@ async fn run_partial_failure_test() -> Result<()> {
                     ClaimSeed::new("pf-b"),
                 ),
             ],
+        },
+        Decision::Idle {
+            next_after: Duration::from_millis(50),
         },
     ]);
 
@@ -664,8 +665,8 @@ async fn drive_partial(client: Client, task_queue: &str, workflow_id: &str) -> R
         "workflow-loop-pf-test",
     );
     input.mandate.tools = assigned_tools();
-    // The loop runs the 2 scripted decisions, then the cap stops it.
-    input.mandate.step_cap = Some(2);
+    // The loop runs the one scripted cycle (2 steps), then the cap stops it.
+    input.mandate.step_cap = Some(1);
     let handle = client
         .start_workflow(
             AgentWorkflow::run,
@@ -681,7 +682,7 @@ async fn drive_partial(client: Client, task_queue: &str, workflow_id: &str) -> R
         .context("AgentWorkflow.get_result [partial]")?;
     let AgentResult::Retired { reason } = result;
     assert_eq!(
-        reason, "step_cap (2) reached",
+        reason, "step_cap (1) reached",
         "workflow returned wrong retire reason in partial-failure test: {reason:?}"
     );
 

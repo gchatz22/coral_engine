@@ -29,8 +29,9 @@
 
 use std::time::Duration;
 
+use coral_node::agent_core::CYCLE_RUNAWAY_FUSE;
 use coral_node::agent_ref::{AgentId, AgentRef, GraphId};
-use coral_node::decision::{ContextBundle, CorrectionContext, Decision, ToolCall};
+use coral_node::decision::{Decision, Observation, Seed, Session, ToolCall};
 use coral_node::evidence::EvidenceId;
 use coral_node::mandate::{Mandate, OutputId, INTERIM_STEP_CAP};
 use coral_node::scheduler::arm_self_wake;
@@ -44,9 +45,10 @@ use temporalio_sdk::{
 };
 
 use crate::activities::{
-    AgentActivities, AppendDecisionLogInput, ApplyFsOpsInput, AssembleContextInput, DecideInput,
-    ExecuteToolInput, PersistOutputInput, PersistRetirementInput, ReconcileChildrenInput,
-    RegisterChildInStructuralDbInput, RegisterChildOutcome, ToolCallFailure, ToolCallOutcome,
+    AgentActivities, AppendDecisionLogInput, ApplyFsOpsInput, BuildSeedInput, DecideStepInput,
+    ExecuteToolInput, FsNavOp, PersistOutputInput, PersistRetirementInput, ReadFsInput,
+    ReconcileChildrenInput, RegisterChildInStructuralDbInput, RegisterChildOutcome,
+    ToolCallFailure, ToolCallOutcome,
 };
 use coral_node::decision::{ConflictRecordIntent, ReconcileSource};
 
@@ -139,16 +141,11 @@ pub struct SchedulerCursor {
 /// | `pending_human_ops` | [`AgentWorkflow::pending_human_ops`] | Drained at top of each tick |
 /// | `pending_mandate_patches` | [`AgentWorkflow::pending_mandate_patches`] | Drained at top of each tick |
 /// | `retirement_request` | [`AgentWorkflow::retirement_request`] | Drained at top of each tick (short-circuits) |
-/// | `staged_correction` | [`AgentWorkflow::staged_correction`] | Threaded into next `assemble_context` |
 /// | `scheduler_cursor` | [`AgentWorkflow::next_wake`] | Honored by the wake gate |
 /// | `last_output_id` | [`AgentWorkflow::last_output_id`] | Latest persisted `EmitOutput` id |
 /// | `mid_tick_evidence` | [`AgentWorkflow::mid_tick_evidence`] | EvidenceIds collected mid-tick |
 /// | `cumulative_*_observed` | matching `AgentWorkflow::cumulative_*_observed` | Observability across CAN boundary |
 /// | `child_handles` | [`AgentWorkflow::child_handles`] | Spawned-child handles across CAN |
-///
-/// `staged_correction` is preserved across CAN: dropping it would lose one
-/// tick of correction context the previous run had already staged for the
-/// next tick (visible behavior change).
 ///
 /// `cumulative_*_observed` must survive CAN — without them, a snapshot taken
 /// on the post-CAN run would report `cumulative_triggers_observed == 0` even
@@ -159,7 +156,6 @@ pub struct Carryover {
     pub pending_human_ops: Vec<HumanOp>,
     pub pending_mandate_patches: Vec<MandatePatch>,
     pub retirement_request: Option<String>,
-    pub staged_correction: Option<CorrectionContext>,
     pub scheduler_cursor: SchedulerCursor,
     /// Handles to spawned child agents the parent retains across
     /// continue-as-new. Each entry is an [`AgentRef`] populated by the
@@ -188,10 +184,10 @@ pub struct Carryover {
 ///
 /// `carryover` is load-bearing: on hydrate the workflow body decodes it via
 /// [`AgentWorkflow::hydrate_from_carryover`] back onto workflow state so
-/// pending signal queues, retirement requests, `next_wake`, the
-/// `staged_correction` from the previous tick, and the cumulative
-/// observability counters all survive a CAN boundary. `None` means "first
-/// run of this workflow" — the workflow starts from `Default` state.
+/// pending signal queues, retirement requests, `next_wake`, and the
+/// cumulative observability counters all survive a CAN boundary. `None`
+/// means "first run of this workflow" — the workflow starts from `Default`
+/// state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInput {
     pub cfg: AgentConfig,
@@ -199,7 +195,7 @@ pub struct AgentInput {
     pub parent_handle: Option<ParentRef>,
     pub carryover: Option<Carryover>,
     /// Resolved [`Mandate`] for this agent. The workflow body passes it into
-    /// every `assemble_context` activity invocation so the LLM sees the real
+    /// every `build_seed` activity invocation so the LLM sees the real
     /// mandate text + cadence.
     pub mandate: Mandate,
     /// Graph this agent belongs to. Carried on `AgentInput` (rather than
@@ -327,10 +323,10 @@ pub struct AgentWorkflow {
     /// the top of every loop iteration.
     pending_triggers: Vec<Trigger>,
     /// `human_override` queue. Drained alongside `pending_triggers` and
-    /// passed to `assemble_context` as a separate field.
+    /// passed to `build_seed` as a separate field.
     pending_human_ops: Vec<HumanOp>,
     /// `mandate_update` queue. Drained alongside `pending_triggers` and
-    /// passed to `assemble_context` as a separate field.
+    /// passed to `build_seed` as a separate field.
     pending_mandate_patches: Vec<MandatePatch>,
     /// `retire` request. Checked at the top of every loop iteration; a set
     /// value short-circuits the tick to the retirement path.
@@ -341,10 +337,6 @@ pub struct AgentWorkflow {
     /// tick fires immediately). A continue-as-new preserves the prior run's
     /// `next_wake` via [`Carryover::scheduler_cursor`].
     next_wake: Option<Duration>,
-    /// Correction context staged by the previous tick when its tool batch
-    /// returned failures. Threaded into the next `assemble_context`
-    /// activity input. Cleared on a non-failing tick.
-    staged_correction: Option<CorrectionContext>,
     /// Cumulative count of `Trigger`s observed via `external_signal` since
     /// the workflow started (or last continue-as-new). Bumped inside the
     /// signal handler so a snapshot taken between signal arrival and the
@@ -479,72 +471,49 @@ impl AgentWorkflow {
             }
             synthesize_scheduled_wake(&mut drained);
 
-            let bundle = assemble(ctx, &input, drained).await?;
-            let decision = decide(ctx, bundle).await?;
-            // Append `<prefix>/decisions/<tick>.jsonl` entry BEFORE the
-            // dispatch arm runs so the artifact lands even if a downstream
-            // activity errors out and short-circuits the workflow. The
-            // activity sources its timestamp from
-            // `ctx.info().scheduled_time` so Temporal retries write
-            // byte-identical bytes.
-            log_decision(ctx, &input.fs_handle, tick, &decision).await?;
-            match decision {
-                Decision::CallTools { calls } => dispatch_call_tools(ctx, &input, calls).await?,
-                Decision::EmitOutput { content, evidence } => {
-                    emit_output(ctx, &input, content, evidence).await?;
-                    ctx.state_mut(clear_correction);
+            // Build the thin orienting seed (activity), then run the inner
+            // ReAct loop: decide_step → execute → observe, until the model
+            // chooses `Idle` (the sole terminal). The `session` is a LOCAL
+            // value rebuilt only from journaled activity results — never from
+            // a live FS read in the workflow body — so replay is
+            // deterministic. It is discarded at cycle end; continue-as-new
+            // fires only at the cycle boundary (below), so no in-flight
+            // session ever needs to survive a CAN in PR1.
+            let seed = build_seed(ctx, &input, drained).await?;
+            let mut session = Session::new(seed);
+            let mut step: u64 = 0;
+            loop {
+                let action = decide_step(ctx, &session).await?;
+                // Append `<prefix>/decisions/<tick>-<step>.jsonl` BEFORE the
+                // action's activity runs so the artifact lands even if a
+                // downstream activity errors out. The activity sources its
+                // timestamp from `ctx.info().scheduled_time` so Temporal
+                // retries write byte-identical bytes.
+                log_decision(ctx, &input.fs_handle, tick, step, &action).await?;
+                step = step.saturating_add(1);
+
+                if let Some(next_after) = action.idle_after() {
+                    // `Idle` is the sole terminal: pin the next cadence and
+                    // end the cycle.
+                    ctx.state_mut(|s| s.next_wake = Some(next_after));
+                    break;
                 }
-                Decision::RewriteFs { ops } => {
-                    rewrite_fs(ctx, &input.fs_handle, ops).await?;
-                    ctx.state_mut(clear_correction);
-                }
-                Decision::Idle { next_after } => ctx.state_mut(|s| {
-                    s.next_wake = Some(next_after);
-                    s.staged_correction = None;
-                }),
-                // `staged_correction` is NOT cleared on SpawnChild: a
-                // successful spawn does not satisfy a previously-staged
-                // tool-failure correction (the correction is about the
-                // parent's *own* prior failed tool call), and clearing it
-                // would silently swallow next-tick LLM context. The
-                // correction clears naturally on the next `EmitOutput` /
-                // `RewriteFs` / `Idle` arm.
-                Decision::SpawnChild {
-                    agent_name,
-                    mandate,
-                } => {
-                    spawn_child(ctx, &input, agent_name, mandate).await?;
-                }
-                Decision::ReconcileChildren { sources, conflict } => {
-                    reconcile_children(ctx, &input, sources, conflict).await;
-                }
-                // `staged_correction` is NOT cleared here for the same
-                // reason `SpawnChild` doesn't clear it: a RetireChild
-                // doesn't satisfy a prior tool-failure correction about
-                // the parent's own work.
-                Decision::RetireChild { child_ref, reason } => {
-                    retire_child(ctx, &child_ref, reason).await;
-                }
-                // Replacement is NOT in-place — the new child gets a fresh
-                // `agent_id` + `workflow_id` + `edges` row. The old `edges`
-                // row stays as an audit trail. Failure-mode: if
-                // `spawn_child` errors after the old child has been
-                // retire-signaled, there is no rollback — the error
-                // propagates so Temporal's activity-failure surface makes
-                // the partial state operator-visible.
-                Decision::ReplaceChild {
-                    child_ref,
-                    new_mandate,
-                } => {
-                    let replacement_name = format!("replacement-of-{}", child_ref.agent_id);
-                    retire_child(ctx, &child_ref, format!("replaced by {replacement_name}")).await;
-                    spawn_child(ctx, &input, replacement_name, new_mandate).await?;
+
+                let observation = execute_action(ctx, &input, &action).await?;
+                session.push(action, observation);
+
+                if session.len() >= CYCLE_RUNAWAY_FUSE {
+                    tracing::error!(
+                        steps = session.len(),
+                        "cycle hit runaway fuse; forcing idle — this mandate never converges, decompose it"
+                    );
+                    break;
                 }
             }
-            // Bump the tick after non-retire arms so the next iteration's
-            // decision lands at `decisions/<tick+1>.jsonl`. The retire arm
-            // above intentionally bypasses this — the retirement-tick log
-            // is the final entry for the workflow.
+            // Bump the tick (cycle counter) after the cycle completes so the
+            // next cycle's decisions land under `decisions/<tick+1>-*.jsonl`.
+            // The retire path above intentionally bypasses this — the
+            // retirement log is the final entry for the workflow.
             ctx.state_mut(|s| s.tick = s.tick.saturating_add(1));
 
             // `continue_as_new_suggested` is server-driven, surfaced on
@@ -582,7 +551,6 @@ impl AgentWorkflow {
             pending_human_ops: self.pending_human_ops.clone(),
             pending_mandate_patches: self.pending_mandate_patches.clone(),
             retirement_request: self.retirement_request.clone(),
-            staged_correction: self.staged_correction.clone(),
             scheduler_cursor: SchedulerCursor {
                 next_wake: self.next_wake,
             },
@@ -605,7 +573,6 @@ impl AgentWorkflow {
         self.pending_human_ops = c.pending_human_ops;
         self.pending_mandate_patches = c.pending_mandate_patches;
         self.retirement_request = c.retirement_request;
-        self.staged_correction = c.staged_correction;
         self.next_wake = c.scheduler_cursor.next_wake;
         self.last_output_id = c.last_output_id;
         self.mid_tick_evidence = c.mid_tick_evidence;
@@ -638,7 +605,6 @@ fn synthesize_scheduled_wake(drained: &mut DrainedBuckets) {
     if drained.triggers.is_empty()
         && drained.human_ops.is_empty()
         && drained.mandate_patches.is_empty()
-        && drained.prior_correction.is_none()
         && drained.retirement.is_none()
     {
         drained.triggers.push(Trigger::ScheduledWake);
@@ -675,41 +641,134 @@ async fn wait_for_tick(ctx: &WorkflowContext<AgentWorkflow>, never: bool) {
     }
 }
 
-/// Invoke the `assemble_context` activity with the per-tick drained buckets.
-async fn assemble(
+/// Invoke the `build_seed` activity with the per-cycle drained buckets,
+/// returning the thin orienting [`Seed`] that starts the cycle's session.
+async fn build_seed(
     ctx: &WorkflowContext<AgentWorkflow>,
     input: &AgentInput,
     drained: DrainedBuckets,
-) -> WorkflowResult<ContextBundle> {
+) -> WorkflowResult<Seed> {
     let out = ctx
         .start_activity(
-            AgentActivities::assemble_context,
-            AssembleContextInput {
+            AgentActivities::build_seed,
+            BuildSeedInput {
                 mandate: input.mandate.clone(),
                 fs_handle: input.fs_handle.clone(),
                 triggers: drained.triggers,
                 human_ops: drained.human_ops,
                 mandate_patches: drained.mandate_patches,
-                prior_correction: drained.prior_correction,
             },
             activity_opts(),
         )
         .await?;
-    Ok(out.bundle)
+    Ok(out.seed)
 }
 
-/// Invoke the `decide_next_action` activity.
-async fn decide(
+/// Invoke the `decide_step` activity for the next inner-loop step, passing
+/// the accumulating session so the model reasons over its in-cycle history.
+async fn decide_step(
     ctx: &WorkflowContext<AgentWorkflow>,
-    bundle: ContextBundle,
+    session: &Session,
 ) -> WorkflowResult<Decision> {
     Ok(ctx
         .start_activity(
-            AgentActivities::decide_next_action,
-            DecideInput { bundle },
+            AgentActivities::decide_step,
+            DecideStepInput {
+                session: session.clone(),
+            },
             activity_opts(),
         )
         .await?)
+}
+
+/// Execute one **repertoire** step against the activity surface and return
+/// the [`Observation`] the workflow pushes into the session for the next
+/// step. `Idle` is terminal and never reaches here.
+///
+/// Failures (tool errors, a missing file, a rejected spawn, a bad reconcile)
+/// come back as a failure `Observation` the model adapts to within the same
+/// cycle — there is no cross-cycle correction state on the Temporal path
+/// either. Genuine infra errors still propagate via `?`.
+async fn execute_action(
+    ctx: &WorkflowContext<AgentWorkflow>,
+    input: &AgentInput,
+    action: &Decision,
+) -> WorkflowResult<Observation> {
+    match action {
+        Decision::CallTools { calls } => dispatch_call_tools(ctx, input, calls.clone()).await,
+        Decision::EmitOutput { content, evidence } => {
+            emit_output(ctx, input, content.clone(), evidence.clone()).await?;
+            Ok(Observation::ok("output persisted"))
+        }
+        Decision::RewriteFs { ops } => {
+            rewrite_fs(ctx, &input.fs_handle, ops.clone()).await?;
+            Ok(Observation::ok("notes updated"))
+        }
+        Decision::Read { .. } | Decision::List { .. } | Decision::Search { .. } => {
+            read_fs(ctx, &input.fs_handle, action).await
+        }
+        Decision::SpawnChild {
+            agent_name,
+            mandate,
+        } => spawn_child(ctx, input, agent_name.clone(), mandate.clone()).await,
+        Decision::ReconcileChildren { sources, conflict } => {
+            reconcile_children(ctx, input, sources.clone(), conflict.clone()).await
+        }
+        Decision::RetireChild { child_ref, reason } => {
+            retire_child(ctx, child_ref, reason.clone()).await;
+            Ok(Observation::ok(format!(
+                "retired child {}",
+                child_ref.agent_id
+            )))
+        }
+        // Replacement is NOT in-place — the new child gets a fresh
+        // `agent_id` + `workflow_id` + `edges` row. The old `edges` row stays
+        // as an audit trail. If `spawn_child` errors after the old child has
+        // been retire-signaled there is no rollback — the error propagates so
+        // Temporal's activity-failure surface makes the partial state
+        // operator-visible.
+        Decision::ReplaceChild {
+            child_ref,
+            new_mandate,
+        } => {
+            let replacement_name = format!("replacement-of-{}", child_ref.agent_id);
+            retire_child(ctx, child_ref, format!("replaced by {replacement_name}")).await;
+            spawn_child(ctx, input, replacement_name, new_mandate.clone()).await
+        }
+        Decision::Idle { .. } => {
+            unreachable!("Idle is terminal; the cycle loop handles it before execute_action")
+        }
+    }
+}
+
+/// Invoke the `read_fs` activity for a `Read`/`List`/`Search` step and return
+/// the resulting observation (the file body, the listing, the matches, or a
+/// recoverable "not found" failure observation).
+async fn read_fs(
+    ctx: &WorkflowContext<AgentWorkflow>,
+    fs_handle: &FsHandle,
+    action: &Decision,
+) -> WorkflowResult<Observation> {
+    let op = match action {
+        Decision::Read { path } => FsNavOp::Read { path: path.clone() },
+        Decision::List { path } => FsNavOp::List { path: path.clone() },
+        Decision::Search { query, path } => FsNavOp::Search {
+            query: query.clone(),
+            path: path.clone(),
+        },
+        _ => unreachable!("read_fs only handles Read/List/Search"),
+    };
+    let out = ctx
+        .start_activity(
+            AgentActivities::read_fs,
+            ReadFsInput {
+                fs_handle: fs_handle.clone(),
+                op,
+            },
+            activity_opts(),
+        )
+        .await?;
+    Ok(out.observation)
 }
 
 /// Invoke the `persist_output` activity for a `Decision::EmitOutput`.
@@ -776,7 +835,7 @@ async fn signal_parent_with_trigger(
 /// `Mandate::new("", Duration::ZERO, None)` is decorative because
 /// `AgentFs::new_with_storage` only writes `mandate.md` when absent, and
 /// `apply_fs_ops` runs only against agents whose `mandate.md` already
-/// exists on disk (assemble_context wrote it on tick 1). The activity body
+/// exists on disk (build_seed wrote it on cycle 1). The activity body
 /// never reads the mandate — it only forwards it to `new_with_storage`,
 /// which short-circuits the write.
 async fn rewrite_fs(
@@ -805,6 +864,7 @@ async fn log_decision(
     ctx: &WorkflowContext<AgentWorkflow>,
     fs_handle: &FsHandle,
     tick: u64,
+    step: u64,
     decision: &Decision,
 ) -> WorkflowResult<()> {
     ctx.start_activity(
@@ -812,6 +872,7 @@ async fn log_decision(
         AppendDecisionLogInput {
             fs_handle: fs_handle.clone(),
             tick,
+            step,
             decision_summary: decision_summary(decision),
         },
         activity_opts(),
@@ -830,6 +891,9 @@ fn decision_summary(decision: &Decision) -> String {
             format!("EmitOutput {{ evidence: {} }}", evidence.len())
         }
         Decision::RewriteFs { ops } => format!("RewriteFs {{ ops: {} }}", ops.len()),
+        Decision::Read { path } => format!("Read {{ path: {path:?} }}"),
+        Decision::List { path } => format!("List {{ path: {path:?} }}"),
+        Decision::Search { query, .. } => format!("Search {{ query: {query:?} }}"),
         Decision::Idle { next_after } => {
             format!("Idle {{ next_after_ms: {} }}", next_after.as_millis())
         }
@@ -886,27 +950,17 @@ async fn retire(
     Ok(AgentResult::Retired { reason })
 }
 
-/// Clear the staged correction in workflow state. Used by the non-failing
-/// `Decision` arms so a previously-staged correction doesn't carry into the
-/// next tick once the LLM has produced a satisfiable decision.
-fn clear_correction(s: &mut AgentWorkflow) {
-    s.staged_correction = None;
-}
-
-/// Owned payload produced by [`drain_buckets`] — the per-tick view of every
-/// signal-staged bucket plus the previously-staged correction. Kept distinct
-/// from `AssembleContextInput` because the workflow body short-circuits on
-/// `retirement` before assembling a context.
+/// Owned payload produced by [`drain_buckets`] — the per-cycle view of every
+/// signal-staged bucket. Kept distinct from `BuildSeedInput` because the
+/// workflow body short-circuits on `retirement` before building a seed.
 struct DrainedBuckets {
     triggers: Vec<Trigger>,
     human_ops: Vec<HumanOp>,
     mandate_patches: Vec<MandatePatch>,
     retirement: Option<String>,
-    prior_correction: Option<CorrectionContext>,
 }
 
-/// Drain the five signal-tracked fields out of workflow state into owned
-/// values.
+/// Drain the signal-tracked fields out of workflow state into owned values.
 ///
 /// `cumulative_*_observed` counters are bumped by the signal handlers at
 /// receipt time (not here at drain time) so a snapshot taken between a
@@ -917,7 +971,6 @@ fn drain_buckets(s: &mut AgentWorkflow) -> DrainedBuckets {
         human_ops: std::mem::take(&mut s.pending_human_ops),
         mandate_patches: std::mem::take(&mut s.pending_mandate_patches),
         retirement: s.retirement_request.take(),
-        prior_correction: s.staged_correction.take(),
     }
 }
 
@@ -927,15 +980,15 @@ fn activity_opts() -> ActivityOptions {
 }
 
 /// Fan out N `execute_tool` activity invocations via the SDK's deterministic
-/// `workflows::join_all`. On any failure, stage a correction context for
-/// next tick's `assemble_context` input — the workflow does NOT ape
-/// `agent_core`'s budget state machine, it just delivers a description of
-/// the failure so the LLM can see it on the next tick.
+/// `workflows::join_all`, then summarize the batch into an [`Observation`]
+/// the inner loop pushes into the session. On failure the observation
+/// carries the per-call failure text the model adapts to on its next step —
+/// the Temporal path does not ape `agent_core`'s budget state machine.
 async fn dispatch_call_tools(
     ctx: &WorkflowContext<AgentWorkflow>,
     input: &AgentInput,
     calls: Vec<ToolCall>,
-) -> WorkflowResult<()> {
+) -> WorkflowResult<Observation> {
     let futures = calls.into_iter().map(|call| {
         ctx.start_activity(
             AgentActivities::execute_tool,
@@ -952,19 +1005,20 @@ async fn dispatch_call_tools(
     let results = temporalio_sdk::workflows::join_all(futures).await;
 
     let mut failures: Vec<ToolCallFailure> = Vec::new();
+    let mut succeeded = 0usize;
     for r in results {
         match r? {
-            ToolCallOutcome::Success { .. } => {}
+            ToolCallOutcome::Success { .. } => succeeded += 1,
             ToolCallOutcome::Failure { failure } => failures.push(failure),
         }
     }
-    let correction = if failures.is_empty() {
-        None
+    if failures.is_empty() {
+        Ok(Observation::ok(format!(
+            "{succeeded} tool call(s) succeeded; evidence recorded"
+        )))
     } else {
-        Some(CorrectionContext::new(format_correction(&failures)))
-    };
-    ctx.state_mut(|s| s.staged_correction = correction);
-    Ok(())
+        Ok(Observation::err(format_correction(&failures)))
+    }
 }
 
 /// Construct the [`AgentInput`] for a freshly-spawned child workflow.
@@ -1053,7 +1107,7 @@ async fn spawn_child(
     input: &AgentInput,
     child_agent_name: String,
     child_mandate: Mandate,
-) -> WorkflowResult<()> {
+) -> WorkflowResult<Observation> {
     let reg = ctx
         .start_activity(
             AgentActivities::register_child_in_structural_db,
@@ -1068,23 +1122,21 @@ async fn spawn_child(
         .await?;
     let child_agent_id = match reg {
         RegisterChildOutcome::Registered { child_agent_id } => child_agent_id,
-        // A grant the graph doesn't define is a model error: stage a
-        // correction so the next tick can re-decide, and leave the parent
-        // running rather than terminating it over a bad spawn.
+        // A grant the graph doesn't define is a model error: return it as a
+        // failure observation the model adapts to next step, leaving the
+        // parent running rather than terminating it over a bad spawn.
         RegisterChildOutcome::RejectedUnknownTool { tool } => {
-            ctx.state_mut(|s| {
-                s.staged_correction = Some(CorrectionContext::new(format!(
-                    "spawn rejected: tool {tool:?} is not defined in this graph; \
-                     grant the child only tools this graph defines"
-                )));
-            });
-            return Ok(());
+            return Ok(Observation::err(format!(
+                "spawn rejected: tool {tool:?} is not defined in this graph; \
+                 grant the child only tools this graph defines"
+            )));
         }
     };
 
     let child_workflow_id =
         agent_workflow_id(&input.graph_id.to_string(), &child_agent_id.to_string());
     let parent_workflow_id = ctx.workflow_id().to_string();
+    let observation = Observation::ok(format!("spawned child {child_agent_name}"));
     let child_input = build_child_input(
         &parent_workflow_id,
         input.agent_id,
@@ -1120,7 +1172,7 @@ async fn spawn_child(
         s.child_handles
             .push(AgentRef::new(child_workflow_id, child_agent_id));
     });
-    Ok(())
+    Ok(observation)
 }
 
 /// The `Decision::RetireChild` workflow arm body (also reused by
@@ -1166,20 +1218,21 @@ async fn retire_child(ctx: &WorkflowContext<AgentWorkflow>, child_ref: &AgentRef
 /// Calls the `reconcile_children` activity (which opens the parent's FS +
 /// each child's FS read-only, writes one synthetic evidence record per
 /// source into the parent's `evidence/`, and returns the freshly-minted
-/// `EvidenceId`s). The synthetic records flow into the parent's next-tick
-/// `assemble_context` bundle via the existing `list_recent_evidence`
-/// window — no workflow-state slot is needed.
+/// `EvidenceId`s). The parent pulls the synthetic records on a later step
+/// via `List`/`Read` of `evidence/` to cite them in a subsequent
+/// `EmitOutput` — no workflow-state slot is needed.
 ///
 /// Errors do NOT propagate via `?` — that would fail the whole workflow on
-/// a single bad source. Instead the typed activity failure is folded into a
-/// `CorrectionContext` staged for the next tick, mirroring the existing
+/// a single bad source. Instead the typed activity failure is returned as a
+/// failure [`Observation`] the model adapts to next step, mirroring the
 /// `Decision::CallTools` tool-failure flow.
 async fn reconcile_children(
     ctx: &WorkflowContext<AgentWorkflow>,
     input: &AgentInput,
     sources: Vec<ReconcileSource>,
     conflict: Option<ConflictRecordIntent>,
-) {
+) -> WorkflowResult<Observation> {
+    let source_count = sources.len();
     let activity_input = ReconcileChildrenInput {
         parent_graph_id: input.graph_id,
         parent_agent_id: input.agent_id,
@@ -1194,19 +1247,16 @@ async fn reconcile_children(
         )
         .await
     {
-        Ok(_out) => {
-            ctx.state_mut(clear_correction);
-        }
-        Err(failure) => {
-            // The activity returned an `ApplicationFailure` carrying either
-            // a typed `ReconciliationError` (non-retryable, structural) or
-            // a wrapped transient error (retryable). Either way we stage a
-            // `CorrectionContext` so the next tick's LLM sees the failure
-            // and emits a satisfiable replacement decision.
-            let correction =
-                CorrectionContext::new(format!("reconcile: activity failed: {failure:?}"));
-            ctx.state_mut(|s| s.staged_correction = Some(correction));
-        }
+        Ok(_out) => Ok(Observation::ok(format!(
+            "reconciled {source_count} child source(s); synthetic evidence recorded"
+        ))),
+        // The activity returned an `ApplicationFailure` carrying either a
+        // typed `ReconciliationError` (non-retryable, structural) or a wrapped
+        // transient error (retryable). Either way the failure becomes an
+        // observation the model adapts to.
+        Err(failure) => Ok(Observation::err(format!(
+            "reconcile: activity failed: {failure:?}"
+        ))),
     }
 }
 
@@ -1387,7 +1437,6 @@ mod tests {
         assert!(wf.pending_mandate_patches.is_empty());
         assert!(wf.retirement_request.is_none());
         assert!(wf.next_wake.is_none());
-        assert!(wf.staged_correction.is_none());
         assert_eq!(wf.cumulative_triggers_observed, 0);
         assert_eq!(wf.cumulative_human_ops_observed, 0);
         assert_eq!(wf.cumulative_mandate_patches_observed, 0);
@@ -1395,7 +1444,7 @@ mod tests {
 
     #[test]
     fn drain_buckets_takes_all_state_and_clears_workflow() {
-        // Critical that all five buckets get cleared so a redundant retire
+        // Critical that all buckets get cleared so a redundant retire
         // signal arriving mid-tick doesn't trip the next iteration's
         // short-circuit.
         let mut wf = AgentWorkflow::default();
@@ -1405,20 +1454,17 @@ mod tests {
         wf.pending_mandate_patches
             .push(MandatePatch::new(serde_json::json!({"m": 1})));
         wf.retirement_request = Some("done".into());
-        wf.staged_correction = Some(CorrectionContext::new("prior failure"));
 
         let drained = drain_buckets(&mut wf);
         assert_eq!(drained.triggers.len(), 1);
         assert_eq!(drained.human_ops.len(), 1);
         assert_eq!(drained.mandate_patches.len(), 1);
         assert_eq!(drained.retirement.as_deref(), Some("done"));
-        assert!(drained.prior_correction.is_some());
 
         assert!(wf.pending_triggers.is_empty());
         assert!(wf.pending_human_ops.is_empty());
         assert!(wf.pending_mandate_patches.is_empty());
         assert!(wf.retirement_request.is_none());
-        assert!(wf.staged_correction.is_none());
 
         // drain_buckets itself does NOT bump cumulative counters; the
         // signal handlers do that at receipt time. The buckets were
@@ -1486,7 +1532,6 @@ mod tests {
             pending_human_ops: vec![HumanOp::new(serde_json::json!({"action": "pause"}))],
             pending_mandate_patches: vec![MandatePatch::new(serde_json::json!({"model": "gpt-x"}))],
             retirement_request: Some("op asked".into()),
-            staged_correction: Some(CorrectionContext::new("prior tool failure")),
             scheduler_cursor: SchedulerCursor {
                 next_wake: Some(Duration::from_millis(250)),
             },
@@ -1549,7 +1594,6 @@ mod tests {
             .pending_mandate_patches
             .push(MandatePatch::new(serde_json::json!({"m": 1})));
         original.retirement_request = Some("op asked".into());
-        original.staged_correction = Some(CorrectionContext::new("prior failure"));
         original.next_wake = Some(Duration::from_millis(123));
         original.cumulative_triggers_observed = 9;
         original.cumulative_human_ops_observed = 13;
@@ -1568,7 +1612,6 @@ mod tests {
             original.pending_mandate_patches
         );
         assert_eq!(hydrated.retirement_request, original.retirement_request);
-        assert_eq!(hydrated.staged_correction, original.staged_correction);
         assert_eq!(hydrated.next_wake, original.next_wake);
         assert_eq!(
             hydrated.cumulative_triggers_observed,
@@ -1604,7 +1647,6 @@ mod tests {
             .pending_mandate_patches
             .push(MandatePatch::new(serde_json::json!({"m": "n"})));
         pre_can.retirement_request = Some("not yet".into());
-        pre_can.staged_correction = Some(CorrectionContext::new("prior batch failed"));
         pre_can.next_wake = Some(Duration::from_millis(500));
         pre_can.cumulative_triggers_observed = 3;
         pre_can.cumulative_human_ops_observed = 5;
@@ -1625,7 +1667,6 @@ mod tests {
             pre_can.pending_mandate_patches
         );
         assert_eq!(post_can.retirement_request, pre_can.retirement_request);
-        assert_eq!(post_can.staged_correction, pre_can.staged_correction);
         assert_eq!(post_can.next_wake, pre_can.next_wake);
         assert_eq!(
             post_can.cumulative_triggers_observed,
@@ -1946,6 +1987,20 @@ mod tests {
         });
         assert!(s.contains("RewriteFs"), "got: {s}");
         assert!(s.contains("ops: 1"), "got: {s}");
+
+        let s = decision_summary(&Decision::Read {
+            path: "notes/x.md".into(),
+        });
+        assert!(s.contains("Read") && s.contains("notes/x.md"), "got: {s}");
+        let s = decision_summary(&Decision::List {
+            path: "notes/".into(),
+        });
+        assert!(s.contains("List"), "got: {s}");
+        let s = decision_summary(&Decision::Search {
+            query: "tsmc".into(),
+            path: None,
+        });
+        assert!(s.contains("Search") && s.contains("tsmc"), "got: {s}");
     }
 
     #[test]
@@ -1997,7 +2052,6 @@ mod tests {
             human_ops: vec![],
             mandate_patches: vec![],
             retirement: None,
-            prior_correction: None,
         }
     }
 
@@ -2042,14 +2096,5 @@ mod tests {
         };
         synthesize_scheduled_wake(&mut with_patch);
         assert!(with_patch.triggers.is_empty());
-
-        // Re-deciding after a tool failure is "other work" — match the
-        // in-process semantic and skip the wake.
-        let mut with_correction = DrainedBuckets {
-            prior_correction: Some(CorrectionContext::new("prior failure")),
-            ..empty_drained()
-        };
-        synthesize_scheduled_wake(&mut with_correction);
-        assert!(with_correction.triggers.is_empty());
     }
 }

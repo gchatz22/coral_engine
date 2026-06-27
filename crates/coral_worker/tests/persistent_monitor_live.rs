@@ -44,7 +44,7 @@ use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 use coral_graph::yaml::{build_workflow_starts, parse_and_validate, yaml_seed_triggers};
 use coral_graph::{GraphStore, MIGRATOR};
 use coral_node::agent_ref::GraphId;
-use coral_node::decision::{ContextBundle, Decide, Decision, ReconcileSource};
+use coral_node::decision::{Decide, Decision, ReconcileSource, Session};
 use coral_node::evidence::{EvidenceId, EvidenceRecord};
 use coral_node::fs::AgentFs;
 use coral_node::mandate::Mandate;
@@ -90,28 +90,77 @@ fn example_graph_path() -> PathBuf {
         .join("graph.yaml")
 }
 
-/// Deterministic loop driver, routed by mandate text.
+/// Deterministic loop driver, routed by mandate text. Each `decide` call is
+/// one STEP of the inner cycle loop; it gates on `session.steps` (what this
+/// cycle has done so far) and the orienting `session.seed`.
 ///
-/// - **Children** emit a fresh, distinct output every wake (`finding N`,
-///   `N` derived from their own recent-outputs window) citing the planted
-///   evidence — so each child accumulates ≥2 distinct outputs before its
-///   `step_cap` stop. Never idles, never retires.
-/// - **Parent** reconciles whatever `ChildOutput`s the tick carries, then —
-///   once it has reconciled more than it has reported — emits a refreshed
-///   consolidated report citing a synthetic reconcile record. Distinct child
-///   outputs arriving over time make it re-reconcile newer ones. Never
-///   retires; only `step_cap` stops it.
+/// - **Children** run a one-step cycle: when no step has been taken yet, emit
+///   a fresh, distinct output (`finding N`, `N` from the seed's outputs
+///   index) citing the planted evidence; once that emit is recorded, `Idle`
+///   ends the cycle. A new distinct finding per cycle ⇒ ≥2 distinct outputs
+///   across the cap.
+/// - **Parent** runs a four-step cycle when the tick carries `ChildOutput`s:
+///   `ReconcileChildren` (writes synthetic `tool: "reconcile"` evidence to
+///   the parent's own FS) → `List` the parent's `evidence/` dir to discover
+///   that synthetic id (the reconcile observation does not surface it) →
+///   `EmitOutput` of a refreshed consolidated report citing the discovered id
+///   → `Idle`. Ticks carrying no `ChildOutput` idle immediately. Distinct
+///   child outputs arriving over time make it fold newer ones each cycle.
+///   Never retires; only `step_cap` stops it.
 struct CyclingDecide;
+
+/// Parse a `<hex>.json` evidence filename out of a `List { path: "evidence/" }`
+/// observation (newline-joined bare filenames) into the id the parent cites.
+/// The parent never calls a tool, so its `evidence/` dir holds only the
+/// synthetic reconcile records — any entry is a valid reconcile id to cite.
+fn first_evidence_id(list_observation: &str) -> Option<EvidenceId> {
+    list_observation
+        .lines()
+        .find_map(|name| name.strip_suffix(".json"))
+        .map(EvidenceId::from_hex)
+}
 
 #[async_trait]
 impl Decide for CyclingDecide {
-    async fn decide(&self, bundle: ContextBundle) -> Result<Decision> {
+    async fn decide(&self, session: &Session) -> Result<Decision> {
+        let seed = &session.seed;
         let idle = Decision::Idle {
-            next_after: bundle.mandate.idle_period.unwrap_or_default(),
+            next_after: seed.mandate.idle_period.unwrap_or_default(),
         };
-        if bundle.mandate.text.contains(PARENT_MARKER) {
-            // Parent.
-            let sources: Vec<ReconcileSource> = bundle
+        if seed.mandate.text.contains(PARENT_MARKER) {
+            // Parent. Drive the cycle off the steps taken so far.
+            let last = session.steps.last();
+            match last.map(|s| &s.action) {
+                // Just reconciled: list the parent's own evidence/ to find
+                // the synthetic reconcile id to cite.
+                Some(Decision::ReconcileChildren { .. }) => {
+                    return Ok(Decision::List {
+                        path: "evidence/".into(),
+                    });
+                }
+                // Listing done: cite the discovered reconcile id and emit a
+                // refreshed consolidated report.
+                Some(Decision::List { .. }) => {
+                    let observation = &last.expect("last is Some in this arm").observation;
+                    if let Some(cite) = first_evidence_id(&observation.content) {
+                        return Ok(Decision::EmitOutput {
+                            content: format!(
+                                "consolidated report {}",
+                                seed.index.outputs.len() + 1
+                            ),
+                            evidence: vec![cite],
+                        });
+                    }
+                    return Ok(idle);
+                }
+                // Report emitted: end the cycle.
+                Some(Decision::EmitOutput { .. }) => return Ok(idle),
+                _ => {}
+            }
+
+            // First step of the cycle: fold any child outputs this tick
+            // carried, else idle.
+            let sources: Vec<ReconcileSource> = seed
                 .triggers
                 .iter()
                 .filter_map(|t| match t {
@@ -126,25 +175,6 @@ impl Decide for CyclingDecide {
                     _ => None,
                 })
                 .collect();
-
-            let reconcile_records: Vec<&EvidenceId> = bundle
-                .recent_evidence
-                .iter()
-                .filter(|e| e.tool == "reconcile")
-                .map(|e| &e.id)
-                .collect();
-            let n_reports = bundle.recent_outputs.len();
-
-            // Report whenever we've reconciled more than we've published —
-            // this is what turns folded child outputs into refreshed parent
-            // reports and keeps reconcile/emit alternating.
-            if reconcile_records.len() > n_reports {
-                let cite = (*reconcile_records.last().expect("non-empty by the > check")).clone();
-                return Ok(Decision::EmitOutput {
-                    content: format!("consolidated report {}", n_reports + 1),
-                    evidence: vec![cite],
-                });
-            }
             if !sources.is_empty() {
                 return Ok(Decision::ReconcileChildren {
                     sources,
@@ -153,16 +183,21 @@ impl Decide for CyclingDecide {
             }
             Ok(idle)
         } else {
-            // Child: emit a fresh distinct finding citing the planted id.
-            let n = bundle.recent_outputs.len() + 1;
-            let ev = CHILD_EVIDENCE
-                .get()
-                .expect("CHILD_EVIDENCE planted before worker start")
-                .clone();
-            Ok(Decision::EmitOutput {
-                content: format!("finding {n}"),
-                evidence: vec![ev],
-            })
+            // Child: one emit per cycle, then idle. A fresh distinct finding
+            // citing the planted id; the count grows across cycles via the
+            // seed's outputs index.
+            if session.steps.is_empty() {
+                let n = seed.index.outputs.len() + 1;
+                let ev = CHILD_EVIDENCE
+                    .get()
+                    .expect("CHILD_EVIDENCE planted before worker start")
+                    .clone();
+                return Ok(Decision::EmitOutput {
+                    content: format!("finding {n}"),
+                    evidence: vec![ev],
+                });
+            }
+            Ok(idle)
         }
     }
 }
@@ -332,9 +367,10 @@ async fn drive(
     seeds: Vec<coral_graph::yaml::ResolvedSeedTrigger>,
     storage: Arc<MemoryStorage>,
 ) -> Result<()> {
-    // `step_cap` is the harness-only runaway backstop — it is not a YAML
-    // authoring field, so inject a small per-agent cap here to terminate the
-    // hermetic run (parent gets more cycles to fold its children's outputs).
+    // `step_cap` is the harness-only runaway backstop counting CYCLES — not
+    // a YAML authoring field — so inject a small per-agent cap here to
+    // terminate the hermetic run. The parent gets more cycles than the
+    // children so it can fold a newer child output on more than one cycle.
     let step_cap_by_agent = |name: &str| -> u64 {
         if name == "analyst" {
             8

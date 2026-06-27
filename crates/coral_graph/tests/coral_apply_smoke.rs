@@ -143,8 +143,8 @@ fn load_graph_yaml() -> Result<String> {
         .with_context(|| format!("reading graph.yaml fixture from {}", path.display()))
 }
 
-/// Live test: drives a four-tick run (Idle → CallTools → EmitOutput
-/// → Retire) where the workflow input and seed triggers come from
+/// Live test: drives a single cycle (CallTools → EmitOutput → Idle)
+/// where the workflow input and seed triggers come from
 /// `examples/smoke_llm_temporal/graph.yaml`. Asserts the three durable
 /// artifacts land on disk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -233,14 +233,12 @@ async fn run_smoke() -> Result<()> {
         .await
         .context("plant evidence for EmitOutput")?;
 
-    // Scripted sequence: Idle → CallTools(echo) → EmitOutput citing the
-    // planted id, then the `step_cap` backstop stops the loop (agents never
+    // One scripted cycle: CallTools(echo) → EmitOutput citing the planted
+    // id → Idle (the sole terminal step ends the cycle). The `step_cap`
+    // backstop then retires at the top of the next cycle (agents never
     // self-terminate). Proves the YAML-derived AgentInput drives the
     // expected agent-loop end-state.
     set_decision_script(vec![
-        Decision::Idle {
-            next_after: Duration::from_millis(50),
-        },
         Decision::CallTools {
             calls: vec![ToolCall::new(
                 TOOL_NAME,
@@ -251,6 +249,9 @@ async fn run_smoke() -> Result<()> {
         Decision::EmitOutput {
             content: "coral_apply_smoke: echo result observed".into(),
             evidence: vec![planted_id.clone()],
+        },
+        Decision::Idle {
+            next_after: Duration::from_millis(50),
         },
     ]);
 
@@ -273,11 +274,11 @@ async fn run_smoke() -> Result<()> {
     input.fs_handle = coral_temporal::workflow::FsHandle {
         prefix: agent_prefix.clone(),
     };
-    // Cap the run at the 3 scripted decisions so the loop terminates on
-    // the runaway backstop right after EmitOutput. Without this the script
-    // would exhaust into the installed decide impl rather than stopping at a
-    // small cap. The agent never self-terminates; `step_cap` is harness-only.
-    input.mandate.step_cap = Some(3);
+    // Cap the run at one cycle so the loop terminates on the runaway backstop
+    // right after the scripted cycle ends on `Idle`. `step_cap` counts cycles;
+    // without this the script would exhaust into the (uninstalled) decide impl
+    // and panic. The agent never self-terminates; `step_cap` is harness-only.
+    input.mandate.step_cap = Some(1);
     // `yaml_seed_triggers` takes an `AppliedGraph` so it can resolve
     // each `seed.triggers[].agent` to a concrete workflow_id (any node
     // in the tree, not just the root). Synthesize a minimal
@@ -396,7 +397,7 @@ async fn drive(
         .context("AgentWorkflow.get_result")?;
     let AgentResult::Retired { reason } = result;
     assert_eq!(
-        reason, "step_cap (3) reached",
+        reason, "step_cap (1) reached",
         "workflow returned wrong retire reason: {reason:?}"
     );
 
@@ -414,7 +415,7 @@ async fn drive(
         .and_then(|x| x.as_str())
         .ok_or_else(|| anyhow::anyhow!("retirement.json missing reason"))?;
     assert_eq!(
-        reason_on_disk, "step_cap (3) reached",
+        reason_on_disk, "step_cap (1) reached",
         "retirement.json carries wrong reason: {reason_on_disk:?}"
     );
 
@@ -452,11 +453,12 @@ async fn drive(
         on_disk.evidence.len()
     );
 
-    // ---- Artifact 3: `<prefix>/decisions/<tick>.jsonl` --------------------
-    // One entry per logged decision. The scripted sequence produces three
-    // decisions (Idle, CallTools, EmitOutput) at `decisions/{0,1,2}.jsonl`.
-    // The `step_cap` backstop retires at the top of the loop without logging
-    // a decision, so it adds no fourth entry.
+    // ---- Artifact 3: `<prefix>/decisions/<tick>-<step>.jsonl` -------------
+    // One entry per logged decision (one file per step within the cycle).
+    // The scripted cycle produces three decisions (CallTools, EmitOutput,
+    // Idle) at `decisions/0-{0,1,2}.jsonl`. The `step_cap` backstop retires
+    // at the top of the next cycle without logging a decision, so it adds no
+    // fourth entry.
     let page = storage
         .list(&format!("{agent_prefix}/decisions/"), None, usize::MAX)
         .await
@@ -468,7 +470,7 @@ async fn drive(
     assert_eq!(
         decision_keys.len(),
         3,
-        "expected 3 decision-log entries (Idle, CallTools, EmitOutput); got {decision_keys:?}"
+        "expected 3 decision-log entries (CallTools, EmitOutput, Idle); got {decision_keys:?}"
     );
 
     let mut summaries: Vec<String> = Vec::with_capacity(3);
@@ -486,18 +488,18 @@ async fn drive(
         summaries.push(entry.decision_summary);
     }
     assert!(
-        summaries[0].starts_with("Idle"),
-        "tick 0 summary: {:?}",
+        summaries[0].starts_with("CallTools"),
+        "step 0 summary: {:?}",
         summaries[0]
     );
     assert!(
-        summaries[1].starts_with("CallTools"),
-        "tick 1 summary: {:?}",
+        summaries[1].starts_with("EmitOutput"),
+        "step 1 summary: {:?}",
         summaries[1]
     );
     assert!(
-        summaries[2].starts_with("EmitOutput"),
-        "tick 2 summary: {:?}",
+        summaries[2].starts_with("Idle"),
+        "step 2 summary: {:?}",
         summaries[2]
     );
 

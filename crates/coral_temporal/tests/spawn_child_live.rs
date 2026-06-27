@@ -27,7 +27,7 @@ use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 use uuid::Uuid;
 
 use coral_node::agent_ref::{AgentId, GraphId};
-use coral_node::decision::{ContextBundle, Decide, Decision};
+use coral_node::decision::{Decide, Decision, Session};
 use coral_node::mandate::Mandate;
 use coral_node::storage::{AgentStorage, MemoryStorage};
 use coral_node::tools::{EchoTool, ToolRegistry};
@@ -110,19 +110,19 @@ impl StructuralDbStore for MemoryStructuralDb {
 }
 
 /// Fallback `Decide` impl installed for the child workflow. The
-/// process-wide `DECISION_SCRIPT` is consumed by the parent's three
-/// scripted ticks (Idle → SpawnChild → Retire); the child workflow
-/// shares the task queue + worker (and therefore the `decide_next_action`
-/// activity) and would race the parent for scripted decisions if no
-/// fallback existed. Returning a long `Idle` keeps the child alive on
-/// the daemon's side without polling for new decisions in the test's
-/// observation window — and matches the `Abandon` semantics under test
-/// (the child survives independently of parent retirement).
+/// process-wide `DECISION_SCRIPT` is consumed by the parent's scripted
+/// steps (Idle, then SpawnChild); the child workflow shares the task
+/// queue + worker (and therefore the `decide_step` activity) and would
+/// race the parent for scripted decisions if no fallback existed.
+/// Returning a long `Idle` keeps the child alive on the daemon's side
+/// without polling for new decisions in the test's observation window —
+/// and matches the `Abandon` semantics under test (the child survives
+/// independently of parent retirement).
 struct LongIdleDecide;
 
 #[async_trait]
 impl Decide for LongIdleDecide {
-    async fn decide(&self, _ctx: ContextBundle) -> anyhow::Result<Decision> {
+    async fn decide(&self, _session: &Session) -> anyhow::Result<Decision> {
         Ok(Decision::Idle {
             next_after: Duration::from_secs(60),
         })
@@ -150,8 +150,8 @@ fn ensure_installed() -> Arc<MemoryStructuralDb> {
         install_structural_db_store(dyn_db);
 
         // Fallback `Decide` so the child workflow (which shares this
-        // process-wide static via the `decide_next_action` activity)
-        // has something to call after the parent drains the scripted
+        // process-wide static via the `decide_step` activity) has
+        // something to call after the parent drains the scripted
         // decisions. See `LongIdleDecide` doc for the rationale.
         let decide: Arc<dyn Decide> = Arc::new(LongIdleDecide);
         install_decide(decide);

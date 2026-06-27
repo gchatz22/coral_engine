@@ -1,11 +1,14 @@
-//! `Decision` — what the agent wants the runtime to do next. Pure data;
-//! every variant carries enough information that a Decision can be
-//! serialized, replayed, or audited without the original `Decide`
-//! implementation in hand.
+//! `Decision` — what the agent wants the runtime to do next, for one step of
+//! the inner cycle loop. Pure data; every variant carries enough information
+//! that a Decision can be serialized, replayed, or audited without the
+//! original `Decide` implementation in hand. `Idle` is the sole *terminal*
+//! step — it ends the cycle and sets the next wake cadence; every other
+//! variant is a *repertoire* step that runs, produces an observation, and
+//! continues the loop.
 //!
-//! Also hosts the per-tick surface the run loop uses: `ContextBundle` (the
-//! read-only snapshot handed to `Decide` each tick), the `Decide` trait,
-//! `MockDecide`, and `assemble_context`.
+//! Also hosts the inner-loop surface: `Seed` (the thin orienting snapshot
+//! built once per cycle), `Session` (the accumulating seed-plus-observations
+//! the model reasons over each step), the `Decide` trait, and `MockDecide`.
 //!
 //! # Parent-child variants
 //!
@@ -51,9 +54,8 @@
 //! file written).
 
 use crate::agent_ref::AgentRef;
-use crate::evidence::{EvidenceId, EvidenceRecord};
-use crate::fs::{AgentFs, Claim, ClaimStatus};
-use crate::mandate::{Mandate, Output, OutputId};
+use crate::evidence::EvidenceId;
+use crate::mandate::{Mandate, OutputId};
 use crate::trigger::Trigger;
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
@@ -87,8 +89,28 @@ pub enum Decision {
     },
     /// Mutate the per-agent filesystem.
     RewriteFs { ops: Vec<FsOp> },
+    /// Read the full contents of one file in the agent's own FS (or, on the
+    /// Temporal path, a descendant agent's FS — always read-only). A
+    /// repertoire step: the file body is appended to the session as the
+    /// observation the next step reasons over. This is half of the
+    /// pull-navigation surface — the model fetches what it needs rather than
+    /// being handed a fat context window.
+    Read { path: String },
+    /// List the filenames under a directory in the agent's own FS (or a
+    /// descendant's, read-only). Repertoire step; the listing is the
+    /// observation.
+    List { path: String },
+    /// Substring-search file contents under an optional path scope. `None`
+    /// scopes the search to the whole own FS. Repertoire step; the matches
+    /// are the observation.
+    Search {
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
     /// Tell the scheduler to wait at least `next_after` before the next
-    /// idle wake.
+    /// idle wake. This is the **sole terminal** step: it ends the inner
+    /// cycle and hands control back to the wake boundary.
     Idle {
         #[serde(with = "crate::duration_ms")]
         next_after: Duration,
@@ -137,6 +159,19 @@ pub enum Decision {
         child_ref: AgentRef,
         new_mandate: Mandate,
     },
+}
+
+impl Decision {
+    /// `Some(next_after)` iff this is the sole terminal step (`Idle`), which
+    /// ends the cycle and sets the next wake cadence. Every other variant is
+    /// a repertoire step that runs, yields an observation, and continues the
+    /// inner loop. The cycle driver uses this to decide whether to break.
+    pub fn idle_after(&self) -> Option<Duration> {
+        match self {
+            Decision::Idle { next_after } => Some(*next_after),
+            _ => None,
+        }
+    }
 }
 
 /// One child output the parent wants folded into its own context. The
@@ -320,58 +355,126 @@ pub enum FsOp {
     DeleteFile { path: String },
 }
 
-/// Snapshot the run loop hands to `Decide::decide` once per tick.
+/// The thin, orienting snapshot built once at the start of each cycle.
 ///
-/// Owned data (not borrows) so an implementation can move the bundle into
-/// an async task, queue it, or serialize it for audit/replay without
-/// fighting lifetimes. Shape: mandate + the triggers that woke us + a
-/// small slice of recent FS state.
+/// Unlike the old fat context bundle, the seed carries only what the model
+/// needs to *orient* — its mandate, the triggers that woke it, and an
+/// `index` of filenames it can pull from. File *contents* are never pushed;
+/// the model fetches what it needs via the `Read`/`List`/`Search` repertoire
+/// steps. This is the push→pull pivot: a small constant seed plus on-demand
+/// navigation, rather than a window whose size has to be tuned per mandate.
 ///
-/// `correction` is `Some` when this tick is a continuation of a prior
-/// attempt the runtime rejected (an unsatisfiable `Decision`). It carries
-/// a human-readable description of why the previous attempt failed; the
-/// prompt renderer surfaces it as a distinct section so the model can
-/// self-correct. See `agent.rs` for the budget-accounting contract that
-/// pairs with this field.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ContextBundle {
+/// Owned data (not borrows) so it can be moved into an async task, queued,
+/// or serialized for audit/replay (and, on the Temporal path, packed into a
+/// `decide_step` activity input) without fighting lifetimes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Seed {
     pub mandate: Mandate,
     pub triggers: Vec<Trigger>,
-    pub recent_outputs: Vec<Output>,
-    pub recent_evidence: Vec<EvidenceRecord>,
-    /// Open claims (`claims/<slug>.json` with `status == Open`), capped by
-    /// `mandate.context_policy.open_claims_max`. Surfaced in the warm cache
-    /// so the seed-reuse convention (see
-    /// `scratch/claim_seed_persistence.md`) works without a tool roundtrip
-    /// every tick. Order is inherited from `AgentFs::list_claims`
-    /// (filename ascending) per `scratch/context_assembly_v2.md` § 8.
-    #[serde(default)]
-    pub open_claims: Vec<Claim>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub correction: Option<CorrectionContext>,
+    pub index: FsIndex,
 }
 
-/// "Your previous decision was unsatisfiable; here is why" — agent-internal
-/// continuation state, distinct from the trigger stream that represents
-/// outside-world events.
-///
-/// Set by the run loop when a `Decision` parses cleanly but cannot be
-/// applied (an unregistered tool, an unresolvable evidence id). The next
-/// tick threads it into the `ContextBundle` so the model gets a chance to
-/// emit a satisfiable `Decision`. Kept off the trigger queue on purpose —
-/// see `agent.rs`'s module doc for the rationale.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CorrectionContext {
-    /// Human-readable description of the failure that prompted this
-    /// correction. Echoed to the model in the rendered prompt and stamped
-    /// into the `HealthIncident` retry trail.
-    pub failure: String,
-}
-
-impl CorrectionContext {
-    pub fn new(failure: impl Into<String>) -> Self {
+impl Seed {
+    pub fn new(mandate: Mandate, triggers: Vec<Trigger>, index: FsIndex) -> Self {
         Self {
-            failure: failure.into(),
+            mandate,
+            triggers,
+            index,
+        }
+    }
+}
+
+/// Pointers — filenames only, never contents — into the agent's working
+/// memory, most-recent-first. The model reads what it needs via the FS-nav
+/// steps; nothing here carries a file body, which is what keeps the seed a
+/// small constant rather than a tuned window.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsIndex {
+    /// Filenames under `notes/`, most-recent-first.
+    #[serde(default)]
+    pub notes: Vec<String>,
+    /// Filenames under `outputs/`, most-recent-first.
+    #[serde(default)]
+    pub outputs: Vec<String>,
+}
+
+/// The accumulating in-cycle context the model reasons over: the orienting
+/// `seed` plus the ordered `(action, observation)` steps taken THIS cycle.
+///
+/// Discarded at cycle end — cross-cycle continuity is the per-agent FS
+/// (`notes/`), not this. On the Temporal path the session is rebuilt only
+/// from journaled activity results held in workflow state, so replay is
+/// deterministic; it is never recomputed from a live FS read in the
+/// workflow body.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Session {
+    pub seed: Seed,
+    pub steps: Vec<Step>,
+}
+
+impl Session {
+    /// Start a fresh cycle from its orienting seed.
+    pub fn new(seed: Seed) -> Self {
+        Self {
+            seed,
+            steps: Vec::new(),
+        }
+    }
+
+    /// Append one completed step (the action taken and what it observed).
+    pub fn push(&mut self, action: Decision, observation: Observation) {
+        self.steps.push(Step {
+            action,
+            observation,
+        });
+    }
+
+    /// Number of repertoire steps taken so far this cycle. Counted against
+    /// the runaway fuse.
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+}
+
+/// One completed repertoire step: the action the model took and the
+/// observation it produced.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Step {
+    pub action: Decision,
+    pub observation: Observation,
+}
+
+/// The result of executing one repertoire action, rendered for the model to
+/// read on its next step.
+///
+/// `ok == false` carries a failure the model is expected to adapt to within
+/// the *same* cycle — a tool error, an unsatisfiable output. There is no
+/// cross-cycle correction state: the failure is just an observation the next
+/// step reasons over, so self-correction happens inline.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Observation {
+    pub ok: bool,
+    pub content: String,
+}
+
+impl Observation {
+    /// A successful step's observation.
+    pub fn ok(content: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            content: content.into(),
+        }
+    }
+
+    /// A recoverable failure the model should adapt to within this cycle.
+    pub fn err(content: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            content: content.into(),
         }
     }
 }
@@ -386,7 +489,11 @@ impl CorrectionContext {
 /// awaits across `.await` points on a multi-threaded runtime.
 #[async_trait::async_trait]
 pub trait Decide: Send + Sync {
-    async fn decide(&self, ctx: ContextBundle) -> anyhow::Result<Decision>;
+    /// Pick the next step given the accumulating cycle `session` (the
+    /// orienting seed plus every `(action, observation)` taken so far). The
+    /// driver calls this once per inner-loop iteration; returning `Idle`
+    /// ends the cycle.
+    async fn decide(&self, session: &Session) -> anyhow::Result<Decision>;
 }
 
 /// Scripted `Decide` for tests: pops decisions from a queue in FIFO order.
@@ -421,61 +528,11 @@ impl MockDecide {
 
 #[async_trait::async_trait]
 impl Decide for MockDecide {
-    async fn decide(&self, _ctx: ContextBundle) -> anyhow::Result<Decision> {
+    async fn decide(&self, _session: &Session) -> anyhow::Result<Decision> {
         let mut q = self.script.lock().expect("MockDecide mutex poisoned");
         q.pop_front()
             .ok_or_else(|| anyhow!("MockDecide script exhausted"))
     }
-}
-
-/// Read FS state and package a `ContextBundle` for the given triggers.
-///
-/// Window sizes are drawn from `cfg.context_policy`
-/// (`crate::mandate::ContextPolicy`), so per-mandate tuning shapes the
-/// warm cache.
-///
-/// Determinism: outputs and evidence are read via the FS helpers, which
-/// sort filenames lexically and return the last N entries — see
-/// `AgentFs::list_recent_outputs` / `AgentFs::list_recent_evidence`. Open
-/// claims are drawn from `AgentFs::list_claims` in its native filename
-/// order per `scratch/context_assembly_v2.md` § 8.
-///
-/// `correction` carries continuation state from the run loop when the
-/// previous tick produced an unsatisfiable `Decision`. When `Some`, the
-/// rendered prompt surfaces it as a dedicated section.
-pub async fn assemble_context(
-    fs: &AgentFs,
-    triggers: &[Trigger],
-    cfg: &Mandate,
-    correction: Option<CorrectionContext>,
-) -> anyhow::Result<ContextBundle> {
-    let policy = &cfg.context_policy;
-    let recent_outputs = fs.list_recent_outputs(policy.recent_outputs).await?;
-    let recent_evidence = fs.list_recent_evidence(policy.recent_evidence).await?;
-    let open_claims: Vec<Claim> = fs
-        .list_claims()
-        .await?
-        .into_iter()
-        .filter(|c| c.status == ClaimStatus::Open)
-        .take(policy.open_claims_max)
-        .collect();
-    // Logs the warm-cache shape without dumping potentially large bodies.
-    tracing::debug!(
-        triggers = triggers.len(),
-        recent_outputs = recent_outputs.len(),
-        recent_evidence = recent_evidence.len(),
-        open_claims = open_claims.len(),
-        correction = correction.is_some(),
-        "assemble_context bundle field counts"
-    );
-    Ok(ContextBundle {
-        mandate: cfg.clone(),
-        triggers: triggers.to_vec(),
-        recent_outputs,
-        recent_evidence,
-        open_claims,
-        correction,
-    })
 }
 
 #[cfg(test)]
@@ -836,40 +893,28 @@ mod tests {
         assert_eq!(del, back2);
     }
 
-    // ---- Decide / MockDecide / assemble_context -------------------------
+    // ---- Seed / Session / Decide / MockDecide ---------------------------
 
-    use crate::evidence::EvidenceRecord;
     use crate::mandate::Mandate;
     use crate::trigger::Trigger;
-    use chrono::{DateTime, Utc};
-    use tempfile::TempDir;
 
-    fn ts() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-05-03T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc)
+    fn dummy_seed() -> Seed {
+        Seed::new(
+            Mandate::new("research foo", Duration::from_millis(1000), Some(10)),
+            vec![Trigger::ScheduledWake],
+            FsIndex::default(),
+        )
     }
 
-    fn dummy_mandate() -> Mandate {
-        Mandate::new("research foo", Duration::from_millis(1000), Some(10))
-    }
-
-    fn dummy_bundle() -> ContextBundle {
-        ContextBundle {
-            mandate: dummy_mandate(),
-            triggers: vec![],
-            recent_outputs: vec![],
-            recent_evidence: vec![],
-            open_claims: vec![],
-            correction: None,
-        }
+    fn dummy_session() -> Session {
+        Session::new(dummy_seed())
     }
 
     #[tokio::test]
     async fn mock_decide_returns_scripted_decisions_in_order() {
         let script = vec![
-            Decision::Idle {
-                next_after: Duration::from_millis(50),
+            Decision::Read {
+                path: "notes/a.md".into(),
             },
             Decision::Idle {
                 next_after: Duration::from_millis(100),
@@ -878,11 +923,11 @@ mod tests {
         let mock = MockDecide::new(script.clone());
         assert_eq!(mock.remaining(), 2);
 
-        let first = mock.decide(dummy_bundle()).await.unwrap();
+        let first = mock.decide(&dummy_session()).await.unwrap();
         assert_eq!(first, script[0]);
         assert_eq!(mock.remaining(), 1);
 
-        let second = mock.decide(dummy_bundle()).await.unwrap();
+        let second = mock.decide(&dummy_session()).await.unwrap();
         assert_eq!(second, script[1]);
         assert_eq!(mock.remaining(), 0);
     }
@@ -890,7 +935,7 @@ mod tests {
     #[tokio::test]
     async fn mock_decide_errors_when_script_exhausted() {
         let mock = MockDecide::new(vec![]);
-        let err = mock.decide(dummy_bundle()).await.unwrap_err();
+        let err = mock.decide(&dummy_session()).await.unwrap_err();
         assert!(
             err.to_string().contains("script exhausted"),
             "unexpected error: {err}"
@@ -904,311 +949,131 @@ mod tests {
         let mock: Box<dyn Decide> = Box::new(MockDecide::new(vec![Decision::Idle {
             next_after: Duration::from_millis(10),
         }]));
-        let d = mock.decide(dummy_bundle()).await.unwrap();
+        let d = mock.decide(&dummy_session()).await.unwrap();
         assert!(matches!(d, Decision::Idle { .. }));
     }
 
-    #[tokio::test]
-    async fn assemble_context_includes_passed_in_triggers_verbatim() {
-        let tmp = TempDir::new().unwrap();
-        let mandate = dummy_mandate();
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
-            .await
-            .unwrap();
+    // ---- idle_after: terminal detection ---------------------------------
 
-        let triggers = vec![
-            Trigger::ScheduledWake,
-            Trigger::External {
-                kind: "webhook".into(),
-                payload: serde_json::json!({"x": 1}),
-            },
-        ];
-
-        let bundle = assemble_context(&fs, &triggers, &mandate, None)
-            .await
-            .unwrap();
-        assert_eq!(bundle.triggers, triggers);
-        assert_eq!(bundle.mandate, mandate);
-        assert!(bundle.recent_outputs.is_empty());
-        assert!(bundle.recent_evidence.is_empty());
-        assert!(bundle.correction.is_none());
-    }
-
-    #[tokio::test]
-    async fn assemble_context_threads_correction_into_bundle() {
-        let tmp = TempDir::new().unwrap();
-        let mandate = dummy_mandate();
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
-            .await
-            .unwrap();
-
-        let correction = CorrectionContext::new("call_tool: no tool registered under name \"x\"");
-        let bundle = assemble_context(&fs, &[], &mandate, Some(correction.clone()))
-            .await
-            .unwrap();
-        assert_eq!(bundle.correction.as_ref(), Some(&correction));
-    }
-
-    #[tokio::test]
-    async fn assemble_context_reads_outputs_and_evidence_deterministically() {
-        let tmp = TempDir::new().unwrap();
-        let mandate = dummy_mandate();
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
-            .await
-            .unwrap();
-
-        // Seed more than the default window so the windowing path is also
-        // exercised. The default `ContextPolicy::recent_outputs` /
-        // `recent_evidence` is 8 (pinned in `mandate.rs::tests`); we write
-        // two extra of each.
-        let default_window = mandate.context_policy.recent_outputs;
-        assert_eq!(default_window, mandate.context_policy.recent_evidence);
-        let mut ev_ids = Vec::new();
-        for i in 0..(default_window + 2) {
-            let rec = EvidenceRecord::new(
-                "echo",
-                serde_json::json!({ "i": i }),
-                serde_json::json!({ "echoed": i }),
-                ts(),
-            );
-            let id = fs.record_evidence(rec).await.unwrap();
-            ev_ids.push(id);
-        }
-        for (i, id) in ev_ids.iter().enumerate() {
-            fs.persist_output(&format!("out-{i}"), &[id.clone()])
-                .await
-                .unwrap();
-        }
-
-        let triggers = vec![Trigger::ScheduledWake];
-        let a = assemble_context(&fs, &triggers, &mandate, None)
-            .await
-            .unwrap();
-        let b = assemble_context(&fs, &triggers, &mandate, None)
-            .await
-            .unwrap();
-
-        // Determinism across calls: same inputs, same output order.
-        assert_eq!(a.recent_outputs, b.recent_outputs);
-        assert_eq!(a.recent_evidence, b.recent_evidence);
-        assert_eq!(a.open_claims, b.open_claims);
-        assert_eq!(a.triggers, b.triggers);
-        assert_eq!(a.correction, b.correction);
-
-        // Window is honored.
-        assert_eq!(a.recent_outputs.len(), default_window);
-        assert_eq!(a.recent_evidence.len(), default_window);
-
-        // Sanity: evidence records sort by their (hex) id; outputs by their
-        // ulid filename. Both should be ascending, so the last entry is the
-        // lexically greatest filename present on disk.
-        let mut ev_sorted = a
-            .recent_evidence
-            .iter()
-            .map(|r| r.id.as_str().to_string())
-            .collect::<Vec<_>>();
-        let original = ev_sorted.clone();
-        ev_sorted.sort();
-        assert_eq!(original, ev_sorted, "evidence not in sorted order");
-    }
-
-    // ---- ContextPolicy plumbing ----------------------------------------
-
-    use crate::fs::{Claim, ClaimStatus};
-    use crate::mandate::ContextPolicy;
-
-    #[tokio::test]
-    async fn assemble_context_honors_per_mandate_recent_outputs_cap() {
-        let tmp = TempDir::new().unwrap();
-        let mandate = Mandate {
-            text: "tiny window".into(),
-            idle_period: Some(Duration::from_millis(100)),
-            step_cap: Some(1),
-            retry_policy: None,
-            context_policy: ContextPolicy {
-                recent_outputs: 2,
-                recent_evidence: 8,
-                open_claims_max: 32,
-            },
-            model: None,
-            tools: Vec::new(),
-        };
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
-            .await
-            .unwrap();
-
-        let id = fs
-            .record_evidence(EvidenceRecord::new(
-                "echo",
-                serde_json::json!({"k": 1}),
-                serde_json::json!({"v": 1}),
-                ts(),
-            ))
-            .await
-            .unwrap();
-        for i in 0..5 {
-            fs.persist_output(&format!("o-{i}"), &[id.clone()])
-                .await
-                .unwrap();
-        }
-
-        let bundle = assemble_context(&fs, &[], &mandate, None).await.unwrap();
+    #[test]
+    fn idle_is_the_sole_terminal_step() {
         assert_eq!(
-            bundle.recent_outputs.len(),
-            2,
-            "per-mandate recent_outputs cap not honored"
+            Decision::Idle {
+                next_after: Duration::from_millis(250)
+            }
+            .idle_after(),
+            Some(Duration::from_millis(250))
         );
+        // Every repertoire step is non-terminal.
+        assert!(Decision::Read {
+            path: "notes/a.md".into()
+        }
+        .idle_after()
+        .is_none());
+        assert!(Decision::List {
+            path: "notes/".into()
+        }
+        .idle_after()
+        .is_none());
+        assert!(Decision::Search {
+            query: "q".into(),
+            path: None
+        }
+        .idle_after()
+        .is_none());
+        assert!(Decision::RewriteFs { ops: vec![] }.idle_after().is_none());
+        assert!(Decision::CallTools { calls: vec![] }.idle_after().is_none());
     }
 
-    #[tokio::test]
-    async fn assemble_context_honors_per_mandate_recent_evidence_cap() {
-        let tmp = TempDir::new().unwrap();
-        let mandate = Mandate {
-            text: "tiny evidence window".into(),
-            idle_period: Some(Duration::from_millis(100)),
-            step_cap: Some(1),
-            retry_policy: None,
-            context_policy: ContextPolicy {
-                recent_outputs: 8,
-                recent_evidence: 3,
-                open_claims_max: 32,
-            },
-            model: None,
-            tools: Vec::new(),
+    // ---- FS-nav round trips ---------------------------------------------
+
+    #[test]
+    fn read_round_trip() {
+        let d = Decision::Read {
+            path: "outputs/abc.json".into(),
         };
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
-            .await
-            .unwrap();
-        for i in 0..6 {
-            fs.record_evidence(EvidenceRecord::new(
-                "echo",
-                serde_json::json!({"i": i}),
-                serde_json::json!({"i": i}),
-                ts(),
-            ))
-            .await
-            .unwrap();
-        }
-
-        let bundle = assemble_context(&fs, &[], &mandate, None).await.unwrap();
-        assert_eq!(bundle.recent_evidence.len(), 3);
+        let s = serde_json::to_string(&d).unwrap();
+        assert!(s.contains("\"type\":\"read\""), "wire shape: {s}");
+        assert!(
+            s.contains("\"path\":\"outputs/abc.json\""),
+            "wire shape: {s}"
+        );
+        assert_eq!(d, serde_json::from_str::<Decision>(&s).unwrap());
     }
 
-    #[tokio::test]
-    async fn assemble_context_surfaces_only_open_claims_capped_in_filename_order() {
-        let tmp = TempDir::new().unwrap();
-        let mandate = Mandate {
-            text: "claims window".into(),
-            idle_period: Some(Duration::from_millis(100)),
-            step_cap: Some(1),
-            retry_policy: None,
-            context_policy: ContextPolicy {
-                recent_outputs: 8,
-                recent_evidence: 8,
-                open_claims_max: 2,
-            },
-            model: None,
-            tools: Vec::new(),
+    #[test]
+    fn list_round_trip() {
+        let d = Decision::List {
+            path: "notes/".into(),
         };
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
-            .await
-            .unwrap();
-
-        // Seed claims in mixed states so the filter has work to do. Use
-        // alphabetic seeds so the on-disk slug order is alphabetic-prefix
-        // (suffix hashes break exact equality of the slug body across
-        // seeds, but the slug body order is what dominates).
-        let claims = vec![
-            ("alpha", ClaimStatus::Open),
-            ("bravo", ClaimStatus::Resolved),
-            ("charlie", ClaimStatus::Open),
-            ("delta", ClaimStatus::Abandoned),
-            ("echo-claim", ClaimStatus::Open),
-        ];
-        for (seed, status) in &claims {
-            fs.write_claim(&Claim {
-                seed: (*seed).into(),
-                description: format!("desc-{seed}"),
-                status: *status,
-                created_at: ts(),
-            })
-            .await
-            .unwrap();
-        }
-
-        let bundle = assemble_context(&fs, &[], &mandate, None).await.unwrap();
-
-        // Cap is honored.
-        assert_eq!(bundle.open_claims.len(), 2);
-        // Every surfaced claim is Open.
-        for c in &bundle.open_claims {
-            assert_eq!(c.status, ClaimStatus::Open, "non-Open claim leaked through");
-        }
-        // Order matches the AgentFs::list_claims (filename ascending)
-        // restricted to Open. We reproduce that ordering here and compare.
-        let expected: Vec<Claim> = fs
-            .list_claims()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|c| c.status == ClaimStatus::Open)
-            .take(2)
-            .collect();
-        assert_eq!(bundle.open_claims, expected);
+        let s = serde_json::to_string(&d).unwrap();
+        assert!(s.contains("\"type\":\"list\""), "wire shape: {s}");
+        assert_eq!(d, serde_json::from_str::<Decision>(&s).unwrap());
     }
 
-    #[tokio::test]
-    async fn assemble_context_empty_claims_yields_empty_open_claims() {
-        let tmp = TempDir::new().unwrap();
-        let mandate = dummy_mandate();
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
-            .await
-            .unwrap();
-        let bundle = assemble_context(&fs, &[], &mandate, None).await.unwrap();
-        assert!(bundle.open_claims.is_empty());
+    #[test]
+    fn search_round_trip_with_and_without_path() {
+        let scoped = Decision::Search {
+            query: "tsmc".into(),
+            path: Some("notes/".into()),
+        };
+        let s = serde_json::to_string(&scoped).unwrap();
+        assert!(s.contains("\"type\":\"search\""), "wire shape: {s}");
+        assert!(s.contains("\"path\":\"notes/\""), "wire shape: {s}");
+        assert_eq!(scoped, serde_json::from_str::<Decision>(&s).unwrap());
+
+        let unscoped = Decision::Search {
+            query: "tsmc".into(),
+            path: None,
+        };
+        let s2 = serde_json::to_string(&unscoped).unwrap();
+        // `path` omitted from the wire when None (skip_serializing_if).
+        assert!(!s2.contains("path"), "wire shape: {s2}");
+        assert_eq!(unscoped, serde_json::from_str::<Decision>(&s2).unwrap());
     }
 
-    #[tokio::test]
-    async fn assemble_context_is_deterministic_across_repeat_calls_with_full_bundle() {
-        // Determinism is the load-bearing property — re-asserted with
-        // every ContextPolicy window populated.
-        let tmp = TempDir::new().unwrap();
-        let mandate = dummy_mandate();
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
-            .await
-            .unwrap();
+    // ---- Session / Seed / Observation -----------------------------------
 
-        let ev = fs
-            .record_evidence(EvidenceRecord::new(
-                "echo",
-                serde_json::json!({"k": 1}),
-                serde_json::json!({"v": 1}),
-                ts(),
-            ))
-            .await
-            .unwrap();
-        fs.persist_output("o-1", &[ev.clone()]).await.unwrap();
-        fs.write_claim(&Claim {
-            seed: "claim-1".into(),
-            description: "d".into(),
-            status: ClaimStatus::Open,
-            created_at: ts(),
-        })
-        .await
-        .unwrap();
+    #[test]
+    fn session_push_accumulates_steps_in_order() {
+        let mut session = dummy_session();
+        assert!(session.is_empty());
+        session.push(
+            Decision::Read {
+                path: "notes/a.md".into(),
+            },
+            Observation::ok("file body"),
+        );
+        session.push(
+            Decision::CallTools { calls: vec![] },
+            Observation::err("tool blew up"),
+        );
+        assert_eq!(session.len(), 2);
+        assert_eq!(session.steps[0].observation, Observation::ok("file body"));
+        assert!(!session.steps[1].observation.ok);
+    }
 
-        let triggers = vec![Trigger::ScheduledWake];
-        let correction = Some(CorrectionContext::new("e"));
-        let a = assemble_context(&fs, &triggers, &mandate, correction.clone())
-            .await
-            .unwrap();
-        let b = assemble_context(&fs, &triggers, &mandate, correction)
-            .await
-            .unwrap();
-        assert_eq!(a.recent_outputs, b.recent_outputs);
-        assert_eq!(a.recent_evidence, b.recent_evidence);
-        assert_eq!(a.open_claims, b.open_claims);
-        assert_eq!(a.triggers, b.triggers);
-        assert_eq!(a.correction, b.correction);
+    #[test]
+    fn session_round_trips_through_serde() {
+        // The session is serialized as a `decide_step` activity input on the
+        // Temporal path, so the round trip is load-bearing.
+        let mut session = dummy_session();
+        session.push(
+            Decision::List {
+                path: "notes/".into(),
+            },
+            Observation::ok("a.md\nb.md"),
+        );
+        let s = serde_json::to_string(&session).unwrap();
+        let back: Session = serde_json::from_str(&s).unwrap();
+        assert_eq!(session, back);
+    }
+
+    #[test]
+    fn fs_index_defaults_to_empty_and_deserializes_from_empty_object() {
+        let idx = FsIndex::default();
+        assert!(idx.notes.is_empty() && idx.outputs.is_empty());
+        let back: FsIndex = serde_json::from_str("{}").unwrap();
+        assert_eq!(back, idx);
     }
 }

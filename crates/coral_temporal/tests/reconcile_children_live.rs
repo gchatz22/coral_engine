@@ -29,7 +29,7 @@ use uuid::Uuid;
 use coral_node::agent_ref::{AgentId, AgentRef, GraphId};
 use coral_node::conflict::ConflictKind;
 use coral_node::decision::{
-    ConflictAlternative, ConflictRecordIntent, ContextBundle, Decide, Decision, ReconcileSource,
+    ConflictAlternative, ConflictRecordIntent, Decide, Decision, ReconcileSource, Session,
 };
 use coral_node::evidence::EvidenceRecord;
 use coral_node::fs::AgentFs;
@@ -121,17 +121,17 @@ struct ReconcileRoutingDecide;
 
 #[async_trait]
 impl Decide for ReconcileRoutingDecide {
-    async fn decide(&self, bundle: ContextBundle) -> anyhow::Result<Decision> {
-        match bundle.mandate.text.as_str() {
+    async fn decide(&self, session: &Session) -> anyhow::Result<Decision> {
+        match session.seed.mandate.text.as_str() {
             PARENT_MANDATE_TEXT => {
-                // Record every trigger the parent sees this tick.
-                if !bundle.triggers.is_empty() {
+                // Record every trigger the parent sees this cycle.
+                if !session.seed.triggers.is_empty() {
                     let log = PARENT_OBSERVED_TRIGGERS
                         .get()
                         .expect("PARENT_OBSERVED_TRIGGERS installed")
                         .clone();
                     let mut guard = log.lock().expect("trigger log mutex poisoned");
-                    for t in &bundle.triggers {
+                    for t in &session.seed.triggers {
                         guard.push(t.clone());
                     }
                 }

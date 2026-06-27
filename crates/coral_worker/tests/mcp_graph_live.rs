@@ -195,8 +195,12 @@ async fn run_smoke(database_url: &str) -> Result<()> {
     // this graph's MCP tool row and spawning the server.
     install_tool_registry_provider(Arc::new(DbToolRegistryProvider::new(store.clone())));
 
-    // Scripted run: CallTools(get-sum) → EmitOutput citing the evidence id
-    // → Retire. No LLM; the mandate text is decorative on this path.
+    // Scripted single cycle: CallTools(get-sum) → EmitOutput citing the
+    // evidence id → Idle (the sole terminal). No `Decide` is installed, so
+    // the script must be exactly consumed: the trailing Idle ends the cycle
+    // and the step_cap (1 cycle) retires the workflow before any further
+    // `decide_step` would fall back to a missing `Decide`. No LLM; the
+    // mandate text is decorative on this path.
     set_decision_script(vec![
         Decision::CallTools {
             calls: vec![ToolCall::new(
@@ -208,6 +212,9 @@ async fn run_smoke(database_url: &str) -> Result<()> {
         Decision::EmitOutput {
             content: "mcp_graph_live: get-sum via server-everything".into(),
             evidence: vec![evidence_id.clone()],
+        },
+        Decision::Idle {
+            next_after: Duration::from_millis(50),
         },
     ]);
 
@@ -285,9 +292,9 @@ async fn drive(
     // def so the scripted call is allowed. The real `DbToolRegistryProvider`
     // records the advertised-name -> def-id ownership at registry build.
     input.mandate.tools = vec!["everything".to_string()];
-    // The loop runs the 2 scripted decisions, then the cap stops it
-    // (agents never self-terminate).
-    input.mandate.step_cap = Some(2);
+    // One cycle runs the 3 scripted steps (CallTools → EmitOutput → Idle),
+    // then the cap stops the workflow (agents never self-terminate).
+    input.mandate.step_cap = Some(1);
     let handle = client
         .start_workflow(
             AgentWorkflow::run,
@@ -303,7 +310,7 @@ async fn drive(
         .context("AgentWorkflow.get_result")?;
     let AgentResult::Retired { reason } = result;
     assert_eq!(
-        reason, "step_cap (2) reached",
+        reason, "step_cap (1) reached",
         "workflow returned wrong retire reason: {reason:?}"
     );
 

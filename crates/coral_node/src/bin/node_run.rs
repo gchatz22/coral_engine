@@ -39,9 +39,9 @@
 //!     examples/smoke/triggers.jsonl /tmp/coral-smoke-fs
 //! ```
 //!
-//! The agent will execute three scripted decisions (call echo, emit one
-//! output backed by the resulting evidence record, idle), then retire on
-//! `step_cap`. The printed tree should contain `mandate.md`,
+//! The agent runs one cycle of three scripted steps (call echo, emit one
+//! output backed by the resulting evidence record, idle), then retires on
+//! `step_cap` (= 1 cycle). The printed tree should contain `mandate.md`,
 //! `outputs/<ulid>.json`, `evidence/<sha256>.json`, and `retirement.json`.
 
 use std::fs;

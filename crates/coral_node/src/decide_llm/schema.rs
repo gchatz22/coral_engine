@@ -24,6 +24,9 @@ const TOOL_NAMES: &[&str] = &[
     "call_tool",
     "emit_output",
     "rewrite_fs",
+    "read",
+    "list",
+    "search",
     "idle",
     "spawn_child",
     "reconcile_children",
@@ -102,6 +105,61 @@ pub fn decision_tools() -> Vec<ToolSpec> {
                     }
                 },
                 "required": ["ops"]
+            }),
+        },
+        ToolSpec {
+            name: "read".into(),
+            description: "Read the full contents of one file in your own filesystem \
+                 (or a descendant agent's, read-only). The file body comes back as the \
+                 observation for your next step. Use this to pull a file the index named, \
+                 rather than expecting its contents to be handed to you."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path relative to the agent root, e.g. \
+                                        `notes/plan.md` or `outputs/<id>.json`."
+                    }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolSpec {
+            name: "list".into(),
+            description: "List the entries directly under a directory in your own \
+                 filesystem (or a descendant's, read-only). Files appear as names; \
+                 subdirectories as `name/`."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path relative to the agent root, e.g. `notes/`."
+                    }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolSpec {
+            name: "search".into(),
+            description: "Substring-search file contents under an optional path scope \
+                 (your whole filesystem when omitted). Returns matching files and the \
+                 first matching line in each."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional directory scope, e.g. `notes/`. \
+                                        Omit to search the whole filesystem."
+                    }
+                },
+                "required": ["query"]
             }),
         },
         ToolSpec {
@@ -333,6 +391,9 @@ pub fn parse_decision(calls: &[ToolCall]) -> Result<Decision, DecisionParseError
     let required: &[&str] = match call.name.as_str() {
         "emit_output" => &["content", "evidence"],
         "rewrite_fs" => &["ops"],
+        "read" => &["path"],
+        "list" => &["path"],
+        "search" => &["query"],
         "idle" => &["next_after"],
         // Parent-child topology variants — terminal singletons. Inner-
         // shape validation (e.g. `mandate` field structure) falls through
@@ -623,6 +684,50 @@ mod tests {
     }
 
     #[test]
+    fn parse_read_round_trips() {
+        let d = parse_decision(&[call("read", json!({"path": "notes/a.md"}))]).unwrap();
+        assert_eq!(
+            d,
+            Decision::Read {
+                path: "notes/a.md".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_list_round_trips() {
+        let d = parse_decision(&[call("list", json!({"path": "notes/"}))]).unwrap();
+        assert_eq!(
+            d,
+            Decision::List {
+                path: "notes/".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_search_round_trips_with_and_without_path() {
+        let scoped =
+            parse_decision(&[call("search", json!({"query": "tsmc", "path": "notes/"}))]).unwrap();
+        assert_eq!(
+            scoped,
+            Decision::Search {
+                query: "tsmc".into(),
+                path: Some("notes/".into()),
+            }
+        );
+        // `path` is optional — a query-only search is valid.
+        let unscoped = parse_decision(&[call("search", json!({"query": "tsmc"}))]).unwrap();
+        assert_eq!(
+            unscoped,
+            Decision::Search {
+                query: "tsmc".into(),
+                path: None,
+            }
+        );
+    }
+
+    #[test]
     fn retire_is_not_in_the_model_vocabulary() {
         // Persistence is universal: a model cannot self-terminate. `retire`
         // is neither advertised nor parseable; a `retire` tool call is an
@@ -660,6 +765,9 @@ mod tests {
                 }),
                 "emit_output" => json!({"content": "", "evidence": []}),
                 "rewrite_fs" => json!({"ops": []}),
+                "read" => json!({"path": "notes/a.md"}),
+                "list" => json!({"path": "notes/"}),
+                "search" => json!({"query": "q"}),
                 "idle" => json!({"next_after": 0}),
                 "spawn_child" => json!({
                     "agent_name": "child",

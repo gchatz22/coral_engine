@@ -1,69 +1,47 @@
 //! `Agent` — the run loop that wires FS, triggers, decide, tools, and health.
 //!
-//! Each iteration of the loop:
+//! Two nested loops. The **outer** loop is the wake boundary: each iteration
+//! is one *cycle* (`tick` counts cycles). The **inner** loop is the unit of
+//! work — a multi-step ReAct session the model drives until it chooses to
+//! idle.
 //!
-//! 1. **If a correction is pending**, skip the wait: the run loop is
-//!    continuing a conversation with itself across an iteration boundary,
-//!    not waiting on the world. Otherwise race the trigger queue against
-//!    the scheduler's idle deadline. The race is `biased;` — when both
-//!    arms are ready (the prior tick took longer than `idle_period` and a
-//!    real trigger is also buffered), the queue arm wins, so
-//!    `ScheduledWake` is pushed only when the queue is genuinely empty.
-//! 2. Drain whatever is currently in the queue (may be empty when a
-//!    correction is pending).
-//! 3. **If a correction is pending**, this iteration is a continuation of
-//!    the prior failed attempt: do **not** call [`HealthTracker::begin_tick`]
-//!    — the per-tick retry budget must accumulate across the correction.
-//!    Otherwise begin a fresh tick.
-//! 4. Build a `ContextBundle` from the drained triggers, the recent FS
-//!    state, and the pending correction (if any), and ask `Decide::decide`
-//!    for a `Decision`.
-//! 5. Dispatch the decision.
-//! 6. **On [`DispatchOutcome::Continue`]**: clear `pending_correction` and
-//!    mark the tick a success (`HealthTracker::mark_tick_success`) — this
-//!    archives any prior Unhealthy incident on recovery.
-//! 7. **The agent never self-terminates.** No decision ends the loop;
-//!    persistence is universal. The loop exits only on the interim
-//!    `step_cap` runaway backstop (checked at the top of each
-//!    iteration) or a non-recoverable error.
-//! 8. **On [`DispatchOutcome::NeedsCorrection`]**: the model emitted a
-//!    `Decision` the runtime cannot satisfy (an unregistered tool, an
-//!    unresolvable evidence id). We record the failure against the
-//!    inference budget; if there is still room we stash the failure
-//!    description in `pending_correction` and let the next iteration give
-//!    the model a chance to self-correct. If the budget is exhausted we
-//!    build a [`HealthIncident`] and transition the tracker to `Unhealthy`.
-//!    The loop **does not halt** — the agent stays subscribed to its
-//!    trigger queue per `health.rs`'s contract; a later successful tick
-//!    recovers to `Healthy`.
+//! One outer iteration:
 //!
-//! Decide-side `Err` (e.g. inference parse retries exhausted in
-//! `LlmDecide`) is treated as inference-retry exhaustion at the run-loop
-//! boundary: the tracker transitions to `Unhealthy` directly without
-//! consulting the per-tick budget. The `LlmDecide` impl already did its
-//! one allowed retry internally; spending another budget slot here would
-//! double-count.
+//! 1. **Wake.** Race the trigger queue against the scheduler's idle
+//!    deadline. The race is `biased;` — when both arms are ready (the prior
+//!    cycle took longer than `idle_period` and a real trigger is also
+//!    buffered), the queue arm wins, so `ScheduledWake` is pushed only when
+//!    the queue is genuinely empty. A `never`-cadence agent self-wakes only
+//!    its first cycle, then blocks on triggers alone.
+//! 2. **Begin the cycle.** Drain the queue, open a fresh per-cycle retry
+//!    budget ([`HealthTracker::begin_tick`]), and build a thin orienting
+//!    [`Session`] from a [`crate::decision::Seed`] — the mandate, the
+//!    drained triggers, and a pointers-only FS index. File contents are
+//!    pulled on demand inside the loop, not pushed here.
+//! 3. **Inner loop.** Ask `Decide::decide(&session)` for the next step:
+//!    * `Idle` is the sole terminal — set the next cadence, mark the cycle a
+//!      success ([`HealthTracker::mark_tick_success`], which archives any
+//!      prior Unhealthy incident on recovery), and end the cycle.
+//!    * any repertoire step runs via [`agent_core::execute_step`]; its
+//!      observation (success *or* failure) is appended to the session so the
+//!      model adapts on the next step. A recoverable failure is also
+//!      accounted against the per-cycle budget; on exhaustion the tracker
+//!      transitions to `Unhealthy` and the cycle ends. There is no
+//!      cross-cycle correction state — the failure lives in the session.
+//!    * [`agent_core::CYCLE_RUNAWAY_FUSE`] force-idles a cycle whose model
+//!      never converges (logged loudly; it never bites real work).
 //!
-//! # Why correction is agent-state, not a queue trigger
+//! Decide-side `Err` (e.g. inference parse retries exhausted in `LlmDecide`)
+//! ends the cycle by transitioning to `Unhealthy` directly, without
+//! consulting the budget — the `LlmDecide` impl already did its one allowed
+//! retry internally, so spending another slot would double-count.
 //!
-//! Expressing mid-correction continuation as a self-injected
-//! `Trigger::External { kind: SYNTHETIC_CORRECTION_KIND, ... }` makes
-//! "are we mid-correction?" derive from queue contents, which has two
-//! failure modes:
-//!
-//! * **External-producer race.** A trigger arriving between the inject and
-//!   the next drain makes `is_correction_only` false, which resets the
-//!   per-tick budget.
-//! * **Scheduler self-race.** If the prior tick took non-trivial time, the
-//!   `select!` arm racing `wait_nonempty` against `sleep_until` can see
-//!   both branches ready at once. Tokio picks pseudo-randomly; if the
-//!   deadline branch wins, `ScheduledWake` lands alongside the synthetic
-//!   correction and the budget resets — even with zero external producers.
-//!
-//! Storing `pending_correction: Option<CorrectionContext>` directly on the
-//! run loop makes the invariant a stored fact rather than a derived one.
-//! The trigger queue stays the boundary with the outside world; corrections
-//! stay agent-internal continuation state. See `decision::CorrectionContext`.
+//! **The agent never self-terminates.** No step ends the *outer* loop;
+//! persistence is universal. `Unhealthy` transitions are not exit
+//! conditions — the agent stays subscribed to its queue and a later
+//! successful cycle recovers it to `Healthy`. The outer loop exits only on
+//! the interim `step_cap` runaway backstop (counted in cycles, checked at
+//! the top of each iteration) or a non-recoverable error.
 
 use anyhow::Result;
 use chrono::Utc;
@@ -71,8 +49,8 @@ use serde_json::json;
 use tokio::time::sleep_until;
 use tracing::{debug, info_span, warn, Instrument};
 
-use crate::agent_core::{self, DispatchOutcome};
-use crate::decision::{CorrectionContext, Decide};
+use crate::agent_core::{self, StepFailure};
+use crate::decision::{Decide, Session};
 use crate::fs::AgentFs;
 use crate::health::{
     Attempt, FailingCall, FailureKind, HealthError, HealthIncident, HealthTracker,
@@ -181,267 +159,214 @@ impl<D: Decide> Agent<D> {
 
         // `never` cadence (`idle_period == None`): self-wake only the first
         // cycle, then wait on triggers alone (the wake gate stops arming the
-        // idle timer). The interim runaway backstop.
+        // idle timer). `step_cap` is the interim runaway backstop, in cycles.
         let never = cfg.is_never();
         let step_cap = cfg.step_cap.unwrap_or(crate::mandate::INTERIM_STEP_CAP);
 
-        // Continuation state. `Some` means the previous tick produced an
-        // unsatisfiable `Decision`; this tick is a correction attempt.
-        // Cleared on a successful Continue, on transition_to_unhealthy
-        // (the tick that exhausts budget closes the correction window),
-        // and on Retire.
-        let mut pending_correction: Option<CorrectionContext> = None;
-
-        // Retry trail accumulated across attempts in the *current* fresh
-        // tick. Cleared whenever `begin_tick` runs (i.e. when no correction
-        // is pending). Used to populate `HealthIncident` on budget
-        // exhaustion.
-        let mut retry_trail: Vec<Attempt> = Vec::new();
-
         let mut tick: u64 = 0;
         loop {
-            // The interim `step_cap` runaway backstop. Checked before
-            // incrementing so the cap is the count of ticks actually
-            // performed.
+            // The interim `step_cap` runaway backstop, counted in cycles.
+            // Checked before incrementing so the cap is the count of cycles
+            // actually performed.
             if tick >= step_cap {
                 let reason = format!("step_cap ({}) reached", step_cap);
                 fs.persist_retirement(&reason, Utc::now()).await?;
                 return Ok(RetireReason(reason));
             }
             tick += 1;
-            let span = info_span!("agent.tick", tick);
+            let span = info_span!("agent.cycle", tick);
             async {
-                // Mid-correction: the loop is continuing where it left off,
-                // so do not wait on the world. Drain whatever happens to be
-                // queued (may be empty) and proceed. Fresh tick: race the
-                // queue against the deadline as usual.
-                let is_correction = pending_correction.is_some();
-                if !is_correction {
-                    if arm_self_wake(never, tick == 1) {
-                        // `biased;` makes tokio poll arms in declaration order
-                        // rather than randomly. The queue arm is listed first
-                        // so that when both are ready (the prior tick took
-                        // longer than `idle_period`, leaving an elapsed
-                        // deadline alongside buffered triggers), the queue
-                        // wins and we don't push a spurious `ScheduledWake`
-                        // onto a queue that already has work. `ScheduledWake`
-                        // should mean "the idle period elapsed without other
-                        // work" — a stronger semantic than tokio's default
-                        // tie-break gives us — and pinning it here keeps the
-                        // bundle deterministic across runs that share world
-                        // state.
-                        tokio::select! {
-                            biased;
-                            _ = triggers.wait_nonempty() => {}
-                            _ = sleep_until(scheduler.next_deadline()) => {
-                                triggers.push(Trigger::ScheduledWake);
-                            }
+                // Wake boundary: race the trigger queue against the deadline.
+                if arm_self_wake(never, tick == 1) {
+                    // `biased;` makes tokio poll arms in declaration order
+                    // rather than randomly. The queue arm is listed first so
+                    // that when both are ready (the prior cycle took longer
+                    // than `idle_period`, leaving an elapsed deadline
+                    // alongside buffered triggers), the queue wins and we
+                    // don't push a spurious `ScheduledWake` onto a queue that
+                    // already has work. `ScheduledWake` should mean "the idle
+                    // period elapsed without other work" — a stronger
+                    // semantic than tokio's default tie-break gives us.
+                    tokio::select! {
+                        biased;
+                        _ = triggers.wait_nonempty() => {}
+                        _ = sleep_until(scheduler.next_deadline()) => {
+                            triggers.push(Trigger::ScheduledWake);
                         }
-                    } else {
-                        // `never` cadence past the first cycle: no self-wake
-                        // timer, so block until a trigger arrives.
-                        triggers.wait_nonempty().await;
                     }
+                } else {
+                    // `never` cadence past the first cycle: no self-wake
+                    // timer, so block until a trigger arrives.
+                    triggers.wait_nonempty().await;
                 }
 
                 let drained = triggers.drain_ordered();
-                if !is_correction {
-                    health.begin_tick();
-                    retry_trail.clear();
-                }
-                debug!(count = drained.len(), is_correction, "drained triggers");
+                debug!(count = drained.len(), "drained triggers");
 
-                // Per-tick logic lives behind the `agent_core` seam:
-                // `drain_triggers` packages the drained vec into a
-                // `ContextBundle`, `decide` calls into the `Decide` impl,
-                // `dispatch` applies the `Decision` and returns a typed
-                // `DispatchOutcome`. The host below maps that outcome
-                // into budget / health / correction state.
-                let bundle =
-                    agent_core::drain_triggers(drained, &fs, &cfg, pending_correction.clone())
-                        .await?;
-                let decision = match agent_core::decide(bundle, &decide).await {
-                    Ok(d) => d,
-                    Err(e) => {
-                        // Decide-side Err: LlmDecide already did its
-                        // one-shot internal retry (or this is `MockDecide`
-                        // returning a script error). Treat as direct
-                        // inference-retry exhaustion — go straight to
-                        // Unhealthy without spending another budget slot.
-                        warn!(error = %e, "decide returned Err; transitioning to Unhealthy");
-                        let attempt = Attempt {
-                            attempt: (retry_trail.len() as u32) + 1,
-                            at: Utc::now(),
-                            error: format!("{e:#}"),
-                        };
-                        retry_trail.push(attempt);
-                        let incident = HealthIncident {
-                            failing: FailingCall {
-                                kind: FailureKind::Inference,
-                                details: json!({
-                                    "stage": "decide",
-                                    "error": format!("{e:#}"),
-                                }),
-                            },
-                            retry_trail: retry_trail.clone(),
-                            last_error: format!("{e:#}"),
-                            transitioned_at: Utc::now(),
-                        };
-                        health.transition_to_unhealthy(incident)?;
-                        // Decide-Err closes the correction window: the
-                        // Unhealthy transition replaces it as the
-                        // operative state, and the next fresh tick should
-                        // begin_tick from a clean slate.
-                        pending_correction = None;
-                        return Ok::<(), anyhow::Error>(());
-                    }
-                };
+                // One cycle: open a fresh per-cycle retry budget, build the
+                // thin orienting session, then run the inner ReAct loop over
+                // the accumulating session until the model chooses `Idle`.
+                health.begin_tick();
+                let mut retry_trail: Vec<Attempt> = Vec::new();
+                let seed = agent_core::build_seed(&fs, drained, &cfg).await?;
+                let mut session = Session::new(seed);
 
-                match agent_core::dispatch(&fs, &tools, &mut scheduler, decision).await? {
-                    DispatchOutcome::Continue => {
-                        health.mark_tick_success(Utc::now())?;
-                        retry_trail.clear();
-                        pending_correction = None;
-                        Ok(())
-                    }
-                    DispatchOutcome::NeedsCorrection(desc) => {
-                        let attempt = Attempt {
-                            attempt: (retry_trail.len() as u32) + 1,
-                            at: Utc::now(),
-                            error: desc.clone(),
-                        };
-                        retry_trail.push(attempt);
-                        match health.record_failure(FailureKind::Inference, &desc) {
-                            Ok(()) => {
-                                warn!(failure = %desc, "apply-time failure; staging correction");
-                                pending_correction = Some(CorrectionContext::new(desc));
-                                Ok(())
-                            }
-                            Err(HealthError::BudgetExhausted { kind }) => {
-                                warn!(
-                                    ?kind,
-                                    "inference budget exhausted; transitioning to Unhealthy"
-                                );
-                                let incident = HealthIncident {
-                                    failing: FailingCall {
-                                        kind,
-                                        details: json!({
-                                            "stage": "apply",
-                                            "error": desc,
-                                        }),
-                                    },
-                                    retry_trail: retry_trail.clone(),
-                                    last_error: desc,
-                                    transitioned_at: Utc::now(),
-                                };
-                                health.transition_to_unhealthy(incident)?;
-                                // Budget exhaustion closes the correction
-                                // window; next fresh tick starts clean.
-                                pending_correction = None;
-                                Ok(())
-                            }
-                            Err(other) => Err(other.into()),
-                        }
-                    }
-                    DispatchOutcome::ToolError { failures } => {
-                        // The tool's internal retry policy
-                        // (`McpTool::call`) has already exhausted its
-                        // `RetryPolicy::max_attempts` attempts before
-                        // surfacing this error. Each exhausted call
-                        // counts as one against `RetryBudget::max_tool`,
-                        // so K parallel failures consume K slots — one
-                        // bad tick can't burn an unbounded number of
-                        // attempts through the noise floor. If the
-                        // budget exhausts partway through, the remaining
-                        // failures still join the retry trail (so the
-                        // `HealthIncident` archive captures the full
-                        // batch) but stop spending slots.
-                        //
-                        // The corrective signal reuses
-                        // `CorrectionContext` (same shape as the
-                        // inference path) rather than introducing a
-                        // parallel trigger class. Budget accumulates
-                        // across the correction continuation: the next
-                        // iteration skips `begin_tick` while
-                        // `pending_correction` is `Some`.
-                        let desc = agent_core::tool_failure_correction_text(&failures);
-                        let mut budget_exhausted: Option<FailureKind> = None;
-                        let mut last_error = String::new();
-                        for f in &failures {
-                            let attempt = Attempt {
+                loop {
+                    let action = match agent_core::decide(&session, &decide).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            // Decide-side Err: LlmDecide already did its
+                            // one-shot internal retry (or this is `MockDecide`
+                            // returning a script error). Treat as direct
+                            // inference-retry exhaustion — straight to
+                            // Unhealthy without spending a budget slot. The
+                            // cycle ends; the outer loop continues.
+                            warn!(error = %e, "decide returned Err; transitioning to Unhealthy");
+                            retry_trail.push(Attempt {
                                 attempt: (retry_trail.len() as u32) + 1,
                                 at: Utc::now(),
-                                error: f.error.clone(),
+                                error: format!("{e:#}"),
+                            });
+                            let incident = HealthIncident {
+                                failing: FailingCall {
+                                    kind: FailureKind::Inference,
+                                    details: json!({
+                                        "stage": "decide",
+                                        "error": format!("{e:#}"),
+                                    }),
+                                },
+                                retry_trail: retry_trail.clone(),
+                                last_error: format!("{e:#}"),
+                                transitioned_at: Utc::now(),
                             };
-                            retry_trail.push(attempt);
-                            last_error = f.error.clone();
-                            if budget_exhausted.is_some() {
-                                continue;
-                            }
-                            match health.record_failure(FailureKind::ToolCall, &f.error) {
-                                Ok(()) => {}
-                                Err(HealthError::BudgetExhausted { kind }) => {
-                                    budget_exhausted = Some(kind);
-                                }
-                                Err(other) => return Err(other.into()),
-                            }
+                            health.transition_to_unhealthy(incident)?;
+                            return Ok::<(), anyhow::Error>(());
                         }
-                        match budget_exhausted {
-                            None => {
-                                warn!(
-                                    failures = failures.len(),
-                                    first_tool = %failures.first().map(|f| f.tool.as_str()).unwrap_or(""),
-                                    "tool call(s) exhausted retries; staging correction"
-                                );
-                                pending_correction = Some(CorrectionContext::new(desc));
-                                Ok(())
-                            }
-                            Some(kind) => {
-                                warn!(
-                                    ?kind,
-                                    failures = failures.len(),
-                                    "tool-call budget exhausted; transitioning to Unhealthy"
-                                );
-                                let failures_json: Vec<serde_json::Value> = failures
-                                    .iter()
-                                    .map(|f| {
-                                        json!({
-                                            "tool": f.tool,
-                                            "error": f.error,
-                                        })
-                                    })
-                                    .collect();
-                                let first_tool = failures
-                                    .first()
-                                    .map(|f| f.tool.clone())
-                                    .unwrap_or_default();
-                                let incident = HealthIncident {
-                                    failing: FailingCall {
-                                        kind,
-                                        details: json!({
-                                            "stage": "apply",
-                                            "tool": first_tool,
-                                            "error": last_error.clone(),
-                                            "failures": failures_json,
-                                        }),
-                                    },
-                                    retry_trail: retry_trail.clone(),
-                                    last_error,
-                                    transitioned_at: Utc::now(),
-                                };
-                                health.transition_to_unhealthy(incident)?;
-                                // Budget exhaustion closes the correction
-                                // window; the next fresh tick starts
-                                // clean.
-                                pending_correction = None;
-                                Ok(())
-                            }
+                    };
+
+                    if let Some(next_after) = action.idle_after() {
+                        // `Idle` is the sole terminal step: set the next wake
+                        // cadence, mark the cycle a success (archiving any
+                        // prior Unhealthy incident on recovery), end the cycle.
+                        debug!(
+                            next_after_ms = next_after.as_millis() as u64,
+                            "cycle: idle (terminal)"
+                        );
+                        scheduler.set_next_after(next_after);
+                        health.mark_tick_success(Utc::now())?;
+                        return Ok(());
+                    }
+
+                    // Repertoire step: run it, account any recoverable failure
+                    // against the per-cycle budget, and append the observation
+                    // (success *or* failure) so the model adapts next step.
+                    let outcome = agent_core::execute_step(&fs, &tools, &action).await?;
+                    let maybe_incident = match &outcome.failure {
+                        None => None,
+                        Some(failure) => {
+                            record_cycle_failure(&mut health, &mut retry_trail, failure)?
                         }
+                    };
+                    session.push(action, outcome.observation);
+                    if let Some(incident) = maybe_incident {
+                        warn!("per-cycle retry budget exhausted; transitioning to Unhealthy");
+                        health.transition_to_unhealthy(incident)?;
+                        return Ok(());
+                    }
+
+                    if session.len() >= agent_core::CYCLE_RUNAWAY_FUSE {
+                        warn!(
+                            steps = session.len(),
+                            "cycle hit runaway fuse; forcing idle — this mandate never converges, decompose it"
+                        );
+                        return Ok(());
                     }
                 }
             }
             .instrument(span)
             .await?;
+        }
+    }
+}
+
+/// Account one repertoire-step failure against the per-cycle retry budget,
+/// extending `retry_trail`. Returns `Some(incident)` when the budget is now
+/// exhausted — the caller transitions the tracker to Unhealthy and ends the
+/// cycle — or `None` when there is still room to keep stepping.
+///
+/// A `ToolError` carries K per-call failures; each counts as one
+/// `FailureKind::ToolCall` slot. Once the budget exhausts mid-batch the
+/// remaining failures still join the retry trail (so the `HealthIncident`
+/// archive captures the full batch) but stop spending slots.
+fn record_cycle_failure(
+    health: &mut HealthTracker,
+    retry_trail: &mut Vec<Attempt>,
+    failure: &StepFailure,
+) -> Result<Option<HealthIncident>> {
+    match failure {
+        StepFailure::NeedsCorrection(desc) => {
+            retry_trail.push(Attempt {
+                attempt: (retry_trail.len() as u32) + 1,
+                at: Utc::now(),
+                error: desc.clone(),
+            });
+            match health.record_failure(FailureKind::Inference, desc) {
+                Ok(()) => Ok(None),
+                Err(HealthError::BudgetExhausted { kind }) => Ok(Some(HealthIncident {
+                    failing: FailingCall {
+                        kind,
+                        details: json!({ "stage": "apply", "error": desc }),
+                    },
+                    retry_trail: retry_trail.clone(),
+                    last_error: desc.clone(),
+                    transitioned_at: Utc::now(),
+                })),
+                Err(other) => Err(other.into()),
+            }
+        }
+        StepFailure::ToolError(failures) => {
+            let mut budget_exhausted: Option<FailureKind> = None;
+            let mut last_error = String::new();
+            for f in failures {
+                retry_trail.push(Attempt {
+                    attempt: (retry_trail.len() as u32) + 1,
+                    at: Utc::now(),
+                    error: f.error.clone(),
+                });
+                last_error = f.error.clone();
+                if budget_exhausted.is_some() {
+                    continue;
+                }
+                match health.record_failure(FailureKind::ToolCall, &f.error) {
+                    Ok(()) => {}
+                    Err(HealthError::BudgetExhausted { kind }) => budget_exhausted = Some(kind),
+                    Err(other) => return Err(other.into()),
+                }
+            }
+            match budget_exhausted {
+                None => Ok(None),
+                Some(kind) => {
+                    let failures_json: Vec<serde_json::Value> = failures
+                        .iter()
+                        .map(|f| json!({ "tool": f.tool, "error": f.error }))
+                        .collect();
+                    let first_tool = failures.first().map(|f| f.tool.clone()).unwrap_or_default();
+                    Ok(Some(HealthIncident {
+                        failing: FailingCall {
+                            kind,
+                            details: json!({
+                                "stage": "apply",
+                                "tool": first_tool,
+                                "error": last_error.clone(),
+                                "failures": failures_json,
+                            }),
+                        },
+                        retry_trail: retry_trail.clone(),
+                        last_error,
+                        transitioned_at: Utc::now(),
+                    }))
+                }
+            }
         }
     }
 }
@@ -618,15 +543,12 @@ mod tests {
             }
         }
 
-        fn empty_bundle() -> crate::decision::ContextBundle {
-            crate::decision::ContextBundle {
-                mandate: Mandate::new("stats-test", std::time::Duration::from_secs(1), Some(1)),
-                triggers: vec![],
-                recent_outputs: vec![],
-                recent_evidence: vec![],
-                open_claims: vec![],
-                correction: None,
-            }
+        fn empty_session() -> crate::decision::Session {
+            crate::decision::Session::new(crate::decision::Seed::new(
+                Mandate::new("stats-test", std::time::Duration::from_secs(1), Some(1)),
+                vec![],
+                crate::decision::FsIndex::default(),
+            ))
         }
 
         #[tokio::test]
@@ -746,7 +668,7 @@ mod tests {
             // Drive one tick directly via the inner `decide` (no run
             // loop) so the test exercises the `decide` reset semantics
             // without depending on agent scheduling.
-            agent.decide.decide(empty_bundle()).await.unwrap();
+            agent.decide.decide(&empty_session()).await.unwrap();
             // Both clones see the same accumulator state.
             assert_eq!(h1.last_tick_calls(), h2.last_tick_calls());
             assert_eq!(h1.last_tick_totals(), h2.last_tick_totals());
