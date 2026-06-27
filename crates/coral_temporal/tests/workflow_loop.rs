@@ -22,7 +22,9 @@ use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
 use coral_node::agent_ref::{AgentId, GraphId};
-use coral_node::decision::{ClaimSeed, Decision, FsOp, ToolCall};
+use coral_node::decision::{
+    ClaimSeed, Decision, FsIndex, FsOp, Observation, Seed, Session, ToolCall,
+};
 use coral_node::evidence::EvidenceRecord;
 use coral_node::fs::AgentFs;
 use coral_node::mandate::Mandate;
@@ -30,7 +32,9 @@ use coral_node::storage::{AgentStorage, MemoryStorage};
 use coral_node::tools::{Tool, ToolRegistry};
 use coral_temporal::activities::set_decision_script;
 use coral_temporal::worker::{build_worker, install_agent_storage, install_tool_registry};
-use coral_temporal::workflow::{agent_workflow_id, AgentInput, AgentResult, AgentWorkflow};
+use coral_temporal::workflow::{
+    agent_workflow_id, AgentInput, AgentResult, AgentWorkflow, Carryover,
+};
 use uuid::Uuid;
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
@@ -819,4 +823,227 @@ async fn run_stop_contract_test(
     let reason = driver.await.context("driver task panicked")??;
     worker_result?;
     Ok(reason)
+}
+
+/// Resume half of A+C (mid-cycle continue-as-new). The *suspend* trigger
+/// (`continue_as_new_suggested`) can't be forced hermetically, but the
+/// replay-risky *resume* path is just a workflow started with a crafted
+/// carryover, so it is fully deterministic. Start `AgentWorkflow` with
+/// `carryover.in_flight = Some(session_with_2_steps)` + `tick = 3` and a
+/// continuation script of a single `Idle`, then assert the run RESUMED the
+/// cycle rather than starting fresh:
+///
+/// - no `build_seed` schedule (resume skips the seed-building path),
+/// - no `execute_tool` schedule (the carried `CallTools` step is NOT
+///   re-executed),
+/// - the continuation decision logs at `decisions/3-2.jsonl` (step derived
+///   from `session.len() == 2`), and `decisions/3-0.jsonl` is absent (no
+///   restart-at-zero clobber),
+/// - the cycle idles and the loop retires at `step_cap=4` — i.e. `tick` went
+///   3 → 4 (one cycle), not 3 → 3+N.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn workflow_loop_resumes_in_flight_cycle_from_carryover() {
+    if env::var("TEMPORAL_LIVE_TEST").ok().as_deref() != Some("1") {
+        eprintln!(
+            "skipping workflow_loop_resumes_in_flight_cycle_from_carryover; \
+             set TEMPORAL_LIVE_TEST=1 with a local Temporal Server to run"
+        );
+        return;
+    }
+    let _guard = LIVE_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    run_resume_test().await.expect("live resume test");
+}
+
+/// Build the 2-step in-flight session the resume test carries. The steps are
+/// synthetic `(action, observation)` pairs — resume never re-runs them, so a
+/// real `CallTools` action here proves the no-re-execution invariant (its
+/// `execute_tool` activity must not fire on the resumed run).
+fn carried_session() -> Session {
+    let seed = Seed::new(
+        Mandate::new("resume-me", Duration::from_millis(20), Some(4)),
+        Vec::new(),
+        FsIndex::default(),
+    );
+    let mut session = Session::new(seed);
+    session.push(
+        Decision::CallTools {
+            calls: vec![ToolCall::new(
+                "tool_a",
+                serde_json::json!({"carried": true}),
+                ClaimSeed::new("carried-a"),
+            )],
+        },
+        Observation::ok("carried: 1 tool call succeeded"),
+    );
+    session.push(
+        Decision::Read {
+            path: "notes/carried.md".into(),
+        },
+        Observation::ok("carried note body"),
+    );
+    session
+}
+
+async fn run_resume_test() -> Result<()> {
+    let suffix = run_suffix();
+    let task_queue = format!("coral-agents-resume-test-{suffix}");
+    let storage = ensure_installed();
+
+    // The resumed cycle needs exactly one more decision to terminate.
+    set_decision_script(vec![Decision::Idle {
+        next_after: Duration::from_millis(20),
+    }]);
+
+    let telemetry_options = TelemetryOptions::builder().build();
+    let runtime = CoreRuntime::new_assume_tokio(
+        RuntimeOptions::builder()
+            .telemetry_options(telemetry_options)
+            .build()
+            .map_err(|e| anyhow::anyhow!("RuntimeOptions build failed: {e}"))?,
+    )?;
+    let client = build_client().await?;
+    let mut worker = build_worker(&runtime, client.clone(), &task_queue)?;
+    let shutdown = worker.shutdown_handle();
+
+    let agent_prefix = format!("graphs/g-resume-test/agents/a-resume-{suffix}");
+    let driver_task_queue = task_queue.clone();
+    let driver_storage = storage.clone();
+    let driver = tokio::spawn(async move {
+        let workflow_id = format!(
+            "{}-{suffix}",
+            agent_workflow_id("g-resume-test", "a-resume")
+        );
+        eprintln!(
+            "workflow_loop_resume: starting workflow_id={workflow_id} on {driver_task_queue}"
+        );
+        struct ShutdownGuard<F: Fn()>(F);
+        impl<F: Fn()> Drop for ShutdownGuard<F> {
+            fn drop(&mut self) {
+                (self.0)();
+            }
+        }
+        let _guard = ShutdownGuard(shutdown);
+        drive_resume(
+            client,
+            &driver_task_queue,
+            &workflow_id,
+            &agent_prefix,
+            driver_storage,
+        )
+        .await
+    });
+
+    let worker_result = tokio::time::timeout(Duration::from_secs(60), worker.run())
+        .await
+        .map_err(|_| anyhow::anyhow!("worker.run() timed out (60s)"))?
+        .map_err(|e| anyhow::anyhow!("worker.run() exited with error: {e}"));
+    let driver_result = driver.await.context("driver task panicked")?;
+
+    worker_result?;
+    driver_result?;
+    Ok(())
+}
+
+async fn drive_resume(
+    client: Client,
+    task_queue: &str,
+    workflow_id: &str,
+    agent_prefix: &str,
+    storage: Arc<MemoryStorage>,
+) -> Result<()> {
+    let mut input = AgentInput::new_for_test(
+        GraphId::new(Uuid::new_v4()),
+        AgentId::new(Uuid::new_v4()),
+        "workflow-loop-resume-test",
+    );
+    input.fs_handle = coral_temporal::workflow::FsHandle {
+        prefix: agent_prefix.into(),
+    };
+    input.mandate.tools = assigned_tools();
+    // tick=3 carried; step_cap=4 so the resumed cycle runs (3 < 4) and the
+    // loop retires on the NEXT iteration once the cycle bumps tick to 4.
+    input.mandate.step_cap = Some(4);
+    input.carryover = Some(Carryover {
+        in_flight: Some(carried_session()),
+        tick: 3,
+        ..Carryover::default()
+    });
+
+    let handle = client
+        .start_workflow(
+            AgentWorkflow::run,
+            input,
+            WorkflowStartOptions::new(task_queue, workflow_id).build(),
+        )
+        .await
+        .context("start_workflow(AgentWorkflow) [resume]")?;
+
+    let result: AgentResult = handle
+        .get_result(WorkflowGetResultOptions::default())
+        .await
+        .context("AgentWorkflow.get_result [resume]")?;
+    let AgentResult::Retired { reason } = result;
+    assert_eq!(
+        reason, "step_cap (4) reached",
+        "resumed cycle must bump tick 3 → 4 (one cycle) then retire at the cap, got {reason:?}"
+    );
+
+    // History: the resume path skips `build_seed` and must not re-execute the
+    // carried `CallTools` step.
+    let history = handle
+        .fetch_history(WorkflowFetchHistoryOptions::builder().build())
+        .await
+        .context("fetch_history [resume]")?;
+    let mut build_seed_schedules = 0usize;
+    let mut execute_tool_schedules = 0usize;
+    let mut persist_retirement_schedules = 0usize;
+    for ev in history.events() {
+        if let Some(Attributes::ActivityTaskScheduledEventAttributes(a)) = &ev.attributes {
+            if let Some(ty) = &a.activity_type {
+                match ty.name.rsplit("::").next().unwrap_or(ty.name.as_str()) {
+                    "build_seed" => build_seed_schedules += 1,
+                    "execute_tool" => execute_tool_schedules += 1,
+                    "persist_retirement" => persist_retirement_schedules += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert_eq!(
+        build_seed_schedules, 0,
+        "resume must skip build_seed (the cycle is already in flight), got {build_seed_schedules}"
+    );
+    assert_eq!(
+        execute_tool_schedules, 0,
+        "carried CallTools step must NOT be re-executed on resume, got {execute_tool_schedules}"
+    );
+    assert!(
+        persist_retirement_schedules >= 1,
+        "resumed run must retire at the step_cap, got {persist_retirement_schedules}"
+    );
+
+    // The continuation decision logs at `<tick>-<step>` = `3-2` (step derived
+    // from the carried `session.len() == 2`), proving the decision stream
+    // continued rather than restarting at `3-0`.
+    let resumed_key = format!("{agent_prefix}/decisions/3-2.jsonl");
+    assert!(
+        storage
+            .get(&resumed_key)
+            .await
+            .context("get resumed decision-log key")?
+            .is_some(),
+        "expected resumed decision log at {resumed_key} (step derived from session.len()==2)"
+    );
+    let clobber_key = format!("{agent_prefix}/decisions/3-0.jsonl");
+    assert!(
+        storage
+            .get(&clobber_key)
+            .await
+            .context("get would-be-clobber decision-log key")?
+            .is_none(),
+        "resume must not restart the decision stream at {clobber_key}"
+    );
+
+    Ok(())
 }
