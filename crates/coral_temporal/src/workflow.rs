@@ -32,7 +32,6 @@ use std::time::Duration;
 use coral_node::agent_core::CYCLE_RUNAWAY_FUSE;
 use coral_node::agent_ref::{AgentId, AgentRef, GraphId};
 use coral_node::decision::{Decision, Observation, Seed, Session, ToolCall};
-use coral_node::evidence::EvidenceId;
 use coral_node::mandate::{Mandate, OutputId, INTERIM_STEP_CAP};
 use coral_node::scheduler::arm_self_wake;
 use coral_node::trigger::{HumanOp, MandatePatch, Trigger};
@@ -132,7 +131,7 @@ pub struct SchedulerCursor {
 /// the current run. Not conversation history or tool results — those survive
 /// via the per-agent FS, which is external to Temporal history.
 ///
-/// Every field maps to a workflow-state field that the run loop observes or
+/// Most fields map to a workflow-state field that the run loop observes or
 /// mutates. The mapping is:
 ///
 /// | Carryover field | Workflow-state field | Lifecycle |
@@ -143,13 +142,19 @@ pub struct SchedulerCursor {
 /// | `retirement_request` | [`AgentWorkflow::retirement_request`] | Drained at top of each tick (short-circuits) |
 /// | `scheduler_cursor` | [`AgentWorkflow::next_wake`] | Honored by the wake gate |
 /// | `last_output_id` | [`AgentWorkflow::last_output_id`] | Latest persisted `EmitOutput` id |
-/// | `mid_tick_evidence` | [`AgentWorkflow::mid_tick_evidence`] | EvidenceIds collected mid-tick |
 /// | `cumulative_*_observed` | matching `AgentWorkflow::cumulative_*_observed` | Observability across CAN boundary |
 /// | `child_handles` | [`AgentWorkflow::child_handles`] | Spawned-child handles across CAN |
 ///
 /// `cumulative_*_observed` must survive CAN — without them, a snapshot taken
 /// on the post-CAN run would report `cumulative_triggers_observed == 0` even
 /// though the workflow lifetime had observed N signals on the pre-CAN run.
+///
+/// `in_flight` is the exception to "maps to workflow state": it is the
+/// in-flight [`Session`] of a cycle a *mid-cycle* continue-as-new suspended.
+/// The run loop reads it once at entry to resume that exact cycle (rehydrate
+/// the session, continue the inner ReAct loop) rather than building a fresh
+/// seed; it never lives on the workflow struct, so `encode_carryover` always
+/// emits `None` and only the mid-cycle CAN site sets it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Carryover {
     pub pending_triggers: Vec<Trigger>,
@@ -162,10 +167,6 @@ pub struct Carryover {
     /// `Decision::SpawnChild` arm of [`AgentWorkflow::run`].
     pub child_handles: Vec<AgentRef>,
     pub last_output_id: Option<OutputId>,
-    /// EvidenceIds collected by activities partway through a tick that CAN
-    /// fires during. Reserved for mid-tick checkpointing; today the CAN
-    /// check fires at end-of-tick so this is structurally empty.
-    pub mid_tick_evidence: Vec<EvidenceId>,
     /// Cumulative count of `Trigger`s observed via `external_signal` across
     /// the workflow's lifetime (including all prior CAN runs). Without
     /// this, a post-CAN snapshot would only reflect signals received on the
@@ -178,6 +179,15 @@ pub struct Carryover {
     /// post-CAN run continues numbering rather than clobbering pre-CAN
     /// files at `decisions/0.jsonl`.
     pub tick: u64,
+    /// In-flight [`Session`] of a cycle a *mid-cycle* continue-as-new
+    /// suspended. `Some` ⇒ the post-CAN run resumes this exact cycle
+    /// (rehydrate the session, continue the inner ReAct loop) instead of
+    /// building a fresh seed; `None` ⇒ a normal between-cycles start. Set
+    /// only at the mid-cycle CAN site in [`AgentWorkflow::run`];
+    /// [`AgentWorkflow::encode_carryover`] always emits `None` because the
+    /// session lives in a run-loop local, not on the workflow struct.
+    #[serde(default)]
+    pub in_flight: Option<Session>,
 }
 
 /// Input handed to `AgentWorkflow::run` at start (and at every continue-as-new).
@@ -308,6 +318,20 @@ pub fn agent_workflow_id(graph_id: &str, agent_id: &str) -> String {
 /// immediately so the workflow doesn't sit idle waiting for nothing.
 const INITIAL_NEXT_WAKE: Duration = Duration::from_millis(1);
 
+/// Hard ceiling for the serialized [`AgentInput`] a *mid-cycle* continue-as-new
+/// would send when carrying an in-flight session. Temporal rejects any single
+/// payload above `limit.blobSize.error` (default 2 MiB) and a CAN input is one
+/// payload, so a too-large carry would fail the CAN command and wedge the
+/// workflow on retry. We measure the *whole* candidate input (carryover +
+/// session + mandate + …) against this cap, set below the server default with
+/// margin so the carry can never trip the limit; a session that would exceed it
+/// force-idles the cycle and rebuilds from the durable FS instead.
+const CAN_PAYLOAD_HARD_BYTES: usize = 1_572_864; // 1.5 MiB
+
+/// Soft warning threshold (kept under Temporal's `limit.blobSize.warn`, default
+/// 512 KiB). Crossing it logs but still carries the session.
+const CAN_PAYLOAD_WARN_BYTES: usize = 262_144; // 256 KiB
+
 /// Per-activity start-to-close timeout. Generous so a stub activity and a
 /// real activity (LLM calls, FS writes) both fit; the workflow loop's own
 /// deadlines come from `next_wake` and the retirement signal.
@@ -349,10 +373,6 @@ pub struct AgentWorkflow {
     /// state today (the field stays `None`); the slot exists so the
     /// [`Carryover`] round-trip is structurally complete.
     last_output_id: Option<OutputId>,
-    /// Evidence ids collected by activities mid-tick. Empty today — the CAN
-    /// check fires at end-of-tick after every activity has returned — but
-    /// reserved for mid-tick checkpointing.
-    mid_tick_evidence: Vec<EvidenceId>,
     /// Per-tick counter bumped at the bottom of each loop iteration.
     /// Stamped onto each `<prefix>/decisions/<tick>.jsonl` artifact via the
     /// `append_decision_log` activity. Hydrated from [`Carryover::tick`] on
@@ -422,26 +442,38 @@ impl AgentWorkflow {
     /// external action (FS read/write, LLM call, tool dispatch) lives in an
     /// activity; the workflow body is pure orchestration.
     ///
-    /// Continue-as-new shape:
+    /// Continue-as-new fires at two points, both gated on
+    /// [`temporalio_sdk::WorkflowContext::continue_as_new_suggested`]:
     ///
-    /// 1. On entry, if `input.carryover.is_some()`, the workflow state is
-    ///    hydrated from it via [`hydrate_from_carryover`].
-    /// 2. At end-of-tick (after the activity for the current decision
-    ///    returned, *and only on non-retirement ticks*),
-    ///    [`temporalio_sdk::WorkflowContext::continue_as_new_suggested`] is
-    ///    consulted. If true, the workflow's current state is encoded into a
-    ///    fresh [`Carryover`] via [`encode_carryover`] and passed to
-    ///    `ctx.continue_as_new(&next_input, opts)`.
+    /// 1. **Cycle boundary** (after a cycle's inner loop ends, only on
+    ///    non-retirement ticks): the workflow state is encoded into a fresh
+    ///    [`Carryover`] via [`encode_carryover`] (`in_flight: None`) and
+    ///    passed to `ctx.continue_as_new(&next_input, opts)`. The next run
+    ///    starts a fresh cycle.
+    /// 2. **Mid-cycle** (between two inner steps, *after* a step's observation
+    ///    has been pushed): the in-flight [`Session`] is attached to the
+    ///    carryover (`in_flight: Some(session)`) so the next run resumes the
+    ///    *same* cycle rather than rebuilding a seed. This is what lets one
+    ///    unit of mandate work span many runs / outgrow a single history.
     ///
-    /// Retirement structurally cannot trigger CAN: both retirement paths
-    /// (the interim `step_cap` backstop and the `drained.retirement`
-    /// short-circuit, both at the top of the loop) return before the CAN
-    /// check.
+    /// On entry, if `input.carryover.in_flight.is_some()` the run resumes the
+    /// suspended cycle (skip the wake gate / drain / `build_seed`); otherwise
+    /// it hydrates the carryover onto workflow state via
+    /// [`hydrate_from_carryover`] and runs the normal wake→drain→seed path.
+    ///
+    /// Retirement structurally cannot trigger CAN: every retirement path (the
+    /// interim `step_cap` backstop, the `drained.retirement` short-circuit,
+    /// and the resume-path retirement peek) returns before any CAN check.
     #[run]
     pub async fn run(
         ctx: &mut WorkflowContext<Self>,
         input: AgentInput,
     ) -> WorkflowResult<AgentResult> {
+        // A mid-cycle continue-as-new attaches the in-flight session here; if
+        // present, this run resumes that suspended cycle. Read it out before
+        // hydrating the rest of the carryover (which deliberately ignores
+        // `in_flight`).
+        let mut resume = input.carryover.as_ref().and_then(|c| c.in_flight.clone());
         if let Some(c) = input.carryover.clone() {
             ctx.state_mut(|s| s.hydrate_from_carryover(c));
         }
@@ -454,34 +486,54 @@ impl AgentWorkflow {
             // `wait_for_tick` so an over-budget agent retires without waking
             // or burning a decide call, mirroring the in-process loop. `tick`
             // is the hydrated state value, so the cap spans a
-            // continue-as-new.
+            // continue-as-new. On a mid-cycle resume `tick` is unchanged from
+            // when the cycle started (it bumps only at a true cycle end), so
+            // this check passes through harmlessly.
             let tick = ctx.state(|s| s.tick);
             if let Some(reason) = step_cap_retire_reason(tick, input.mandate.step_cap) {
                 return retire(ctx, &input, reason).await;
             }
 
-            wait_for_tick(ctx, never).await;
+            // Resume a mid-cycle-CAN-suspended session, or start a fresh
+            // cycle. The `session` is a LOCAL value rebuilt only from
+            // journaled activity results (or, on resume, from the immutable
+            // workflow input) — never from a live FS read in the workflow
+            // body — so replay stays deterministic.
+            let mut session = if let Some(session) = resume.take() {
+                // Resuming: we are mid-cycle, not at a wake boundary, so skip
+                // the wake gate / drain / `build_seed`. Still honor a `retire`
+                // request — the one signal that preempts a long cycle at a
+                // rollover. Other pending signals (triggers / human ops /
+                // mandate patches) stay queued for the next fresh cycle's
+                // seed, matching the cycle-granularity drain model.
+                if let Some(reason) = ctx.state_mut(|s| s.retirement_request.take()) {
+                    return retire(ctx, &input, reason).await;
+                }
+                session
+            } else {
+                wait_for_tick(ctx, never).await;
 
-            // Retirement short-circuit fires before any activity invocation
-            // and before any CAN check, so a `retire` signal can never
-            // trigger a continue-as-new.
-            let mut drained = ctx.state_mut(drain_buckets);
-            if let Some(reason) = drained.retirement {
-                return retire(ctx, &input, reason).await;
-            }
-            synthesize_scheduled_wake(&mut drained);
+                // Retirement short-circuit fires before any activity
+                // invocation and before any CAN check, so a `retire` signal
+                // can never trigger a continue-as-new.
+                let mut drained = ctx.state_mut(drain_buckets);
+                if let Some(reason) = drained.retirement {
+                    return retire(ctx, &input, reason).await;
+                }
+                synthesize_scheduled_wake(&mut drained);
 
-            // Build the thin orienting seed (activity), then run the inner
-            // ReAct loop: decide_step → execute → observe, until the model
-            // chooses `Idle` (the sole terminal). The `session` is a LOCAL
-            // value rebuilt only from journaled activity results — never from
-            // a live FS read in the workflow body — so replay is
-            // deterministic. It is discarded at cycle end; continue-as-new
-            // fires only at the cycle boundary (below), so no in-flight
-            // session ever needs to survive a CAN in PR1.
-            let seed = build_seed(ctx, &input, drained).await?;
-            let mut session = Session::new(seed);
-            let mut step: u64 = 0;
+                // Build the thin orienting seed (activity) and start a fresh
+                // session for the inner ReAct loop: decide_step → execute →
+                // observe, until the model chooses `Idle` (the sole terminal).
+                let seed = build_seed(ctx, &input, drained).await?;
+                Session::new(seed)
+            };
+            // `step` is the decision-log index. It equals `session.len()` at
+            // the top of every inner iteration, so deriving it here keeps the
+            // `decisions/<tick>-<step>.jsonl` stream monotonic across a
+            // mid-cycle CAN (fresh → 0; resume → where the cycle left off)
+            // with no clobber and no extra carried counter.
+            let mut step = session.len() as u64;
             loop {
                 let action = decide_step(ctx, &session).await?;
                 // Append `<prefix>/decisions/<tick>-<step>.jsonl` BEFORE the
@@ -508,6 +560,53 @@ impl AgentWorkflow {
                         "cycle hit runaway fuse; forcing idle — this mandate never converges, decompose it"
                     );
                     break;
+                }
+
+                // Mid-cycle continue-as-new. This check MUST stay strictly
+                // after `session.push`: that ordering is what keeps `step ==
+                // session.len()` on resume, so the post-CAN run re-enters the
+                // inner loop at exactly the next decision index with the
+                // just-executed step's observation already in the carried
+                // session — nothing re-executes and the decision log never
+                // clobbers. Moving it earlier would resume on a
+                // logged-but-not-executed decision.
+                if ctx.continue_as_new_suggested() {
+                    let candidate = mid_cycle_input(
+                        &input,
+                        ctx.state(|s| s.encode_carryover()),
+                        session.clone(),
+                    );
+                    let payload_bytes = serde_json::to_vec(&candidate)
+                        .map(|v| v.len())
+                        .unwrap_or(usize::MAX);
+                    match carry_decision(payload_bytes) {
+                        CarryDecision::ForceIdle => {
+                            tracing::error!(
+                                payload_bytes,
+                                hard = CAN_PAYLOAD_HARD_BYTES,
+                                "in-flight session too large to carry across continue-as-new; \
+                                 force-idling this cycle — it will rebuild from the durable FS on \
+                                 the next wake"
+                            );
+                            // Wake promptly so the dropped in-cycle work
+                            // resumes from the FS regardless of cadence (a
+                            // `never` agent must not sleep forever here).
+                            ctx.state_mut(|s| s.next_wake = Some(INITIAL_NEXT_WAKE));
+                            break;
+                        }
+                        CarryDecision::Carry { warn } => {
+                            if warn {
+                                tracing::warn!(
+                                    payload_bytes,
+                                    warn = CAN_PAYLOAD_WARN_BYTES,
+                                    "in-flight session carry size approaching the \
+                                     continue-as-new payload limit"
+                                );
+                            }
+                            ctx.continue_as_new(&candidate, ContinueAsNewOptions::default())?;
+                            unreachable!("continue_as_new should have terminated this run");
+                        }
+                    }
                 }
             }
             // Bump the tick (cycle counter) after the cycle completes so the
@@ -556,7 +655,10 @@ impl AgentWorkflow {
             },
             child_handles: self.child_handles.clone(),
             last_output_id: self.last_output_id.clone(),
-            mid_tick_evidence: self.mid_tick_evidence.clone(),
+            // `in_flight` is never workflow state — only the mid-cycle CAN
+            // site attaches a session. A boundary CAN carries no in-flight
+            // cycle (the cycle just ended), so emit `None` here.
+            in_flight: None,
             cumulative_triggers_observed: self.cumulative_triggers_observed,
             cumulative_human_ops_observed: self.cumulative_human_ops_observed,
             cumulative_mandate_patches_observed: self.cumulative_mandate_patches_observed,
@@ -575,7 +677,9 @@ impl AgentWorkflow {
         self.retirement_request = c.retirement_request;
         self.next_wake = c.scheduler_cursor.next_wake;
         self.last_output_id = c.last_output_id;
-        self.mid_tick_evidence = c.mid_tick_evidence;
+        // `c.in_flight` is intentionally not hydrated onto workflow state: the
+        // run loop reads it directly from `input.carryover` to decide whether
+        // to resume a suspended cycle (see [`AgentWorkflow::run`]).
         self.cumulative_triggers_observed = c.cumulative_triggers_observed;
         self.cumulative_human_ops_observed = c.cumulative_human_ops_observed;
         self.cumulative_mandate_patches_observed = c.cumulative_mandate_patches_observed;
@@ -591,6 +695,45 @@ impl AgentWorkflow {
 fn step_cap_retire_reason(tick: u64, step_cap: Option<u64>) -> Option<String> {
     let cap = step_cap.unwrap_or(INTERIM_STEP_CAP);
     (tick >= cap).then(|| format!("step_cap ({cap}) reached"))
+}
+
+/// Outcome of sizing a candidate mid-cycle continue-as-new payload.
+#[derive(Debug, PartialEq, Eq)]
+enum CarryDecision {
+    /// Carry the in-flight session across the CAN. `warn` flags a payload
+    /// over the soft threshold (carried anyway, logged).
+    Carry { warn: bool },
+    /// The payload would risk Temporal's `blobSize.error` limit — force-idle
+    /// the cycle and rebuild from the FS instead of carrying.
+    ForceIdle,
+}
+
+/// Map a serialized candidate-input size to a [`CarryDecision`]. Pure so the
+/// threshold logic is unit-testable at the boundary values without a live
+/// continue-as-new (which can't be forced hermetically). Both thresholds are
+/// strict `>` — a payload exactly at the cap still carries.
+fn carry_decision(payload_bytes: usize) -> CarryDecision {
+    if payload_bytes > CAN_PAYLOAD_HARD_BYTES {
+        CarryDecision::ForceIdle
+    } else {
+        CarryDecision::Carry {
+            warn: payload_bytes > CAN_PAYLOAD_WARN_BYTES,
+        }
+    }
+}
+
+/// Build the candidate [`AgentInput`] a mid-cycle continue-as-new would send:
+/// the base carryover with the in-flight `session` attached. Cloning `input`
+/// (rather than the boundary CAN's `..input` move) is deliberate — the
+/// mid-cycle site may decide *not* to carry (the size-guard force-idle path),
+/// in which case the caller keeps using the original `input`. The clone is
+/// paid at most once per run (only when `continue_as_new_suggested` fires).
+fn mid_cycle_input(input: &AgentInput, mut base: Carryover, session: Session) -> AgentInput {
+    base.in_flight = Some(session);
+    AgentInput {
+        carryover: Some(base),
+        ..input.clone()
+    }
 }
 
 /// Give a pure idle-timer wake an explicit "you woke on schedule" signal.
@@ -1540,12 +1683,161 @@ mod tests {
                 AgentId::new(Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap()),
             )],
             last_output_id: Some(OutputId::from_hex("ab".repeat(32))),
-            mid_tick_evidence: vec![EvidenceId::from_hex("0123456789abcdef")],
             cumulative_triggers_observed: 5,
             cumulative_human_ops_observed: 7,
             cumulative_mandate_patches_observed: 11,
             tick: 13,
+            in_flight: Some(sample_session()),
         }
+    }
+
+    /// Small in-flight [`Session`] fixture for the mid-cycle carryover tests:
+    /// a seed plus one completed step, enough to exercise the
+    /// in_flight-carry round trip without approaching the size guard.
+    fn sample_session() -> Session {
+        let seed = Seed::new(
+            Mandate::new("resume me", Duration::from_millis(10), Some(5)),
+            vec![Trigger::ScheduledWake],
+            coral_node::decision::FsIndex::default(),
+        );
+        let mut session = Session::new(seed);
+        session.push(
+            Decision::Read {
+                path: "notes/plan.md".into(),
+            },
+            Observation::ok("the plan body"),
+        );
+        session
+    }
+
+    #[test]
+    fn default_carryover_has_no_in_flight_session() {
+        assert!(Carryover::default().in_flight.is_none());
+    }
+
+    #[test]
+    fn carryover_with_in_flight_session_roundtrips_through_json() {
+        let c = Carryover {
+            in_flight: Some(sample_session()),
+            tick: 4,
+            ..Carryover::default()
+        };
+        let json = serde_json::to_string(&c).expect("serialize in-flight Carryover");
+        let back: Carryover = serde_json::from_str(&json).expect("deserialize in-flight Carryover");
+        assert_eq!(c, back);
+        assert_eq!(back.in_flight.as_ref().map(|s| s.len()), Some(1));
+    }
+
+    #[test]
+    fn encode_carryover_never_emits_in_flight() {
+        // The in-flight session lives in a run-loop local, never on the
+        // workflow struct, so a boundary CAN (which goes through
+        // `encode_carryover`) must always carry `in_flight: None`. Only the
+        // mid-cycle site attaches a session.
+        let mut wf = AgentWorkflow::default();
+        wf.pending_triggers.push(Trigger::ScheduledWake);
+        wf.tick = 9;
+        assert!(wf.encode_carryover().in_flight.is_none());
+    }
+
+    #[test]
+    fn mid_cycle_input_attaches_session_and_preserves_identity() {
+        let input = AgentInput {
+            cfg: AgentConfig::default(),
+            fs_handle: FsHandle {
+                prefix: "graphs/g/agents/a".into(),
+            },
+            parent_handle: None,
+            carryover: None,
+            mandate: Mandate::new("orig", Duration::from_millis(7), Some(3)),
+            graph_id: GraphId::new(uuid::Uuid::from_u128(0xAB)),
+            agent_id: AgentId::new(uuid::Uuid::from_u128(0xCD)),
+            agent_name: "a".into(),
+        };
+        let base = Carryover {
+            tick: 6,
+            ..Carryover::default()
+        };
+        let session = sample_session();
+
+        let candidate = mid_cycle_input(&input, base, session.clone());
+
+        let carried = candidate.carryover.expect("carryover present");
+        assert_eq!(carried.in_flight, Some(session));
+        assert_eq!(carried.tick, 6);
+        // Identity fields pass through untouched.
+        assert_eq!(candidate.mandate, input.mandate);
+        assert_eq!(candidate.graph_id, input.graph_id);
+        assert_eq!(candidate.agent_id, input.agent_id);
+        assert_eq!(candidate.fs_handle, input.fs_handle);
+        assert_eq!(candidate.agent_name, input.agent_name);
+    }
+
+    #[test]
+    fn carry_decision_classifies_at_thresholds() {
+        assert_eq!(carry_decision(0), CarryDecision::Carry { warn: false });
+        assert_eq!(
+            carry_decision(CAN_PAYLOAD_WARN_BYTES),
+            CarryDecision::Carry { warn: false },
+            "exactly at the warn threshold still carries without warning (strict >)"
+        );
+        assert_eq!(
+            carry_decision(CAN_PAYLOAD_WARN_BYTES + 1),
+            CarryDecision::Carry { warn: true }
+        );
+        assert_eq!(
+            carry_decision(CAN_PAYLOAD_HARD_BYTES),
+            CarryDecision::Carry { warn: true },
+            "exactly at the hard cap still carries (strict >)"
+        );
+        assert_eq!(
+            carry_decision(CAN_PAYLOAD_HARD_BYTES + 1),
+            CarryDecision::ForceIdle
+        );
+    }
+
+    #[test]
+    fn small_session_candidate_payload_carries_without_warning() {
+        let input = AgentInput::new_for_test(
+            GraphId::new(uuid::Uuid::nil()),
+            AgentId::new(uuid::Uuid::nil()),
+            "a",
+        );
+        let candidate = mid_cycle_input(&input, Carryover::default(), sample_session());
+        let bytes = serde_json::to_vec(&candidate).unwrap().len();
+        assert!(
+            bytes < CAN_PAYLOAD_WARN_BYTES,
+            "small session candidate ({bytes} bytes) should sit well under the warn threshold"
+        );
+        assert_eq!(carry_decision(bytes), CarryDecision::Carry { warn: false });
+    }
+
+    #[test]
+    fn oversized_session_candidate_payload_force_idles() {
+        // A session whose pushed observation alone exceeds the hard cap: the
+        // measured candidate payload must trip the force-idle path so the
+        // real CAN command can never exceed Temporal's blob-size limit.
+        let seed = Seed::new(
+            Mandate::new("big", Duration::from_millis(1), None),
+            vec![Trigger::ScheduledWake],
+            coral_node::decision::FsIndex::default(),
+        );
+        let mut session = Session::new(seed);
+        session.push(
+            Decision::Read {
+                path: "notes/huge.md".into(),
+            },
+            Observation::ok("x".repeat(CAN_PAYLOAD_HARD_BYTES + 1)),
+        );
+        let input = AgentInput::new_for_test(
+            GraphId::new(uuid::Uuid::nil()),
+            AgentId::new(uuid::Uuid::nil()),
+            "a",
+        );
+        let candidate = mid_cycle_input(&input, Carryover::default(), session);
+        let bytes = serde_json::to_vec(&candidate).unwrap().len();
+        assert!(bytes > CAN_PAYLOAD_HARD_BYTES, "candidate is {bytes} bytes");
+        assert_eq!(carry_decision(bytes), CarryDecision::ForceIdle);
     }
 
     #[test]
@@ -1974,7 +2266,9 @@ mod tests {
 
         let s = decision_summary(&Decision::EmitOutput {
             content: "claim".into(),
-            evidence: vec![EvidenceId::from_hex("0123456789abcdef")],
+            evidence: vec![coral_node::evidence::EvidenceId::from_hex(
+                "0123456789abcdef",
+            )],
         });
         assert!(s.contains("EmitOutput"), "got: {s}");
         assert!(s.contains("evidence: 1"), "got: {s}");
