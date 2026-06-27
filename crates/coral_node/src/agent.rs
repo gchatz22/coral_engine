@@ -47,7 +47,7 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::json;
 use tokio::time::sleep_until;
-use tracing::{debug, info_span, warn, Instrument};
+use tracing::{debug, info, info_span, warn, Instrument};
 
 use crate::agent_core::{self, StepFailure};
 use crate::decision::{Decide, Session};
@@ -251,6 +251,11 @@ impl<D: Decide> Agent<D> {
                         debug!(
                             next_after_ms = next_after.as_millis() as u64,
                             "cycle: idle (terminal)"
+                        );
+                        info!(
+                            steps = session.len(),
+                            status_note_written = agent_core::status_note_written(&session),
+                            "cycle complete: status-note telemetry"
                         );
                         scheduler.set_next_after(next_after);
                         health.mark_tick_success(Utc::now())?;

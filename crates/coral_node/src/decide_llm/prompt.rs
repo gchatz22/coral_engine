@@ -36,7 +36,8 @@ Invariants:
 4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` steps can cite.
 5. Idle ends the work. When you have finished this unit of work — produced or refreshed your Output — call `idle` to wait for your next wake. `idle` is the only step that ends the cycle.
 6. Refresh, don't stop. On each wake, re-research and emit an updated Output reflecting what changed since the last one. There is no self-terminate step: the runtime stops you only via a retirement signal or your budget. Keep cycling: research -> emit_output -> idle -> refresh.
-7. Fold child reports as they arrive. When a child reports an output (a `ChildOutput` trigger), reconcile the cited output, then emit a refreshed consolidated report that incorporates it and cites its evidence. When a child you have already folded reports again, reconcile its newer output rather than re-reconciling the one you already used.";
+7. Fold child reports as they arrive. When a child reports an output (a `ChildOutput` trigger), reconcile the cited output, then emit a refreshed consolidated report that incorporates it and cites its evidence. When a child you have already folded reports again, reconcile its newer output rather than re-reconciling the one you already used.
+8. Keep a status note. Maintain `notes/STATUS.md` with your standing progress and current outlook on the mandate — key conclusions, what you are investigating, what is still open. It is the durable memory you carry across wakes and is always pinned in your file index, so a current note lets your next wake start from your own synthesis instead of a cold re-read. Create it if it does not exist yet.";
 
 /// Render a `Session` into the message list a `ModelClient::complete` call
 /// should send.
@@ -327,7 +328,16 @@ mod tests {
              4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` steps can cite.\n\
              5. Idle ends the work. When you have finished this unit of work — produced or refreshed your Output — call `idle` to wait for your next wake. `idle` is the only step that ends the cycle.\n\
              6. Refresh, don't stop. On each wake, re-research and emit an updated Output reflecting what changed since the last one. There is no self-terminate step: the runtime stops you only via a retirement signal or your budget. Keep cycling: research -> emit_output -> idle -> refresh.\n\
-             7. Fold child reports as they arrive. When a child reports an output (a `ChildOutput` trigger), reconcile the cited output, then emit a refreshed consolidated report that incorporates it and cites its evidence. When a child you have already folded reports again, reconcile its newer output rather than re-reconciling the one you already used."
+             7. Fold child reports as they arrive. When a child reports an output (a `ChildOutput` trigger), reconcile the cited output, then emit a refreshed consolidated report that incorporates it and cites its evidence. When a child you have already folded reports again, reconcile its newer output rather than re-reconciling the one you already used.\n\
+             8. Keep a status note. Maintain `notes/STATUS.md` with your standing progress and current outlook on the mandate — key conclusions, what you are investigating, what is still open. It is the durable memory you carry across wakes and is always pinned in your file index, so a current note lets your next wake start from your own synthesis instead of a cold re-read. Create it if it does not exist yet."
+        );
+    }
+
+    #[test]
+    fn invariants_name_the_pinned_status_note_path() {
+        assert!(
+            INVARIANTS.contains(crate::agent_core::STATUS_NOTE_PATH),
+            "the status-note invariant must reference the pinned path so the prompt and the seed pin cannot drift"
         );
     }
 

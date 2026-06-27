@@ -30,7 +30,7 @@ use anyhow::Result;
 use futures::future::join_all;
 use tracing::debug;
 
-use crate::decision::{Decide, Decision, FsIndex, Observation, Seed, Session, ToolCall};
+use crate::decision::{Decide, Decision, FsIndex, FsOp, Observation, Seed, Session, ToolCall};
 use crate::fs::{AgentFs, FsError};
 use crate::mandate::Mandate;
 use crate::tools::ToolRegistry;
@@ -54,6 +54,18 @@ const SEED_INDEX_OUTPUTS: usize = 32;
 /// must stay a small constant even for an agent with thousands of notes. The
 /// model can always `list notes/` for the full set.
 const SEED_INDEX_NOTES: usize = 32;
+
+/// The bare filename, under `notes/`, of the agent's standing status note —
+/// its running progress and current outlook on the mandate. [`build_seed`]
+/// pins it into the seed index so it survives the [`SEED_INDEX_NOTES`] tail,
+/// and the host surfaces its per-cycle maintenance as telemetry via
+/// [`status_note_written`]. Kept in sync with [`STATUS_NOTE_PATH`].
+pub const STATUS_NOTE: &str = "STATUS.md";
+
+/// The status note's path relative to the agent root: what the model writes
+/// and what [`status_note_written`] matches on. Kept in sync with
+/// [`STATUS_NOTE`] — a test binds the two so they cannot drift.
+pub const STATUS_NOTE_PATH: &str = "notes/STATUS.md";
 
 /// The result of executing one repertoire [`Decision`].
 ///
@@ -140,9 +152,16 @@ pub struct ToolFailure {
 /// workflow-state buffer. Per-cycle semantics are identical.
 pub async fn build_seed(fs: &AgentFs, triggers: Vec<Trigger>, cfg: &Mandate) -> Result<Seed> {
     let mut notes = fs.list_dir("notes/").await?;
+    let has_status = notes.iter().any(|n| n == STATUS_NOTE);
     if notes.len() > SEED_INDEX_NOTES {
         let start = notes.len() - SEED_INDEX_NOTES;
         notes.drain(..start);
+    }
+    // Pin the standing status note: it is the agent's durable cross-cycle
+    // memory, so it must stay visible even after the lexicographic tail above
+    // drops it once the agent holds more than SEED_INDEX_NOTES notes.
+    if has_status && !notes.iter().any(|n| n == STATUS_NOTE) {
+        notes.insert(0, STATUS_NOTE.to_string());
     }
     let outputs = fs.recent_output_filenames(SEED_INDEX_OUTPUTS).await?;
     debug!(
@@ -152,6 +171,28 @@ pub async fn build_seed(fs: &AgentFs, triggers: Vec<Trigger>, cfg: &Mandate) -> 
         "build_seed index sizes"
     );
     Ok(Seed::new(cfg.clone(), triggers, FsIndex { notes, outputs }))
+}
+
+/// Did this cycle's `session` refresh the standing status note?
+///
+/// Pure inspection of the session's own steps — it scans for a `rewrite_fs`
+/// step that wrote [`STATUS_NOTE_PATH`] — so it does no FS read and is
+/// replay-deterministic on the workflow host. The host surfaces this as
+/// telemetry at the cycle's idle terminal; it never gates the cycle. On a
+/// mid-cycle continue-as-new the carried session holds the whole cycle's
+/// steps, so a write from an earlier run is still counted here.
+pub fn status_note_written(session: &Session) -> bool {
+    session.steps.iter().any(|step| match &step.action {
+        Decision::RewriteFs { ops } => ops.iter().any(|op| match op {
+            FsOp::WriteFile { path, .. } => is_status_note_path(path),
+            FsOp::DeleteFile { .. } => false,
+        }),
+        _ => false,
+    })
+}
+
+fn is_status_note_path(path: &str) -> bool {
+    path.trim_start_matches("./") == STATUS_NOTE_PATH
 }
 
 /// Ask the [`Decide`] impl for the next step given the accumulating
@@ -502,6 +543,157 @@ mod tests {
             SEED_INDEX_NOTES,
             "notes index must be capped so the seed stays a small constant"
         );
+    }
+
+    #[tokio::test]
+    async fn build_seed_pins_status_note_past_the_cap() {
+        let (fs, m) = fixture().await;
+        fs.apply_ops(vec![FsOp::WriteFile {
+            path: STATUS_NOTE_PATH.into(),
+            content: "outlook".into(),
+        }])
+        .await
+        .unwrap();
+        // More lower-sorting notes than the cap, so the lexicographic tail
+        // would drop the uppercase status note were it not pinned.
+        for i in 0..(SEED_INDEX_NOTES + 5) {
+            fs.apply_ops(vec![FsOp::WriteFile {
+                path: format!("notes/n-{i:03}.md"),
+                content: "x".into(),
+            }])
+            .await
+            .unwrap();
+        }
+        let seed = build_seed(&fs, vec![], &m).await.unwrap();
+        let hits = seed
+            .index
+            .notes
+            .iter()
+            .filter(|n| n.as_str() == STATUS_NOTE)
+            .count();
+        assert_eq!(
+            hits, 1,
+            "status note must be pinned exactly once past the index cap, got {:?}",
+            seed.index.notes
+        );
+    }
+
+    #[tokio::test]
+    async fn build_seed_does_not_duplicate_status_note_within_the_cap() {
+        let (fs, m) = fixture().await;
+        for path in ["notes/a.md", STATUS_NOTE_PATH, "notes/b.md"] {
+            fs.apply_ops(vec![FsOp::WriteFile {
+                path: path.into(),
+                content: "x".into(),
+            }])
+            .await
+            .unwrap();
+        }
+        let seed = build_seed(&fs, vec![], &m).await.unwrap();
+        let hits = seed
+            .index
+            .notes
+            .iter()
+            .filter(|n| n.as_str() == STATUS_NOTE)
+            .count();
+        assert_eq!(
+            hits, 1,
+            "pin must not duplicate a status note already in the tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_seed_does_not_invent_an_absent_status_note() {
+        let (fs, m) = fixture().await;
+        fs.apply_ops(vec![FsOp::WriteFile {
+            path: "notes/only.md".into(),
+            content: "x".into(),
+        }])
+        .await
+        .unwrap();
+        let seed = build_seed(&fs, vec![], &m).await.unwrap();
+        assert!(
+            !seed.index.notes.iter().any(|n| n == STATUS_NOTE),
+            "pin must be a no-op when the status note does not exist yet"
+        );
+    }
+
+    // ---------- `status_note_written` ------------------------------------
+
+    fn session_with(steps: Vec<(Decision, Observation)>) -> Session {
+        let mut s = Session::new(Seed::new(mandate(), vec![], FsIndex::default()));
+        for (action, obs) in steps {
+            s.push(action, obs);
+        }
+        s
+    }
+
+    #[test]
+    fn status_note_written_true_when_status_note_rewritten() {
+        let s = session_with(vec![(
+            Decision::RewriteFs {
+                ops: vec![FsOp::WriteFile {
+                    path: STATUS_NOTE_PATH.into(),
+                    content: "outlook".into(),
+                }],
+            },
+            Observation::ok("notes updated"),
+        )]);
+        assert!(status_note_written(&s));
+    }
+
+    #[test]
+    fn status_note_written_false_without_a_status_write() {
+        let s = session_with(vec![
+            (
+                Decision::Read {
+                    path: "notes/other.md".into(),
+                },
+                Observation::ok("body"),
+            ),
+            (
+                Decision::RewriteFs {
+                    ops: vec![FsOp::WriteFile {
+                        path: "notes/other.md".into(),
+                        content: "x".into(),
+                    }],
+                },
+                Observation::ok("notes updated"),
+            ),
+        ]);
+        assert!(!status_note_written(&s));
+    }
+
+    #[test]
+    fn status_note_written_tolerates_a_dot_slash_prefix() {
+        let s = session_with(vec![(
+            Decision::RewriteFs {
+                ops: vec![FsOp::WriteFile {
+                    path: format!("./{STATUS_NOTE_PATH}"),
+                    content: "x".into(),
+                }],
+            },
+            Observation::ok("notes updated"),
+        )]);
+        assert!(status_note_written(&s));
+    }
+
+    #[test]
+    fn status_note_written_ignores_a_status_note_delete() {
+        let s = session_with(vec![(
+            Decision::RewriteFs {
+                ops: vec![FsOp::DeleteFile {
+                    path: STATUS_NOTE_PATH.into(),
+                }],
+            },
+            Observation::ok("notes updated"),
+        )]);
+        assert!(!status_note_written(&s));
+    }
+
+    #[test]
+    fn status_note_path_matches_the_pinned_filename() {
+        assert_eq!(STATUS_NOTE_PATH, format!("notes/{STATUS_NOTE}"));
     }
 
     // ---------- `execute_step` — clean steps -----------------------------
