@@ -31,7 +31,7 @@ use futures::future::join_all;
 use tracing::debug;
 
 use crate::decision::{Decide, Decision, FsIndex, FsOp, Observation, Seed, Session, ToolCall};
-use crate::fs::{AgentFs, FsError};
+use crate::fs::{AgentFs, FsError, RecentWindow};
 use crate::mandate::Mandate;
 use crate::tools::ToolRegistry;
 use crate::trigger::Trigger;
@@ -45,15 +45,18 @@ use crate::trigger::Trigger;
 /// decomposed. Superseded by the per-cycle token budget when that lands.
 pub const CYCLE_RUNAWAY_FUSE: usize = 50_000;
 
-/// Number of recent output filenames to surface in the cycle seed's index.
-/// Pointers only — the model reads the bodies it wants via `Read`.
-const SEED_INDEX_OUTPUTS: usize = 32;
+/// Filenames surfaced per bucket (`notes/`, `outputs/`) in the cycle seed's
+/// index — a **recency window**, not the whole directory. Pointers only: the
+/// model reads bodies via `Read` and `list`s/`search`es for anything past the
+/// window (the seed flags `*_has_more` so it knows there is more). Kept small
+/// deliberately — the index is paid in prompt tokens and attention on *every*
+/// cycle across many agents, and a thin orienting seed is the point of
+/// pull-navigation. 8 mirrors the FS layer's `recent_*` window.
+const SEED_INDEX_OUTPUTS: usize = 8;
 
-/// Cap on note filenames in the seed index. `notes/` has no recency sidecar,
-/// so this is a lexicographic tail — the bound is what matters: a thin seed
-/// must stay a small constant even for an agent with thousands of notes. The
-/// model can always `list notes/` for the full set.
-const SEED_INDEX_NOTES: usize = 32;
+/// Same bound for `notes/`; see [`SEED_INDEX_OUTPUTS`]. `notes/` now has its
+/// own recency sidecar, so this window is most-recent-first too.
+const SEED_INDEX_NOTES: usize = 8;
 
 /// The bare filename, under `notes/`, of the agent's standing status note —
 /// its running progress and current outlook on the mandate. [`build_seed`]
@@ -151,26 +154,42 @@ pub struct ToolFailure {
 /// `TriggerQueue::drain_ordered`; in the workflow host it comes from a
 /// workflow-state buffer. Per-cycle semantics are identical.
 pub async fn build_seed(fs: &AgentFs, triggers: Vec<Trigger>, cfg: &Mandate) -> Result<Seed> {
-    let mut notes = fs.list_dir("notes/").await?;
-    let has_status = notes.iter().any(|n| n == STATUS_NOTE);
-    if notes.len() > SEED_INDEX_NOTES {
-        let start = notes.len() - SEED_INDEX_NOTES;
-        notes.drain(..start);
-    }
-    // Pin the standing status note: it is the agent's durable cross-cycle
-    // memory, so it must stay visible even after the lexicographic tail above
-    // drops it once the agent holds more than SEED_INDEX_NOTES notes.
-    if has_status && !notes.iter().any(|n| n == STATUS_NOTE) {
+    let RecentWindow {
+        filenames: mut notes,
+        has_more: mut notes_has_more,
+    } = fs.recent_note_filenames(SEED_INDEX_NOTES).await?;
+    // Pin the standing status note so it stays visible even after it ages out
+    // of the recency window — precisely when a long-running monitor most needs
+    // its own synthesis. Skip the existence GET in the common case where a
+    // freshly-written note is already in the window.
+    if !notes.iter().any(|n| n == STATUS_NOTE) && fs.file_exists(STATUS_NOTE_PATH).await? {
         notes.insert(0, STATUS_NOTE.to_string());
+        // It aged out of the window, so the directory held more than the window
+        // surfaced; keep the signpost on. Conservative at the exact boundary
+        // where the pinned note was the only overflow — at worst one extra
+        // `list` — which is the safe direction for a "did I miss something" cue.
+        notes_has_more = true;
     }
-    let outputs = fs.recent_output_filenames(SEED_INDEX_OUTPUTS).await?;
+    let RecentWindow {
+        filenames: outputs,
+        has_more: outputs_has_more,
+    } = fs.recent_output_filenames(SEED_INDEX_OUTPUTS).await?;
     debug!(
         notes = notes.len(),
         outputs = outputs.len(),
         triggers = triggers.len(),
         "build_seed index sizes"
     );
-    Ok(Seed::new(cfg.clone(), triggers, FsIndex { notes, outputs }))
+    Ok(Seed::new(
+        cfg.clone(),
+        triggers,
+        FsIndex {
+            notes,
+            outputs,
+            notes_has_more,
+            outputs_has_more,
+        },
+    ))
 }
 
 /// Did this cycle's `session` refresh the standing status note?
@@ -554,8 +573,9 @@ mod tests {
         }])
         .await
         .unwrap();
-        // More lower-sorting notes than the cap, so the lexicographic tail
-        // would drop the uppercase status note were it not pinned.
+        // Status note written first, then more recent notes than the cap, so
+        // the recency window would drop the now-oldest status note were it not
+        // pinned.
         for i in 0..(SEED_INDEX_NOTES + 5) {
             fs.apply_ops(vec![FsOp::WriteFile {
                 path: format!("notes/n-{i:03}.md"),
@@ -615,6 +635,48 @@ mod tests {
         assert!(
             !seed.index.notes.iter().any(|n| n == STATUS_NOTE),
             "pin must be a no-op when the status note does not exist yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_seed_orders_notes_most_recent_first() {
+        let (fs, m) = fixture().await;
+        for name in ["alpha.md", "beta.md", "gamma.md"] {
+            fs.apply_ops(vec![FsOp::WriteFile {
+                path: format!("notes/{name}"),
+                content: "x".into(),
+            }])
+            .await
+            .unwrap();
+        }
+        let seed = build_seed(&fs, vec![], &m).await.unwrap();
+        assert_eq!(
+            seed.index.notes,
+            vec!["gamma.md", "beta.md", "alpha.md"],
+            "notes index is recency-ordered, not lexicographic"
+        );
+        assert!(
+            !seed.index.notes_has_more,
+            "the whole note set fits the window"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_seed_flags_more_when_notes_exceed_the_window() {
+        let (fs, m) = fixture().await;
+        for i in 0..(SEED_INDEX_NOTES + 3) {
+            fs.apply_ops(vec![FsOp::WriteFile {
+                path: format!("notes/n-{i:03}.md"),
+                content: "x".into(),
+            }])
+            .await
+            .unwrap();
+        }
+        let seed = build_seed(&fs, vec![], &m).await.unwrap();
+        assert_eq!(seed.index.notes.len(), SEED_INDEX_NOTES);
+        assert!(
+            seed.index.notes_has_more,
+            "a truncated note set must flag that more exist"
         );
     }
 

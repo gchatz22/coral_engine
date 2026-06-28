@@ -396,6 +396,14 @@ pub struct FsIndex {
     /// Filenames under `outputs/`, most-recent-first.
     #[serde(default)]
     pub outputs: Vec<String>,
+    /// True when `notes/` holds files beyond those in `notes` — the index is
+    /// a recency window, not the whole directory, so the model should `list`
+    /// or `search` to reach the rest.
+    #[serde(default)]
+    pub notes_has_more: bool,
+    /// True when `outputs/` holds files beyond those in `outputs`.
+    #[serde(default)]
+    pub outputs_has_more: bool,
 }
 
 /// The accumulating in-cycle context the model reasons over: the orienting
@@ -540,6 +548,19 @@ mod tests {
     use super::*;
     use crate::evidence::EvidenceId;
     use serde_json::json;
+
+    #[test]
+    fn fs_index_deserializes_pre_signpost_payload_with_defaults() {
+        // A seed serialized before the `*_has_more` fields existed (e.g. an
+        // in-flight carryover or journaled `build_seed` output) must still
+        // deserialize, defaulting the new flags to false.
+        let old = json!({ "notes": ["a.md"], "outputs": ["b.json"] });
+        let idx: FsIndex = serde_json::from_value(old).unwrap();
+        assert_eq!(idx.notes, vec!["a.md".to_string()]);
+        assert_eq!(idx.outputs, vec!["b.json".to_string()]);
+        assert!(!idx.notes_has_more);
+        assert!(!idx.outputs_has_more);
+    }
 
     #[test]
     fn call_tools_single_call_round_trip() {
