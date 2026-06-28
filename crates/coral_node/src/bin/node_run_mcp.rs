@@ -30,7 +30,7 @@
 //!
 //! See `examples/smoke_mcp/README.md` for the full runbook, expected
 //! outputs, and how to capture the evidence id that the fixture's
-//! `EmitOutput` declares.
+//! `WriteOutput` declares.
 
 use std::fs;
 use std::io::{self, Write};

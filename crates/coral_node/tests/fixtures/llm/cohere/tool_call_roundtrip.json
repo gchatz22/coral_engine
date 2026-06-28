@@ -40,8 +40,8 @@
               "id": "tc_emit_42",
               "type": "function",
               "function": {
-                "name": "emit_output",
-                "arguments": "{\"content\":\"echoed tool-call roundtrip via the echo tool\",\"evidence\":[\"feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface\"]}"
+                "name": "write_output",
+                "arguments": "{\"body\":\"echoed tool-call roundtrip via the echo tool\",\"citations\":[\"feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface\"]}"
               }
             }
           ]

@@ -163,8 +163,8 @@ pub struct ToolCallFailure {
 pub struct PersistOutputInput {
     pub cfg: AgentConfig,
     pub fs_handle: FsHandle,
-    pub content: String,
-    pub evidence: Vec<EvidenceId>,
+    pub body: String,
+    pub citations: Vec<EvidenceId>,
 }
 
 /// Input to [`AgentActivities::apply_fs_ops`].
@@ -273,7 +273,7 @@ pub struct ReconcileChildrenInput {
 /// `sources[i]` cross-agent fold (written into the parent's
 /// `evidence/<id>.json`). The parent pulls these on a later step via
 /// `List`/`Read` of `evidence/` to cite them in a subsequent
-/// `EmitOutput` — no workflow-state slot involved.
+/// `WriteOutput` — no workflow-state slot involved.
 ///
 /// `conflict_id` is `Some` iff `input.conflict.is_some()` and the
 /// activity wrote the conflict record successfully.
@@ -291,10 +291,10 @@ pub struct ReconcileChildrenOutput {
 /// model adapts to on its next step.
 #[derive(Debug, thiserror::Error)]
 pub enum ReconciliationError {
-    /// A `sources[i].output_id` did not resolve in the named child's
-    /// `outputs/<id>.json`. Carries the child agent id + the output
-    /// id so the workflow body's correction text is precise enough
-    /// for the LLM to fix on the next tick.
+    /// The named child has no canonical output (`outputs/output.md`) to
+    /// fold. Carries the child agent id + the observed output id so the
+    /// workflow body's correction text is precise enough for the LLM to
+    /// fix on the next tick.
     #[error("reconcile: child output {output_id} not found for agent {agent_id}")]
     ChildOutputNotFound {
         agent_id: AgentId,
@@ -425,16 +425,15 @@ pub(crate) async fn append_decision_log_impl(
 pub(crate) async fn persist_output_impl(
     storage: Arc<dyn AgentStorage>,
     prefix: &str,
-    content: &str,
-    evidence: &[EvidenceId],
+    body: &str,
+    citations: &[EvidenceId],
 ) -> anyhow::Result<OutputId> {
     // Placeholder mandate: `AgentFs` only writes `mandate.md` when
     // absent, so the real mandate persisted by an earlier
     // `build_seed` (or prior agent boot) is not clobbered.
     let mandate = Mandate::new("", Duration::ZERO, None);
     let fs = AgentFs::new_with_storage(storage, prefix, &mandate).await?;
-    let output = fs.persist_output(content, evidence).await?;
-    Ok(output.id)
+    fs.persist_output(body, citations).await
 }
 
 /// Activity bundle registered on the worker. The `#[activities]` macro
@@ -682,8 +681,8 @@ impl AgentActivities {
         let id = persist_output_impl(
             storage,
             &input.fs_handle.prefix,
-            &input.content,
-            &input.evidence,
+            &input.body,
+            &input.citations,
         )
         .await?;
         Ok(id)
@@ -961,11 +960,13 @@ pub async fn reconcile_children_impl(
             input.parent_graph_id,
             source.child_ref.agent_id,
         );
-        let child_output = child_fs.read_output(&source.output_id).await.map_err(|e| {
-            if matches!(
-                e.downcast_ref::<FsError>(),
-                Some(FsError::OutputNotFound(_))
-            ) {
+        // Read the child's single canonical Output (current version). The
+        // `source.output_id` the parent named is the version it observed at
+        // decide time; the current body may be newer (kept-current
+        // semantics) — reconciling the latest is correct, and V6 re-wakes
+        // the parent if it drifts again.
+        let child_output = child_fs.read_output().await.map_err(|e| {
+            if matches!(e.downcast_ref::<FsError>(), Some(FsError::OutputNotFound)) {
                 anyhow::Error::new(ReconciliationError::ChildOutputNotFound {
                     agent_id: source.child_ref.agent_id,
                     output_id: source.output_id.clone(),
@@ -1123,9 +1124,9 @@ mod tests {
             Decision::Idle {
                 next_after: Duration::from_millis(100),
             },
-            Decision::EmitOutput {
-                content: "test".into(),
-                evidence: vec![],
+            Decision::WriteOutput {
+                body: "test".into(),
+                citations: vec![],
             },
         ]);
         let first = pop_scripted_decision();
@@ -1136,7 +1137,7 @@ mod tests {
             }) if next_after == Duration::from_millis(100)
         ));
         let second = pop_scripted_decision();
-        assert!(matches!(second, Some(Decision::EmitOutput { content, .. }) if content == "test"));
+        assert!(matches!(second, Some(Decision::WriteOutput { body, .. }) if body == "test"));
         // Drained — falls back to None.
         assert!(pop_scripted_decision().is_none());
     }
@@ -1144,9 +1145,9 @@ mod tests {
     #[test]
     fn decision_script_resets_between_tests() {
         let _g = SCRIPT_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-        set_decision_script(vec![Decision::EmitOutput {
-            content: "first".into(),
-            evidence: vec![],
+        set_decision_script(vec![Decision::WriteOutput {
+            body: "first".into(),
+            citations: vec![],
         }]);
         set_decision_script(vec![Decision::Idle {
             next_after: Duration::from_secs(5),
@@ -1256,8 +1257,8 @@ mod tests {
             fs_handle: FsHandle {
                 prefix: "g1/a1".into(),
             },
-            content: "claim".into(),
-            evidence: vec![id],
+            body: "claim".into(),
+            citations: vec![id],
         };
         let s = serde_json::to_string(&i).unwrap();
         let _back: PersistOutputInput = serde_json::from_str(&s).unwrap();
@@ -1616,23 +1617,17 @@ mod tests {
         .await
         .expect("persist_output_impl ok");
 
-        // Inspect via a fresh `AgentFs` view; `list_recent_outputs`
-        // exercises the tail-index path too.
+        // Inspect via a fresh `AgentFs` view: the single canonical
+        // output holds the body, and the returned id fingerprints it.
         let mandate = Mandate::new("inspect", Duration::from_millis(0), None);
         let fs = AgentFs::new_with_storage(storage, prefix, &mandate)
             .await
             .unwrap();
-        let outs = fs.list_recent_outputs(8).await.expect("list outputs");
-        assert_eq!(outs.len(), 1, "expected exactly one output on disk");
-        let on_disk = &outs[0];
+        assert_eq!(fs.read_output().await.expect("read output"), "claim X");
         assert_eq!(
-            on_disk.id, out_id,
-            "OutputId returned must match on-disk file"
-        );
-        assert_eq!(on_disk.content, "claim X");
-        assert!(
-            on_disk.evidence.contains(&id_a) && on_disk.evidence.contains(&id_b),
-            "output must cite both planted evidence ids"
+            out_id,
+            OutputId::new("claim X"),
+            "returned id must fingerprint the body"
         );
     }
 
@@ -1658,8 +1653,14 @@ mod tests {
         let fs = AgentFs::new_with_storage(storage, prefix, &mandate)
             .await
             .unwrap();
-        let outs = fs.list_recent_outputs(8).await.unwrap();
-        assert!(outs.is_empty(), "no output should have been written");
+        let err = fs
+            .read_output()
+            .await
+            .expect_err("no output should have been written");
+        assert!(matches!(
+            err.downcast_ref::<FsError>(),
+            Some(FsError::OutputNotFound)
+        ));
     }
 
     #[tokio::test]
@@ -2022,7 +2023,7 @@ mod tests {
         let ts = DateTime::parse_from_rfc3339("2026-05-25T14:30:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let e = DecisionLogEntry::new(42, 1, "EmitOutput { evidence: 1 }".into(), ts);
+        let e = DecisionLogEntry::new(42, 1, "WriteOutput { citations: 1 }".into(), ts);
         let s2 = serde_json::to_string(&e).unwrap();
         let back2: DecisionLogEntry = serde_json::from_str(&s2).unwrap();
         assert_eq!(e, back2);
@@ -2068,7 +2069,7 @@ mod tests {
             .expect("plant child output");
         // Canonical scheme minted by `FsHandle::for_agent`.
         let child_workflow_id = format!("graphs/{graph_id}/agents/{child_agent_id}");
-        (child_workflow_id, out.id, ev)
+        (child_workflow_id, out, ev)
     }
 
     #[tokio::test]
@@ -2211,12 +2212,10 @@ mod tests {
 
         // The citation half of the contract: each reconcile is followed by a
         // refreshed parent Output citing the synthetic evidence it just
-        // produced. Two distinct parent outputs result, the second citing
-        // B's synthetic evidence — the provenance check inside
-        // `persist_output` passes because reconcile wrote that evidence
-        // under the parent's own prefix. (Trigger delivery + loop driving is
-        // generic machinery proven elsewhere; CM-6 covers the full
-        // multi-cycle persistent flow live.)
+        // produced. The kept-current Output is overwritten, so the two emits
+        // mint distinct ids while the canonical body reflects the latest. The
+        // provenance check inside `persist_output` passes because reconcile
+        // wrote that evidence under the parent's own prefix.
         let parent_prefix = format!("graphs/{graph_id}/agents/{parent_agent_id}");
         let out_v1 = persist_output_impl(
             storage.clone(),
@@ -2236,22 +2235,12 @@ mod tests {
         .expect("parent emits refreshed report v2");
         assert_ne!(out_v1, out_v2, "two refreshed reports ⇒ distinct outputs");
 
-        let parent_outputs = parent_view
-            .list_recent_outputs(8)
-            .await
-            .expect("list parent outputs");
+        // Kept-current semantics: the canonical Output reflects the latest
+        // refresh (v2), not an accumulation.
         assert_eq!(
-            parent_outputs.len(),
-            2,
-            "parent emitted two distinct refreshed reports"
-        );
-        let newest = parent_outputs
-            .iter()
-            .find(|o| o.id == out_v2)
-            .expect("v2 present");
-        assert!(
-            newest.evidence.contains(&r2.synthetic_evidence[0]),
-            "the second refreshed report must cite B's synthetic evidence"
+            parent_view.read_output().await.expect("read parent output"),
+            "consolidated report (folds A + newer B)",
+            "parent's canonical output must be the latest refreshed report"
         );
 
         // Re-cite the already-folded first output: idempotent. Same
@@ -2285,12 +2274,9 @@ mod tests {
         let parent_agent_id = AgentId::new(Uuid::new_v4());
         let child_agent_id = AgentId::new(Uuid::new_v4());
 
-        // No child output planted. Synthesize an `OutputId` for content
+        // No child output planted. Synthesize an `OutputId` for a body
         // we never persisted — the cross-agent read will miss.
-        let bogus = OutputId::new(
-            "never-written",
-            &[EvidenceId::new("t", &json!({}), &json!({}))],
-        );
+        let bogus = OutputId::new("never-written");
         let child_workflow_id = format!("graphs/{graph_id}/agents/{child_agent_id}");
         let input = ReconcileChildrenInput {
             parent_graph_id: graph_id,

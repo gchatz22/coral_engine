@@ -66,7 +66,7 @@ fn expected_model() -> String {
 // ---------- (a) happy-path tick ----------
 
 #[tokio::test]
-async fn happy_path_tick_drives_call_tool_then_emit_output() {
+async fn happy_path_tick_drives_call_tool_then_write_output() {
     ensure_dummy_api_key();
     let fixtures = load_fixture("cohere", "happy_path_tick");
     let mock = MockServer::spawn(fixtures).await;
@@ -100,21 +100,21 @@ async fn happy_path_tick_drives_call_tool_then_emit_output() {
         "tick 1 stats.latency_ms must be > 0"
     );
 
-    // Tick 2: model emits EmitOutput.
+    // Tick 2: model emits WriteOutput.
     let dec_2 = decide
         .decide(&empty_session())
         .await
         .expect("tick 2 decide");
     match &dec_2 {
-        Decision::EmitOutput { content, evidence } => {
-            assert_eq!(content, "the echo tool returned hello coral");
-            assert_eq!(evidence.len(), 1);
+        Decision::WriteOutput { body, citations } => {
+            assert_eq!(body, "the echo tool returned hello coral");
+            assert_eq!(citations.len(), 1);
             assert_eq!(
-                evidence[0].as_str(),
+                citations[0].as_str(),
                 "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
             );
         }
-        other => panic!("expected EmitOutput, got {other:?}"),
+        other => panic!("expected WriteOutput, got {other:?}"),
     }
     let calls_2 = decide.last_tick_calls();
     assert_eq!(calls_2.len(), 1);
@@ -142,8 +142,8 @@ async fn happy_path_tick_drives_call_tool_then_emit_output() {
         assert!(
             tools
                 .iter()
-                .any(|t| t["function"]["name"] == json!("emit_output")),
-            "decision-tool list must include emit_output"
+                .any(|t| t["function"]["name"] == json!("write_output")),
+            "decision-tool list must include write_output"
         );
     }
 }
@@ -376,10 +376,10 @@ async fn tool_call_roundtrip_assistant_turn_omits_empty_content() {
         .await
         .expect("Cohere accepts tool-call -> tool-result roundtrip after the Bug-A fix");
 
-    // The model's reply on tick 2 is `emit_output` (per the fixture).
+    // The model's reply on tick 2 is `write_output` (per the fixture).
     assert_eq!(resp.tool_calls.len(), 1);
     let tc: &ToolCall = &resp.tool_calls[0];
-    assert_eq!(tc.name, "emit_output");
+    assert_eq!(tc.name, "write_output");
 
     // The captured request body for the *second* call is what we care
     // about. The pre-fix code path would have emitted

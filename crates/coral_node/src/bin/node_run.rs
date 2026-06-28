@@ -42,7 +42,7 @@
 //! The agent runs one cycle of three scripted steps (call echo, emit one
 //! output backed by the resulting evidence record, idle), then retires on
 //! `step_cap` (= 1 cycle). The printed tree should contain `mandate.md`,
-//! `outputs/<ulid>.json`, `evidence/<sha256>.json`, and `retirement.json`.
+//! `outputs/output.md`, `evidence/<sha256>.json`, and `retirement.json`.
 
 use std::fs;
 use std::io::{self, Write};

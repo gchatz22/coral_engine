@@ -241,16 +241,16 @@ pub async fn execute_step(
 ) -> Result<StepOutcome> {
     match action {
         Decision::CallTools { calls } => execute_call_tools(fs, tools, calls).await,
-        Decision::EmitOutput { content, evidence } => {
-            debug!(evidence_count = evidence.len(), "step: emit_output");
-            match fs.persist_output(content, evidence).await {
+        Decision::WriteOutput { body, citations } => {
+            debug!(citation_count = citations.len(), "step: write_output");
+            match fs.persist_output(body, citations).await {
                 Ok(_) => Ok(StepOutcome::ok("output persisted")),
                 Err(e) => match e.downcast_ref::<FsError>() {
                     Some(FsError::EmptyEvidence) => Ok(StepOutcome::needs_correction(
-                        "emit_output: evidence list is empty (provenance contract)",
+                        "write_output: citations list is empty (provenance contract)",
                     )),
                     Some(FsError::EvidenceNotFound(id)) => Ok(StepOutcome::needs_correction(
-                        format!("emit_output: evidence {id} not found on disk"),
+                        format!("write_output: cited evidence {id} not found on disk"),
                     )),
                     _ => Err(e),
                 },
@@ -485,8 +485,9 @@ mod tests {
         (fs, m)
     }
 
-    /// Seed one evidence record + one output so output-index / cite tests
-    /// have something to read. Returns the output's on-disk filename.
+    /// Seed one evidence record + the canonical output so output-index /
+    /// cite tests have something to read. Returns the output's on-disk
+    /// filename (always the canonical `output.md`).
     async fn seed_one_output(fs: &AgentFs) -> String {
         let ev = fs
             .record_evidence(EvidenceRecord::new(
@@ -497,8 +498,8 @@ mod tests {
             ))
             .await
             .unwrap();
-        let out = fs.persist_output("a claim", &[ev]).await.unwrap();
-        format!("{}.json", out.id)
+        let _ = fs.persist_output("a claim", &[ev]).await.unwrap();
+        "output.md".to_string()
     }
 
     // ---------- `decide` --------------------------------------------------
@@ -790,7 +791,7 @@ mod tests {
     // ---------- `execute_step` — clean steps -----------------------------
 
     #[tokio::test]
-    async fn execute_emit_output_with_resolvable_evidence_succeeds() {
+    async fn execute_write_output_with_resolvable_evidence_succeeds() {
         let (fs, _m) = fixture().await;
         let ev_id = fs
             .record_evidence(EvidenceRecord::new(
@@ -805,17 +806,17 @@ mod tests {
         let outcome = execute_step(
             &fs,
             &tools,
-            &Decision::EmitOutput {
-                content: "claim".into(),
-                evidence: vec![ev_id],
+            &Decision::WriteOutput {
+                body: "claim".into(),
+                citations: vec![ev_id],
             },
         )
         .await
         .unwrap();
         assert!(outcome.failure.is_none());
         assert!(outcome.observation.ok);
-        let outs = fs.list_recent_outputs(8).await.unwrap();
-        assert_eq!(outs.len(), 1, "EmitOutput should have persisted an output");
+        let body = fs.read_output().await.unwrap();
+        assert_eq!(body, "claim", "WriteOutput should have persisted the body");
     }
 
     #[tokio::test]
@@ -927,15 +928,15 @@ mod tests {
     // ---------- `execute_step` — recoverable failures --------------------
 
     #[tokio::test]
-    async fn execute_emit_output_with_empty_evidence_needs_correction() {
+    async fn execute_write_output_with_empty_evidence_needs_correction() {
         let (fs, _m) = fixture().await;
         let tools = ToolRegistry::new();
         let outcome = execute_step(
             &fs,
             &tools,
-            &Decision::EmitOutput {
-                content: "no evidence".into(),
-                evidence: vec![],
+            &Decision::WriteOutput {
+                body: "no evidence".into(),
+                citations: vec![],
             },
         )
         .await
@@ -943,7 +944,7 @@ mod tests {
         match outcome.failure {
             Some(StepFailure::NeedsCorrection(desc)) => {
                 assert!(
-                    desc.contains("evidence list is empty"),
+                    desc.contains("citations list is empty"),
                     "unexpected description: {desc}"
                 );
             }
@@ -952,7 +953,11 @@ mod tests {
         // The failure is also the observation so the model adapts in-cycle.
         assert!(!outcome.observation.ok);
         // Provenance violation must NOT have produced an output on disk.
-        assert!(fs.list_recent_outputs(8).await.unwrap().is_empty());
+        let err = fs.read_output().await.unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<FsError>(),
+            Some(FsError::OutputNotFound)
+        ));
     }
 
     #[tokio::test]
@@ -981,16 +986,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_emit_output_with_unresolved_evidence_needs_correction() {
+    async fn execute_write_output_with_unresolved_evidence_needs_correction() {
         let (fs, _m) = fixture().await;
         let tools = ToolRegistry::new();
         let bogus = EvidenceId::new("echo", &json!({"never": "written"}), &json!({"x": 0}));
         let outcome = execute_step(
             &fs,
             &tools,
-            &Decision::EmitOutput {
-                content: "claim".into(),
-                evidence: vec![bogus],
+            &Decision::WriteOutput {
+                body: "claim".into(),
+                citations: vec![bogus],
             },
         )
         .await

@@ -106,7 +106,7 @@ async fn end_to_end_get_sum_against_server_everything() {
     // the layout). We don't drive the full agent loop here — the
     // separate `examples/smoke_mcp/` runbook + binary cover that path —
     // but pinning that evidence persistence works against a live server
-    // catches the "EmitOutput cannot find the evidence" failure mode
+    // catches the "WriteOutput cannot find the evidence" failure mode
     // before it surfaces in the runbook.
     let tmp = TempDir::new().expect("tempdir");
     let evidence_dir = tmp.path().join("evidence");

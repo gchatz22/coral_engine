@@ -17,7 +17,7 @@
 //!
 //! In single-triple mode the canonical sha256 hex is written to stdout
 //! followed by a newline (and nothing else). In `--from-file` mode each
-//! `emit_output` entry's declared evidence ids are listed alongside the
+//! `write_output` entry's declared evidence ids are listed alongside the
 //! immediately preceding `call_tool`, so a reviewer can eyeball whether the
 //! fixture's static hash still matches what `EvidenceId::new` would produce
 //! today. The `--from-file` parser tolerates lines whose JSON *shape* it
@@ -46,7 +46,7 @@ ARGS:
     <args-json>      JSON value for the tool's args.
     <result-json>    JSON value for the tool's result.
     <decisions.jsonl>
-                     Path to a scripted decisions file. Each `emit_output`
+                     Path to a scripted decisions file. Each `write_output`
                      entry's declared evidence ids are listed alongside the
                      immediately preceding `call_tool`. Blank lines and
                      `#`-prefixed comments are skipped.
@@ -93,7 +93,7 @@ fn single(tool: &str, args_json: &str, result_json: &str) -> Result<()> {
     Ok(())
 }
 
-/// Mode 2: walk a `decisions.jsonl` and pair each `emit_output`'s declared
+/// Mode 2: walk a `decisions.jsonl` and pair each `write_output`'s declared
 /// evidence ids with the immediately preceding `call_tool` for audit.
 ///
 /// We match on the `type` discriminator over a generic `serde_json::Value`
@@ -105,8 +105,8 @@ fn audit_file(path: &Path) -> Result<()> {
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
     // Tracks the most recent CallTool seen in the script. Tuple is (tool
-    // name, args). Reset to None after each EmitOutput is reported, so a
-    // stray EmitOutput with no preceding CallTool is flagged rather than
+    // name, args). Reset to None after each WriteOutput is reported, so a
+    // stray WriteOutput with no preceding CallTool is flagged rather than
     // silently associated with a much earlier one.
     let mut last_call: Option<(String, serde_json::Value)> = None;
     let mut emitted = 0usize;
@@ -132,17 +132,17 @@ fn audit_file(path: &Path) -> Result<()> {
                     .unwrap_or(serde_json::Value::Null);
                 last_call = Some((name, args));
             }
-            "emit_output" => {
-                let evidence = value
-                    .get("evidence")
+            "write_output" => {
+                let citations = value
+                    .get("citations")
                     .and_then(|v| v.as_array())
                     .cloned()
                     .unwrap_or_default();
-                if evidence.is_empty() {
+                if citations.is_empty() {
                     continue;
                 }
                 emitted += 1;
-                println!("emit_output @ line {}", i + 1);
+                println!("write_output @ line {}", i + 1);
                 match &last_call {
                     Some((tool, args)) => {
                         println!("  preceding call_tool: name={tool} args={args}");
@@ -151,7 +151,7 @@ fn audit_file(path: &Path) -> Result<()> {
                         println!("  (no preceding call_tool seen)");
                     }
                 }
-                for id in &evidence {
+                for id in &citations {
                     let id_str = id.as_str().unwrap_or("<non-string>");
                     println!("  declared evidence id: {id_str}");
                 }
@@ -163,7 +163,7 @@ fn audit_file(path: &Path) -> Result<()> {
 
     if emitted == 0 {
         return Err(anyhow!(
-            "no emit_output entries found in {}",
+            "no write_output entries found in {}",
             path.display()
         ));
     }
@@ -205,7 +205,7 @@ mod tests {
         )
         .unwrap();
         writeln!(tmp, "this is not json").unwrap();
-        writeln!(tmp, r#"{{"type":"emit_output","evidence":["abc"]}}"#).unwrap();
+        writeln!(tmp, r#"{{"type":"write_output","citations":["abc"]}}"#).unwrap();
 
         let err = audit_file(tmp.path()).expect_err("expected hard fail on invalid JSON");
         let chain = format!("{err:#}");
@@ -231,7 +231,7 @@ mod tests {
             r#"{{"type":"call_tool","name":"echo","args":{{"hello":"smoke"}}}}"#
         )
         .unwrap();
-        writeln!(tmp, r#"{{"type":"emit_output","evidence":["abc"]}}"#).unwrap();
+        writeln!(tmp, r#"{{"type":"write_output","citations":["abc"]}}"#).unwrap();
 
         audit_file(tmp.path()).expect("blank/comment lines should not be a hard failure");
     }

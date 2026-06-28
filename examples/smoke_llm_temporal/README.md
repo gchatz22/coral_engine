@@ -43,7 +43,7 @@ the daemon; follow it via the Temporal Web UI at
 
 The daemon writes artifacts under its configured `AGENT_FS_ROOT`:
 
-- `<root>/outputs/<sha>.json`
+- `<root>/outputs/output.md`
 - `<root>/retirement.json`
 - `<root>/decisions/<tick>.jsonl`
 - `<root>/evidence/<sha>.json`

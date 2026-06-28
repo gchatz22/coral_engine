@@ -18,7 +18,7 @@
 //! so a real-LLM citation against a synthetic id would fail the
 //! workflow's provenance check; we plant a real `EchoLike`-shaped
 //! evidence record under the workflow's FS prefix, then script
-//! EmitOutput to cite that planted id.
+//! WriteOutput to cite that planted id.
 //!
 //! `TEMPORAL_LIVE_TEST=1` opts in — same env var `workflow_smoke.rs`
 //! uses, so a single CI gate covers both. Without it the test prints a
@@ -143,7 +143,7 @@ fn load_graph_yaml() -> Result<String> {
         .with_context(|| format!("reading graph.yaml fixture from {}", path.display()))
 }
 
-/// Live test: drives a single cycle (CallTools → EmitOutput → Idle)
+/// Live test: drives a single cycle (CallTools → WriteOutput → Idle)
 /// where the workflow input and seed triggers come from
 /// `examples/smoke_llm_temporal/graph.yaml`. Asserts the three durable
 /// artifacts land on disk.
@@ -214,7 +214,7 @@ async fn run_smoke() -> Result<()> {
     let storage = ensure_installed();
 
     // Plant one `EchoLike`-shaped evidence record under the workflow's
-    // FS prefix so the scripted EmitOutput cites a real, on-disk
+    // FS prefix so the scripted WriteOutput cites a real, on-disk
     // evidence id. EvidenceId is content-addressed on
     // (tool, args, result), so we compute it by writing the same record
     // the planting AgentFs writes — `record_evidence` returns the id.
@@ -231,9 +231,9 @@ async fn run_smoke() -> Result<()> {
             Utc::now(),
         ))
         .await
-        .context("plant evidence for EmitOutput")?;
+        .context("plant evidence for WriteOutput")?;
 
-    // One scripted cycle: CallTools(echo) → EmitOutput citing the planted
+    // One scripted cycle: CallTools(echo) → WriteOutput citing the planted
     // id → Idle (the sole terminal step ends the cycle). The `step_cap`
     // backstop then retires at the top of the next cycle (agents never
     // self-terminate). Proves the YAML-derived AgentInput drives the
@@ -246,9 +246,9 @@ async fn run_smoke() -> Result<()> {
                 ClaimSeed::new("smoke-seed"),
             )],
         },
-        Decision::EmitOutput {
-            content: "coral_apply_smoke: echo result observed".into(),
-            evidence: vec![planted_id.clone()],
+        Decision::WriteOutput {
+            body: "coral_apply_smoke: echo result observed".into(),
+            citations: vec![planted_id.clone()],
         },
         Decision::Idle {
             next_after: Duration::from_millis(50),
@@ -367,7 +367,7 @@ async fn drive(
     triggers: Vec<coral_node::trigger::Trigger>,
     agent_prefix: &str,
     storage: Arc<MemoryStorage>,
-    planted_id: coral_node::evidence::EvidenceId,
+    _planted_id: coral_node::evidence::EvidenceId,
 ) -> Result<()> {
     let handle = client
         .start_workflow(
@@ -419,43 +419,25 @@ async fn drive(
         "retirement.json carries wrong reason: {reason_on_disk:?}"
     );
 
-    // ---- Artifact 2: `<prefix>/outputs/<sha>.json` ------------------------
-    // OutputId is content-addressed (`sha256(content, evidence)`), so
-    // given the same scripted EmitOutput the filename on disk is fixed.
+    // ---- Artifact 2: `<prefix>/outputs/output.md` -------------------------
+    // The agent keeps a single canonical Output, overwritten each write.
+    // `read_output` returns its body; citations live in the DB reference
+    // graph, not the file, so only the body is checked here.
     let inspect_mandate = Mandate::new("inspect", Duration::from_millis(0), None);
     let inspect_storage: Arc<dyn AgentStorage> = storage.clone();
     let inspect_fs = AgentFs::new_with_storage(inspect_storage, agent_prefix, &inspect_mandate)
         .await
         .context("open inspecting AgentFs")?;
-    let outs = inspect_fs
-        .list_recent_outputs(8)
-        .await
-        .context("list_recent_outputs")?;
+    let body = inspect_fs.read_output().await.context("read_output")?;
     assert_eq!(
-        outs.len(),
-        1,
-        "expected exactly one output on disk after EmitOutput; got {}: {outs:?}",
-        outs.len()
+        body, "coral_apply_smoke: echo result observed",
+        "output body must match scripted WriteOutput"
     );
-    let on_disk = &outs[0];
-    assert_eq!(
-        on_disk.content, "coral_apply_smoke: echo result observed",
-        "output content must match scripted EmitOutput"
-    );
-    assert!(
-        on_disk.evidence.contains(&planted_id),
-        "output must cite the planted evidence id; got {:?}",
-        on_disk.evidence
-    );
-    eprintln!(
-        "coral_apply_smoke: output landed at outputs/{}.json with {} evidence id(s)",
-        on_disk.id,
-        on_disk.evidence.len()
-    );
+    eprintln!("coral_apply_smoke: output landed at outputs/output.md");
 
     // ---- Artifact 3: `<prefix>/decisions/<tick>-<step>.jsonl` -------------
     // One entry per logged decision (one file per step within the cycle).
-    // The scripted cycle produces three decisions (CallTools, EmitOutput,
+    // The scripted cycle produces three decisions (CallTools, WriteOutput,
     // Idle) at `decisions/0-{0,1,2}.jsonl`. The `step_cap` backstop retires
     // at the top of the next cycle without logging a decision, so it adds no
     // fourth entry.
@@ -470,7 +452,7 @@ async fn drive(
     assert_eq!(
         decision_keys.len(),
         3,
-        "expected 3 decision-log entries (CallTools, EmitOutput, Idle); got {decision_keys:?}"
+        "expected 3 decision-log entries (CallTools, WriteOutput, Idle); got {decision_keys:?}"
     );
 
     let mut summaries: Vec<String> = Vec::with_capacity(3);
@@ -493,7 +475,7 @@ async fn drive(
         summaries[0]
     );
     assert!(
-        summaries[1].starts_with("EmitOutput"),
+        summaries[1].starts_with("WriteOutput"),
         "step 1 summary: {:?}",
         summaries[1]
     );

@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! mandate.md             — standing instruction (pure prose; no metadata)
-//! outputs/<sha256>.json  — claims, content-addressed, immutable, require evidence
+//! outputs/output.md      — the single, kept-current Output (pure prose, overwritten each cycle)
 //! evidence/<sha256>.json — raw tool-call record, content-addressed, dedup via put_if_absent
 //! notes/                 — mutable private working memory
 //! claims/<slug>.json     — claim_seed registry
@@ -13,9 +13,11 @@
 //! retirement.json        — terminal marker (presence ⇒ agent retired, not crashed)
 //! ```
 //!
-//! `outputs/` are deliverables a parent or auditor reads; every output
-//! must cite resolvable evidence ids ([`AgentFs::persist_output`] enforces
-//! via [`FsError::EmptyEvidence`] / [`FsError::EvidenceNotFound`]).
+//! The single canonical Output is the deliverable a parent or auditor reads;
+//! [`AgentFs::persist_output`] overwrites it each cycle and enforces that
+//! every cited evidence id resolves (via [`FsError::EmptyEvidence`] /
+//! [`FsError::EvidenceNotFound`]). A stable path (not a content-addressed
+//! name) is what lets a parent pin the output's version across refreshes.
 //! `notes/` is private scratch that [`AgentFs::apply_ops`] writes to,
 //! rejecting anything that escapes `<root>/notes/`.
 
@@ -23,7 +25,7 @@ use crate::agent_ref::{AgentId, GraphId};
 use crate::conflict::ConflictRecord;
 use crate::decision::{ConflictId, FsOp, Remainder};
 use crate::evidence::{EvidenceId, EvidenceRecord};
-use crate::mandate::{Mandate, Output, OutputId};
+use crate::mandate::{Mandate, OutputId};
 use crate::storage::{AgentStorage, LocalStorage, PutOutcome};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -66,17 +68,22 @@ pub struct TailObject {
     pub entries: Vec<TailEntry>,
 }
 
-/// Tail-object key suffix for `outputs/`.
-const OUTPUTS_TAIL_SUFFIX: &str = "outputs/_tail.json";
+/// The single canonical Output path. Each agent keeps ONE kept-current
+/// Output here, overwritten each cycle. A *stable* path (not content-
+/// addressed) is what lets a parent pin a child's output version and the
+/// runtime detect staleness when the child later refreshes it.
+const CANONICAL_OUTPUT: &str = "outputs/output.md";
+/// Bare filename of the canonical Output, relative to `outputs/`.
+const CANONICAL_OUTPUT_FILENAME: &str = "output.md";
 /// Tail-object key suffix for `evidence/`.
 const EVIDENCE_TAIL_SUFFIX: &str = "evidence/_tail.json";
-/// Tail-object key suffix for `notes/`. Unlike outputs/evidence, notes are
+/// Tail-object key suffix for `notes/`. Unlike evidence, notes are
 /// agent-authored, mutable, and deletable, so the tail is maintained on every
 /// `apply_ops` write/delete rather than on a content-addressed first-write.
 const NOTES_TAIL_SUFFIX: &str = "notes/_tail.json";
 
-/// Tail-record predicate for the content-addressed prefixes (`outputs/`,
-/// `evidence/`): a `.json` record, never the sidecar.
+/// Tail-record predicate for the content-addressed `evidence/` prefix: a
+/// `.json` record, never the sidecar.
 fn is_json_record(filename: &str) -> bool {
     filename.ends_with(".json") && filename != "_tail.json"
 }
@@ -110,11 +117,11 @@ pub enum FsError {
     /// `persist_output` referenced an evidence id with no record on disk.
     #[error("output rejected: evidence {0} not found on disk")]
     EvidenceNotFound(EvidenceId),
-    /// [`AgentFs::read_output`] could not resolve the requested
-    /// `OutputId`. Typed so the reconcile path can fold it into a
-    /// correction context without losing the id.
-    #[error("output {0} not found on disk")]
-    OutputNotFound(OutputId),
+    /// [`AgentFs::read_output`] found no canonical Output on disk — the
+    /// agent has not emitted one yet. Typed so the reconcile path can fold
+    /// it into a correction context.
+    #[error("no canonical output found on disk")]
+    OutputNotFound,
     /// [`AgentFs::read_file`] was asked for a path that resolves to no
     /// file. The model picked a filename that does not exist; surfaced as
     /// a typed error so the cycle can fold it into a failure observation
@@ -331,8 +338,7 @@ impl AgentFs {
         // Reconcile any tail that lags on-disk reality after a crash
         // mid-PUT, so the O(1) read path can trust a sub-capacity tail
         // as complete. One LIST + at most one PUT per indexed prefix.
-        me.reconcile_tail(OUTPUTS_TAIL_SUFFIX, "outputs/", is_json_record)
-            .await?;
+        // `outputs/` has no tail — it holds one canonical, overwritten file.
         me.reconcile_tail(EVIDENCE_TAIL_SUFFIX, "evidence/", is_json_record)
             .await?;
         me.reconcile_tail(NOTES_TAIL_SUFFIX, "notes/", is_note_record)
@@ -346,10 +352,10 @@ impl AgentFs {
     /// that [`AgentFs::new_with_storage`] performs. Makes no I/O calls.
     ///
     /// Use when the caller has no `Mandate` in scope, or when the
-    /// operation does not touch `outputs/` / `evidence/` and the
+    /// operation does not touch `evidence/` / `notes/` and the
     /// per-attach LIST is wasted work. Callers must not use `attach`
     /// for fresh-FS paths that rely on tail-index invariants
-    /// (`list_recent_outputs`, `list_recent_evidence`); those need
+    /// (`list_recent_evidence`, `recent_note_filenames`); those need
     /// `new_with_storage`'s reconcile step.
     pub fn attach(storage: Arc<dyn AgentStorage>, prefix: impl Into<String>) -> Self {
         let mut prefix = prefix.into();
@@ -362,7 +368,7 @@ impl AgentFs {
     /// Build an `AgentFs` scoped to an arbitrary agent's
     /// `graphs/<graph_id>/agents/<agent_id>/` prefix on the supplied
     /// storage backend. Cross-agent reads (a parent reading a child's
-    /// `outputs/<id>.json`) flow through this constructor.
+    /// canonical `outputs/output.md`) flow through this constructor.
     ///
     /// An `attach` wrapper — no `mandate.md` read, no tail-index
     /// reconcile. The caller does not have the other agent's `Mandate`
@@ -523,45 +529,36 @@ impl AgentFs {
         }
     }
 
-    /// Persist an `Output` under `<prefix>outputs/<sha256>.json`,
-    /// enforcing the provenance contract: at least one evidence id,
-    /// and every id must resolve to a record.
+    /// Persist the agent's single, kept-current Output as pure prose at the
+    /// canonical path `outputs/output.md`, **overwriting** any prior cycle's
+    /// body. A stable path (not a content-addressed filename) is what lets a
+    /// parent pin this output's version and the runtime detect staleness when
+    /// it is later refreshed — see [`CANONICAL_OUTPUT`].
     ///
-    /// Idempotent under retries. `OutputId::new` is content-addressed
-    /// over `(content, evidence)`, so two calls with the same
-    /// arguments target the same key. `put_if_absent` skips the
-    /// tail-index update on a duplicate so `added_at` stays pinned at
-    /// the first write. `created_at` is not in the hash; the bytes
-    /// from the first call are the bytes that stay on disk.
+    /// Enforces the provenance contract: at least one citation, and every
+    /// cited evidence id must resolve to a record on disk. Only the body is
+    /// written to the FS — citations live in the DB reference graph, never in
+    /// the file (A1: content in the FS, provenance in the DB). Returns the
+    /// [`OutputId`] fingerprint of the body for the `ChildOutput` signal.
+    /// Idempotent under retries: the same body PUTs byte-identical bytes.
     pub async fn persist_output(
         &self,
-        content: &str,
-        evidence: &[EvidenceId],
-    ) -> anyhow::Result<Output> {
-        if evidence.is_empty() {
+        body: &str,
+        citations: &[EvidenceId],
+    ) -> anyhow::Result<OutputId> {
+        if citations.is_empty() {
             return Err(FsError::EmptyEvidence.into());
         }
         // Verify every cited evidence id before the write.
-        for id in evidence {
+        for id in citations {
             self.evidence_must_exist(id).await?;
         }
-        let output = Output::new(content.to_string(), evidence.to_vec(), Utc::now());
-        let filename = format!("{}.json", output.id);
-        let key = self.key(&format!("outputs/{filename}"));
-        let bytes = serde_json::to_vec_pretty(&output)?;
-        let outcome: PutOutcome = self
-            .storage
-            .put_if_absent(&key, Bytes::from(bytes))
+        let key = self.key(CANONICAL_OUTPUT);
+        self.storage
+            .put(&key, Bytes::from(body.as_bytes().to_vec()))
             .await
             .map_err(|e| FsError::storage(&key, e))?;
-        // Tail update only on first write — duplicates must not
-        // shuffle `added_at` forward. File is PUT before the tail; a
-        // crash between the two leaves the file recoverable via the
-        // LIST fallback in `read_recent_window_with_tail`.
-        if matches!(outcome, PutOutcome::Created) {
-            self.append_to_tail(OUTPUTS_TAIL_SUFFIX, filename).await?;
-        }
-        Ok(output)
+        Ok(OutputId::new(body))
     }
 
     /// Apply a batch of model-authored filesystem ops. Writes and
@@ -617,41 +614,22 @@ impl AgentFs {
         Ok(())
     }
 
-    /// Return the most recent (up to) `n` `Output`s on disk, in
-    /// ascending filename order.
+    /// Read the agent's single canonical Output body (`outputs/output.md`).
     ///
-    /// Output filenames are sha256 digests, so the lex-greatest `n`
-    /// across the whole history is not the same set as the `n` most
-    /// recently written. The tail-fast-path is only used when the
-    /// tail is provably complete (under `TAIL_K`). Beyond `TAIL_K`,
-    /// the LIST fallback gives the lex-window semantics.
-    ///
-    /// Crash recovery: if a previous write PUT the file but crashed
-    /// before the tail update, `read_recent_window_with_tail` detects
-    /// the lag and falls back to LIST automatically.
-    pub async fn list_recent_outputs(&self, n: usize) -> anyhow::Result<Vec<Output>> {
-        let prefix = self.key("outputs/");
-        self.read_recent_window_with_tail::<Output>(&prefix, OUTPUTS_TAIL_SUFFIX, n, false)
-            .await
-    }
-
-    /// Point lookup of one persisted [`Output`] by its content-
-    /// addressed [`OutputId`].
-    ///
-    /// Returns `Err(FsError::OutputNotFound(id))` when absent so
-    /// callers can fold the miss into a typed error without losing
-    /// the id. Read-only by construction; composes with
-    /// [`AgentFs::open_for_agent`] for cross-agent reads.
-    pub async fn read_output(&self, id: &OutputId) -> anyhow::Result<Output> {
-        let key = self.key(&format!("outputs/{}.json", id));
+    /// Returns `Err(FsError::OutputNotFound)` when the agent has not yet
+    /// emitted an output, so callers can fold the miss into a typed error.
+    /// Read-only by construction; composes with [`AgentFs::open_for_agent`]
+    /// for cross-agent reads (a parent reading its child's current Output).
+    pub async fn read_output(&self) -> anyhow::Result<String> {
+        let key = self.key(CANONICAL_OUTPUT);
         let got = self
             .storage
             .get(&key)
             .await
             .map_err(|e| FsError::storage(&key, e))?;
         match got {
-            Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
-            None => Err(FsError::OutputNotFound(id.clone()).into()),
+            Some(bytes) => Ok(String::from_utf8(bytes.to_vec())?),
+            None => Err(FsError::OutputNotFound.into()),
         }
     }
 
@@ -914,10 +892,33 @@ impl AgentFs {
         Ok(hits)
     }
 
-    /// Recency window of `outputs/` filenames for the cycle seed's index.
-    /// See [`AgentFs::recent_window`].
-    pub async fn recent_output_filenames(&self, n: usize) -> anyhow::Result<RecentWindow> {
-        self.recent_window(OUTPUTS_TAIL_SUFFIX, "outputs/", n).await
+    /// The `outputs/` bucket for the cycle seed's index. The agent keeps a
+    /// single canonical Output, so this is a one-file existence check, not a
+    /// recency window: the canonical filename if it exists, else empty.
+    pub async fn recent_output_filenames(&self, _n: usize) -> anyhow::Result<RecentWindow> {
+        // Existence check only. The seed is rebuilt every cycle across many
+        // agents, so list keys (no body transfer) rather than GET the
+        // (possibly large) body just to test presence. `outputs/` holds only
+        // the canonical file, so a one-key page settles it.
+        let prefix = self.key("outputs/");
+        let page = self
+            .storage
+            .list(&prefix, None, 1)
+            .await
+            .map_err(|e| FsError::storage(&prefix, e))?;
+        let present = page
+            .keys
+            .iter()
+            .any(|k| k.ends_with(CANONICAL_OUTPUT_FILENAME));
+        let filenames = if present {
+            vec![CANONICAL_OUTPUT_FILENAME.to_string()]
+        } else {
+            Vec::new()
+        };
+        Ok(RecentWindow {
+            filenames,
+            more: Remainder::None,
+        })
     }
 
     /// Recency window of `notes/` filenames for the cycle seed's index.
@@ -1494,52 +1495,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_output_writes_file_referencing_evidence() {
+    async fn persist_output_writes_canonical_file_referencing_evidence() {
         let (tmp, fs, _m) = fresh_fs().await;
         let rec = record("echo", json!({"msg": "hi"}), json!({"echoed": "hi"}));
         let id = fs.record_evidence(rec).await.unwrap();
 
-        let out = fs.persist_output("hello", &[id.clone()]).await.unwrap();
-        assert_eq!(out.content, "hello");
-        assert_eq!(out.evidence, vec![id.clone()]);
+        let out_id = fs.persist_output("hello", &[id.clone()]).await.unwrap();
+        assert_eq!(out_id, OutputId::new("hello"));
 
-        let path = tmp.path().join("outputs").join(format!("{}.json", out.id));
+        // The single canonical Output lands at the stable path.
+        let path = tmp.path().join("outputs").join("output.md");
         assert!(path.is_file());
-        let bytes = std::fs::read(&path).unwrap();
-        let back: Output = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(back, out);
-        assert!(back.evidence.contains(&id));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body, "hello");
     }
 
     // ---- read_output + open_for_agent ----
 
     #[tokio::test]
-    async fn read_output_returns_persisted_output_by_id() {
+    async fn read_output_returns_persisted_body() {
         let (_tmp, fs, _m) = fresh_fs().await;
         let rec = record("echo", json!({"q": "k"}), json!({"r": "v"}));
         let ev = fs.record_evidence(rec).await.unwrap();
-        let out = fs.persist_output("the claim", &[ev.clone()]).await.unwrap();
+        let _ = fs.persist_output("the claim", &[ev.clone()]).await.unwrap();
 
-        let back = fs.read_output(&out.id).await.unwrap();
-        assert_eq!(back, out, "read_output must return the persisted Output");
-        assert_eq!(back.evidence, vec![ev]);
+        let back = fs.read_output().await.unwrap();
+        assert_eq!(
+            back, "the claim",
+            "read_output must return the persisted body"
+        );
     }
 
     #[tokio::test]
-    async fn read_output_returns_typed_error_for_missing_id() {
+    async fn read_output_returns_typed_error_when_none_written() {
         let (_tmp, fs, _m) = fresh_fs().await;
-        let ev = EvidenceId::from_hex("0".repeat(64));
-        // Manufacture an OutputId for content we never persisted.
-        let bogus = OutputId::new("never-written", &[ev]);
         let err = fs
-            .read_output(&bogus)
+            .read_output()
             .await
             .expect_err("missing output must error");
         let typed = err.downcast_ref::<FsError>().expect("typed FsError");
-        match typed {
-            FsError::OutputNotFound(id) => assert_eq!(id, &bogus),
-            other => panic!("expected OutputNotFound, got {other:?}"),
-        }
+        assert!(matches!(typed, FsError::OutputNotFound));
     }
 
     #[tokio::test]
@@ -1597,16 +1592,16 @@ mod tests {
             .record_evidence(record("echo", json!({"q": "child"}), json!({"r": 1})))
             .await
             .unwrap();
-        let child_out = child_fs
+        let _ = child_fs
             .persist_output("child's claim", &[ev])
             .await
             .unwrap();
 
         // Parent uses `open_for_agent` (no mandate) to read the
-        // child's output by id — the cross-agent reconcile surface.
+        // child's canonical output — the cross-agent reconcile surface.
         let parent_view = AgentFs::open_for_agent(storage, graph_id, child_agent_id);
-        let read_back = parent_view.read_output(&child_out.id).await.unwrap();
-        assert_eq!(read_back, child_out);
+        let read_back = parent_view.read_output().await.unwrap();
+        assert_eq!(read_back, "child's claim");
     }
 
     #[tokio::test]
@@ -1937,50 +1932,12 @@ mod tests {
         );
     }
 
+    /// `persist_output` keeps ONE canonical Output. The same body PUTs
+    /// byte-identical bytes (same `OutputId`); a different body overwrites
+    /// the one file in place — `read_output` returns the latest, never an
+    /// accumulating history.
     #[tokio::test]
-    async fn list_recent_outputs_returns_window_in_filename_order() {
-        let (_tmp, fs, _m) = fresh_fs().await;
-        // Seed an evidence record we can attach to every output.
-        let id = fs
-            .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
-            .await
-            .unwrap();
-
-        let mut all_ids = Vec::new();
-        for i in 0..10 {
-            let out = fs
-                .persist_output(&format!("o-{i}"), &[id.clone()])
-                .await
-                .unwrap();
-            all_ids.push(out.id);
-        }
-
-        // Last 8.
-        let recent = fs.list_recent_outputs(8).await.unwrap();
-        assert_eq!(recent.len(), 8);
-
-        // Returned outputs are in ascending filename (= sha256) order
-        // — a lex-sort assertion only. Recency lives on the tail
-        // object's `added_at`, not on the filename.
-        let ids: Vec<_> = recent.iter().map(|o| o.id.clone()).collect();
-        let mut sorted = ids.clone();
-        sorted.sort();
-        assert_eq!(ids, sorted);
-
-        // n larger than available → all entries returned.
-        let all = fs.list_recent_outputs(100).await.unwrap();
-        assert_eq!(all.len(), 10);
-
-        // n = 0 → empty.
-        let none = fs.list_recent_outputs(0).await.unwrap();
-        assert!(none.is_empty());
-    }
-
-    /// `persist_output` is idempotent over `(content, evidence)`: two
-    /// calls with the same arguments produce one file and one tail
-    /// entry, with `added_at` pinned at the first write.
-    #[tokio::test]
-    async fn persist_output_is_idempotent_for_identical_content_and_evidence() {
+    async fn persist_output_keeps_one_canonical_output_overwritten_in_place() {
         let (tmp, fs, _m) = fresh_fs().await;
         let id = fs
             .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
@@ -1991,67 +1948,35 @@ mod tests {
             .persist_output("the same claim", &[id.clone()])
             .await
             .unwrap();
-        // Capture the first tail object's added_at for the new entry.
-        let tail_path = tmp.path().join("outputs").join("_tail.json");
-        let tail_first: TailObject =
-            serde_json::from_slice(&std::fs::read(&tail_path).unwrap()).unwrap();
-        assert_eq!(tail_first.entries.len(), 1);
-        let added_at_first = tail_first.entries[0].added_at;
-
-        // Ensure wall-clock advances enough for a fresh Utc::now() to
-        // differ from the first one — otherwise the test would pass
-        // trivially even if we did re-stamp added_at.
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-
         let second = fs
             .persist_output("the same claim", &[id.clone()])
             .await
             .unwrap();
 
-        // Same content + evidence → same content-addressed OutputId.
-        assert_eq!(first.id, second.id);
+        // Same body → same content-addressed OutputId.
+        assert_eq!(first, second);
 
-        // Exactly one file under outputs/ (sha256 dedup at the storage
-        // layer — `put_if_absent` returned Existed).
+        // Exactly one file under outputs/ — the canonical Output.
         let output_files: Vec<_> = std::fs::read_dir(tmp.path().join("outputs"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-            .filter(|n| n != "_tail.json")
             .collect();
-        assert_eq!(
-            output_files.len(),
-            1,
-            "duplicate persist_output created extra file: {output_files:?}"
-        );
+        assert_eq!(output_files, vec!["output.md".to_string()]);
+        assert_eq!(fs.read_output().await.unwrap(), "the same claim");
 
-        // Tail object has exactly one entry, with the original
-        // `added_at` — the retry path skipped the tail update.
-        let tail_after: TailObject =
-            serde_json::from_slice(&std::fs::read(&tail_path).unwrap()).unwrap();
-        assert_eq!(tail_after.entries.len(), 1);
-        assert_eq!(
-            tail_after.entries[0].added_at, added_at_first,
-            "tail added_at must not move on a retry/dedup write"
-        );
-
-        // list_recent_outputs surfaces a single output, not two.
-        let recent = fs.list_recent_outputs(8).await.unwrap();
-        assert_eq!(recent.len(), 1);
-        assert_eq!(recent[0].id, first.id);
-
-        // Sanity: a *different* content with the same evidence still
-        // mints a fresh id and lands a second file.
+        // A *different* body overwrites the same file (still one), and
+        // mints a fresh id.
         let third = fs
             .persist_output("a different claim", &[id.clone()])
             .await
             .unwrap();
-        assert_ne!(third.id, first.id);
+        assert_ne!(third, first);
         let output_files: Vec<_> = std::fs::read_dir(tmp.path().join("outputs"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-            .filter(|n| n != "_tail.json")
             .collect();
-        assert_eq!(output_files.len(), 2);
+        assert_eq!(output_files, vec!["output.md".to_string()]);
+        assert_eq!(fs.read_output().await.unwrap(), "a different claim");
     }
 
     #[tokio::test]
@@ -2528,131 +2453,31 @@ mod tests {
 
         let rec = record("t", json!({}), json!({}));
         let id = fs.record_evidence(rec).await.unwrap();
-        let out = fs.persist_output("hello", &[id]).await.unwrap();
-        let recent = fs.list_recent_outputs(8).await.unwrap();
-        assert_eq!(recent.len(), 1);
-        assert_eq!(recent[0].id, out.id);
+        let out_id = fs.persist_output("hello", &[id]).await.unwrap();
+        assert_eq!(out_id, OutputId::new("hello"));
+        assert_eq!(fs.read_output().await.unwrap(), "hello");
     }
 
     // ---- tail-index integration -------------------------------
 
-    /// Round-trip a small workload through the tail-fast path. The
-    /// `outputs/_tail.json` and `evidence/_tail.json` objects must be
-    /// present after writes, and `list_recent_*` returns the same
-    /// answer the LIST fallback would.
+    /// The `evidence/_tail.json` object must be present after a
+    /// `record_evidence` put — the evidence tail is written on each
+    /// first-write.
     #[tokio::test]
-    async fn tail_index_outputs_and_evidence_are_written_on_each_put() {
+    async fn tail_index_evidence_is_written_on_each_put() {
         let (tmp, fs, _m) = fresh_fs().await;
-        let id = fs
+        let _id = fs
             .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
             .await
             .unwrap();
-        let _out = fs.persist_output("o", &[id.clone()]).await.unwrap();
 
-        // Tail files on disk.
-        let outputs_tail = tmp.path().join("outputs").join("_tail.json");
         let evidence_tail = tmp.path().join("evidence").join("_tail.json");
-        assert!(outputs_tail.is_file(), "outputs/_tail.json missing");
         assert!(evidence_tail.is_file(), "evidence/_tail.json missing");
 
         let parsed: TailObject =
-            serde_json::from_slice(&std::fs::read(&outputs_tail).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(&evidence_tail).unwrap()).unwrap();
         assert_eq!(parsed.entries.len(), 1);
         assert!(parsed.entries[0].filename.ends_with(".json"));
-    }
-
-    /// The tail trims to `TAIL_K`. Write `TAIL_K + 16` outputs and
-    /// assert the on-disk tail has exactly `TAIL_K` entries with the
-    /// newest at index 0 by `added_at` (filenames are sha256, so they
-    /// carry no temporal meaning).
-    #[tokio::test]
-    async fn tail_index_trims_to_tail_k() {
-        let (tmp, fs, _m) = fresh_fs().await;
-        let id = fs
-            .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
-            .await
-            .unwrap();
-        for i in 0..(TAIL_K + 16) {
-            fs.persist_output(&format!("o-{i}"), &[id.clone()])
-                .await
-                .unwrap();
-        }
-        let bytes = std::fs::read(tmp.path().join("outputs").join("_tail.json")).unwrap();
-        let parsed: TailObject = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(parsed.entries.len(), TAIL_K);
-        // Newest first by `added_at`: index 0 is the most recently
-        // appended entry. Filename ordering carries no temporal
-        // meaning under content-addressing, so we assert on the
-        // timestamp the tail records explicitly.
-        assert!(
-            parsed.entries[0].added_at >= parsed.entries[1].added_at,
-            "tail must be reverse-chronological on added_at"
-        );
-    }
-
-    /// `list_recent_outputs(N)` returns the same lex-ascending
-    /// window the LIST path would, even after the tail has trimmed
-    /// older entries. Under sha256 filenames this asserts the
-    /// LIST-fallback lex-window — the tail-fast-path is bypassed
-    /// because `lex_monotonic=false` and the tail is at capacity.
-    #[tokio::test]
-    async fn list_recent_outputs_after_trim_matches_lex_window() {
-        let (_tmp, fs, _m) = fresh_fs().await;
-        let id = fs
-            .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
-            .await
-            .unwrap();
-        // Slightly over TAIL_K so we know the tail dropped some.
-        let total = TAIL_K + 5;
-        let mut all_ids = Vec::new();
-        for i in 0..total {
-            let o = fs
-                .persist_output(&format!("o-{i}"), &[id.clone()])
-                .await
-                .unwrap();
-            all_ids.push(o.id);
-        }
-        all_ids.sort();
-        let want_last_8: Vec<_> = all_ids.iter().rev().take(8).rev().cloned().collect();
-
-        let got = fs.list_recent_outputs(8).await.unwrap();
-        let got_ids: Vec<_> = got.iter().map(|o| o.id.clone()).collect();
-        assert_eq!(got_ids, want_last_8);
-    }
-
-    /// Crash recovery — missing tail object. The read path's LIST
-    /// fallback kicks in when the tail object is absent (e.g. an
-    /// operator deleted it for forensics, or the very first tail PUT
-    /// in this agent's history never reached durable storage). On-
-    /// disk records surface normally.
-    #[tokio::test]
-    async fn list_recent_outputs_recovers_via_list_when_tail_object_absent() {
-        let (_tmp, fs, _m) = fresh_fs().await;
-        let id = fs
-            .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
-            .await
-            .unwrap();
-        let _ = fs.persist_output("o-1", &[id.clone()]).await.unwrap();
-        let _ = fs.persist_output("o-2", &[id.clone()]).await.unwrap();
-        let orphan = Output::new("o-orphan".to_string(), vec![id.clone()], Utc::now());
-        let orphan_key = format!("outputs/{}.json", orphan.id);
-        fs.storage()
-            .put(
-                &orphan_key,
-                Bytes::from(serde_json::to_vec_pretty(&orphan).unwrap()),
-            )
-            .await
-            .unwrap();
-        // Simulate a tail-PUT that never reached durable storage.
-        fs.storage().delete("outputs/_tail.json").await.unwrap();
-
-        let got = fs.list_recent_outputs(8).await.unwrap();
-        let ids: Vec<_> = got.iter().map(|o| o.id.clone()).collect();
-        assert!(
-            ids.contains(&orphan.id),
-            "orphan output should be recovered via LIST fallback when tail is missing"
-        );
-        assert_eq!(got.len(), 3);
     }
 
     /// Same shape for `evidence/`: tail object absent, LIST fallback
@@ -2673,182 +2498,14 @@ mod tests {
         assert_eq!(got.len(), 2);
     }
 
-    /// Crash recovery: tail lags on-disk reality. A previous process
-    /// PUT `outputs/<sha256>.json` but crashed before updating the
-    /// tail. The in-process read path would trust the sub-capacity
-    /// tail and silently drop the orphan. Open-time reconciliation in
-    /// `new_with_storage` rebuilds the tail from the LIST.
-    #[tokio::test]
-    async fn open_time_reconcile_rebuilds_tail_when_lagging_behind_outputs() {
-        let tmp = TempDir::new().unwrap();
-        let mandate = Mandate::new("reconcile", Duration::from_millis(100), Some(1));
-        // First session: write two outputs through the facade so the
-        // tail is consistent.
-        let id = {
-            let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
-                .await
-                .unwrap();
-            let id = fs
-                .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
-                .await
-                .unwrap();
-            let _ = fs.persist_output("o-1", &[id.clone()]).await.unwrap();
-            let _ = fs.persist_output("o-2", &[id.clone()]).await.unwrap();
-            id
-        };
-
-        // Simulate a crashed worker that PUT an orphan output but
-        // never updated the tail. A fresh `LocalStorage` handle
-        // mimics an out-of-band write — or a crashed-mid-update.
-        let orphan = Output::new("orphan".to_string(), vec![id.clone()], Utc::now());
-        let orphan_key = format!("outputs/{}.json", orphan.id);
-        let storage_handle = Arc::new(LocalStorage::new(tmp.path().to_path_buf()).unwrap());
-        storage_handle
-            .put(
-                &orphan_key,
-                Bytes::from(serde_json::to_vec_pretty(&orphan).unwrap()),
-            )
-            .await
-            .unwrap();
-
-        // Sanity precondition: the pre-reconciliation tail does NOT
-        // contain the orphan, so a naive O(1) read path would miss it.
-        let pre_bytes = storage_handle
-            .get("outputs/_tail.json")
-            .await
-            .unwrap()
-            .unwrap();
-        let pre_tail: TailObject = serde_json::from_slice(&pre_bytes).unwrap();
-        let orphan_filename = format!("{}.json", orphan.id);
-        assert!(
-            !pre_tail
-                .entries
-                .iter()
-                .any(|e| e.filename == orphan_filename),
-            "precondition: tail should NOT yet contain the orphan"
-        );
-
-        // Re-open the FS — open-time reconcile rebuilds the tail.
-        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
-            .await
-            .unwrap();
-        let got = fs.list_recent_outputs(8).await.unwrap();
-        let ids: Vec<_> = got.iter().map(|o| o.id.clone()).collect();
-        assert!(
-            ids.contains(&orphan.id),
-            "orphan output must surface after open-time reconcile"
-        );
-        assert_eq!(got.len(), 3);
-
-        // The rebuilt tail object on disk now carries every entry.
-        let post_bytes = storage_handle
-            .get("outputs/_tail.json")
-            .await
-            .unwrap()
-            .unwrap();
-        let post_tail: TailObject = serde_json::from_slice(&post_bytes).unwrap();
-        assert_eq!(post_tail.entries.len(), 3);
-        assert!(
-            post_tail
-                .entries
-                .iter()
-                .any(|e| e.filename == orphan_filename),
-            "rebuilt tail should contain the orphan"
-        );
-    }
-
-    /// Open-time reconcile is a no-op (no tail PUT) when on-disk and
-    /// tail agree — pins that we don't churn the tail file on every
-    /// process restart.
-    #[tokio::test]
-    async fn open_time_reconcile_is_noop_when_tail_matches_disk() {
-        let tmp = TempDir::new().unwrap();
-        let mandate = Mandate::new("noop", Duration::from_millis(100), Some(1));
-        let id;
-        {
-            let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
-                .await
-                .unwrap();
-            id = fs
-                .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
-                .await
-                .unwrap();
-            let _ = fs.persist_output("o-1", &[id.clone()]).await.unwrap();
-        }
-        // Snapshot the tail file's bytes before re-open.
-        let before = std::fs::read(tmp.path().join("outputs").join("_tail.json")).unwrap();
-
-        // Re-open. Reconcile detects no lag and skips the PUT,
-        // leaving the bytes byte-identical.
-        let _fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
-            .await
-            .unwrap();
-        let after = std::fs::read(tmp.path().join("outputs").join("_tail.json")).unwrap();
-        assert_eq!(
-            before, after,
-            "tail file should be untouched when reconcile is a no-op"
-        );
-    }
-
-    /// `list_recent_*` returns an empty Vec when the prefix has no
+    /// `list_recent_evidence` returns an empty Vec when the prefix has no
     /// writes yet — "safe to call right after open". Verifies the
     /// no-tail-object path.
     #[tokio::test]
-    async fn list_recent_outputs_returns_empty_when_no_writes() {
+    async fn list_recent_evidence_returns_empty_when_no_writes() {
         let (_tmp, fs, _m) = fresh_fs().await;
-        let out = fs.list_recent_outputs(8).await.unwrap();
-        assert!(out.is_empty());
         let ev = fs.list_recent_evidence(8).await.unwrap();
         assert!(ev.is_empty());
-    }
-
-    /// `n == 0` short-circuits with no I/O. Pin the behaviour so a
-    /// future caller passing `0` (e.g. a feature-flagged
-    /// `recent_outputs = 0` policy) doesn't pay a round-trip.
-    #[tokio::test]
-    async fn list_recent_outputs_n_zero_returns_empty_without_io() {
-        let (_tmp, fs, _m) = fresh_fs().await;
-        let id = fs
-            .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
-            .await
-            .unwrap();
-        let _ = fs.persist_output("o", &[id]).await.unwrap();
-        let got = fs.list_recent_outputs(0).await.unwrap();
-        assert!(got.is_empty());
-    }
-
-    /// Microbench: `list_recent_outputs(8)` over 10_000 outputs.
-    ///
-    /// Output filenames are sha256 digests (non-monotonic), so once
-    /// the tail is at `TAIL_K` capacity `list_recent_outputs` falls
-    /// back to the LIST path and the bench measures LIST cost. The
-    /// bench is retained as a regression guard against the LIST path
-    /// degrading further; restoring an O(1) property at the prefix
-    /// level would need a different naming scheme or a sidecar
-    /// recency index.
-    #[tokio::test]
-    #[ignore = "microbench: long-running"]
-    async fn tail_index_outputs_is_o1_at_10k() {
-        let (_tmp, fs, _m) = fresh_fs().await;
-        let id = fs
-            .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
-            .await
-            .unwrap();
-        for i in 0..10_000usize {
-            fs.persist_output(&format!("o-{i}"), &[id.clone()])
-                .await
-                .unwrap();
-        }
-        let start = std::time::Instant::now();
-        let got = fs.list_recent_outputs(8).await.unwrap();
-        let elapsed = start.elapsed();
-        assert_eq!(got.len(), 8);
-        // Loose bound — LIST fallback over 10 k sha256 filenames +
-        // sort + 8-entry get_many. Regression guard, not a tight cap.
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "list_recent_outputs(8) over 10k outputs took {elapsed:?}; bound exceeded"
-        );
     }
 
     // ---- conflict-log FS writer ------------------

@@ -179,7 +179,7 @@ fn action_label(action: &Decision) -> String {
             let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
             format!("call_tool: {}", names.join(", "))
         }
-        Decision::EmitOutput { .. } => "emit_output".to_string(),
+        Decision::WriteOutput { .. } => "write_output".to_string(),
         Decision::RewriteFs { .. } => "rewrite_fs".to_string(),
         Decision::Read { path } => format!("read {path}"),
         Decision::List { path } => format!("list {path}"),
@@ -621,11 +621,11 @@ mod tests {
             "search \"q\""
         );
         assert_eq!(
-            action_label(&Decision::EmitOutput {
-                content: "x".into(),
-                evidence: vec![]
+            action_label(&Decision::WriteOutput {
+                body: "x".into(),
+                citations: vec![]
             }),
-            "emit_output"
+            "write_output"
         );
         assert_eq!(
             action_label(&Decision::RewriteFs { ops: vec![] }),

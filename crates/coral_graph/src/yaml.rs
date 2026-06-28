@@ -922,8 +922,8 @@ agents:
     mandate:
       text: |
         Your task: call the `echo` tool exactly once with arguments {"msg": "hello from temporal"},
-        then on the next tick emit an Output via the `emit_output` decision whose `content` is a short
-        summary citing the resulting evidence id, then retire. Do not call any other tool; do not loop;
+        then on the next tick emit an Output via the `write_output` decision whose `body` is a short
+        summary citing the resulting evidence id in `citations`, then retire. Do not call any other tool; do not loop;
         do not idle except as a last resort.
       idle_period: 1s
     tools: [echo]
@@ -988,7 +988,7 @@ seed:
     #[test]
     fn rejects_mandate_from_file() {
         let yaml = HAPPY_YAML.replace(
-            "    mandate:\n      text: |\n        Your task: call the `echo` tool exactly once with arguments {\"msg\": \"hello from temporal\"},\n        then on the next tick emit an Output via the `emit_output` decision whose `content` is a short\n        summary citing the resulting evidence id, then retire. Do not call any other tool; do not loop;\n        do not idle except as a last resort.\n      idle_period: 1s\n",
+            "    mandate:\n      text: |\n        Your task: call the `echo` tool exactly once with arguments {\"msg\": \"hello from temporal\"},\n        then on the next tick emit an Output via the `write_output` decision whose `body` is a short\n        summary citing the resulting evidence id in `citations`, then retire. Do not call any other tool; do not loop;\n        do not idle except as a last resort.\n      idle_period: 1s\n",
             "    mandate:\n      text: stub\n      from_file: ./mandates/root.md\n      idle_period: 1s\n",
         );
         let err = parse_err(&yaml);
@@ -1055,7 +1055,7 @@ seed:
     #[test]
     fn rejects_zero_agents() {
         let yaml = HAPPY_YAML.replace(
-            "agents:\n  - id: root\n    mandate:\n      text: |\n        Your task: call the `echo` tool exactly once with arguments {\"msg\": \"hello from temporal\"},\n        then on the next tick emit an Output via the `emit_output` decision whose `content` is a short\n        summary citing the resulting evidence id, then retire. Do not call any other tool; do not loop;\n        do not idle except as a last resort.\n      idle_period: 1s\n    tools: [echo]\n",
+            "agents:\n  - id: root\n    mandate:\n      text: |\n        Your task: call the `echo` tool exactly once with arguments {\"msg\": \"hello from temporal\"},\n        then on the next tick emit an Output via the `write_output` decision whose `body` is a short\n        summary citing the resulting evidence id in `citations`, then retire. Do not call any other tool; do not loop;\n        do not idle except as a last resort.\n      idle_period: 1s\n    tools: [echo]\n",
             "agents: []\n",
         );
         let err = validate_err(&yaml);

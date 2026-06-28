@@ -403,7 +403,7 @@ async fn run_happy_path() -> Result<()> {
     let storage = ensure_installed();
     reset_observed_state();
 
-    // Plant evidence the child's EmitOutput will cite.
+    // Plant evidence the child's WriteOutput will cite.
     let plant_mandate = Mandate::new("plant", Duration::from_millis(0), None);
     let plant_storage: Arc<dyn AgentStorage> = storage.clone();
     let plant_fs = AgentFs::new_with_storage(plant_storage, &child_prefix, &plant_mandate)
@@ -417,16 +417,16 @@ async fn run_happy_path() -> Result<()> {
             Utc::now(),
         ))
         .await
-        .context("plant evidence for child EmitOutput")?;
+        .context("plant evidence for child WriteOutput")?;
 
     // Parent: spin on reconcile_placeholder until the ChildOutput lands,
     // reconcile, then idle until the `step_cap` cap stops it (agents
     // never self-terminate). The cap only bounds the post-reconcile idle
     // tail, so the synthetic evidence is durable before retirement.
     let parent_script = vec![reconcile_placeholder()];
-    let child_script = vec![Decision::EmitOutput {
-        content: "child output".into(),
-        evidence: vec![planted_id.clone()],
+    let child_script = vec![Decision::WriteOutput {
+        body: "child output".into(),
+        citations: vec![planted_id.clone()],
     }];
     install_role_scripts(parent_script, child_script);
 
@@ -541,7 +541,7 @@ async fn drive_happy_path(
         .context("start_workflow(child)")?;
     eprintln!("happy: child started at {child_workflow_id}");
 
-    // Wait for child to retire. It emits once (the EmitOutput signals the
+    // Wait for child to retire. It emits once (the WriteOutput signals the
     // parent), then the `step_cap=1` cap retires it.
     let _child_result: AgentResult = child_handle
         .get_result(WorkflowGetResultOptions::default())
@@ -660,7 +660,7 @@ async fn run_failure_path() -> Result<()> {
             Utc::now(),
         ))
         .await
-        .context("plant evidence for child EmitOutput (failure path)")?;
+        .context("plant evidence for child WriteOutput (failure path)")?;
 
     // Override the OutputId in the reconcile decision with a bogus
     // hash that won't resolve on the child's FS.
@@ -668,9 +668,9 @@ async fn run_failure_path() -> Result<()> {
     set_pending_reconcile((None, None, Some(bogus_output_id.clone())));
 
     let parent_script = vec![reconcile_placeholder()];
-    let child_script = vec![Decision::EmitOutput {
-        content: "fail child output".into(),
-        evidence: vec![planted_id.clone()],
+    let child_script = vec![Decision::WriteOutput {
+        body: "fail child output".into(),
+        citations: vec![planted_id.clone()],
     }];
     install_role_scripts(parent_script, child_script);
 
@@ -817,7 +817,7 @@ async fn run_conflict_path() -> Result<()> {
     let storage = ensure_installed();
     reset_observed_state();
 
-    // Plant evidence the child's EmitOutput will cite.
+    // Plant evidence the child's WriteOutput will cite.
     let plant_mandate = Mandate::new("plant", Duration::from_millis(0), None);
     let plant_storage: Arc<dyn AgentStorage> = storage.clone();
     let plant_fs = AgentFs::new_with_storage(plant_storage, &child_prefix, &plant_mandate)
@@ -831,7 +831,7 @@ async fn run_conflict_path() -> Result<()> {
             Utc::now(),
         ))
         .await
-        .context("plant evidence for child EmitOutput (conflict path)")?;
+        .context("plant evidence for child WriteOutput (conflict path)")?;
 
     // Plant a `ConflictRecordIntent` for the parent's reconcile
     // synthesizer to lift. `resolution: None` → `HeldOpen`.
@@ -853,9 +853,9 @@ async fn run_conflict_path() -> Result<()> {
     });
 
     let parent_script = vec![reconcile_placeholder()];
-    let child_script = vec![Decision::EmitOutput {
-        content: "conflict child output".into(),
-        evidence: vec![planted_id.clone()],
+    let child_script = vec![Decision::WriteOutput {
+        body: "conflict child output".into(),
+        citations: vec![planted_id.clone()],
     }];
     install_role_scripts(parent_script, child_script);
 
