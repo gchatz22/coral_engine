@@ -939,6 +939,7 @@ async fn write_output(
             PersistOutputInput {
                 cfg: input.cfg.clone(),
                 fs_handle: input.fs_handle.clone(),
+                agent_id: input.agent_id,
                 body,
                 citations,
             },

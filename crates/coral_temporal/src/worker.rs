@@ -28,7 +28,7 @@ use coral_node::model_client::CompleteOptions;
 use coral_node::model_client::ModelClient;
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 use coral_node::model_client::ModelRegistry;
-use coral_node::storage::AgentStorage;
+use coral_node::storage::{AgentStorage, BlobSha};
 use coral_node::tools::ToolRegistry;
 use temporalio_client::Client;
 use temporalio_sdk::{Worker, WorkerOptions};
@@ -187,6 +187,35 @@ pub trait StructuralDbStore: Send + Sync {
     /// validates a child's granted `Mandate.tools` against this set so a
     /// parent can only grant tools the graph actually defines.
     async fn list_tool_def_ids_for_graph(&self, graph_id: GraphId) -> anyhow::Result<Vec<String>>;
+
+    /// Point a file's current version at `blob_sha` in the file index
+    /// (insert or move in place). Called by `persist_output` after the FS
+    /// write so the index always names the current bytes; idempotent under
+    /// retries (same path repoints to the same sha). Returns no row to keep
+    /// `coral_graph`'s `FileIndexEntry` out of this crate.
+    async fn set_file_version(
+        &self,
+        agent_id: AgentId,
+        filepath: &str,
+        blob_sha: &BlobSha,
+    ) -> anyhow::Result<()>;
+
+    /// Record one version-pinned citation edge: `(citing file @ sha) ->
+    /// (cited file @ sha)`. Both ends pin a blob sha so provenance is
+    /// time-scrubbable (an old citing version stays bound to the exact cited
+    /// version). Idempotent — an identical edge is a no-op — so a retried
+    /// `persist_output` converges. Append-only otherwise; this is the
+    /// dependency graph the staleness reactor walks.
+    #[allow(clippy::too_many_arguments)]
+    async fn add_citation(
+        &self,
+        citing_agent_id: AgentId,
+        citing_filepath: &str,
+        citing_blob_sha: &BlobSha,
+        cited_agent_id: AgentId,
+        cited_filepath: &str,
+        cited_blob_sha: &BlobSha,
+    ) -> anyhow::Result<()>;
 }
 
 /// Process-wide [`StructuralDbStore`] backend the
@@ -391,6 +420,27 @@ mod tests {
                 panic!(
                     "PanicStructuralDbStore::list_tool_def_ids_for_graph must not be called from this test"
                 )
+            }
+
+            async fn set_file_version(
+                &self,
+                _agent_id: AgentId,
+                _filepath: &str,
+                _blob_sha: &BlobSha,
+            ) -> anyhow::Result<()> {
+                panic!("PanicStructuralDbStore::set_file_version must not be called from this test")
+            }
+
+            async fn add_citation(
+                &self,
+                _citing_agent_id: AgentId,
+                _citing_filepath: &str,
+                _citing_blob_sha: &BlobSha,
+                _cited_agent_id: AgentId,
+                _cited_filepath: &str,
+                _cited_blob_sha: &BlobSha,
+            ) -> anyhow::Result<()> {
+                panic!("PanicStructuralDbStore::add_citation must not be called from this test")
             }
         }
     }

@@ -18,17 +18,17 @@ use coral_node::decision::{
     Session, ToolCall,
 };
 use coral_node::evidence::{EvidenceId, EvidenceRecord};
-use coral_node::fs::{AgentFs, FsError};
+use coral_node::fs::{AgentFs, FsError, CANONICAL_OUTPUT};
 use coral_node::mandate::{Mandate, OutputId};
 use coral_node::model_client::ModelError;
-use coral_node::storage::AgentStorage;
+use coral_node::storage::{AgentStorage, BlobSha};
 use coral_node::trigger::{HumanOp, MandatePatch, Trigger};
 use serde::{Deserialize, Serialize};
 use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use temporalio_sdk::ApplicationFailure;
 
-use crate::worker::{agent_storage, structural_db_store};
+use crate::worker::{agent_storage, structural_db_store, StructuralDbStore};
 use crate::workflow::{AgentConfig, FsHandle};
 
 /// Input to [`AgentActivities::build_seed`]. Carries the per-cycle drained
@@ -157,12 +157,16 @@ pub struct ToolCallFailure {
     pub error: String,
 }
 
-/// Input to [`AgentActivities::persist_output`]. The activity calls
-/// `AgentFs::persist_output` and returns the minted `OutputId`.
+/// Input to [`AgentActivities::persist_output`]. The activity writes the
+/// body to the canonical FS path and the version-pinned citation edges to
+/// the DB reference graph, then returns the minted `OutputId`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PersistOutputInput {
     pub cfg: AgentConfig,
     pub fs_handle: FsHandle,
+    /// This agent's structural-DB id — keys the `file_index` row and the
+    /// `citing`/self-`cited` ends of every citation written for this output.
+    pub agent_id: AgentId,
     pub body: String,
     pub citations: Vec<EvidenceId>,
 }
@@ -424,6 +428,8 @@ pub(crate) async fn append_decision_log_impl(
 
 pub(crate) async fn persist_output_impl(
     storage: Arc<dyn AgentStorage>,
+    db: Arc<dyn StructuralDbStore>,
+    agent_id: AgentId,
     prefix: &str,
     body: &str,
     citations: &[EvidenceId],
@@ -433,7 +439,70 @@ pub(crate) async fn persist_output_impl(
     // `build_seed` (or prior agent boot) is not clobbered.
     let mandate = Mandate::new("", Duration::ZERO, None);
     let fs = AgentFs::new_with_storage(storage, prefix, &mandate).await?;
-    fs.persist_output(body, citations).await
+    // FS first: writes the body and enforces that every citation resolves
+    // to an evidence record on disk (the output-level provenance gate).
+    let output_id = fs.persist_output(body, citations).await?;
+
+    // DB second: the version-pinned reference graph. Both stores are
+    // idempotent, so a retried activity converges. The blob sha is computed
+    // from the same bytes git would commit, so a reference pinned here stays
+    // resolvable against `file_index` (and, once git-backed, the blob).
+    let output_sha = BlobSha::of_bytes(body.as_bytes());
+    db.set_file_version(agent_id, CANONICAL_OUTPUT, &output_sha)
+        .await?;
+    for cid in citations {
+        let (cited_agent, cited_path, cited_sha) = resolve_cited(&fs, agent_id, cid).await?;
+        db.add_citation(
+            agent_id,
+            CANONICAL_OUTPUT,
+            &output_sha,
+            cited_agent,
+            &cited_path,
+            &cited_sha,
+        )
+        .await?;
+    }
+    Ok(output_id)
+}
+
+/// Resolve a citation's *cited* end. A `reconcile` evidence record cites the
+/// CHILD's output at the version folded — a cross-agent edge pinned to the
+/// sha captured at fold time (see [`reconcile_children_impl`]). Any other
+/// evidence is the agent's own tool-call observation, cited at the evidence
+/// file's own blob sha (a within-agent edge). Evidence is immutable, so its
+/// pin can never go stale; only the cross-agent output pin can.
+async fn resolve_cited(
+    fs: &AgentFs,
+    self_agent_id: AgentId,
+    cid: &EvidenceId,
+) -> anyhow::Result<(AgentId, String, BlobSha)> {
+    let bytes = fs.read_evidence_bytes(cid).await?;
+    let record: EvidenceRecord = serde_json::from_slice(&bytes)?;
+    if record.tool == "reconcile" {
+        let child_agent_id: AgentId = serde_json::from_value(
+            record
+                .args
+                .get("child_agent_id")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("reconcile evidence missing child_agent_id"))?,
+        )?;
+        let child_sha = record
+            .args
+            .get("child_output_blob_sha")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("reconcile evidence missing child_output_blob_sha"))?;
+        Ok((
+            child_agent_id,
+            CANONICAL_OUTPUT.to_string(),
+            BlobSha::from_hex(child_sha),
+        ))
+    } else {
+        Ok((
+            self_agent_id,
+            format!("evidence/{}.json", cid.as_str()),
+            BlobSha::of_bytes(&bytes),
+        ))
+    }
 }
 
 /// Activity bundle registered on the worker. The `#[activities]` macro
@@ -659,27 +728,24 @@ impl AgentActivities {
         }
     }
 
-    /// Open an [`AgentFs`] over the process-wide [`AgentStorage`]
-    /// backend at the agent's prefix and delegate to
-    /// [`AgentFs::persist_output`] — which enforces the provenance
-    /// contract (every cited `EvidenceId` must resolve to a file in
-    /// `evidence/`) and updates the outputs tail-index.
+    /// Persist an output across both stores in one activity: the body to
+    /// the canonical FS path (enforcing that every cited `EvidenceId`
+    /// resolves to a file in `evidence/`), then the version-pinned citation
+    /// edges + `file_index` row to the structural DB.
     ///
-    /// Idempotency: `OutputId::new(content, evidence)` is
-    /// content-addressed and `AgentFs::persist_output` uses
-    /// `put_if_absent`, so a Temporal retry of a successful FS write +
-    /// failed activity ack returns the same `OutputId` and does not
-    /// land a second file or shuffle the tail-index entry. Two ticks
-    /// that emit byte-identical `(content, evidence)` also collapse to
-    /// one file.
+    /// Idempotency: both writes are idempotent — the FS `put` overwrites the
+    /// stable path with byte-identical bytes, and `set_file_version` /
+    /// `add_citation` upsert — so a Temporal retry of a successful write +
+    /// failed activity ack converges without duplicating a file or an edge.
     #[activity]
     pub async fn persist_output(
         _ctx: ActivityContext,
         input: PersistOutputInput,
     ) -> Result<OutputId, ActivityError> {
-        let storage = agent_storage();
         let id = persist_output_impl(
-            storage,
+            agent_storage(),
+            structural_db_store(),
+            input.agent_id,
             &input.fs_handle.prefix,
             &input.body,
             &input.citations,
@@ -985,10 +1051,17 @@ pub async fn reconcile_children_impl(
     for (source, child_output) in input.sources.iter().zip(child_outputs.iter()) {
         // `tool = "reconcile"` is the wire-locked discriminator; do
         // NOT introduce a new EvidenceKind / sub-tool taxonomy.
+        //
+        // Pin the blob sha of the body actually *read* here, not the
+        // `source.output_id` the parent signaled (the two can differ under
+        // kept-current semantics). `persist_output` turns this into the
+        // cross-agent citation's `cited_blob_sha`, so the pin records the
+        // exact child version this reconcile folded — pin-what-you-read.
         let args = serde_json::json!({
             "child_agent_id": source.child_ref.agent_id,
             "child_workflow_id": source.child_ref.workflow_id,
             "source_output_id": source.output_id,
+            "child_output_blob_sha": BlobSha::of_bytes(child_output.as_bytes()).as_str(),
         });
         let result = serde_json::to_value(child_output)?;
         let record = EvidenceRecord::new("reconcile", args, result, now);
@@ -1257,6 +1330,7 @@ mod tests {
             fs_handle: FsHandle {
                 prefix: "g1/a1".into(),
             },
+            agent_id: AgentId::new(uuid::Uuid::from_u128(0xa1)),
             body: "claim".into(),
             citations: vec![id],
         };
@@ -1608,8 +1682,12 @@ mod tests {
         .await;
         assert_ne!(id_a, id_b);
 
+        let db = Arc::new(MemoryStructuralDbStore::new());
+        let agent_id = AgentId::new(uuid::Uuid::from_u128(0xa1));
         let out_id = persist_output_impl(
             storage.clone(),
+            db.clone(),
+            agent_id,
             prefix,
             "claim X",
             &[id_a.clone(), id_b.clone()],
@@ -1629,6 +1707,34 @@ mod tests {
             OutputId::new("claim X"),
             "returned id must fingerprint the body"
         );
+
+        // DB reference graph: `file_index` pins the output's blob sha, and
+        // each cited evidence becomes a within-agent citation edge pinned to
+        // the evidence file's own blob sha.
+        let output_sha = BlobSha::of_bytes(b"claim X");
+        assert_eq!(
+            db.current_sha(agent_id, CANONICAL_OUTPUT).as_ref(),
+            Some(&output_sha),
+            "output version pinned in file_index"
+        );
+        let cites = db.citations();
+        assert_eq!(cites.len(), 2, "one citation per cited evidence");
+        for (cid, cite) in [&id_a, &id_b].iter().zip(cites.iter()) {
+            assert_eq!(cite.citing_agent, agent_id);
+            assert_eq!(cite.citing_path, CANONICAL_OUTPUT);
+            assert_eq!(cite.citing_sha, output_sha);
+            assert_eq!(
+                cite.cited_agent, agent_id,
+                "own tool-call evidence is a within-agent edge"
+            );
+            assert_eq!(cite.cited_path, format!("evidence/{}.json", cid.as_str()));
+            let ev_bytes = fs.read_evidence_bytes(cid).await.unwrap();
+            assert_eq!(
+                cite.cited_sha,
+                BlobSha::of_bytes(&ev_bytes),
+                "evidence pinned at its own blob sha"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1639,9 +1745,18 @@ mod tests {
         // Reference an evidence id that was never planted — the
         // `AgentFs::persist_output` provenance check fires.
         let bogus = EvidenceId::new("tool_x", &json!({}), &json!({"never": "written"}));
-        let err = persist_output_impl(storage.clone(), prefix, "claim Y", &[bogus.clone()])
-            .await
-            .expect_err("must fail on unresolved evidence id");
+        let db = Arc::new(MemoryStructuralDbStore::new());
+        let agent_id = AgentId::new(uuid::Uuid::from_u128(0xa2));
+        let err = persist_output_impl(
+            storage.clone(),
+            db.clone(),
+            agent_id,
+            prefix,
+            "claim Y",
+            &[bogus.clone()],
+        )
+        .await
+        .expect_err("must fail on unresolved evidence id");
         let typed = err.downcast_ref::<FsError>().expect("typed FsError");
         match typed {
             FsError::EvidenceNotFound(missing) => assert_eq!(missing, &bogus),
@@ -1661,6 +1776,17 @@ mod tests {
             err.downcast_ref::<FsError>(),
             Some(FsError::OutputNotFound)
         ));
+
+        // The FS provenance gate runs before the DB write, so a rejected
+        // output leaves the reference graph untouched.
+        assert!(
+            db.citations().is_empty(),
+            "rejected output writes no citation edges"
+        );
+        assert!(
+            db.current_sha(agent_id, CANONICAL_OUTPUT).is_none(),
+            "rejected output writes no file_index row"
+        );
     }
 
     #[tokio::test]
@@ -1670,7 +1796,9 @@ mod tests {
         let storage: Arc<dyn coral_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
         let prefix = "graphs/g1/agents/a-empty/";
 
-        let err = persist_output_impl(storage, prefix, "claim Z", &[])
+        let db = Arc::new(MemoryStructuralDbStore::new());
+        let agent_id = AgentId::new(uuid::Uuid::from_u128(0xa3));
+        let err = persist_output_impl(storage, db, agent_id, prefix, "claim Z", &[])
             .await
             .expect_err("must fail on empty evidence");
         let typed = err.downcast_ref::<FsError>().expect("typed FsError");
@@ -1810,9 +1938,22 @@ mod tests {
         allocated_id: AgentId,
     }
 
+    /// One recorded `add_citation` call — a version-pinned edge.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct RecordedCitation {
+        citing_agent: AgentId,
+        citing_path: String,
+        citing_sha: BlobSha,
+        cited_agent: AgentId,
+        cited_path: String,
+        cited_sha: BlobSha,
+    }
+
     struct MemoryStructuralDbStore {
         agents: std::sync::Mutex<Vec<RecordedAgent>>,
         edges: std::sync::Mutex<Vec<(AgentId, AgentId)>>,
+        file_index: std::sync::Mutex<Vec<(AgentId, String, BlobSha)>>,
+        citations: std::sync::Mutex<Vec<RecordedCitation>>,
         defined_tools: Vec<String>,
     }
 
@@ -1825,8 +1966,26 @@ mod tests {
             Self {
                 agents: std::sync::Mutex::new(Vec::new()),
                 edges: std::sync::Mutex::new(Vec::new()),
+                file_index: std::sync::Mutex::new(Vec::new()),
+                citations: std::sync::Mutex::new(Vec::new()),
                 defined_tools,
             }
+        }
+
+        /// Current sha bound to `(agent, path)` — last write wins, mirroring
+        /// the real upsert. `None` if the path was never written.
+        fn current_sha(&self, agent: AgentId, path: &str) -> Option<BlobSha> {
+            self.file_index
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(a, p, _)| *a == agent && p == path)
+                .map(|(_, _, sha)| sha.clone())
+        }
+
+        fn citations(&self) -> Vec<RecordedCitation> {
+            self.citations.lock().unwrap().clone()
         }
     }
 
@@ -1859,6 +2018,41 @@ mod tests {
             _graph_id: GraphId,
         ) -> anyhow::Result<Vec<String>> {
             Ok(self.defined_tools.clone())
+        }
+
+        async fn set_file_version(
+            &self,
+            agent_id: AgentId,
+            filepath: &str,
+            blob_sha: &BlobSha,
+        ) -> anyhow::Result<()> {
+            self.file_index.lock().unwrap().push((
+                agent_id,
+                filepath.to_string(),
+                blob_sha.clone(),
+            ));
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn add_citation(
+            &self,
+            citing_agent_id: AgentId,
+            citing_filepath: &str,
+            citing_blob_sha: &BlobSha,
+            cited_agent_id: AgentId,
+            cited_filepath: &str,
+            cited_blob_sha: &BlobSha,
+        ) -> anyhow::Result<()> {
+            self.citations.lock().unwrap().push(RecordedCitation {
+                citing_agent: citing_agent_id,
+                citing_path: citing_filepath.to_string(),
+                citing_sha: citing_blob_sha.clone(),
+                cited_agent: cited_agent_id,
+                cited_path: cited_filepath.to_string(),
+                cited_sha: cited_blob_sha.clone(),
+            });
+            Ok(())
         }
     }
 
@@ -2217,8 +2411,11 @@ mod tests {
         // provenance check inside `persist_output` passes because reconcile
         // wrote that evidence under the parent's own prefix.
         let parent_prefix = format!("graphs/{graph_id}/agents/{parent_agent_id}");
+        let db = Arc::new(MemoryStructuralDbStore::new());
         let out_v1 = persist_output_impl(
             storage.clone(),
+            db.clone(),
+            parent_agent_id,
             &parent_prefix,
             "consolidated report (folds A)",
             &[r1.synthetic_evidence[0].clone()],
@@ -2227,6 +2424,8 @@ mod tests {
         .expect("parent emits refreshed report v1");
         let out_v2 = persist_output_impl(
             storage.clone(),
+            db.clone(),
+            parent_agent_id,
             &parent_prefix,
             "consolidated report (folds A + newer B)",
             &[r2.synthetic_evidence[0].clone()],
@@ -2261,6 +2460,137 @@ mod tests {
             after_reseen.len(),
             2,
             "re-seen output must not add a synthetic record"
+        );
+    }
+
+    /// The cross-agent reference edge and the staleness-detection prerequisite.
+    /// A child writes its output (pinning its own `file_index` sha); the parent
+    /// folds it via reconcile and refreshes its Output citing the synthetic
+    /// evidence. The resulting citation must be a CROSS-AGENT edge to the
+    /// child's canonical output, pinned to the exact version folded — and that
+    /// pinned sha must equal the child's own `file_index` sha (the same bytes
+    /// flow through the reconcile read and the child write). If that equality
+    /// drifts, the staleness reactor silently never fires. When the child later
+    /// refreshes, its current sha advances while the parent's pin is retained —
+    /// that gap between pin and current sha is the detectable staleness.
+    #[tokio::test]
+    async fn reconcile_then_persist_writes_cross_agent_edge_pinned_to_child_version() {
+        use coral_node::agent_ref::AgentRef;
+        use uuid::Uuid;
+
+        let storage: Arc<dyn coral_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
+        let db = Arc::new(MemoryStructuralDbStore::new());
+        let graph_id = GraphId::new(Uuid::new_v4());
+        let parent_agent_id = AgentId::new(Uuid::new_v4());
+        let child_id = AgentId::new(Uuid::new_v4());
+
+        // Child writes its output the way production does, so `set_file_version`
+        // records its current blob sha.
+        let child_prefix = format!("graphs/{graph_id}/agents/{child_id}");
+        let child_ev = plant_evidence(
+            storage.clone(),
+            &child_prefix,
+            "scan",
+            json!({"q": "fab"}),
+            json!({"util": 91}),
+        )
+        .await;
+        let child_body = "child finding: utilization 91%";
+        persist_output_impl(
+            storage.clone(),
+            db.clone(),
+            child_id,
+            &child_prefix,
+            child_body,
+            &[child_ev],
+        )
+        .await
+        .expect("child persists output");
+
+        // Parent folds the child's current output, then refreshes its own.
+        let input = ReconcileChildrenInput {
+            parent_graph_id: graph_id,
+            parent_agent_id,
+            sources: vec![ReconcileSource {
+                child_ref: AgentRef::new(child_prefix.clone(), child_id),
+                output_id: OutputId::new(child_body),
+            }],
+            conflict: None,
+        };
+        let r = reconcile_children_impl(storage.clone(), input, fixed_now())
+            .await
+            .expect("reconcile child");
+        let parent_prefix = format!("graphs/{graph_id}/agents/{parent_agent_id}");
+        persist_output_impl(
+            storage.clone(),
+            db.clone(),
+            parent_agent_id,
+            &parent_prefix,
+            "consolidated finding",
+            &[r.synthetic_evidence[0].clone()],
+        )
+        .await
+        .expect("parent persists consolidated output");
+
+        // Exactly one parent → child edge, citing the child's canonical output.
+        let edge = db
+            .citations()
+            .into_iter()
+            .find(|c| c.citing_agent == parent_agent_id && c.cited_agent == child_id)
+            .expect("a cross-agent citation to the child");
+        assert_eq!(edge.citing_path, CANONICAL_OUTPUT);
+        assert_eq!(
+            edge.cited_path, CANONICAL_OUTPUT,
+            "cross-agent edge cites the child's canonical output, not parent self-evidence"
+        );
+
+        // Staleness-detection prerequisite: the pinned sha equals the child's
+        // current file_index sha equals of_bytes(child_body) — one version,
+        // three paths. Drift here would make staleness silently undetectable.
+        let child_current = db
+            .current_sha(child_id, CANONICAL_OUTPUT)
+            .expect("child file_index set by its own write");
+        assert_eq!(
+            edge.cited_sha, child_current,
+            "the parent's pin must equal the child's file_index sha"
+        );
+        assert_eq!(edge.cited_sha, BlobSha::of_bytes(child_body.as_bytes()));
+
+        // Child refreshes → its current sha advances, but the parent's pin is
+        // retained at the folded version. That difference between current and
+        // pinned sha is the detectable staleness; resolving the pinned bytes
+        // back is a separate concern (it needs a retained-history backend).
+        let child_ev2 = plant_evidence(
+            storage.clone(),
+            &child_prefix,
+            "scan",
+            json!({"q": "fab"}),
+            json!({"util": 95}),
+        )
+        .await;
+        persist_output_impl(
+            storage.clone(),
+            db.clone(),
+            child_id,
+            &child_prefix,
+            "child finding: utilization 95%",
+            &[child_ev2],
+        )
+        .await
+        .expect("child refreshes output");
+        let child_after = db
+            .current_sha(child_id, CANONICAL_OUTPUT)
+            .expect("child file_index after refresh");
+        assert_ne!(
+            child_after, edge.cited_sha,
+            "child's current sha must advance past the parent's pin"
+        );
+        assert!(
+            db.citations()
+                .iter()
+                .any(|c| c.citing_agent == parent_agent_id
+                    && c.cited_sha == BlobSha::of_bytes(child_body.as_bytes())),
+            "the parent's earlier pin is retained, not auto-followed to latest"
         );
     }
 

@@ -166,6 +166,20 @@ impl BlobSha {
         Self(hex.into())
     }
 
+    /// Compute a file's `BlobSha` from its bytes, without a repository.
+    ///
+    /// Delegates to libgit2's object hasher, so the result is identical to
+    /// the sha [`GitStorage`](super::GitStorage)'s `commit` records for the
+    /// same bytes — letting a reference be pinned at write time (DB) and
+    /// resolved later (git) by the same address. That equality is asserted
+    /// by a guard test; if it ever drifts (e.g. an `autocrlf`/filter config
+    /// crept in) staleness detection silently breaks.
+    pub fn of_bytes(bytes: &[u8]) -> Self {
+        let oid = git2::Oid::hash_object(git2::ObjectType::Blob, bytes)
+            .expect("libgit2 blob hashing of in-memory bytes is infallible");
+        Self(oid.to_string())
+    }
+
     /// The 40-char lowercase hex digest.
     pub fn as_str(&self) -> &str {
         &self.0

@@ -31,7 +31,11 @@ use coral_node::mandate::Mandate;
 use coral_node::storage::{AgentStorage, MemoryStorage};
 use coral_node::tools::{Tool, ToolRegistry};
 use coral_temporal::activities::set_decision_script;
-use coral_temporal::worker::{build_worker, install_agent_storage, install_tool_registry};
+use coral_temporal::worker::{
+    build_worker, install_agent_storage, install_structural_db_store, install_tool_registry,
+};
+
+mod common;
 use coral_temporal::workflow::{
     agent_workflow_id, AgentInput, AgentResult, AgentWorkflow, Carryover,
 };
@@ -111,6 +115,7 @@ fn ensure_installed() -> Arc<MemoryStorage> {
             .expect("SHARED_STORAGE set exactly once");
         let dyn_storage: Arc<dyn AgentStorage> = storage;
         install_agent_storage(dyn_storage);
+        install_structural_db_store(Arc::new(common::NoopStructuralDb::new()));
 
         let mut reg = ToolRegistry::new();
         for name in SUCCEEDING_TOOL_NAMES {
