@@ -47,10 +47,13 @@ use coral_node::decision::{ClaimSeed, Decision, ToolCall};
 use coral_node::evidence::EvidenceRecord;
 use coral_node::fs::AgentFs;
 use coral_node::mandate::Mandate;
-use coral_node::storage::{AgentStorage, MemoryStorage};
+use coral_node::storage::{AgentStorage, BlobSha, MemoryStorage};
 use coral_node::tools::{Tool, ToolRegistry};
 use coral_temporal::activities::{set_decision_script, DecisionLogEntry};
-use coral_temporal::worker::{build_worker, install_agent_storage, install_tool_registry};
+use coral_temporal::worker::{
+    build_worker, install_agent_storage, install_structural_db_store, install_tool_registry,
+    StructuralDbStore,
+};
 use coral_temporal::workflow::{agent_workflow_id, AgentInput, AgentResult, AgentWorkflow};
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
@@ -89,6 +92,56 @@ impl Tool for EchoLike {
 
 const TOOL_NAME: &str = "echo";
 
+/// No-op `StructuralDbStore` so the scripted `WriteOutput` cycle drives the
+/// `persist_output` activity without a Postgres backend. This test runs on
+/// `MemoryStorage` with synthesized UUIDs (no agent rows exist), so the
+/// file-index / citation writes have nothing to bind to and are dropped;
+/// the structural-DB surface itself is covered by the `GraphStore` unit
+/// tests. WriteOutput is the only DB-touching decision scripted here, so
+/// the spawn-path methods are unreachable.
+struct NoopStructuralDb;
+
+#[async_trait]
+impl StructuralDbStore for NoopStructuralDb {
+    async fn add_agent(&self, _graph_id: GraphId, _name: &str) -> anyhow::Result<AgentId> {
+        Ok(AgentId::new(uuid::Uuid::new_v4()))
+    }
+
+    async fn add_edge(
+        &self,
+        _parent_agent_id: AgentId,
+        _child_agent_id: AgentId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn list_tool_def_ids_for_graph(&self, _graph_id: GraphId) -> anyhow::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    async fn set_file_version(
+        &self,
+        _agent_id: AgentId,
+        _filepath: &str,
+        _blob_sha: &BlobSha,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_citation(
+        &self,
+        _citing_agent_id: AgentId,
+        _citing_filepath: &str,
+        _citing_blob_sha: &BlobSha,
+        _cited_agent_id: AgentId,
+        _cited_filepath: &str,
+        _cited_blob_sha: &BlobSha,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 /// Install the worker-shared storage + tool registry once per process.
 /// Matches `workflow_smoke.rs::ensure_installed` verbatim — separate
 /// test binary means a separate process means a separate set of
@@ -112,6 +165,8 @@ fn ensure_installed() -> Arc<MemoryStorage> {
         // map the advertised name to that def id for the call to be allowed.
         reg.record_owner(TOOL_NAME, "echo");
         install_tool_registry(Arc::new(reg));
+
+        install_structural_db_store(Arc::new(NoopStructuralDb));
     });
     SHARED_STORAGE.get().cloned().expect("storage installed")
 }

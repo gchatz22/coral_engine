@@ -64,12 +64,13 @@ use coral_node::decision::{
 use coral_node::evidence::{EvidenceId, EvidenceRecord};
 use coral_node::fs::AgentFs;
 use coral_node::mandate::{Mandate, OutputId};
-use coral_node::storage::{AgentStorage, MemoryStorage};
+use coral_node::storage::{AgentStorage, BlobSha, MemoryStorage};
 use coral_node::tools::ToolRegistry;
 use coral_node::trigger::Trigger;
 use coral_temporal::activities::set_decision_script;
 use coral_temporal::worker::{
-    build_worker, install_agent_storage, install_decide, install_tool_registry,
+    build_worker, install_agent_storage, install_decide, install_structural_db_store,
+    install_tool_registry, StructuralDbStore,
 };
 use coral_temporal::workflow::{AgentInput, AgentResult, AgentWorkflow, FsHandle, ParentRef};
 
@@ -122,6 +123,56 @@ static CHILD_B_SCRIPT: OnceLock<Mutex<VecDeque<Decision>>> = OnceLock::new();
 
 static INIT: std::sync::Once = std::sync::Once::new();
 
+/// No-op `StructuralDbStore`. The reconcile + `WriteOutput` cycles drive
+/// the `persist_output` activity, which writes the file index / citation
+/// edges; this test asserts the FS-side provenance trail (reconcile
+/// evidence records, output bodies) on `MemoryStorage`, not the DB rows,
+/// so those writes are dropped. The structural-DB surface is covered by
+/// the `GraphStore` unit tests. No `SpawnChild` is scripted (children are
+/// seeded workflows), so the spawn-path methods are unreachable.
+struct NoopStructuralDb;
+
+#[async_trait]
+impl StructuralDbStore for NoopStructuralDb {
+    async fn add_agent(&self, _graph_id: GraphId, _name: &str) -> anyhow::Result<AgentId> {
+        Ok(AgentId::new(Uuid::new_v4()))
+    }
+
+    async fn add_edge(
+        &self,
+        _parent_agent_id: AgentId,
+        _child_agent_id: AgentId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn list_tool_def_ids_for_graph(&self, _graph_id: GraphId) -> anyhow::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    async fn set_file_version(
+        &self,
+        _agent_id: AgentId,
+        _filepath: &str,
+        _blob_sha: &BlobSha,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_citation(
+        &self,
+        _citing_agent_id: AgentId,
+        _citing_filepath: &str,
+        _citing_blob_sha: &BlobSha,
+        _cited_agent_id: AgentId,
+        _cited_filepath: &str,
+        _cited_blob_sha: &BlobSha,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 /// One-shot install of shared storage + tool registry +
 /// `RoutingDecide`. Subsequent calls are no-ops (the install hooks
 /// panic on double-install; `Once` guards against that).
@@ -153,6 +204,8 @@ fn ensure_installed() -> Arc<MemoryStorage> {
             .expect("CHILD_B_SCRIPT set exactly once");
 
         install_decide(Arc::new(RoutingDecide));
+
+        install_structural_db_store(Arc::new(NoopStructuralDb));
     });
     SHARED_STORAGE.get().cloned().expect("storage installed")
 }
