@@ -21,14 +21,16 @@ use coral_node::evidence::{EvidenceId, EvidenceRecord};
 use coral_node::fs::{AgentFs, FsError, CANONICAL_OUTPUT};
 use coral_node::mandate::{Mandate, OutputId};
 use coral_node::model_client::ModelError;
-use coral_node::storage::{AgentStorage, BlobSha};
+use coral_node::storage::{AgentStorage, BlobSha, VersionedStorage};
 use coral_node::trigger::{HumanOp, MandatePatch, Trigger};
 use serde::{Deserialize, Serialize};
 use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use temporalio_sdk::ApplicationFailure;
 
-use crate::worker::{agent_storage, structural_db_store, StructuralDbStore};
+use crate::worker::{
+    agent_storage, agent_versioned_storage_opt, structural_db_store, StructuralDbStore,
+};
 use crate::workflow::{AgentConfig, FsHandle};
 
 /// Input to [`AgentActivities::build_seed`]. Carries the per-cycle drained
@@ -216,6 +218,17 @@ pub struct AppendDecisionLogInput {
     /// steps). Each step lands at its own `decisions/<tick>-<step>.jsonl`.
     pub step: u64,
     pub decision_summary: String,
+}
+
+/// Input to [`AgentActivities::commit_tick`]. The cycle-boundary commit that
+/// snapshots the agent's FS as one tick. `tick` is the completed cycle's
+/// counter — it both names the commit (`"tick {tick}"`) and is the only
+/// non-deterministic-free field, since it comes from durable workflow state,
+/// not wall-clock.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommitTickInput {
+    pub fs_handle: FsHandle,
+    pub tick: u64,
 }
 
 /// Input for the `register_child_in_structural_db` activity. Carries
@@ -423,6 +436,19 @@ pub(crate) async fn append_decision_log_impl(
     fs.storage()
         .put(&key, bytes::Bytes::from(line.into_bytes()))
         .await?;
+    Ok(())
+}
+
+/// Commit one agent's working tree as a single tick via the versioned
+/// backend. The message is `"tick {tick}"` — deterministic (sourced from
+/// durable workflow state, never wall-clock) so a Temporal retry commits an
+/// identical message, and idempotent because a clean tree is a git no-op.
+pub(crate) async fn commit_tick_impl(
+    storage: Arc<dyn VersionedStorage>,
+    prefix: &str,
+    tick: u64,
+) -> anyhow::Result<()> {
+    storage.commit(prefix, &format!("tick {tick}")).await?;
     Ok(())
 }
 
@@ -837,6 +863,22 @@ impl AgentActivities {
             .unwrap_or_else(Utc::now);
         let entry = DecisionLogEntry::new(input.tick, input.step, input.decision_summary, ts);
         append_decision_log_impl(agent_storage(), &input.fs_handle.prefix, &entry).await?;
+        Ok(())
+    }
+
+    /// Commit the agent's FS as one tick at the cycle boundary ("commit =
+    /// cycle"). No-ops when no [`VersionedStorage`] backend is installed
+    /// (e.g. a hermetic test on a plain `MemoryStorage`), so the workflow can
+    /// schedule it unconditionally. Idempotent on retry: a clean tree is a git
+    /// no-op, and the `"tick {tick}"` message is deterministic.
+    #[activity]
+    pub async fn commit_tick(
+        _ctx: ActivityContext,
+        input: CommitTickInput,
+    ) -> Result<(), ActivityError> {
+        if let Some(storage) = agent_versioned_storage_opt() {
+            commit_tick_impl(storage, &input.fs_handle.prefix, input.tick).await?;
+        }
         Ok(())
     }
 
@@ -1924,6 +1966,107 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.as_ref(), second.as_ref());
+    }
+
+    /// Spy [`VersionedStorage`] recording every `commit(prefix, message)` so a
+    /// hermetic test can assert the cycle-boundary commit's deterministic
+    /// message without a git backend. The data plane delegates to an inner
+    /// `MemoryStorage` — `commit_tick_impl` only commits, so it stays untouched.
+    struct CommitSpy {
+        inner: MemoryStorage,
+        commits: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl CommitSpy {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStorage::new(),
+                commits: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentStorage for CommitSpy {
+        async fn put(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+        ) -> coral_node::storage::StorageResult<()> {
+            self.inner.put(key, value).await
+        }
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+        ) -> coral_node::storage::StorageResult<coral_node::storage::PutOutcome> {
+            self.inner.put_if_absent(key, value).await
+        }
+        async fn get(&self, key: &str) -> coral_node::storage::StorageResult<Option<bytes::Bytes>> {
+            self.inner.get(key).await
+        }
+        async fn get_many(
+            &self,
+            keys: &[&str],
+        ) -> coral_node::storage::StorageResult<Vec<Option<bytes::Bytes>>> {
+            self.inner.get_many(keys).await
+        }
+        async fn delete(&self, key: &str) -> coral_node::storage::StorageResult<()> {
+            self.inner.delete(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            after: Option<&str>,
+            limit: usize,
+        ) -> coral_node::storage::StorageResult<coral_node::storage::ListPage> {
+            self.inner.list(prefix, after, limit).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VersionedStorage for CommitSpy {
+        async fn commit(
+            &self,
+            agent_prefix: &str,
+            message: &str,
+        ) -> coral_node::storage::StorageResult<Vec<(String, BlobSha)>> {
+            self.commits
+                .lock()
+                .unwrap()
+                .push((agent_prefix.to_string(), message.to_string()));
+            Ok(Vec::new())
+        }
+        async fn read_at(
+            &self,
+            _agent_prefix: &str,
+            _sha: &BlobSha,
+        ) -> coral_node::storage::StorageResult<Option<bytes::Bytes>> {
+            Ok(None)
+        }
+    }
+
+    /// `commit_tick_impl` commits the agent's prefix with the deterministic
+    /// `"tick {tick}"` message — and a retry (Temporal at-least-once) replays
+    /// the identical message, the property that keeps commit-per-tick safe.
+    #[tokio::test]
+    async fn commit_tick_impl_commits_with_deterministic_tick_message() {
+        let spy = Arc::new(CommitSpy::new());
+        let storage: Arc<dyn VersionedStorage> = spy.clone();
+        let prefix = "graphs/g/agents/a";
+
+        commit_tick_impl(storage.clone(), prefix, 7).await.unwrap();
+        commit_tick_impl(storage, prefix, 7).await.unwrap();
+
+        let commits = spy.commits.lock().unwrap();
+        assert_eq!(
+            *commits,
+            vec![
+                (prefix.to_string(), "tick 7".to_string()),
+                (prefix.to_string(), "tick 7".to_string()),
+            ],
+            "commit_tick_impl must commit (prefix, \"tick {{tick}}\") deterministically across retries"
+        );
     }
 
     /// In-memory `StructuralDbStore` fake. Records every `add_agent`

@@ -369,6 +369,10 @@ async fn drive(
     let mut persist_output_schedules = 0usize;
     let mut persist_retirement_schedules = 0usize;
     let mut apply_fs_ops_schedules = 0usize;
+    // The cycle-boundary commit fires once per completed cycle and NOT on the
+    // retire path (which returns before the boundary). One scripted cycle then
+    // a `step_cap` retire ⇒ exactly one `commit_tick` schedule.
+    let mut commit_tick_schedules = 0usize;
     // A retiring workflow must NOT emit a
     // `WorkflowExecutionContinuedAsNew` event — counting CAN events is
     // the most direct end-to-end assertion that the CAN check sits
@@ -386,6 +390,7 @@ async fn drive(
                         "persist_output" => persist_output_schedules += 1,
                         "persist_retirement" => persist_retirement_schedules += 1,
                         "apply_fs_ops" => apply_fs_ops_schedules += 1,
+                        "commit_tick" => commit_tick_schedules += 1,
                         _ => {}
                     }
                 }
@@ -424,6 +429,11 @@ async fn drive(
         "a retiring workflow must NOT emit a \
          WorkflowExecutionContinuedAsNew event (the CAN check sits after \
          the retirement-return arms in run()), got {continued_as_new_events}"
+    );
+    assert_eq!(
+        commit_tick_schedules, 1,
+        "exactly one commit_tick (one completed cycle); the retire path must \
+         NOT commit, got {commit_tick_schedules}"
     );
 
     // The `persist_retirement` activity body wrote
@@ -981,6 +991,7 @@ async fn drive_resume(
     let mut build_seed_schedules = 0usize;
     let mut execute_tool_schedules = 0usize;
     let mut persist_retirement_schedules = 0usize;
+    let mut commit_tick_schedules = 0usize;
     for ev in history.events() {
         if let Some(Attributes::ActivityTaskScheduledEventAttributes(a)) = &ev.attributes {
             if let Some(ty) = &a.activity_type {
@@ -988,6 +999,7 @@ async fn drive_resume(
                     "build_seed" => build_seed_schedules += 1,
                     "execute_tool" => execute_tool_schedules += 1,
                     "persist_retirement" => persist_retirement_schedules += 1,
+                    "commit_tick" => commit_tick_schedules += 1,
                     _ => {}
                 }
             }
@@ -1004,6 +1016,11 @@ async fn drive_resume(
     assert!(
         persist_retirement_schedules >= 1,
         "resumed run must retire at the step_cap, got {persist_retirement_schedules}"
+    );
+    assert_eq!(
+        commit_tick_schedules, 1,
+        "the resumed cycle commits exactly once at its true completion (a cycle \
+         spanning a continue-as-new still gets one commit), got {commit_tick_schedules}"
     );
 
     // The continuation decision logs at `<tick>-<step>` = `3-2` (step derived

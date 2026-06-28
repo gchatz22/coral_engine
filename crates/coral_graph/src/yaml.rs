@@ -2169,7 +2169,7 @@ seed:
     /// `mandate.md` blob sha resolves back.
     #[tokio::test]
     async fn materialize_then_seed_commit_versions_each_agent_independently() {
-        use coral_node::storage::{BlobSha, PerAgentGitStorage};
+        use coral_node::storage::{BlobSha, PerAgentGitStorage, VersionedStorage};
 
         let g = parse_and_validate(TREE_YAML).expect("tree fixture validates");
         let applied = synthetic_applied_tree(&g);
@@ -2185,7 +2185,7 @@ seed:
         for start in &starts {
             let prefix = &start.input.fs_handle.prefix;
             let manifest = storage
-                .commit_agent(prefix, "seed: coral apply")
+                .commit(prefix, "seed: coral apply")
                 .await
                 .expect("seed commit");
             let sha: &BlobSha = &manifest
@@ -2194,7 +2194,7 @@ seed:
                 .expect("mandate.md in the committed manifest")
                 .1;
             let bytes = storage
-                .read_agent_at(prefix, sha)
+                .read_at(prefix, sha)
                 .await
                 .unwrap()
                 .expect("seed mandate.md blob resolves by sha");

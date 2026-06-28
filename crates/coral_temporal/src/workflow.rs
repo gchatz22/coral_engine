@@ -44,9 +44,9 @@ use temporalio_sdk::{
 };
 
 use crate::activities::{
-    AgentActivities, AppendDecisionLogInput, ApplyFsOpsInput, BuildSeedInput, DecideStepInput,
-    ExecuteToolInput, FsNavOp, PersistOutputInput, PersistRetirementInput, ReadFsInput,
-    ReconcileChildrenInput, RegisterChildInStructuralDbInput, RegisterChildOutcome,
+    AgentActivities, AppendDecisionLogInput, ApplyFsOpsInput, BuildSeedInput, CommitTickInput,
+    DecideStepInput, ExecuteToolInput, FsNavOp, PersistOutputInput, PersistRetirementInput,
+    ReadFsInput, ReconcileChildrenInput, RegisterChildInStructuralDbInput, RegisterChildOutcome,
     ToolCallFailure, ToolCallOutcome,
 };
 use coral_node::decision::{ConflictRecordIntent, ReconcileSource};
@@ -621,6 +621,16 @@ impl AgentWorkflow {
                     }
                 }
             }
+            // Commit the agent's FS as this completed cycle ("commit =
+            // cycle"). Sits after every inner-loop `break` (Idle / runaway /
+            // force-idle) but before the tick bump, so it commits under the
+            // tick the cycle ran as. The mid-cycle continue-as-new returns
+            // before reaching here, so a cycle that spanned a CAN still gets
+            // exactly one commit — at its true completion on the resumed run.
+            // The retire path bypasses this entirely (it returns above): any
+            // prior cycle's work was already committed at its own boundary.
+            commit_tick(ctx, &input.fs_handle, tick).await?;
+
             // Bump the tick (cycle counter) after the cycle completes so the
             // next cycle's decisions land under `decisions/<tick+1>-*.jsonl`.
             // The retire path above intentionally bypasses this — the
@@ -1030,6 +1040,27 @@ async fn log_decision(
             tick,
             step,
             decision_summary: decision_summary(decision),
+        },
+        activity_opts(),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Invoke the `commit_tick` activity for the just-completed cycle. `tick` is
+/// the cycle's counter (read before the post-cycle bump), so the commit lands
+/// under the tick the cycle ran as and the message stays deterministic across
+/// retries.
+async fn commit_tick(
+    ctx: &WorkflowContext<AgentWorkflow>,
+    fs_handle: &FsHandle,
+    tick: u64,
+) -> WorkflowResult<()> {
+    ctx.start_activity(
+        AgentActivities::commit_tick,
+        CommitTickInput {
+            fs_handle: fs_handle.clone(),
+            tick,
         },
         activity_opts(),
     )
