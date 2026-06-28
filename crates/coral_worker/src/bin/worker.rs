@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use coral_graph::GraphStore;
-use coral_node::storage::LocalStorage;
+use coral_node::storage::PerAgentGitStorage;
 use coral_worker::tool_provider::DbToolRegistryProvider;
 use sqlx::postgres::PgPoolOptions;
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
@@ -88,11 +88,14 @@ async fn main() -> Result<()> {
     let fs_root = env::var("AGENT_FS_ROOT").unwrap_or_else(|_| DEFAULT_FS_ROOT.into());
     let fs_root_path = PathBuf::from(&fs_root);
     let storage = Arc::new(
-        LocalStorage::new(fs_root_path.clone())
-            .with_context(|| format!("opening LocalStorage at {fs_root}"))?,
+        PerAgentGitStorage::new(fs_root_path.clone())
+            .with_context(|| format!("opening PerAgentGitStorage at {fs_root}"))?,
     );
     install_agent_storage(storage);
-    info!(fs_root = fs_root.as_str(), "installed AgentStorage backend");
+    info!(
+        fs_root = fs_root.as_str(),
+        "installed AgentStorage backend (per-agent git-versioned)"
+    );
 
     let (providers, decide) = build_decide_from_env()?;
     install_decide(decide);
