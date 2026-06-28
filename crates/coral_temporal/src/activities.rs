@@ -2069,6 +2069,110 @@ mod tests {
         );
     }
 
+    /// The full provenance-retention chain over the production git backend:
+    /// `persist_output_impl` (FS write + DB version-pin) → `commit_tick_impl`
+    /// (cycle-boundary commit) → refresh the canonical output next cycle →
+    /// the sha pinned at the first cycle still resolves to the original bytes
+    /// via `read_at`, even though HEAD now holds the refreshed output. The
+    /// individual links each have a unit test; this is the only hermetic
+    /// coverage of them composed on a real `PerAgentGitStorage` (the worker
+    /// install seam is exercised only by the live persistent-monitor run).
+    #[tokio::test]
+    async fn pinned_output_resolves_after_refresh_over_git_backend() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let git = Arc::new(coral_node::storage::PerAgentGitStorage::new(tmp.path()).unwrap());
+        let storage: Arc<dyn coral_node::storage::AgentStorage> = git.clone();
+        let versioned: Arc<dyn VersionedStorage> = git.clone();
+        let prefix = "graphs/g1/agents/a1/";
+
+        // One immutable evidence record both cycles cite — the provenance
+        // gate must pass for either output to persist.
+        let cite = plant_evidence(
+            storage.clone(),
+            prefix,
+            "tool_a",
+            json!({"q": "alpha"}),
+            json!({"r": 1}),
+        )
+        .await;
+
+        let db = Arc::new(MemoryStructuralDbStore::new());
+        let agent_id = AgentId::new(uuid::Uuid::from_u128(0xa1));
+
+        // Cycle 0: write the first output, then commit the cycle. The sha
+        // pinned in `file_index` is exactly what a parent citing this output
+        // would pin — same bytes, same blob sha.
+        let body_v1 = "first conclusion";
+        persist_output_impl(
+            storage.clone(),
+            db.clone(),
+            agent_id,
+            prefix,
+            body_v1,
+            &[cite.clone()],
+        )
+        .await
+        .unwrap();
+        let pinned = db
+            .current_sha(agent_id, CANONICAL_OUTPUT)
+            .expect("output pinned in file_index");
+        commit_tick_impl(versioned.clone(), prefix, 0)
+            .await
+            .unwrap();
+
+        // Cycle 1: refresh the canonical output (same path, new bytes), commit.
+        let body_v2 = "revised conclusion";
+        persist_output_impl(
+            storage.clone(),
+            db.clone(),
+            agent_id,
+            prefix,
+            body_v2,
+            &[cite.clone()],
+        )
+        .await
+        .unwrap();
+        commit_tick_impl(versioned.clone(), prefix, 1)
+            .await
+            .unwrap();
+
+        // The refresh moved the canonical path's current version, so the
+        // earlier pin is no longer current — the detectable staleness that
+        // drives re-reconciliation.
+        assert_eq!(
+            db.current_sha(agent_id, CANONICAL_OUTPUT),
+            Some(BlobSha::of_bytes(body_v2.as_bytes())),
+            "file_index now points at the refreshed version"
+        );
+        assert_ne!(
+            db.current_sha(agent_id, CANONICAL_OUTPUT),
+            Some(pinned.clone()),
+            "the pinned version is no longer current"
+        );
+
+        // HEAD reflects the refresh...
+        let mandate = Mandate::new("inspect", Duration::from_millis(0), None);
+        let fs = AgentFs::new_with_storage(storage, prefix, &mandate)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs.read_output().await.unwrap(),
+            body_v2,
+            "HEAD is the refresh"
+        );
+
+        // ...yet the version pinned at cycle 0 still resolves to its original
+        // bytes: git retained the blob the citation points at across the
+        // overwrite. This is the time-scrubbable provenance the reference
+        // graph promises.
+        let resolved = versioned
+            .read_at(prefix, &pinned)
+            .await
+            .unwrap()
+            .expect("pinned version still resolves after refresh");
+        assert_eq!(resolved.as_ref(), body_v1.as_bytes());
+    }
+
     /// In-memory `StructuralDbStore` fake. Records every `add_agent`
     /// / `add_edge` call so hermetic tests can assert without Postgres.
     /// Extracted to a struct (rather than a tuple) to keep clippy's
