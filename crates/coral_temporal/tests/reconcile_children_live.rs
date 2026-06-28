@@ -39,8 +39,11 @@ use coral_node::tools::ToolRegistry;
 use coral_node::trigger::Trigger;
 use coral_temporal::activities::set_decision_script;
 use coral_temporal::worker::{
-    build_worker, install_agent_storage, install_decide, install_tool_registry,
+    build_worker, install_agent_storage, install_decide, install_structural_db_store,
+    install_tool_registry,
 };
+
+mod common;
 use coral_temporal::workflow::{AgentInput, AgentResult, AgentWorkflow, FsHandle, ParentRef};
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
@@ -88,6 +91,7 @@ fn ensure_installed() -> Arc<MemoryStorage> {
             .expect("SHARED_STORAGE set exactly once");
         let dyn_storage: Arc<dyn AgentStorage> = storage;
         install_agent_storage(dyn_storage);
+        install_structural_db_store(Arc::new(common::NoopStructuralDb::new()));
 
         install_tool_registry(Arc::new(ToolRegistry::new()));
 

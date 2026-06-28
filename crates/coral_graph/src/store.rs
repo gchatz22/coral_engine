@@ -782,6 +782,38 @@ impl StructuralDbStore for GraphStore {
         let ids = GraphStore::list_tool_def_ids_for_graph(self, graph_id.into_uuid()).await?;
         Ok(ids)
     }
+
+    async fn set_file_version(
+        &self,
+        agent_id: AgentId,
+        filepath: &str,
+        blob_sha: &BlobSha,
+    ) -> anyhow::Result<()> {
+        GraphStore::set_file_version(self, agent_id.into_uuid(), filepath, blob_sha).await?;
+        Ok(())
+    }
+
+    async fn add_citation(
+        &self,
+        citing_agent_id: AgentId,
+        citing_filepath: &str,
+        citing_blob_sha: &BlobSha,
+        cited_agent_id: AgentId,
+        cited_filepath: &str,
+        cited_blob_sha: &BlobSha,
+    ) -> anyhow::Result<()> {
+        GraphStore::add_citation(
+            self,
+            citing_agent_id.into_uuid(),
+            citing_filepath,
+            citing_blob_sha,
+            cited_agent_id.into_uuid(),
+            cited_filepath,
+            cited_blob_sha,
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

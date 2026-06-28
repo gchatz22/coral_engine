@@ -29,7 +29,7 @@ use uuid::Uuid;
 use coral_node::agent_ref::{AgentId, GraphId};
 use coral_node::decision::{Decide, Decision, Session};
 use coral_node::mandate::Mandate;
-use coral_node::storage::{AgentStorage, MemoryStorage};
+use coral_node::storage::{AgentStorage, BlobSha, MemoryStorage};
 use coral_node::tools::{EchoTool, ToolRegistry};
 use coral_temporal::activities::set_decision_script;
 use coral_temporal::worker::{
@@ -106,6 +106,28 @@ impl StructuralDbStore for MemoryStructuralDb {
 
     async fn list_tool_def_ids_for_graph(&self, _graph_id: GraphId) -> anyhow::Result<Vec<String>> {
         Ok(Vec::new())
+    }
+
+    async fn set_file_version(
+        &self,
+        _agent_id: AgentId,
+        _filepath: &str,
+        _blob_sha: &BlobSha,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_citation(
+        &self,
+        _citing_agent_id: AgentId,
+        _citing_filepath: &str,
+        _citing_blob_sha: &BlobSha,
+        _cited_agent_id: AgentId,
+        _cited_filepath: &str,
+        _cited_blob_sha: &BlobSha,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

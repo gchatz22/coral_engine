@@ -305,6 +305,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn of_bytes_matches_committed_blob_sha() {
+        // The linchpin of version-pinning: a sha computed from bytes at
+        // write time (DB) must equal the sha git records on commit, so a
+        // pinned reference resolves back to the same blob later.
+        let (_tmp, gs) = fresh();
+        let content = b"watch TSMC fab utilization\nrising\n";
+        gs.put("outputs/output.md", Bytes::copy_from_slice(content))
+            .await
+            .unwrap();
+        let manifest = gs.commit("t").await.unwrap();
+        let committed = sha_for(&manifest, "outputs/output.md");
+        assert_eq!(
+            BlobSha::of_bytes(content).as_str(),
+            committed.as_str(),
+            "of_bytes must equal git2's committed blob sha (no autocrlf/filter drift)"
+        );
+    }
+
+    #[tokio::test]
     async fn identical_content_has_identical_blob_sha() {
         let (_tmp, gs) = fresh();
         gs.put("a.md", Bytes::from_static(b"same")).await.unwrap();

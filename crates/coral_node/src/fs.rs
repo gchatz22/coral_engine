@@ -72,7 +72,7 @@ pub struct TailObject {
 /// Output here, overwritten each cycle. A *stable* path (not content-
 /// addressed) is what lets a parent pin a child's output version and the
 /// runtime detect staleness when the child later refreshes it.
-const CANONICAL_OUTPUT: &str = "outputs/output.md";
+pub const CANONICAL_OUTPUT: &str = "outputs/output.md";
 /// Bare filename of the canonical Output, relative to `outputs/`.
 const CANONICAL_OUTPUT_FILENAME: &str = "output.md";
 /// Tail-object key suffix for `evidence/`.
@@ -527,6 +527,21 @@ impl AgentFs {
         } else {
             Err(FsError::EvidenceNotFound(id.clone()).into())
         }
+    }
+
+    /// Read an evidence record's raw on-disk bytes (the stored `.json`).
+    /// The bytes — not a re-serialization — are what callers hash for the
+    /// blob sha (so it matches what git would commit) and parse for the
+    /// `tool`/`args` discriminator. `Err(FsError::EvidenceNotFound)` if `id`
+    /// does not resolve.
+    pub async fn read_evidence_bytes(&self, id: &EvidenceId) -> anyhow::Result<Bytes> {
+        let key = self.evidence_key(id);
+        let got = self
+            .storage
+            .get(&key)
+            .await
+            .map_err(|e| FsError::storage(&key, e))?;
+        got.ok_or_else(|| FsError::EvidenceNotFound(id.clone()).into())
     }
 
     /// Persist the agent's single, kept-current Output as pure prose at the
