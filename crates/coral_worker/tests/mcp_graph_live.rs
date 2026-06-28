@@ -170,7 +170,7 @@ async fn run_smoke(database_url: &str) -> Result<()> {
     // Probe the same server out-of-band: `McpTool::call` returns
     // `McpClient::call_tool` verbatim, and `EvidenceId` is content-addressed
     // on (tool, args, result), so this id equals the one `execute_tool`
-    // records — letting the scripted EmitOutput cite it ahead of time.
+    // records — letting the scripted WriteOutput cite it ahead of time.
     let tool_args = serde_json::json!({"a": 2, "b": 3});
     let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let probe = tokio::time::timeout(
@@ -195,7 +195,7 @@ async fn run_smoke(database_url: &str) -> Result<()> {
     // this graph's MCP tool row and spawning the server.
     install_tool_registry_provider(Arc::new(DbToolRegistryProvider::new(store.clone())));
 
-    // Scripted single cycle: CallTools(get-sum) → EmitOutput citing the
+    // Scripted single cycle: CallTools(get-sum) → WriteOutput citing the
     // evidence id → Idle (the sole terminal). No `Decide` is installed, so
     // the script must be exactly consumed: the trailing Idle ends the cycle
     // and the step_cap (1 cycle) retires the workflow before any further
@@ -209,9 +209,9 @@ async fn run_smoke(database_url: &str) -> Result<()> {
                 ClaimSeed::new("mcp-smoke-seed"),
             )],
         },
-        Decision::EmitOutput {
-            content: "mcp_graph_live: get-sum via server-everything".into(),
-            evidence: vec![evidence_id.clone()],
+        Decision::WriteOutput {
+            body: "mcp_graph_live: get-sum via server-everything".into(),
+            citations: vec![evidence_id.clone()],
         },
         Decision::Idle {
             next_after: Duration::from_millis(50),
@@ -292,7 +292,7 @@ async fn drive(
     // def so the scripted call is allowed. The real `DbToolRegistryProvider`
     // records the advertised-name -> def-id ownership at registry build.
     input.mandate.tools = vec!["everything".to_string()];
-    // One cycle runs the 3 scripted steps (CallTools → EmitOutput → Idle),
+    // One cycle runs the 3 scripted steps (CallTools → WriteOutput → Idle),
     // then the cap stops the workflow (agents never self-terminate).
     input.mandate.step_cap = Some(1);
     let handle = client
@@ -314,30 +314,20 @@ async fn drive(
         "workflow returned wrong retire reason: {reason:?}"
     );
 
-    // The emitted Output must exist and cite the MCP call's evidence id.
-    // `persist_output` enforces provenance (the cited id must resolve to a
-    // record on disk), so a present, correctly-cited output proves the
-    // get-sum call was dispatched through the per-graph MCP registry and
-    // its evidence persisted.
+    // The emitted Output must exist with the scripted body. Citations live
+    // in the DB reference graph, not the file, so the cited-id check is the
+    // direct evidence-record assertion below: that the get-sum call
+    // dispatched through the per-graph MCP registry and persisted its
+    // evidence is proven by the record being on disk.
     let inspect_mandate = Mandate::new("inspect", Duration::from_millis(0), None);
     let inspect_storage: Arc<dyn AgentStorage> = storage.clone();
     let fs = AgentFs::new_with_storage(inspect_storage, agent_prefix, &inspect_mandate)
         .await
         .context("open inspecting AgentFs")?;
-    let outs = fs
-        .list_recent_outputs(8)
-        .await
-        .context("list_recent_outputs")?;
+    let body = fs.read_output().await.context("read_output")?;
     assert_eq!(
-        outs.len(),
-        1,
-        "expected exactly one output after EmitOutput; got {}: {outs:?}",
-        outs.len()
-    );
-    assert!(
-        outs[0].evidence.contains(&evidence_id),
-        "output must cite the MCP call's evidence id {evidence_id:?}; got {:?}",
-        outs[0].evidence
+        body, "mcp_graph_live: get-sum via server-everything",
+        "output body must match scripted WriteOutput"
     );
 
     // The evidence record itself must be on disk (provenance resolves).

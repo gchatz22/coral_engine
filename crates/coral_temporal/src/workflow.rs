@@ -141,7 +141,7 @@ pub struct SchedulerCursor {
 /// | `pending_mandate_patches` | [`AgentWorkflow::pending_mandate_patches`] | Drained at top of each tick |
 /// | `retirement_request` | [`AgentWorkflow::retirement_request`] | Drained at top of each tick (short-circuits) |
 /// | `scheduler_cursor` | [`AgentWorkflow::next_wake`] | Honored by the wake gate |
-/// | `last_output_id` | [`AgentWorkflow::last_output_id`] | Latest persisted `EmitOutput` id |
+/// | `last_output_id` | [`AgentWorkflow::last_output_id`] | Latest persisted `WriteOutput` id |
 /// | `cumulative_*_observed` | matching `AgentWorkflow::cumulative_*_observed` | Observability across CAN boundary |
 /// | `child_handles` | [`AgentWorkflow::child_handles`] | Spawned-child handles across CAN |
 ///
@@ -851,8 +851,8 @@ async fn execute_action(
 ) -> WorkflowResult<Observation> {
     match action {
         Decision::CallTools { calls } => dispatch_call_tools(ctx, input, calls.clone()).await,
-        Decision::EmitOutput { content, evidence } => {
-            emit_output(ctx, input, content.clone(), evidence.clone()).await?;
+        Decision::WriteOutput { body, citations } => {
+            write_output(ctx, input, body.clone(), citations.clone()).await?;
             Ok(Observation::ok("output persisted"))
         }
         Decision::RewriteFs { ops } => {
@@ -926,12 +926,12 @@ async fn read_fs(
     Ok(out.observation)
 }
 
-/// Invoke the `persist_output` activity for a `Decision::EmitOutput`.
-async fn emit_output(
+/// Invoke the `persist_output` activity for a `Decision::WriteOutput`.
+async fn write_output(
     ctx: &WorkflowContext<AgentWorkflow>,
     input: &AgentInput,
-    content: String,
-    evidence: Vec<coral_node::evidence::EvidenceId>,
+    body: String,
+    citations: Vec<coral_node::evidence::EvidenceId>,
 ) -> WorkflowResult<()> {
     let output_id = ctx
         .start_activity(
@@ -939,8 +939,8 @@ async fn emit_output(
             PersistOutputInput {
                 cfg: input.cfg.clone(),
                 fs_handle: input.fs_handle.clone(),
-                content,
-                evidence,
+                body,
+                citations,
             },
             activity_opts(),
         )
@@ -1042,8 +1042,8 @@ async fn log_decision(
 fn decision_summary(decision: &Decision) -> String {
     match decision {
         Decision::CallTools { calls } => format!("CallTools {{ count: {} }}", calls.len()),
-        Decision::EmitOutput { evidence, .. } => {
-            format!("EmitOutput {{ evidence: {} }}", evidence.len())
+        Decision::WriteOutput { citations, .. } => {
+            format!("WriteOutput {{ citations: {} }}", citations.len())
         }
         Decision::RewriteFs { ops } => format!("RewriteFs {{ ops: {} }}", ops.len()),
         Decision::Read { path } => format!("Read {{ path: {path:?} }}"),
@@ -1375,7 +1375,7 @@ async fn retire_child(ctx: &WorkflowContext<AgentWorkflow>, child_ref: &AgentRef
 /// source into the parent's `evidence/`, and returns the freshly-minted
 /// `EvidenceId`s). The parent pulls the synthetic records on a later step
 /// via `List`/`Read` of `evidence/` to cite them in a subsequent
-/// `EmitOutput` — no workflow-state slot is needed.
+/// `WriteOutput` — no workflow-state slot is needed.
 ///
 /// Errors do NOT propagate via `?` — that would fail the whole workflow on
 /// a single bad source. Instead the typed activity failure is returned as a
@@ -2276,14 +2276,14 @@ mod tests {
         assert!(s.contains("CallTools"), "got: {s}");
         assert!(s.contains("count: 2"), "got: {s}");
 
-        let s = decision_summary(&Decision::EmitOutput {
-            content: "claim".into(),
-            evidence: vec![coral_node::evidence::EvidenceId::from_hex(
+        let s = decision_summary(&Decision::WriteOutput {
+            body: "claim".into(),
+            citations: vec![coral_node::evidence::EvidenceId::from_hex(
                 "0123456789abcdef",
             )],
         });
-        assert!(s.contains("EmitOutput"), "got: {s}");
-        assert!(s.contains("evidence: 1"), "got: {s}");
+        assert!(s.contains("WriteOutput"), "got: {s}");
+        assert!(s.contains("citations: 1"), "got: {s}");
 
         let s = decision_summary(&Decision::RewriteFs {
             ops: vec![FsOp::WriteFile {

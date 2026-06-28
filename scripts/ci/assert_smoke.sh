@@ -47,18 +47,13 @@ expected_args=$(jq -cS . <<< "$args")
 [[ "$got_args" == "$expected_args" ]] \
     || fail "evidence.args: expected $expected_args, got $got_args"
 
-# 4. outputs/<ulid>.json — filename is random, body fields are stable.
-# Exclude underscore-prefixed bookkeeping files (e.g. the `outputs/_tail.json`
-# tail-index sidecar) so the count and selector keep matching the ULID output.
-out_count=$(find "$fs_root/outputs" -mindepth 1 -maxdepth 1 -type f -name '*.json' -not -name '_*' | wc -l | tr -d ' ')
-[[ "$out_count" == "1" ]] \
-    || fail "expected exactly 1 ULID file under outputs/ (excluding _* sidecars), found $out_count"
-out_file=$(find "$fs_root/outputs" -mindepth 1 -maxdepth 1 -type f -name '*.json' -not -name '_*' | head -n1)
-got_content=$(jq -r '.content' "$out_file")
+# 4. outputs/output.md — the single, kept-current Output. A stable filename
+#    (not content-addressed), pure prose: the body IS the file content, and
+#    citations live in the DB reference graph, not the file.
+out_file="$fs_root/outputs/output.md"
+[[ -f "$out_file" ]] || fail "missing outputs/output.md"
+got_content=$(cat "$out_file")
 [[ "$got_content" == "$content" ]] \
-    || fail "output.content: expected '$content', got '$got_content'"
-got_evidence_idx=$(jq -r --arg sha "$sha" '.evidence | index($sha)' "$out_file")
-[[ "$got_evidence_idx" != "null" ]] \
-    || fail "output.evidence does not contain expected sha $sha"
+    || fail "output body: expected '$content', got '$got_content'"
 
 echo "assert_smoke[$fs_root]: OK"

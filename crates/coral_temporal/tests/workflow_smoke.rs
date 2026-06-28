@@ -1,12 +1,12 @@
 //! Workflow-driven smoke. Proves the full per-tick loop runs end-to-end
 //! against a real Temporal Server and lands the three durable artifacts:
 //!
-//! - `<prefix>/outputs/<ulid>.json` — a provenance-grounded `EmitOutput`.
+//! - `<prefix>/outputs/output.md` — a provenance-grounded `WriteOutput`.
 //! - `<prefix>/retirement.json` — the retirement marker.
 //! - `<prefix>/decisions/<tick>-<step>.jsonl` — one-line JSONL entry per step.
 //!
 //! Env-gated behind `TEMPORAL_LIVE_TEST=1`. Uses a scripted `Decide` and
-//! a planted evidence id so `EmitOutput`'s content-addressed provenance
+//! a planted evidence id so `WriteOutput`'s content-addressed provenance
 //! check resolves against an on-disk record.
 
 use std::env;
@@ -46,7 +46,7 @@ static SHARED_STORAGE: OnceLock<Arc<MemoryStorage>> = OnceLock::new();
 static INIT: std::sync::Once = std::sync::Once::new();
 
 /// Produces a deterministic `EvidenceRecord` we can plant against and
-/// assert on in the EmitOutput arm.
+/// assert on in the WriteOutput arm.
 struct EchoLike {
     name: String,
 }
@@ -108,7 +108,7 @@ async fn build_client() -> Result<Client> {
     Ok(client)
 }
 
-/// Scripts a single cycle (CallTools → EmitOutput → Idle) capped by
+/// Scripts a single cycle (CallTools → WriteOutput → Idle) capped by
 /// `step_cap=1`, drives it via Temporal, and asserts the three durable
 /// artifacts land. The agent never self-terminates; the cap stops the loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -133,7 +133,7 @@ async fn run_smoke() -> Result<()> {
     let storage = ensure_installed();
 
     // Plant one `EchoLike`-shaped `EvidenceRecord` under the workflow's
-    // FS prefix so the scripted `EmitOutput` cites a real, on-disk
+    // FS prefix so the scripted `WriteOutput` cites a real, on-disk
     // evidence id. EvidenceId is content-addressed on
     // (tool, args, result), so we compute it by building the same
     // record the planting `AgentFs` writes — `record_evidence` returns
@@ -151,9 +151,9 @@ async fn run_smoke() -> Result<()> {
             Utc::now(),
         ))
         .await
-        .context("plant evidence for EmitOutput")?;
+        .context("plant evidence for WriteOutput")?;
 
-    // Scripted cycle: CallTools(echo) (step 0) → EmitOutput citing the
+    // Scripted cycle: CallTools(echo) (step 0) → WriteOutput citing the
     // planted id (step 1) → Idle (step 2, the sole terminal that ends the
     // cycle), then the `step_cap=1` cap stops the loop at the top of cycle
     // 1. Three steps, three decision-log files (the cap-driven retirement
@@ -166,9 +166,9 @@ async fn run_smoke() -> Result<()> {
                 ClaimSeed::new("smoke-seed"),
             )],
         },
-        Decision::EmitOutput {
-            content: "workflow_smoke: echo result observed".into(),
-            evidence: vec![planted_id.clone()],
+        Decision::WriteOutput {
+            body: "workflow_smoke: echo result observed".into(),
+            citations: vec![planted_id.clone()],
         },
         Decision::Idle {
             next_after: Duration::from_millis(50),
@@ -189,7 +189,6 @@ async fn run_smoke() -> Result<()> {
     let driver_task_queue = task_queue.clone();
     let driver_storage = storage.clone();
     let driver_prefix = agent_prefix.clone();
-    let driver_planted_id = planted_id.clone();
     let driver = tokio::spawn(async move {
         let workflow_id = format!("{}-{suffix}", agent_workflow_id("g-smoke", "a-smoke"));
         eprintln!("workflow_smoke: starting workflow_id={workflow_id} on {driver_task_queue}");
@@ -206,7 +205,6 @@ async fn run_smoke() -> Result<()> {
             &workflow_id,
             &driver_prefix,
             driver_storage,
-            driver_planted_id,
         )
         .await
     });
@@ -230,7 +228,6 @@ async fn drive(
     workflow_id: &str,
     agent_prefix: &str,
     storage: Arc<MemoryStorage>,
-    planted_id: coral_node::evidence::EvidenceId,
 ) -> Result<()> {
     // Override `fs_handle` so the per-run prefix namespaces storage writes.
     let mut input = AgentInput::new_for_test(
@@ -281,44 +278,24 @@ async fn drive(
         "retirement.json carries wrong reason: {reason_on_disk:?}"
     );
 
-    // ---- Artifact 2: `<prefix>/outputs/<ulid>.json` -----------------------
-    // Open a fresh `AgentFs` view over the same storage so the
-    // tail-index is exercised. The single scripted `EmitOutput` must
-    // land exactly one output.
+    // ---- Artifact 2: `<prefix>/outputs/output.md` -------------------------
+    // Open a fresh `AgentFs` view over the same storage. The single
+    // scripted `WriteOutput` must land the canonical output body.
     let inspect_mandate = Mandate::new("inspect", Duration::from_millis(0), None);
     let inspect_storage: Arc<dyn AgentStorage> = storage.clone();
     let inspect_fs = AgentFs::new_with_storage(inspect_storage, agent_prefix, &inspect_mandate)
         .await
         .context("open inspecting AgentFs")?;
-    let outs = inspect_fs
-        .list_recent_outputs(8)
-        .await
-        .context("list_recent_outputs")?;
+    let body = inspect_fs.read_output().await.context("read_output")?;
     assert_eq!(
-        outs.len(),
-        1,
-        "expected exactly one output on disk after EmitOutput; got {}: {outs:?}",
-        outs.len()
+        body, "workflow_smoke: echo result observed",
+        "output body must match scripted WriteOutput"
     );
-    let on_disk = &outs[0];
-    assert_eq!(
-        on_disk.content, "workflow_smoke: echo result observed",
-        "output content must match scripted EmitOutput"
-    );
-    assert!(
-        on_disk.evidence.contains(&planted_id),
-        "output must cite the planted evidence id; got {:?}",
-        on_disk.evidence
-    );
-    eprintln!(
-        "workflow_smoke: output landed at outputs/{}.json with {} evidence id(s)",
-        on_disk.id,
-        on_disk.evidence.len()
-    );
+    eprintln!("workflow_smoke: canonical output landed at outputs/output.md");
 
     // ---- Artifact 3: `<prefix>/decisions/<tick>-<step>.jsonl` -------------
     // One entry per logged step. The scripted cycle produces three steps
-    // (CallTools, EmitOutput, Idle) at `decisions/{0-0,0-1,0-2}.jsonl`.
+    // (CallTools, WriteOutput, Idle) at `decisions/{0-0,0-1,0-2}.jsonl`.
     // The `step_cap` cap retires at the top of the next cycle without
     // logging a decision, so it adds no fourth entry.
     let page = storage
@@ -332,7 +309,7 @@ async fn drive(
     assert_eq!(
         decision_keys.len(),
         3,
-        "expected 3 decision-log entries (CallTools, EmitOutput, Idle); got {decision_keys:?}"
+        "expected 3 decision-log entries (CallTools, WriteOutput, Idle); got {decision_keys:?}"
     );
 
     // Each file is a single JSONL line that deserializes back to a
@@ -361,7 +338,7 @@ async fn drive(
         summaries[0]
     );
     assert!(
-        summaries[1].starts_with("EmitOutput"),
+        summaries[1].starts_with("WriteOutput"),
         "step 1 summary: {:?}",
         summaries[1]
     );

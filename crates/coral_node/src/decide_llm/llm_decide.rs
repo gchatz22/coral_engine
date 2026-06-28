@@ -314,7 +314,7 @@ fn corrective_system_text(err: &DecisionParseError) -> String {
     format!(
         "Your previous tool-use response could not be parsed into a Decision: {err}. \
          Reply by calling exactly one decision tool \
-         (`read`, `list`, `search`, `emit_output`, `rewrite_fs`, `idle`) \
+         (`read`, `list`, `search`, `write_output`, `rewrite_fs`, `idle`) \
          OR one or more `call_tool` blocks dispatched together as a single \
          parallel batch, with schema-correct arguments. Do not mix `call_tool` \
          with another decision tool in the same response."
@@ -820,7 +820,7 @@ mod tests {
         let req = &seen[0];
         let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"call_tool"));
-        assert!(names.contains(&"emit_output"));
+        assert!(names.contains(&"write_output"));
         assert!(names.contains(&"rewrite_fs"));
         assert!(names.contains(&"idle"));
         // Persistence is universal: the model is never offered a
@@ -844,9 +844,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_does_not_blow_away_emit_output_evidence_correlation() {
+    async fn retry_does_not_blow_away_write_output_evidence_correlation() {
         // Sanity: when the corrective fixes the issue and the second
-        // attempt is `emit_output`, the parsed `Decision` carries the
+        // attempt is `write_output`, the parsed `Decision` carries the
         // evidence id verbatim. This pins one of the more error-prone
         // variants through the retry path.
         let ev = EvidenceId::from_hex(
@@ -856,10 +856,10 @@ mod tests {
             MockOutcome::Resp(resp_with_tool_calls(vec![malformed_unknown_tool()])),
             MockOutcome::Resp(resp_with_tool_calls(vec![ToolCall {
                 id: "toolu_emit".into(),
-                name: "emit_output".into(),
+                name: "write_output".into(),
                 arguments: json!({
-                    "content": "the answer",
-                    "evidence": [ev.as_str()],
+                    "body": "the answer",
+                    "citations": [ev.as_str()],
                 }),
             }])),
         ]);
@@ -867,11 +867,11 @@ mod tests {
 
         let dec = decide.decide(&empty_session()).await.unwrap();
         match dec {
-            Decision::EmitOutput { content, evidence } => {
-                assert_eq!(content, "the answer");
-                assert_eq!(evidence, vec![ev]);
+            Decision::WriteOutput { body, citations } => {
+                assert_eq!(body, "the answer");
+                assert_eq!(citations, vec![ev]);
             }
-            other => panic!("expected EmitOutput, got {other:?}"),
+            other => panic!("expected WriteOutput, got {other:?}"),
         }
     }
 

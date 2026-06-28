@@ -9,7 +9,7 @@ emits an `Output` that cites that evidence id.
 
 The runbook acceptance is: *smoke fixture exercises a non-trivial
 decision path: model is asked, emits `CallTool`, runtime executes,
-model receives result, emits `EmitOutput` whose evidence resolves.*
+model receives result, emits `WriteOutput` whose evidence resolves.*
 The mock-decide variant (`examples/smoke_mcp/`) still covers the
 deterministic MCP wiring; this one adds the live model.
 
@@ -82,8 +82,8 @@ The agent runs under a `step_cap = 8` cap. The model is instructed by
 the mandate text to:
 
 1. Call `get-sum` with `{"a": 2, "b": 3}` via the `call_tool` decision.
-2. Once the tool result arrives, emit an output via `emit_output` whose
-   `content` mentions the sum and whose `evidence` array cites the
+2. Once the tool result arrives, write the output via `write_output` whose
+   `content` mentions the sum and whose `citations` array cites the
    evidence id minted by step 1.
 3. Retire.
 
@@ -117,7 +117,7 @@ node-run-llm: fs tree at /tmp/coral-smoke-llm-mcp-fs/2026-05-20T04-30-07-123Z:
 ├── mandate.json
 ├── notes
 ├── outputs
-│   └── 01<ulid>.json
+│   └── output.md
 └── retirement.json
 ```
 
@@ -130,7 +130,7 @@ Key files in the per-agent FS tree:
 * `evidence/<hex>.json` — the `(get-sum, {a:2,b:3}, result)` triple the
   MCP server returned, content-addressed by sha256. There may be more
   than one record if the model retried.
-* `outputs/<ulid>.json` — the `EmitOutput` payload, with its
+* `outputs/output.md` — the `WriteOutput` payload, with its
   `evidence: [...]` array pointing at the evidence record(s) above.
 * `retirement.json` — terminal marker with the reason the loop ended.
 * `health.json` — `"state": "Healthy"` on a clean run.

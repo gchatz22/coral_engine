@@ -4,7 +4,7 @@
 //! Sibling of `node-run-mcp`. The difference is the `Decide` impl: instead
 //! of `MockDecide` driven by a `decisions.jsonl` script, this binary
 //! constructs `LlmDecide` over a vendor `ModelClient` so the model itself
-//! decides each tick — `CallTool`, `EmitOutput`, `Idle`, or `Retire`. The
+//! decides each tick — `CallTool`, `WriteOutput`, or `Idle`. The
 //! rest of the wiring (per-agent FS, health tracker, MCP client spawn,
 //! `register_mcp_server_with_policy`, trigger feeder, `agent.run`) is
 //! identical and copied verbatim.

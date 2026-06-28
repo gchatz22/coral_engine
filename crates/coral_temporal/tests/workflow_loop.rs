@@ -2,7 +2,7 @@
 //!
 //! Env-gated behind `TEMPORAL_LIVE_TEST=1`. Drives the workflow against a
 //! real Temporal Server with a scripted `decide_next_action` activity
-//! and asserts the per-tick dispatch shape (Idle / CallTools / EmitOutput /
+//! and asserts the per-tick dispatch shape (Idle / CallTools / WriteOutput /
 //! RewriteFs / Retire) via the workflow's history events and the
 //! resulting FS artifacts.
 
@@ -153,7 +153,7 @@ async fn build_client() -> Result<Client> {
     Ok(client)
 }
 
-/// Live test: scripts a single cycle of CallTools(3) → EmitOutput →
+/// Live test: scripts a single cycle of CallTools(3) → WriteOutput →
 /// RewriteFs → Idle (capped at `step_cap=1`), then asserts the workflow
 /// history shows the expected parallel tool dispatch + persist_retirement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -192,7 +192,7 @@ async fn run_live_test() -> Result<()> {
     let storage = ensure_installed();
 
     // Plant one evidence record under the workflow's FS prefix so the
-    // scripted `Decision::EmitOutput`'s provenance check resolves. The
+    // scripted `Decision::WriteOutput`'s provenance check resolves. The
     // planting `AgentFs` must share the same `Arc<dyn AgentStorage>` the
     // worker hands to activities — a fresh `MemoryStorage` would not
     // share state.
@@ -209,10 +209,10 @@ async fn run_live_test() -> Result<()> {
             Utc::now(),
         ))
         .await
-        .context("plant evidence for EmitOutput")?;
+        .context("plant evidence for WriteOutput")?;
 
     // Install the scripted cycle BEFORE the worker starts. One cycle of
-    // four steps: CallTools(3 parallel) → EmitOutput → RewriteFs → Idle
+    // four steps: CallTools(3 parallel) → WriteOutput → RewriteFs → Idle
     // (the sole terminal that ends the cycle), then the `step_cap=1` cap
     // stops the loop at the top of cycle 1 (agents never self-terminate).
     set_decision_script(vec![
@@ -223,9 +223,9 @@ async fn run_live_test() -> Result<()> {
                 ToolCall::new("tool_c", serde_json::json!({"i": 3}), ClaimSeed::new("s-c")),
             ],
         },
-        Decision::EmitOutput {
-            content: "workflow_loop test: scripted output".into(),
-            evidence: vec![planted_id.clone()],
+        Decision::WriteOutput {
+            body: "workflow_loop test: scripted output".into(),
+            citations: vec![planted_id.clone()],
         },
         Decision::RewriteFs {
             ops: vec![FsOp::WriteFile {
@@ -251,7 +251,6 @@ async fn run_live_test() -> Result<()> {
 
     let driver_task_queue = task_queue.clone();
     let driver_storage = storage.clone();
-    let driver_planted_id = planted_id.clone();
     let driver = tokio::spawn(async move {
         let workflow_id = format!(
             "{}-{suffix}",
@@ -275,7 +274,6 @@ async fn run_live_test() -> Result<()> {
             &workflow_id,
             &driver_prefix,
             driver_storage,
-            driver_planted_id,
         )
         .await
     });
@@ -299,12 +297,11 @@ async fn drive(
     workflow_id: &str,
     agent_prefix: &str,
     storage: Arc<MemoryStorage>,
-    planted_id: coral_node::evidence::EvidenceId,
 ) -> Result<()> {
     // Build an `AgentInput` that scopes the per-agent FS to a per-run
     // prefix — the workflow body passes it into every activity input,
     // so `persist_retirement` writes to `<prefix>/retirement.json`,
-    // `persist_output` to `<prefix>/outputs/<ulid>.json`, and
+    // `persist_output` to `<prefix>/outputs/output.md`, and
     // `apply_fs_ops` to `<prefix>/notes/loop-test.md`.
     let mut input = AgentInput::new_for_test(
         GraphId::new(Uuid::new_v4()),
@@ -326,7 +323,7 @@ async fn drive(
         .await
         .context("start_workflow(AgentWorkflow)")?;
 
-    // Workflow runs the scripted CallTools(3) → EmitOutput → RewriteFs →
+    // Workflow runs the scripted CallTools(3) → WriteOutput → RewriteFs →
     // Idle cycle on its own, then the step_cap cap stops it; no
     // client-side signals needed. Each step calls `decide_step` which pops
     // the next scripted decision.
@@ -345,7 +342,7 @@ async fn drive(
     // activity type. The scripted sequence guarantees:
     //
     // - exactly 3 `execute_tool` schedules (one per `ToolCall`);
-    // - exactly 1 `persist_output` schedule (from `EmitOutput`);
+    // - exactly 1 `persist_output` schedule (from `WriteOutput`);
     // - exactly 1 `persist_retirement` schedule (from the `step_cap` cap).
     //
     // `WorkflowFetchHistoryOptions::default()` leaves `event_filter_type`
@@ -482,38 +479,19 @@ async fn drive(
 
     // FS assertions: open a fresh `AgentFs` over the same process-wide
     // storage the worker hands to activities and verify the scripted
-    // `EmitOutput` actually landed at `outputs/<ulid>.json` with the
-    // scripted content + the planted evidence id.
+    // `WriteOutput` actually landed the canonical output body at
+    // `outputs/output.md`.
     let inspect_mandate = Mandate::new("inspect", Duration::from_millis(0), None);
     let inspect_storage: Arc<dyn AgentStorage> = storage.clone();
     let inspect_fs = AgentFs::new_with_storage(inspect_storage, agent_prefix, &inspect_mandate)
         .await
         .context("open inspecting AgentFs")?;
-    let outs = inspect_fs
-        .list_recent_outputs(8)
-        .await
-        .context("list_recent_outputs")?;
+    let body = inspect_fs.read_output().await.context("read_output")?;
     assert_eq!(
-        outs.len(),
-        1,
-        "expected exactly one output on disk after EmitOutput; got {}: {outs:?}",
-        outs.len()
+        body, "workflow_loop test: scripted output",
+        "output body must match scripted WriteOutput"
     );
-    let on_disk = &outs[0];
-    assert_eq!(
-        on_disk.content, "workflow_loop test: scripted output",
-        "output content must match scripted EmitOutput"
-    );
-    assert!(
-        on_disk.evidence.contains(&planted_id),
-        "output must cite the planted evidence id, got {:?}",
-        on_disk.evidence
-    );
-    eprintln!(
-        "workflow_loop: output landed at outputs/{}.json with {} evidence id(s)",
-        on_disk.id,
-        on_disk.evidence.len()
-    );
+    eprintln!("workflow_loop: canonical output landed at outputs/output.md");
 
     // The `RewriteFs` step writes `<prefix>/notes/loop-test.md`. Pull
     // it from the same shared `MemoryStorage` backend the activity

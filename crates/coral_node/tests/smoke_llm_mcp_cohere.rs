@@ -31,7 +31,7 @@
 
 #![cfg(all(feature = "mcp", feature = "llm-cohere"))]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::Value;
@@ -69,26 +69,6 @@ fn spawn_command() -> (String, Vec<String>) {
             "@modelcontextprotocol/server-everything".to_string(),
         ],
     )
-}
-
-/// Read every JSON file under `dir`, returning each parsed `Value`. Used
-/// to walk the agent's `outputs/` directory after the binary exits.
-fn read_json_dir(dir: &Path) -> Vec<Value> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(it) => it,
-        Err(_) => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        let bytes = std::fs::read(&path).expect("read output file");
-        let v: Value = serde_json::from_slice(&bytes).expect("parse output JSON");
-        out.push(v);
-    }
-    out
 }
 
 /// Parallel-tool smoke for Cohere. Mirrors the Anthropic sibling:
@@ -158,27 +138,20 @@ fn end_to_end_parallel_call_tools_against_server_everything() {
         "expected >= 3 evidence records (K=3 parallel calls), got {evidence_count}"
     );
 
-    let outputs_dir = fs_root.join("outputs");
-    let outputs = read_json_dir(&outputs_dir);
+    // The single canonical Output (pure prose, citations live in the DB,
+    // not the file) must be present and non-empty.
+    let output_path = fs_root.join("outputs").join("output.md");
+    let output_body = std::fs::read_to_string(&output_path).unwrap_or_else(|e| {
+        panic!(
+            "expected canonical output at {}: {e}",
+            output_path.display()
+        )
+    });
     assert!(
-        !outputs.is_empty(),
-        "expected >= 1 output under {}",
-        outputs_dir.display()
+        !output_body.trim().is_empty(),
+        "canonical output {} is empty",
+        output_path.display()
     );
-    for out in &outputs {
-        let evidence_arr = out["evidence"]
-            .as_array()
-            .expect("Output.evidence is an array");
-        for ev in evidence_arr {
-            let id = ev.as_str().expect("evidence id string");
-            let path = evidence_dir.join(format!("{id}.json"));
-            assert!(
-                path.exists(),
-                "evidence id {id} from output does not resolve to {}",
-                path.display()
-            );
-        }
-    }
 
     let health_path = fs_root.join("health.json");
     let health: Value =
@@ -288,34 +261,19 @@ fn end_to_end_llm_decide_against_server_everything() {
         "expected health.json to record Healthy state, got: {health}"
     );
 
-    // At least one output is the parent-acceptance bar.
-    let outputs_dir = fs_root.join("outputs");
-    let outputs = read_json_dir(&outputs_dir);
+    // The canonical Output (pure prose) is the parent-acceptance bar.
+    // Citations now live in the DB reference graph, not in the file, so
+    // the FS check is "the agent produced a non-empty Output."
+    let output_path = fs_root.join("outputs").join("output.md");
+    let output_body = std::fs::read_to_string(&output_path).unwrap_or_else(|e| {
+        panic!(
+            "expected canonical output at {}: {e}",
+            output_path.display()
+        )
+    });
     assert!(
-        !outputs.is_empty(),
-        "expected >=1 output under {}, found none",
-        outputs_dir.display()
+        !output_body.trim().is_empty(),
+        "canonical output {} is empty",
+        output_path.display()
     );
-
-    // Every evidence id in every Output must resolve to a file on disk
-    // under `evidence/<id>.json` — the parent-acceptance contract.
-    let evidence_dir = fs_root.join("evidence");
-    for out in &outputs {
-        let evidence = out["evidence"]
-            .as_array()
-            .expect("Output.evidence is an array");
-        assert!(
-            !evidence.is_empty(),
-            "Output.evidence empty in {out}; LLM is expected to cite the get-sum evidence id"
-        );
-        for ev in evidence {
-            let id = ev.as_str().expect("evidence id is a string");
-            let path = evidence_dir.join(format!("{id}.json"));
-            assert!(
-                path.exists(),
-                "evidence id {id} from output does not resolve to {}",
-                path.display()
-            );
-        }
-    }
 }

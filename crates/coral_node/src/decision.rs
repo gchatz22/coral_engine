@@ -43,7 +43,7 @@
 //!
 //! The reconcile activity persists the decision verbatim: one synthetic
 //! evidence record per [`ReconcileSource`] in the parent's `evidence/`
-//! directory (so the parent's next `EmitOutput` can cite the children
+//! directory (so the parent's next `WriteOutput` can cite the children
 //! through the existing evidence contract) and — only when `conflict`
 //! is `Some` — one [`ConflictRecordIntent`] written as a
 //! [`crate::conflict::ConflictRecord`] under the parent's `conflicts/`.
@@ -81,11 +81,14 @@ pub enum Decision {
     /// the wire form `{"type":"call_tools","calls":[...]}` flat and
     /// round-trippable.
     CallTools { calls: Vec<ToolCall> },
-    /// Emit a finished output. The run loop will refuse to persist an
-    /// output whose evidence ids don't all resolve.
-    EmitOutput {
-        content: String,
-        evidence: Vec<EvidenceId>,
+    /// Write the agent's single, kept-current Output: the prose `body` is
+    /// persisted to the canonical `outputs/output.md` (overwriting the prior
+    /// cycle's), and `citations` records the evidence the output rests on. The
+    /// run loop refuses to persist an output whose citations don't all resolve
+    /// to runtime-authored evidence.
+    WriteOutput {
+        body: String,
+        citations: Vec<EvidenceId>,
     },
     /// Mutate the per-agent filesystem.
     RewriteFs { ops: Vec<FsOp> },
@@ -175,11 +178,13 @@ impl Decision {
 }
 
 /// One child output the parent wants folded into its own context. The
-/// `reconcile_children` activity reads the child's
-/// `outputs/<output_id>.json` and writes one synthetic evidence record
-/// per source into the parent's `evidence/` directory; the parent's
-/// subsequent `EmitOutput { evidence: [..] }` then cites those synthetic
-/// ids, so cross-agent provenance becomes a normal evidence trail.
+/// `reconcile_children` activity reads the child's single canonical
+/// `outputs/output.md` and writes one synthetic evidence record per source
+/// into the parent's `evidence/` directory; the parent's subsequent
+/// `WriteOutput { citations: [..] }` then cites those synthetic ids, so
+/// cross-agent provenance becomes a normal evidence trail. `output_id` is
+/// the version the parent observed at decide time; the activity reads the
+/// child's current canonical output (kept-current semantics).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconcileSource {
     pub child_ref: AgentRef,
@@ -655,36 +660,36 @@ mod tests {
     }
 
     #[test]
-    fn emit_output_round_trip_non_empty_evidence() {
+    fn write_output_round_trip_non_empty_citations() {
         let ev1 = EvidenceId::new("echo", &json!({"a": 1}), &json!({"r": 1}));
         let ev2 = EvidenceId::new("echo", &json!({"a": 2}), &json!({"r": 2}));
-        let d = Decision::EmitOutput {
-            content: "hello".into(),
-            evidence: vec![ev1.clone(), ev2.clone()],
+        let d = Decision::WriteOutput {
+            body: "hello".into(),
+            citations: vec![ev1.clone(), ev2.clone()],
         };
         let s = serde_json::to_string(&d).unwrap();
         let back: Decision = serde_json::from_str(&s).unwrap();
         assert_eq!(d, back);
-        if let Decision::EmitOutput { evidence, .. } = back {
-            assert_eq!(evidence, vec![ev1, ev2]);
+        if let Decision::WriteOutput { citations, .. } = back {
+            assert_eq!(citations, vec![ev1, ev2]);
         } else {
-            panic!("expected EmitOutput");
+            panic!("expected WriteOutput");
         }
     }
 
     #[test]
-    fn emit_output_round_trip_empty_evidence() {
-        let d = Decision::EmitOutput {
-            content: "draft".into(),
-            evidence: vec![],
+    fn write_output_round_trip_empty_citations() {
+        let d = Decision::WriteOutput {
+            body: "draft".into(),
+            citations: vec![],
         };
         let s = serde_json::to_string(&d).unwrap();
         let back: Decision = serde_json::from_str(&s).unwrap();
         assert_eq!(d, back);
-        if let Decision::EmitOutput { evidence, .. } = back {
-            assert!(evidence.is_empty());
+        if let Decision::WriteOutput { citations, .. } = back {
+            assert!(citations.is_empty());
         } else {
-            panic!("expected EmitOutput");
+            panic!("expected WriteOutput");
         }
     }
 

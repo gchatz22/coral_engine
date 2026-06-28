@@ -2,7 +2,7 @@
 //!
 //! Exercises the public surface only (`Agent::new`, `Agent::signal`,
 //! `Agent::run`) plus the FS root the agent writes to: signal/deadline
-//! wakeups; the `Read`/`List`/`Search`/`EmitOutput`/`RewriteFs`/`CallTool`
+//! wakeups; the `Read`/`List`/`Search`/`WriteOutput`/`RewriteFs`/`CallTool`
 //! repertoire steps; the inner ReAct cycle (multiple steps, terminated by
 //! `Idle`); `step_cap` (now counted in *cycles*); in-cycle failure
 //! adaptation; health budget exhaustion + recovery across cycles.
@@ -160,10 +160,10 @@ async fn loop_wakes_on_deadline_when_no_signal_arrives() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn emit_output_with_valid_evidence_writes_file_under_outputs() {
+async fn write_output_with_valid_evidence_writes_canonical_output() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
     mandate.step_cap = Some(1);
-    // Pre-seed an evidence record on disk so the EmitOutput's evidence id
+    // Pre-seed an evidence record on disk so the WriteOutput's citation id
     // resolves. Computing the id here keeps the test independent of how
     // the agent would have produced it.
     let rec = EvidenceRecord::new(
@@ -174,11 +174,11 @@ async fn emit_output_with_valid_evidence_writes_file_under_outputs() {
     );
     let ev_id: EvidenceId = fs.record_evidence(rec).await.expect("seed evidence");
 
-    // One cycle: emit, then idle (the terminal step).
+    // One cycle: write the output, then idle (the terminal step).
     let script = vec![
-        Decision::EmitOutput {
-            content: "the answer".into(),
-            evidence: vec![ev_id.clone()],
+        Decision::WriteOutput {
+            body: "the answer".into(),
+            citations: vec![ev_id.clone()],
         },
         idle(),
     ];
@@ -197,22 +197,11 @@ async fn emit_output_with_valid_evidence_writes_file_under_outputs() {
         .expect("join")
         .expect("run ok");
 
-    // Exactly one file under outputs/, and it references the evidence id.
-    let outputs_dir = tmp.path().join("outputs");
-    let entries = agent_record_files(&outputs_dir);
-    assert_eq!(entries.len(), 1, "expected exactly one output file");
-    let bytes = std::fs::read(&entries[0]).expect("read output");
-    let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-    assert_eq!(
-        v.get("content").and_then(|s| s.as_str()),
-        Some("the answer")
-    );
-    let ev_arr = v
-        .get("evidence")
-        .and_then(|x| x.as_array())
-        .expect("evidence array");
-    assert_eq!(ev_arr.len(), 1);
-    assert_eq!(ev_arr[0].as_str(), Some(ev_id.as_str()));
+    // The single canonical Output landed at the stable path with the body.
+    let output_path = tmp.path().join("outputs").join("output.md");
+    assert!(output_path.is_file(), "expected canonical output file");
+    let body = std::fs::read_to_string(&output_path).expect("read output");
+    assert_eq!(body, "the answer");
 }
 
 /// A `never`-cadence agent self-wakes only its *first* cycle: it runs once
@@ -238,18 +227,19 @@ async fn never_cadence_fires_first_cycle_then_waits_for_triggers() {
         ))
         .await
         .expect("seed evidence");
-    // Two scripted cycles, each an emit + idle. A correct `never` node
+    // Two scripted cycles, each a write + idle. A correct `never` node
     // reaches only the first (it blocks before a second self-wake). A
-    // self-wake regression would run the second cycle and leave two outputs.
+    // self-wake regression would run the second cycle and overwrite the
+    // canonical Output with "finding 2".
     let script = vec![
-        Decision::EmitOutput {
-            content: "finding 1".into(),
-            evidence: vec![ev_id.clone()],
+        Decision::WriteOutput {
+            body: "finding 1".into(),
+            citations: vec![ev_id.clone()],
         },
         idle(),
-        Decision::EmitOutput {
-            content: "finding 2".into(),
-            evidence: vec![ev_id],
+        Decision::WriteOutput {
+            body: "finding 2".into(),
+            citations: vec![ev_id],
         },
         idle(),
     ];
@@ -270,11 +260,12 @@ async fn never_cadence_fires_first_cycle_then_waits_for_triggers() {
         "never node must not self-wake past its first cycle (expected block, got {result:?})"
     );
 
-    // Exactly the first cycle's output landed; the second cycle was unreached.
-    let entries = agent_record_files(&tmp.path().join("outputs"));
+    // The canonical Output holds the first cycle's body; the second cycle
+    // was unreached, so it never overwrote it with "finding 2".
+    let body = std::fs::read_to_string(tmp.path().join("outputs").join("output.md"))
+        .expect("read canonical output");
     assert_eq!(
-        entries.len(),
-        1,
+        body, "finding 1",
         "never node must emit exactly its first-cycle output"
     );
 }
@@ -314,16 +305,16 @@ async fn rewrite_fs_writes_file_under_notes() {
     );
 }
 
-/// One cycle, multiple steps: the model calls echo, reads the resulting
-/// note... actually it emits an output citing the evidence echo produced,
-/// then idles. Exercises that `CallTools` and `EmitOutput` compose inside a
-/// single cycle (what used to be two ticks is now two steps of one cycle).
+/// One cycle, multiple steps: the model calls echo, then writes an output
+/// citing the evidence echo produced, then idles. Exercises that `CallTools`
+/// and `WriteOutput` compose inside a single cycle (what used to be two ticks
+/// is now two steps of one cycle).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn call_tool_records_evidence_and_emit_output_consumes_it_in_one_cycle() {
+async fn call_tool_records_evidence_and_write_output_consumes_it_in_one_cycle() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
     mandate.step_cap = Some(1);
     // Compute the id we expect echo to produce so we can reference it in
-    // the EmitOutput step.
+    // the WriteOutput step.
     let args = json!({"msg": "hi"});
     let result = json!({"echoed": {"msg": "hi"}});
     let expected_ev = EvidenceId::new("echo", &args, &result);
@@ -336,9 +327,9 @@ async fn call_tool_records_evidence_and_emit_output_consumes_it_in_one_cycle() {
                 ClaimSeed::new("seed-1"),
             )],
         },
-        Decision::EmitOutput {
-            content: "echoed".into(),
-            evidence: vec![expected_ev.clone()],
+        Decision::WriteOutput {
+            body: "echoed".into(),
+            citations: vec![expected_ev.clone()],
         },
         idle(),
     ];
@@ -364,10 +355,10 @@ async fn call_tool_records_evidence_and_emit_output_consumes_it_in_one_cycle() {
         .join(format!("{}.json", expected_ev));
     assert!(ev_path.is_file(), "expected evidence file at {ev_path:?}");
 
-    // Output file written by the EmitOutput step references that evidence.
-    let outputs_dir = tmp.path().join("outputs");
-    let entries = agent_record_files(&outputs_dir);
-    assert_eq!(entries.len(), 1);
+    // Canonical Output written by the WriteOutput step.
+    let body = std::fs::read_to_string(tmp.path().join("outputs").join("output.md"))
+        .expect("read canonical output");
+    assert_eq!(body, "echoed");
 }
 
 /// A multi-step cycle (read → call_tool → emit → idle) runs as exactly ONE
@@ -395,9 +386,9 @@ async fn multi_step_cycle_counts_as_one_cycle() {
         Decision::CallTools {
             calls: vec![ToolCall::new("echo", args, ClaimSeed::new("s"))],
         },
-        Decision::EmitOutput {
-            content: "did the work".into(),
-            evidence: vec![expected_ev],
+        Decision::WriteOutput {
+            body: "did the work".into(),
+            citations: vec![expected_ev],
         },
         idle(),
     ];
@@ -418,7 +409,7 @@ async fn multi_step_cycle_counts_as_one_cycle() {
     // Four steps, one Idle → ONE cycle. step_cap=1 retires right after.
     assert_eq!(reason, "step_cap (1) reached");
     // The work products of the single cycle are all on disk.
-    assert_eq!(agent_record_files(&tmp.path().join("outputs")).len(), 1);
+    assert!(tmp.path().join("outputs").join("output.md").is_file());
     assert_eq!(agent_record_files(&tmp.path().join("evidence")).len(), 1);
     // Stayed Healthy — no failing steps.
     let v: serde_json::Value = serde_json::from_slice(
@@ -532,18 +523,18 @@ async fn invalid_call_tool_is_recoverable_in_cycle_failure() {
     assert!(tmp.path().join("retirement.json").is_file());
 }
 
-/// `EmitOutput` with an *empty* evidence list is rejected by
+/// `WriteOutput` with an *empty* citations list is rejected by
 /// `AgentFs::persist_output` with `FsError::EmptyEvidence`; that maps to a
 /// recoverable in-cycle failure observation the model adapts to (here by
 /// idling). Stays Healthy under the default budget.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn emit_output_with_empty_evidence_is_recoverable_in_cycle() {
+async fn write_output_with_empty_evidence_is_recoverable_in_cycle() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
     mandate.step_cap = Some(1);
     let script = vec![
-        Decision::EmitOutput {
-            content: "no provenance".into(),
-            evidence: vec![],
+        Decision::WriteOutput {
+            body: "no provenance".into(),
+            citations: vec![],
         },
         idle(),
     ];
@@ -581,19 +572,19 @@ async fn emit_output_with_empty_evidence_is_recoverable_in_cycle() {
     assert_eq!(v.get("state").and_then(|x| x.as_str()), Some("Healthy"));
 }
 
-/// Same shape of failure driven through the `EmitOutput` step with a
+/// Same shape of failure driven through the `WriteOutput` step with a
 /// well-formed-but-not-on-disk evidence id (`FsError::EvidenceNotFound`).
 /// Mirrors the empty-evidence test above; the two cover the two distinct
 /// `FsError` variants the in-cycle failure path catches.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn emit_output_with_unknown_evidence_is_recoverable_in_cycle() {
+async fn write_output_with_unknown_evidence_is_recoverable_in_cycle() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
     mandate.step_cap = Some(1);
     let bogus = EvidenceId::from_hex("deadbeef".repeat(8));
     let script = vec![
-        Decision::EmitOutput {
-            content: "lying about provenance".into(),
-            evidence: vec![bogus],
+        Decision::WriteOutput {
+            body: "lying about provenance".into(),
+            citations: vec![bogus],
         },
         idle(),
     ];
@@ -1263,7 +1254,7 @@ async fn seed_index_reaches_the_run_loop() {
         ))
         .await
         .expect("record evidence");
-    let out = fs
+    let _out_id = fs
         .persist_output("a finding", &[ev_id])
         .await
         .expect("persist output");
@@ -1299,14 +1290,14 @@ async fn seed_index_reaches_the_run_loop() {
     );
     assert_eq!(
         seed.index.outputs,
-        vec![format!("{}.json", out.id)],
-        "seed index must point at the output filename"
+        vec!["output.md".to_string()],
+        "seed index must point at the canonical output filename"
     );
 }
 
 /// K=3 parallel tool calls in a single step. All three succeed; the agent
 /// loop must persist three distinct evidence records and the cycle proceeds
-/// to `EmitOutput` then `Idle`. Models the "synthesize 3 file reads in one
+/// to `WriteOutput` then `Idle`. Models the "synthesize 3 file reads in one
 /// step" path.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn parallel_call_tools_k3_all_succeed_persists_evidence() {
@@ -1344,9 +1335,9 @@ async fn parallel_call_tools_k3_all_succeed_persists_evidence() {
             ],
         },
         // Step 2: cite all three.
-        Decision::EmitOutput {
-            content: "synthesized from 3 reads".into(),
-            evidence: vec![ev_a.clone(), ev_b.clone(), ev_c.clone()],
+        Decision::WriteOutput {
+            body: "synthesized from 3 reads".into(),
+            citations: vec![ev_a.clone(), ev_b.clone(), ev_c.clone()],
         },
         idle(),
     ];
@@ -1381,13 +1372,10 @@ async fn parallel_call_tools_k3_all_succeed_persists_evidence() {
         );
     }
 
-    // EmitOutput succeeded — one output file referencing all three ids.
-    let outputs_dir = tmp.path().join("outputs");
-    let outs = agent_record_files(&outputs_dir);
-    assert_eq!(outs.len(), 1);
-    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&outs[0]).unwrap()).unwrap();
-    let ev_arr = v["evidence"].as_array().expect("evidence array");
-    assert_eq!(ev_arr.len(), 3);
+    // WriteOutput succeeded — the canonical Output holds the synthesized body.
+    let body = std::fs::read_to_string(tmp.path().join("outputs").join("output.md"))
+        .expect("read canonical output");
+    assert_eq!(body, "synthesized from 3 reads");
 
     let v: serde_json::Value = serde_json::from_slice(
         &std::fs::read(tmp.path().join("health.json")).expect("read health"),

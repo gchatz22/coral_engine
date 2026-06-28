@@ -28,7 +28,7 @@ use coral_node::agent_ref::{AgentId, GraphId};
 use coral_node::decision::{Decide, Decision, Session};
 use coral_node::evidence::EvidenceRecord;
 use coral_node::fs::AgentFs;
-use coral_node::mandate::Mandate;
+use coral_node::mandate::{Mandate, OutputId};
 use coral_node::storage::{AgentStorage, MemoryStorage};
 use coral_node::tools::ToolRegistry;
 use coral_node::trigger::Trigger;
@@ -229,7 +229,7 @@ async fn run_happy_path() -> Result<()> {
     reset_parent_observed_triggers();
 
     // Plant one evidence record under the CHILD's FS prefix so the
-    // scripted EmitOutput resolves provenance. EvidenceId is content-
+    // scripted WriteOutput resolves provenance. EvidenceId is content-
     // addressed; capture the returned id for the post-run assertion
     // on the trigger payload.
     let plant_mandate = Mandate::new("plant", Duration::from_millis(0), None);
@@ -245,7 +245,7 @@ async fn run_happy_path() -> Result<()> {
             Utc::now(),
         ))
         .await
-        .context("plant evidence for child EmitOutput")?;
+        .context("plant evidence for child WriteOutput")?;
 
     // Parent script: idle forever. The tick loop wakes on every signal
     // arrival (wake gate races `wait_condition` against the idle timer),
@@ -254,9 +254,9 @@ async fn run_happy_path() -> Result<()> {
     // `RoutingDecide` records. A `retire` signal at the end ends the
     // parent cleanly.
     let parent_script: Vec<Decision> = Vec::new();
-    let child_script = vec![Decision::EmitOutput {
-        content: "child output".into(),
-        evidence: vec![planted_id.clone()],
+    let child_script = vec![Decision::WriteOutput {
+        body: "child output".into(),
+        citations: vec![planted_id.clone()],
     }];
     install_role_scripts(parent_script, child_script);
 
@@ -276,7 +276,6 @@ async fn run_happy_path() -> Result<()> {
     let driver_child_prefix = child_prefix.clone();
     let driver_parent_workflow_id = parent_workflow_id.clone();
     let driver_child_workflow_id = child_workflow_id.clone();
-    let driver_planted_id = planted_id.clone();
     let driver = tokio::spawn(async move {
         struct ShutdownGuard<F: Fn()>(F);
         impl<F: Fn()> Drop for ShutdownGuard<F> {
@@ -292,7 +291,6 @@ async fn run_happy_path() -> Result<()> {
             &driver_child_workflow_id,
             &driver_parent_prefix,
             &driver_child_prefix,
-            driver_planted_id,
         )
         .await
     });
@@ -315,7 +313,6 @@ async fn drive_happy_path(
     child_workflow_id: &str,
     parent_prefix: &str,
     child_prefix: &str,
-    planted_id: coral_node::evidence::EvidenceId,
 ) -> Result<()> {
     // Start the parent first so it's running and addressable when the
     // child fires the signal.
@@ -372,7 +369,7 @@ async fn drive_happy_path(
         .context("start_workflow(child)")?;
     eprintln!("happy: child started at {child_workflow_id}");
 
-    // Wait for the child to retire. It emits once (the `EmitOutput` arm
+    // Wait for the child to retire. It emits once (the `WriteOutput` arm
     // fires the ChildOutput signal at the parent), then the `step_cap=1`
     // cap retires it (firing the ChildRetired signal).
     let child_result: AgentResult = child_handle
@@ -489,9 +486,9 @@ async fn drive_happy_path(
         "ChildOutput.child_ref.agent_id mismatch"
     );
     assert_eq!(agent_name, "fda_scraper", "ChildOutput.agent_name mismatch");
-    // OutputId is the content-addressed hash of (content, evidence).
-    // Look up the child's outputs/_tail.json and assert the trigger's
-    // id matches what `persist_output` minted.
+    // OutputId is the content-addressed hash of the body. Read the
+    // child's single canonical output and assert the trigger's id
+    // matches what `persist_output` minted from that body.
     let inspect_mandate = Mandate::new("inspect", Duration::from_millis(0), None);
     let inspect_storage: Arc<dyn AgentStorage> = SHARED_STORAGE
         .get()
@@ -500,27 +497,18 @@ async fn drive_happy_path(
     let inspect_fs = AgentFs::new_with_storage(inspect_storage, child_prefix, &inspect_mandate)
         .await
         .context("open inspecting AgentFs over child")?;
-    let outs = inspect_fs
-        .list_recent_outputs(8)
+    let body = inspect_fs
+        .read_output()
         .await
-        .context("list_recent_outputs on child")?;
+        .context("read_output on child")?;
     assert_eq!(
-        outs.len(),
-        1,
-        "expected exactly one output on the child's FS; got {}",
-        outs.len()
-    );
-    assert_eq!(
-        &outs[0].id, output_id,
+        OutputId::new(&body),
+        *output_id,
         "Trigger::ChildOutput.output_id must match the child's persisted output id"
     );
-
-    // Sanity: the child's output cites the planted evidence, proving
-    // `persist_output` ran end-to-end against the real activity body.
-    assert!(
-        outs[0].evidence.contains(&planted_id),
-        "child's persisted output must cite the planted evidence id"
-    );
+    // The body proves `persist_output` ran end-to-end (its provenance
+    // check requires the planted evidence to resolve before writing).
+    assert_eq!(body, "child output", "child's canonical output body");
 
     let _ = parent_prefix;
 
@@ -553,11 +541,11 @@ async fn run_failure_path() -> Result<()> {
             Utc::now(),
         ))
         .await
-        .context("plant evidence for child EmitOutput (failure path)")?;
+        .context("plant evidence for child WriteOutput (failure path)")?;
 
-    let child_script = vec![Decision::EmitOutput {
-        content: "child (failure path) output".into(),
-        evidence: vec![planted_id.clone()],
+    let child_script = vec![Decision::WriteOutput {
+        body: "child (failure path) output".into(),
+        citations: vec![planted_id.clone()],
     }];
     install_role_scripts(Vec::new(), child_script);
 
@@ -668,15 +656,13 @@ async fn drive_failure_path(
     let inspect_fs = AgentFs::new_with_storage(inspect_storage, child_prefix, &inspect_mandate)
         .await
         .context("open inspecting AgentFs over child (failure path)")?;
-    let outs = inspect_fs
-        .list_recent_outputs(8)
+    let body = inspect_fs
+        .read_output()
         .await
-        .context("list_recent_outputs on child (failure path)")?;
+        .context("read_output on child (failure path)")?;
     assert_eq!(
-        outs.len(),
-        1,
-        "expected child to have persisted its output despite parent-unreachable; got {}",
-        outs.len()
+        body, "child (failure path) output",
+        "child must have persisted its output despite parent-unreachable"
     );
 
     Ok(())

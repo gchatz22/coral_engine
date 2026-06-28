@@ -42,7 +42,7 @@ The agent runs three scripted steps in one cycle under a `step_cap = 1` cap:
 1. **Step 1** — `CallTool { name: "get-sum", args: {"a": 2, "b": 3} }`.
    Dispatched through `ToolRegistry::call`, which forwards into the
    MCP client and writes an `EvidenceRecord` to disk.
-2. **Step 2** — `EmitOutput` referencing the evidence id from step 1.
+2. **Step 2** — `WriteOutput` referencing the evidence id from step 1.
 3. **Step 3** — `Idle`. The mandate's `step_cap` retires the
    agent at the end of this tick.
 
@@ -60,7 +60,7 @@ node-run-mcp: fs tree at /tmp/coral-smoke-mcp-fs:
 ├── mandate.json
 ├── notes
 ├── outputs
-│   └── 01<ulid>.json
+│   └── output.md
 └── retirement.json
 ```
 
@@ -68,7 +68,7 @@ Key files:
 
 * `evidence/10c78548...json` — the `(get-sum, {a:2,b:3}, result)`
   triple the MCP server returned, content-addressed by sha256.
-* `outputs/<ulid>.json` — the `EmitOutput` payload, with its
+* `outputs/output.md` — the `WriteOutput` payload, with its
   `evidence: [...]` array pointing at the evidence record above.
 * `retirement.json` — `{"reason": "step_cap (1) reached", ...}`.
 * `health.json` — `"state": "Healthy"`.
@@ -83,7 +83,7 @@ will drift if the server's release bumps its tool surface.
 `(tool="get-sum", args={"a":2,"b":3}, result=<CallToolResult>)` triple
 that the server returns. If the canonical-JSON encoder in
 `src/evidence.rs` ever changes — or if the server's `CallToolResult`
-envelope drifts — the hash goes stale and the `EmitOutput` tick will
+envelope drifts — the hash goes stale and the `WriteOutput` tick will
 fail with `evidence <id> not found on disk`.
 
 To recompute:

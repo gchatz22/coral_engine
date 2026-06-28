@@ -73,7 +73,7 @@ fn expected_model() -> String {
 // ---------- (a) happy-path tick ----------
 
 #[tokio::test]
-async fn happy_path_tick_drives_call_tool_then_emit_output() {
+async fn happy_path_tick_drives_call_tool_then_write_output() {
     ensure_dummy_api_key();
     let fixtures = load_fixture("anthropic", "happy_path_tick");
     let mock = MockServer::spawn(fixtures).await;
@@ -114,22 +114,22 @@ async fn happy_path_tick_drives_call_tool_then_emit_output() {
         s1.latency_ms
     );
 
-    // Tick 2: model emits EmitOutput citing the synthesized evidence id.
+    // Tick 2: model emits WriteOutput citing the synthesized evidence id.
     let dec_2 = decide
         .decide(&empty_session())
         .await
         .expect("tick 2 decide");
     match &dec_2 {
-        Decision::EmitOutput { content, evidence } => {
-            assert_eq!(content, "the echo tool returned hello coral");
-            assert_eq!(evidence.len(), 1);
+        Decision::WriteOutput { body, citations } => {
+            assert_eq!(body, "the echo tool returned hello coral");
+            assert_eq!(citations.len(), 1);
             // The fixture id is hex-encoded; just check the round-trip.
             assert_eq!(
-                evidence[0].as_str(),
+                citations[0].as_str(),
                 "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
             );
         }
-        other => panic!("expected EmitOutput, got {other:?}"),
+        other => panic!("expected WriteOutput, got {other:?}"),
     }
 
     let calls_2 = decide.last_tick_calls();
@@ -173,7 +173,7 @@ async fn happy_path_tick_drives_call_tool_then_emit_output() {
         assert!(
             body["tools"]
                 .as_array()
-                .map(|t| t.iter().any(|s| s["name"] == json!("emit_output")))
+                .map(|t| t.iter().any(|s| s["name"] == json!("write_output")))
                 .unwrap_or(false),
             "request body must publish the decision-tool list"
         );

@@ -97,13 +97,13 @@ fn example_graph_path() -> PathBuf {
 /// - **Children** run a one-step cycle: when no step has been taken yet, emit
 ///   a fresh, distinct output (`finding N`, `N` from the seed's outputs
 ///   index) citing the planted evidence; once that emit is recorded, `Idle`
-///   ends the cycle. A new distinct finding per cycle ⇒ ≥2 distinct outputs
-///   across the cap.
+///   ends the cycle. A new distinct finding per cycle overwrites the single
+///   canonical output, so only the latest body persists on disk.
 /// - **Parent** runs a four-step cycle when the tick carries `ChildOutput`s:
 ///   `ReconcileChildren` (writes synthetic `tool: "reconcile"` evidence to
 ///   the parent's own FS) → `List` the parent's `evidence/` dir to discover
 ///   that synthetic id (the reconcile observation does not surface it) →
-///   `EmitOutput` of a refreshed consolidated report citing the discovered id
+///   `WriteOutput` of a refreshed consolidated report citing the discovered id
 ///   → `Idle`. Ticks carrying no `ChildOutput` idle immediately. Distinct
 ///   child outputs arriving over time make it fold newer ones each cycle.
 ///   Never retires; only `step_cap` stops it.
@@ -143,18 +143,15 @@ impl Decide for CyclingDecide {
                 Some(Decision::List { .. }) => {
                     let observation = &last.expect("last is Some in this arm").observation;
                     if let Some(cite) = first_evidence_id(&observation.content) {
-                        return Ok(Decision::EmitOutput {
-                            content: format!(
-                                "consolidated report {}",
-                                seed.index.outputs.len() + 1
-                            ),
-                            evidence: vec![cite],
+                        return Ok(Decision::WriteOutput {
+                            body: format!("consolidated report {}", seed.index.outputs.len() + 1),
+                            citations: vec![cite],
                         });
                     }
                     return Ok(idle);
                 }
                 // Report emitted: end the cycle.
-                Some(Decision::EmitOutput { .. }) => return Ok(idle),
+                Some(Decision::WriteOutput { .. }) => return Ok(idle),
                 _ => {}
             }
 
@@ -192,9 +189,9 @@ impl Decide for CyclingDecide {
                     .get()
                     .expect("CHILD_EVIDENCE planted before worker start")
                     .clone();
-                return Ok(Decision::EmitOutput {
-                    content: format!("finding {n}"),
-                    evidence: vec![ev],
+                return Ok(Decision::WriteOutput {
+                    body: format!("finding {n}"),
+                    citations: vec![ev],
                 });
             }
             Ok(idle)
@@ -423,21 +420,26 @@ async fn drive(
         );
     }
 
-    // ---- Assertion 1: each agent emitted ≥2 distinct outputs ----
+    // ---- Assertion 1: each agent kept a canonical current output ----
+    // Each agent keeps a single canonical Output, overwritten each refresh
+    // cycle, so only the latest body survives on disk — past bodies cannot
+    // be counted here. The "refreshes repeatedly over time" intent is
+    // carried by Assertion 2 (distinct folded source outputs accumulate in
+    // the parent's reconcile evidence, which is not overwritten). Here we
+    // pin that each agent emitted at all: its canonical body is present and
+    // carries a refresh-cycle marker.
     for start in &starts {
         let agent_id = start.input.agent_id;
         let fs =
             AgentFs::open_for_agent(storage.clone() as Arc<dyn AgentStorage>, graph_id, agent_id);
-        let outs = fs
-            .list_recent_outputs(16)
+        let body = fs
+            .read_output()
             .await
-            .with_context(|| format!("list outputs for {}", start.input.agent_name))?;
-        let distinct: BTreeSet<&str> = outs.iter().map(|o| o.content.as_str()).collect();
+            .with_context(|| format!("read output for {}", start.input.agent_name))?;
         assert!(
-            distinct.len() >= 2,
-            "{} must emit ≥2 distinct outputs (emit→idle→refresh repeats); got {:?}",
+            body.starts_with("finding ") || body.starts_with("consolidated report "),
+            "{} canonical output body drifted from scripted WriteOutput; got {body:?}",
             start.input.agent_name,
-            outs.iter().map(|o| &o.content).collect::<Vec<_>>()
         );
     }
 

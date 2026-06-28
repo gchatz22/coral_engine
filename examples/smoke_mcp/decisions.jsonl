@@ -10,5 +10,5 @@
 # src/evidence.rs ever change, or if the server's reply shape drifts (e.g.
 # server-everything bumps its content envelope).
 {"type":"call_tools","calls":[{"name":"get-sum","args":{"a":2,"b":3},"claim_seed":"seed-1"}]}
-{"type":"emit_output","content":"get-sum(2, 3) via MCP server-everything","evidence":["10c7854829677f9d39acaafa5aa5ae4e9fa59ae5cba2a1dafc941c4c9f4938de"]}
+{"type":"write_output","body":"get-sum(2, 3) via MCP server-everything","citations":["10c7854829677f9d39acaafa5aa5ae4e9fa59ae5cba2a1dafc941c4c9f4938de"]}
 {"type":"idle","next_after":50}

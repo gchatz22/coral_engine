@@ -15,7 +15,7 @@ asserts every artifact below lands on disk in its byte-checkable
 shape, and that the cross-agent provenance trail resolves
 transitively:
 
-- Each child's `outputs/<output_id>.json` carries the scripted claim
+- Each child's `outputs/output.md` carries the scripted claim
   (child-a: `"claim-A says X"`; child-b: `"claim-B says NOT-X"`).
 - Parent's `evidence/` contains exactly 2 synthetic records (`tool ==
   "reconcile"`), one per cited child output. Each record's `args`
@@ -28,13 +28,13 @@ transitively:
   `source_output_id` match the children's emitted outputs.
 - **Cross-FS provenance trail (load-bearing):** parent's output →
   cited synthetic evidence → `args.source_output_id` → child's
-  `outputs/<source_output_id>.json` resolves across two agent FS
+  `outputs/output.md` resolves across two agent FS
   roots without ambiguity. This is the property the synthetic-
   evidence pattern was designed to guarantee, and the integration
   test pins it.
 
 The children each cite one planted `EvidenceRecord` (`tool == "echo"`)
-in their `EmitOutput` — `AgentFs::persist_output` rejects empty
+in their `WriteOutput` — `AgentFs::persist_output` rejects empty
 evidence, and the test never runs a real tool, so the planted record
 stands in for the tool call output. This is harness scaffolding, not
 a contract; the parent's synthetic-evidence trail and the children's

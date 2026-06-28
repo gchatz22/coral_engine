@@ -22,7 +22,7 @@ use thiserror::Error;
 /// can scan the two side by side.
 const TOOL_NAMES: &[&str] = &[
     "call_tool",
-    "emit_output",
+    "write_output",
     "rewrite_fs",
     "read",
     "list",
@@ -72,22 +72,23 @@ pub fn decision_tools() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
-            name: "emit_output".into(),
-            description: "Express the decision to emit a finished output. Every id in \
-                 `evidence` must resolve in the agent's evidence store; the \
+            name: "write_output".into(),
+            description: "Write your single, kept-current Output. `body` (prose) replaces \
+                 your canonical output; `citations` are the evidence ids it rests on. \
+                 Every id in `citations` must resolve in your evidence store; the \
                  runtime will refuse to persist the output otherwise."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "content": { "type": "string" },
-                    "evidence": {
+                    "body": { "type": "string" },
+                    "citations": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Hex-encoded evidence ids."
+                        "description": "Hex-encoded evidence ids the output cites."
                     }
                 },
-                "required": ["content", "evidence"]
+                "required": ["body", "citations"]
             }),
         },
         ToolSpec {
@@ -120,7 +121,7 @@ pub fn decision_tools() -> Vec<ToolSpec> {
                     "path": {
                         "type": "string",
                         "description": "Path relative to the agent root, e.g. \
-                                        `notes/plan.md` or `outputs/<id>.json`."
+                                        `notes/plan.md`."
                     }
                 },
                 "required": ["path"]
@@ -214,7 +215,7 @@ pub fn decision_tools() -> Vec<ToolSpec> {
                  parent's context as synthetic evidence; optionally record \
                  a conflict if the children disagree. Each source becomes \
                  one synthetic evidence record in the parent's evidence/ \
-                 directory; the parent's next emit_output can cite those \
+                 directory; the parent's next write_output can cite those \
                  synthetic ids."
                 .into(),
             input_schema: json!({
@@ -285,7 +286,7 @@ pub enum DecisionParseError {
     NoCalls,
     /// The model returned multiple tool calls that mix `call_tool` (the
     /// parallel-tool path) with one of the terminal decision tools
-    /// (`emit_output`, `rewrite_fs`, `idle`). Terminal decisions cannot
+    /// (`write_output`, `rewrite_fs`, `idle`). Terminal decisions cannot
     /// batch with other calls in the same tick.
     #[error("mixed decision tools in one response: {names:?}")]
     MixedDecisionTools { names: Vec<String> },
@@ -324,7 +325,7 @@ pub enum DecisionParseError {
 /// `ToolCall.id` (the `tool_use.id` on the wire) propagates into each
 /// `decision::ToolCall.tool_use_id` so the run loop can stage the paired
 /// `tool_result` blocks for the next prompt bundle. Terminal decision
-/// tools (`emit_output`, `rewrite_fs`, `idle`) remain singular: a
+/// tools (`write_output`, `rewrite_fs`, `idle`) remain singular: a
 /// response that includes any terminal tool alongside another call fails
 /// as `MixedDecisionTools` rather than silently discarding the extras.
 pub fn parse_decision(calls: &[ToolCall]) -> Result<Decision, DecisionParseError> {
@@ -389,7 +390,7 @@ pub fn parse_decision(calls: &[ToolCall]) -> Result<Decision, DecisionParseError
     // error fires cleanly before serde gets a chance to complain about
     // shape. Lists below mirror the variant fields in `decision.rs`.
     let required: &[&str] = match call.name.as_str() {
-        "emit_output" => &["content", "evidence"],
+        "write_output" => &["body", "citations"],
         "rewrite_fs" => &["ops"],
         "read" => &["path"],
         "list" => &["path"],
@@ -611,34 +612,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_emit_output_round_trips() {
+    fn parse_write_output_round_trips() {
         let ev = EvidenceId::new("echo", &json!({"a": 1}), &json!({"r": 1}));
         let tc = call(
-            "emit_output",
+            "write_output",
             json!({
-                "content": "hello",
-                "evidence": [ev.as_str()]
+                "body": "hello",
+                "citations": [ev.as_str()]
             }),
         );
         let d = parse_decision(&[tc]).unwrap();
         assert_eq!(
             d,
-            Decision::EmitOutput {
-                content: "hello".into(),
-                evidence: vec![ev],
+            Decision::WriteOutput {
+                body: "hello".into(),
+                citations: vec![ev],
             }
         );
     }
 
     #[test]
-    fn parse_emit_output_accepts_empty_evidence() {
-        let tc = call("emit_output", json!({"content": "draft", "evidence": []}));
+    fn parse_write_output_accepts_empty_citations() {
+        let tc = call("write_output", json!({"body": "draft", "citations": []}));
         let d = parse_decision(&[tc]).unwrap();
         assert_eq!(
             d,
-            Decision::EmitOutput {
-                content: "draft".into(),
-                evidence: vec![],
+            Decision::WriteOutput {
+                body: "draft".into(),
+                citations: vec![],
             }
         );
     }
@@ -763,7 +764,7 @@ mod tests {
                     "args": {},
                     "claim_seed": "s"
                 }),
-                "emit_output" => json!({"content": "", "evidence": []}),
+                "write_output" => json!({"body": "", "citations": []}),
                 "rewrite_fs" => json!({"ops": []}),
                 "read" => json!({"path": "notes/a.md"}),
                 "list" => json!({"path": "notes/"}),
@@ -1029,7 +1030,7 @@ mod tests {
     #[test]
     fn parse_mixed_call_tool_and_terminal_errors() {
         // `call_tool` is the parallel-call shape; mixing it with any
-        // terminal decision (`emit_output`, `rewrite_fs`, `idle`) is never
+        // terminal decision (`write_output`, `rewrite_fs`, `idle`) is never
         // a valid single-tick decision.
         let err = parse_decision(&[
             call(

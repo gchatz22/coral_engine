@@ -20,23 +20,25 @@
 //!
 //! ## End-state assertions (load-bearing)
 //!
-//! 1. Each child's `outputs/<output_id>.json` contains the scripted
+//! 1. Each child's canonical `outputs/output.md` body equals the scripted
 //!    content.
 //! 2. Parent's `evidence/` contains exactly 2 synthetic `EvidenceRecord`s
 //!    (`tool == "reconcile"`), one per child output, with `args`
 //!    referencing the right `(child_agent_id, child_workflow_id,
 //!    source_output_id)` triple.
-//! 3. Parent's `outputs/` contains exactly 1 reconciled output citing
-//!    both synthetic evidence ids in `evidence`.
+//! 3. Parent's canonical `outputs/output.md` body is the reconciled output.
+//!    Citations live in the DB reference graph, not the file, so the
+//!    synthetic-id provenance is pinned via the reconcile evidence records
+//!    and the cross-FS walk rather than a per-output citation list.
 //! 4. Parent's `conflicts/` contains exactly 1 `ConflictRecord` with
 //!    `kind == HeldOpen`, `alternatives.len() == 2`, and `resolution ==
 //!    None`. Each `ConflictAlternative.source_child` +
 //!    `source_output_id` resolves correctly.
-//! 5. **Cross-FS provenance trail:** starting from the parent's output,
-//!    the cited evidence record's `args.source_output_id` resolves to
-//!    the child's `outputs/<id>.json` via cross-agent
-//!    `AgentFs::open_for_agent` — no ambiguity, no string-shape
-//!    guessing.
+//! 5. **Cross-FS provenance trail:** each parent reconcile evidence
+//!    record's `args.source_output_id` resolves to the child's canonical
+//!    `outputs/output.md` via cross-agent `AgentFs::open_for_agent` — the
+//!    cross-read body's content-addressed `OutputId` matches the recorded
+//!    `source_output_id`, no string-shape guessing.
 
 use std::collections::VecDeque;
 use std::env;
@@ -95,7 +97,7 @@ const PARENT_OUTPUT_CONTENT: &str = "reconciled: held open";
 
 /// The parent's `evidence/` directory, listed between the reconcile and
 /// emit steps so the synthetic evidence ids can be recovered for the
-/// `EmitOutput` citation. Used both in the parent script's `List` step and
+/// `WriteOutput` citation. Used both in the parent script's `List` step and
 /// in the matcher that recovers the ids from that step's observation.
 const EVIDENCE_DIR: &str = "evidence/";
 
@@ -161,7 +163,7 @@ fn ensure_installed() -> Arc<MemoryStorage> {
 ///   carries (once per cycle); synthesizes a `Decision::ReconcileChildren`
 ///   from the first observed `ChildOutput` triggers (one per child) when
 ///   the script pops the `reconcile_placeholder` sentinel; synthesizes a
-///   `Decision::EmitOutput` citing the synthetic evidence ids recovered
+///   `Decision::WriteOutput` citing the synthetic evidence ids recovered
 ///   from a prior `List { path: "evidence/" }` step in this cycle's
 ///   session when the script pops the `emit_with_synthetic_placeholder`
 ///   sentinel.
@@ -341,7 +343,7 @@ fn synthesize_reconcile_or_wait() -> anyhow::Result<Decision> {
     Ok(Decision::ReconcileChildren { sources, conflict })
 }
 
-/// Synthesize `Decision::EmitOutput { content, evidence }` from the
+/// Synthesize `Decision::WriteOutput { body, citations }` from the
 /// synthetic evidence records the reconcile activity wrote into the
 /// parent's `evidence/` directory earlier in this same cycle. The
 /// reconcile activity's observation does not carry the minted
@@ -382,9 +384,9 @@ fn synthesize_emit_or_wait(session: &Session) -> anyhow::Result<Decision> {
                 next_after: Duration::from_millis(50),
             })
         }
-        2 => Ok(Decision::EmitOutput {
-            content: PARENT_OUTPUT_CONTENT.into(),
-            evidence: synthetic_ids,
+        2 => Ok(Decision::WriteOutput {
+            body: PARENT_OUTPUT_CONTENT.into(),
+            citations: synthetic_ids,
         }),
         n => panic!(
             "synthesize_emit_or_wait: unexpected synthetic-evidence count {n} \
@@ -542,7 +544,7 @@ async fn run_end_to_end() -> Result<()> {
     reset_observed_triggers();
 
     // Plant one evidence record under each child's FS prefix so the
-    // scripted EmitOutput resolves provenance. `AgentFs::persist_output`
+    // scripted WriteOutput resolves provenance. `AgentFs::persist_output`
     // rejects empty `evidence` (`FsError::EmptyEvidence`) — children
     // therefore need to cite *something*. The synthetic-evidence
     // pattern is the parent's mechanism for cross-agent provenance and
@@ -564,7 +566,7 @@ async fn run_end_to_end() -> Result<()> {
             chrono::Utc::now(),
         ))
         .await
-        .expect("plant evidence for child-a EmitOutput");
+        .expect("plant evidence for child-a WriteOutput");
     let plant_storage_b: Arc<dyn AgentStorage> = storage.clone();
     let plant_fs_b = AgentFs::new_with_storage(plant_storage_b, &child_b_prefix, &plant_mandate)
         .await
@@ -577,13 +579,13 @@ async fn run_end_to_end() -> Result<()> {
             chrono::Utc::now(),
         ))
         .await
-        .expect("plant evidence for child-b EmitOutput");
+        .expect("plant evidence for child-b WriteOutput");
 
     // ---- 3. Scripts ---------------------------------------------------
     //
-    // Children: each runs an Idle cycle, then an EmitOutput cycle (the
-    // EmitOutput signals the parent), then the `step_cap=2` cap stops each
-    // (agents never self-terminate). Each EmitOutput cites its planted
+    // Children: each runs an Idle cycle, then a WriteOutput cycle (the
+    // WriteOutput signals the parent), then the `step_cap=2` cap stops each
+    // (agents never self-terminate). Each WriteOutput cites its planted
     // evidence id (one per child) so `persist_output`'s provenance contract
     // is satisfied.
     //
@@ -598,18 +600,18 @@ async fn run_end_to_end() -> Result<()> {
         Decision::Idle {
             next_after: Duration::from_millis(50),
         },
-        Decision::EmitOutput {
-            content: CHILD_A_CONTENT.into(),
-            evidence: vec![planted_a_id.clone()],
+        Decision::WriteOutput {
+            body: CHILD_A_CONTENT.into(),
+            citations: vec![planted_a_id.clone()],
         },
     ];
     let child_b_script = vec![
         Decision::Idle {
             next_after: Duration::from_millis(50),
         },
-        Decision::EmitOutput {
-            content: CHILD_B_CONTENT.into(),
-            evidence: vec![planted_b_id.clone()],
+        Decision::WriteOutput {
+            body: CHILD_B_CONTENT.into(),
+            citations: vec![planted_b_id.clone()],
         },
     ];
     let parent_script = vec![
@@ -775,8 +777,8 @@ async fn drive(
         .context("start_workflow(child-b)")?;
     eprintln!("child-b started at {child_b_workflow_id}");
 
-    // Wait for each child to retire (EmitOutput, then the step_cap cap).
-    // Each signals the parent on its EmitOutput cycle before the cap stops
+    // Wait for each child to retire (WriteOutput, then the step_cap cap).
+    // Each signals the parent on its WriteOutput cycle before the cap stops
     // it. The cap-driven retirement also fires `Trigger::ChildRetired` at
     // the parent — orthogonal to the reconcile assertion but exercises the
     // lifecycle-signal path as a side effect.
@@ -865,46 +867,38 @@ async fn assert_end_state(
 
     // --- Children' outputs ---------------------------------------------
     //
-    // Each child's `outputs/<id>.json` carries the scripted content.
+    // Each child keeps a single canonical Output (`outputs/output.md`,
+    // overwritten each write); `read_output` returns its body. The
+    // content-addressed `OutputId` is recomputed from the scripted body —
+    // it equals the id the child's `ChildOutput` trigger carried, so the
+    // downstream provenance cross-checks pin the same value.
     let child_a_view =
         AgentFs::new_with_storage(inspect_storage.clone(), child_a_prefix, &inspect_mandate)
             .await
             .context("open child-a AgentFs")?;
-    let a_outs = child_a_view
-        .list_recent_outputs(8)
+    let child_a_body = child_a_view
+        .read_output()
         .await
-        .context("list_recent_outputs(child-a)")?;
+        .context("read_output(child-a)")?;
     assert_eq!(
-        a_outs.len(),
-        1,
-        "child-a should have exactly one output on disk; got {}",
-        a_outs.len()
+        child_a_body, CHILD_A_CONTENT,
+        "child-a output body drifted from scripted WriteOutput"
     );
-    let child_a_output = &a_outs[0];
-    assert_eq!(
-        child_a_output.content, CHILD_A_CONTENT,
-        "child-a output content drifted from scripted EmitOutput"
-    );
+    let child_a_output_id = OutputId::new(CHILD_A_CONTENT);
 
     let child_b_view =
         AgentFs::new_with_storage(inspect_storage.clone(), child_b_prefix, &inspect_mandate)
             .await
             .context("open child-b AgentFs")?;
-    let b_outs = child_b_view
-        .list_recent_outputs(8)
+    let child_b_body = child_b_view
+        .read_output()
         .await
-        .context("list_recent_outputs(child-b)")?;
+        .context("read_output(child-b)")?;
     assert_eq!(
-        b_outs.len(),
-        1,
-        "child-b should have exactly one output on disk; got {}",
-        b_outs.len()
+        child_b_body, CHILD_B_CONTENT,
+        "child-b output body drifted from scripted WriteOutput"
     );
-    let child_b_output = &b_outs[0];
-    assert_eq!(
-        child_b_output.content, CHILD_B_CONTENT,
-        "child-b output content drifted from scripted EmitOutput"
-    );
+    let child_b_output_id = OutputId::new(CHILD_B_CONTENT);
 
     // --- Parent evidence -----------------------------------------------
     //
@@ -970,7 +964,7 @@ async fn assert_end_state(
                 .as_object()
                 .and_then(|o| o.get("source_output_id"))
                 .and_then(|v| serde_json::from_value::<OutputId>(v.clone()).ok())
-                .map(|o| o == child_a_output.id)
+                .map(|o| o == child_a_output_id)
                 .unwrap_or(false)
         })
         .copied()
@@ -982,7 +976,7 @@ async fn assert_end_state(
                 .as_object()
                 .and_then(|o| o.get("source_output_id"))
                 .and_then(|v| serde_json::from_value::<OutputId>(v.clone()).ok())
-                .map(|o| o == child_b_output.id)
+                .map(|o| o == child_b_output_id)
                 .unwrap_or(false)
         })
         .copied()
@@ -991,43 +985,26 @@ async fn assert_end_state(
         rec_for_a,
         child_a_workflow_id,
         child_a_agent_id,
-        &child_a_output.id,
+        &child_a_output_id,
     )?;
     assert_record_matches(
         rec_for_b,
         child_b_workflow_id,
         child_b_agent_id,
-        &child_b_output.id,
+        &child_b_output_id,
     )?;
 
     // --- Parent output -------------------------------------------------
     //
-    // Exactly 1 reconciled output, citing both synthetic evidence ids.
-    let parent_outs = parent_view
-        .list_recent_outputs(8)
+    // The parent keeps a single canonical reconciled Output. Citations live
+    // in the DB reference graph, not the file, so the synthetic-id
+    // provenance is checked via the reconcile evidence records on disk
+    // (`rec_for_a`/`rec_for_b`, asserted above) and the cross-FS walk below.
+    let parent_body = parent_view
+        .read_output()
         .await
-        .context("list_recent_outputs(parent)")?;
-    assert_eq!(
-        parent_outs.len(),
-        1,
-        "parent should have exactly one output (the reconciled one); got {}",
-        parent_outs.len()
-    );
-    let parent_output = &parent_outs[0];
-    assert_eq!(parent_output.content, PARENT_OUTPUT_CONTENT);
-    assert_eq!(
-        parent_output.evidence.len(),
-        2,
-        "parent output must cite both synthetic evidence ids"
-    );
-    assert!(
-        parent_output.evidence.contains(&rec_for_a.id),
-        "parent output evidence missing child-a's synthetic id"
-    );
-    assert!(
-        parent_output.evidence.contains(&rec_for_b.id),
-        "parent output evidence missing child-b's synthetic id"
-    );
+        .context("read_output(parent)")?;
+    assert_eq!(parent_body, PARENT_OUTPUT_CONTENT);
 
     // --- Parent conflicts ----------------------------------------------
     //
@@ -1054,12 +1031,12 @@ async fn assert_end_state(
     let alt_a = conflict
         .alternatives
         .iter()
-        .find(|a| a.source_output_id == child_a_output.id)
+        .find(|a| a.source_output_id == child_a_output_id)
         .expect("conflict alternatives must include child-a's output");
     let alt_b = conflict
         .alternatives
         .iter()
-        .find(|a| a.source_output_id == child_b_output.id)
+        .find(|a| a.source_output_id == child_b_output_id)
         .expect("conflict alternatives must include child-b's output");
     assert_eq!(alt_a.claim, CHILD_A_CONTENT);
     assert_eq!(alt_b.claim, CHILD_B_CONTENT);
@@ -1070,18 +1047,12 @@ async fn assert_end_state(
 
     // --- Cross-FS provenance trail (load-bearing) ---------------------
     //
-    // parent output → its evidence ids → resolve each via the
-    // parent's own evidence/<id>.json → that record's
-    // args.source_output_id → cross-agent open of the child's FS
-    // → read_output(source_output_id) returns the child's output
-    // → byte-equal to what we already asserted on the child side.
-    for synth_ev in &parent_output.evidence {
-        let rec = parent_evidence
-            .iter()
-            .find(|e| &e.id == synth_ev)
-            .ok_or_else(|| {
-                anyhow::anyhow!("synthetic evidence id missing from parent evidence/")
-            })?;
+    // parent's reconcile evidence records → each record's
+    // args.source_output_id + child_agent_id → cross-agent open of the
+    // child's FS → read_output() returns the child's current Output body
+    // → byte-equal to what we already asserted on the child side, and the
+    // content-addressed OutputId matches the recorded source_output_id.
+    for rec in [rec_for_a, rec_for_b] {
         assert_eq!(rec.tool, "reconcile");
         let args = rec
             .args
@@ -1103,30 +1074,29 @@ async fn assert_end_state(
         // Cross-agent FS read — the operation the synthetic-evidence
         // pattern is designed to make a normal evidence trail support.
         let child_fs = AgentFs::open_for_agent(storage.clone(), graph_id, source_child_aid);
-        let resolved = child_fs.read_output(&source_oid).await.with_context(|| {
-            format!("cross-agent read_output({source_oid:?}) on child {source_child_aid}")
-        })?;
-        // The output we cross-read must match the child's own
-        // list_recent_outputs view byte-for-byte (modulo created_at,
-        // which the test doesn't compare — OutputId is
-        // content-addressed over (content, evidence), so id+content+
-        // evidence equality is the load-bearing pin).
-        let expected = if source_child_aid == child_a_agent_id {
-            child_a_output
+        let resolved_body = child_fs
+            .read_output()
+            .await
+            .with_context(|| format!("cross-agent read_output() on child {source_child_aid}"))?;
+        // The body we cross-read must match the child's own current Output
+        // byte-for-byte, and its content-addressed OutputId must equal the
+        // source_output_id the reconcile record recorded.
+        let (expected_body, expected_id) = if source_child_aid == child_a_agent_id {
+            (CHILD_A_CONTENT, &child_a_output_id)
         } else if source_child_aid == child_b_agent_id {
-            child_b_output
+            (CHILD_B_CONTENT, &child_b_output_id)
         } else {
             return Err(anyhow::anyhow!(
                 "reconcile evidence pointed at a child this test never started: {source_child_aid}"
             ));
         };
-        assert_eq!(resolved.id, expected.id);
-        assert_eq!(resolved.content, expected.content);
-        assert_eq!(resolved.evidence, expected.evidence);
+        assert_eq!(resolved_body, expected_body);
+        assert_eq!(&OutputId::new(&resolved_body), expected_id);
+        assert_eq!(&source_oid, expected_id);
 
         // The child's `evidence/` directory contains exactly one
         // record — the per-child planted "echo" record cited by the
-        // scripted EmitOutput. (Children don't call any tools at
+        // scripted WriteOutput. (Children don't call any tools at
         // runtime; the planted record is the test-harness analogue
         // of what a real `execute_tool` activity would have written.)
         // The point of the assertion is to confirm the cross-agent
