@@ -312,6 +312,18 @@ jobs:
           cargo test --locked -p coral_temporal --test workflow_smoke -- --nocapture \
             2>&1 | tee ci-logs/workflow-smoke.log
 
+      # The cycle-loop suite: scripted multi-step/multi-cycle runs that assert
+      # the per-tick dispatch shape AND the cycle-boundary `commit_tick`
+      # schedule — one per completed cycle, never on the retire path, and
+      # exactly one on a continue-as-new-spanning resume.
+      - name: Run workflow_loop live
+        env:
+          TEMPORAL_LIVE_TEST: "1"
+        run: |
+          set -o pipefail
+          cargo test --locked -p coral_temporal --test workflow_loop -- --nocapture \
+            2>&1 | tee ci-logs/workflow-loop-live.log
+
       # Drives the same scripted-Decide sequence as `workflow_smoke` but routes
       # `AgentInput` + seed triggers through `coral_graph::yaml::{parse_and_validate,
       # into_agent_input, yaml_seed_triggers}` against
