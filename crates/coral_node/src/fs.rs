@@ -21,7 +21,7 @@
 
 use crate::agent_ref::{AgentId, GraphId};
 use crate::conflict::ConflictRecord;
-use crate::decision::{ConflictId, FsOp};
+use crate::decision::{ConflictId, FsOp, Remainder};
 use crate::evidence::{EvidenceId, EvidenceRecord};
 use crate::mandate::{Mandate, Output, OutputId};
 use crate::storage::{AgentStorage, LocalStorage, PutOutcome};
@@ -70,6 +70,34 @@ pub struct TailObject {
 const OUTPUTS_TAIL_SUFFIX: &str = "outputs/_tail.json";
 /// Tail-object key suffix for `evidence/`.
 const EVIDENCE_TAIL_SUFFIX: &str = "evidence/_tail.json";
+/// Tail-object key suffix for `notes/`. Unlike outputs/evidence, notes are
+/// agent-authored, mutable, and deletable, so the tail is maintained on every
+/// `apply_ops` write/delete rather than on a content-addressed first-write.
+const NOTES_TAIL_SUFFIX: &str = "notes/_tail.json";
+
+/// Tail-record predicate for the content-addressed prefixes (`outputs/`,
+/// `evidence/`): a `.json` record, never the sidecar.
+fn is_json_record(filename: &str) -> bool {
+    filename.ends_with(".json") && filename != "_tail.json"
+}
+
+/// Tail-record predicate for `notes/`: any agent-authored file (markdown or
+/// otherwise, at any depth) except the runtime-owned recency sidecar.
+fn is_note_record(filename: &str) -> bool {
+    filename != "_tail.json" && !filename.ends_with("/_tail.json")
+}
+
+/// A recency-ordered window of bare filenames under one indexed prefix, plus
+/// how many files lie beyond it. Built for the cycle seed's pointer index:
+/// `more` lets the seed tell the model the view is partial (and by how much)
+/// so it explores (`list`/`search`) for the rest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecentWindow {
+    /// Up to `n` filenames, most-recent-first.
+    pub filenames: Vec<String>,
+    /// How many files exist under the prefix beyond those in `filenames`.
+    pub more: Remainder,
+}
 
 /// Typed errors the `AgentFs` raises. The run loop matches on these to
 /// distinguish provenance/traversal violations from real storage
@@ -106,6 +134,11 @@ pub enum FsError {
     /// `<root>/notes/`. Bootstrap `apply_ops` only writes under `notes/`.
     #[error("path outside notes/ rejected: {0}")]
     PathOutsideNotes(String),
+    /// An `FsOp` targeted `notes/_tail.json`, the runtime-owned recency
+    /// sidecar. It is excluded from the agent's writable surface like
+    /// `evidence/` — a model write would corrupt the notes index.
+    #[error("path reserved (runtime-owned): {0}")]
+    ReservedNotesPath(String),
     /// Wrapped backend error from the underlying
     /// [`crate::storage::AgentStorage`]. The `key` field carries the
     /// logical key (under the agent's prefix) that the operation
@@ -298,8 +331,12 @@ impl AgentFs {
         // Reconcile any tail that lags on-disk reality after a crash
         // mid-PUT, so the O(1) read path can trust a sub-capacity tail
         // as complete. One LIST + at most one PUT per indexed prefix.
-        me.reconcile_tail(OUTPUTS_TAIL_SUFFIX, "outputs/").await?;
-        me.reconcile_tail(EVIDENCE_TAIL_SUFFIX, "evidence/").await?;
+        me.reconcile_tail(OUTPUTS_TAIL_SUFFIX, "outputs/", is_json_record)
+            .await?;
+        me.reconcile_tail(EVIDENCE_TAIL_SUFFIX, "evidence/", is_json_record)
+            .await?;
+        me.reconcile_tail(NOTES_TAIL_SUFFIX, "notes/", is_note_record)
+            .await?;
 
         Ok(me)
     }
@@ -354,7 +391,12 @@ impl AgentFs {
     /// lex-greatest `TAIL_K` filenames in newest-first order,
     /// preserving any prior `added_at` so a no-op re-reconciliation
     /// produces byte-identical bytes, and PUT it back.
-    async fn reconcile_tail(&self, tail_suffix: &str, indexed_prefix: &str) -> anyhow::Result<()> {
+    async fn reconcile_tail(
+        &self,
+        tail_suffix: &str,
+        indexed_prefix: &str,
+        is_record: fn(&str) -> bool,
+    ) -> anyhow::Result<()> {
         let full_prefix = self.key(indexed_prefix);
         let page = self
             .storage
@@ -366,8 +408,7 @@ impl AgentFs {
             .keys
             .into_iter()
             .filter_map(|k| k.strip_prefix(&full_prefix).map(|s| s.to_string()))
-            .filter(|f| f.ends_with(".json"))
-            .filter(|f| f != "_tail.json")
+            .filter(|f| is_record(f))
             .collect();
         if on_disk.is_empty() {
             return Ok(());
@@ -534,6 +575,7 @@ impl AgentFs {
     /// non-fakeable. Any future widening of the model's writable set
     /// must keep `evidence/` excluded.
     pub async fn apply_ops(&self, ops: Vec<FsOp>) -> anyhow::Result<()> {
+        let notes_prefix = self.key("notes/");
         // Pre-validate so a bad path mid-batch leaves no partial state.
         let mut planned: Vec<(String, FsOp)> = Vec::with_capacity(ops.len());
         for op in ops {
@@ -541,16 +583,24 @@ impl AgentFs {
                 FsOp::WriteFile { path, .. } | FsOp::DeleteFile { path } => path.as_str(),
             };
             let resolved = self.resolve_notes_key(raw)?;
+            let rel = resolved.strip_prefix(&notes_prefix).unwrap_or(&resolved);
+            if !is_note_record(rel) {
+                return Err(FsError::ReservedNotesPath(raw.to_string()).into());
+            }
             planned.push((resolved, op));
         }
 
         for (key, op) in planned {
+            let rel = key.strip_prefix(&notes_prefix).map(str::to_string);
             match op {
                 FsOp::WriteFile { content, .. } => {
                     self.storage
                         .put(&key, Bytes::from(content.into_bytes()))
                         .await
                         .map_err(|e| FsError::storage(&key, e))?;
+                    if let Some(rel) = rel {
+                        self.append_to_tail(NOTES_TAIL_SUFFIX, rel).await?;
+                    }
                 }
                 FsOp::DeleteFile { .. } => {
                     // Idempotent: missing key is fine.
@@ -558,6 +608,9 @@ impl AgentFs {
                         .delete(&key)
                         .await
                         .map_err(|e| FsError::storage(&key, e))?;
+                    if let Some(rel) = rel {
+                        self.remove_from_tail(NOTES_TAIL_SUFFIX, &rel).await?;
+                    }
                 }
             }
         }
@@ -861,15 +914,37 @@ impl AgentFs {
         Ok(hits)
     }
 
-    /// Filenames in `outputs/`, most-recent-first, capped at `n`. Recency
-    /// comes from the `_tail.json` sidecar; a missing or torn tail falls
-    /// back to a lexicographic LIST — which loses strict recency but never
-    /// the set. Used to build the cycle seed's output index.
-    pub async fn recent_output_filenames(&self, n: usize) -> anyhow::Result<Vec<String>> {
+    /// Recency window of `outputs/` filenames for the cycle seed's index.
+    /// See [`AgentFs::recent_window`].
+    pub async fn recent_output_filenames(&self, n: usize) -> anyhow::Result<RecentWindow> {
+        self.recent_window(OUTPUTS_TAIL_SUFFIX, "outputs/", n).await
+    }
+
+    /// Recency window of `notes/` filenames for the cycle seed's index.
+    /// See [`AgentFs::recent_window`].
+    pub async fn recent_note_filenames(&self, n: usize) -> anyhow::Result<RecentWindow> {
+        self.recent_window(NOTES_TAIL_SUFFIX, "notes/", n).await
+    }
+
+    /// Up to `n` filenames under `indexed_prefix`, most-recent-first, plus how
+    /// many lie beyond the window. Recency comes from the `_tail.json` sidecar;
+    /// a missing or torn tail falls back to a lexicographic LIST — which loses
+    /// strict recency but never the set. The `more` count is exact while the
+    /// tail is sub-capacity (it is then the complete set) and a lower bound at
+    /// capacity, so we never pay a full LIST just to count.
+    async fn recent_window(
+        &self,
+        tail_suffix: &str,
+        indexed_prefix: &str,
+        n: usize,
+    ) -> anyhow::Result<RecentWindow> {
         if n == 0 {
-            return Ok(Vec::new());
+            return Ok(RecentWindow {
+                filenames: Vec::new(),
+                more: Remainder::None,
+            });
         }
-        let tail_key = self.key(OUTPUTS_TAIL_SUFFIX);
+        let tail_key = self.key(tail_suffix);
         let tail_bytes = self
             .storage
             .get(&tail_key)
@@ -878,16 +953,52 @@ impl AgentFs {
         if let Some(bytes) = tail_bytes {
             if let Ok(tail) = serde_json::from_slice::<TailObject>(&bytes) {
                 let take = tail.entries.len().min(n);
-                return Ok(tail.entries[..take]
+                let filenames = tail.entries[..take]
                     .iter()
                     .map(|e| e.filename.clone())
-                    .collect());
+                    .collect();
+                let more = if tail.entries.len() == TAIL_K {
+                    // At capacity: the (TAIL_K - take) tail entries past the
+                    // window are a hard floor, and older files may exist on
+                    // disk beyond the tail — a lower bound, no LIST.
+                    Remainder::AtLeast(TAIL_K - take)
+                } else {
+                    // Sub-capacity: the tail is the complete set, so exact.
+                    match tail.entries.len() - take {
+                        0 => Remainder::None,
+                        k => Remainder::Exactly(k),
+                    }
+                };
+                return Ok(RecentWindow { filenames, more });
             }
         }
-        let mut all = self.list_dir("outputs/").await?;
-        let start = all.len().saturating_sub(n);
+        // LIST fallback already pays the listing, so the count is exact here.
+        let mut all = self.list_dir(indexed_prefix).await?;
+        let total = all.len();
+        let start = total.saturating_sub(n);
         all.drain(..start);
-        Ok(all)
+        let more = match total - all.len() {
+            0 => Remainder::None,
+            k => Remainder::Exactly(k),
+        };
+        Ok(RecentWindow {
+            filenames: all,
+            more,
+        })
+    }
+
+    /// Whether a file exists at `path` (relative to the agent root). One
+    /// point GET; used by `build_seed` to decide whether to pin a standing
+    /// note that has aged out of the recency window.
+    pub async fn file_exists(&self, path: &str) -> anyhow::Result<bool> {
+        let rel = self.clean_relpath(path)?;
+        let key = self.key(&rel);
+        Ok(self
+            .storage
+            .get(&key)
+            .await
+            .map_err(|e| FsError::storage(&key, e))?
+            .is_some())
     }
 
     /// Validate `raw` as a read target relative to the agent root and
@@ -969,6 +1080,33 @@ impl AgentFs {
         );
         if tail.entries.len() > TAIL_K {
             tail.entries.truncate(TAIL_K);
+        }
+        let bytes = serde_json::to_vec(&tail)?;
+        self.storage
+            .put(&key, Bytes::from(bytes))
+            .await
+            .map_err(|e| FsError::storage(&key, e))?;
+        Ok(())
+    }
+
+    /// Drop `filename` from the tail object at `<prefix><tail_suffix>`, if
+    /// present. For `notes/`, where files are deletable; no-op (no PUT) when
+    /// the tail is absent or the filename was not tracked.
+    async fn remove_from_tail(&self, tail_suffix: &str, filename: &str) -> anyhow::Result<()> {
+        let key = self.key(tail_suffix);
+        let Some(bytes) = self
+            .storage
+            .get(&key)
+            .await
+            .map_err(|e| FsError::storage(&key, e))?
+        else {
+            return Ok(());
+        };
+        let mut tail: TailObject = serde_json::from_slice(&bytes).unwrap_or_default();
+        let before = tail.entries.len();
+        tail.entries.retain(|e| e.filename != filename);
+        if tail.entries.len() == before {
+            return Ok(());
         }
         let bytes = serde_json::to_vec(&tail)?;
         self.storage
@@ -1581,6 +1719,169 @@ mod tests {
         assert!(err.downcast_ref::<FsError>().is_some());
         // Pre-flight validation rejects the batch before any write.
         assert!(!tmp.path().join("notes").join("good.md").exists());
+    }
+
+    async fn write_note(fs: &AgentFs, name: &str) {
+        fs.apply_ops(vec![FsOp::WriteFile {
+            path: format!("notes/{name}"),
+            content: format!("body of {name}"),
+        }])
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn notes_recency_window_is_most_recent_first_and_signposts_more() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        for name in ["a.md", "b.md", "c.md"] {
+            write_note(&fs, name).await;
+        }
+        let all = fs.recent_note_filenames(8).await.unwrap();
+        assert_eq!(
+            all.filenames,
+            vec!["c.md", "b.md", "a.md"],
+            "notes must surface most-recent-first"
+        );
+        assert_eq!(all.more, Remainder::None, "the whole set fits the window");
+
+        let windowed = fs.recent_note_filenames(2).await.unwrap();
+        assert_eq!(windowed.filenames, vec!["c.md", "b.md"]);
+        assert_eq!(
+            windowed.more,
+            Remainder::Exactly(1),
+            "a sub-capacity tail yields an exact overflow count"
+        );
+    }
+
+    #[tokio::test]
+    async fn notes_recency_window_reports_a_lower_bound_at_tail_capacity() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        for i in 0..(TAIL_K + 3) {
+            write_note(&fs, &format!("n-{i:03}.md")).await;
+        }
+        let got = fs.recent_note_filenames(8).await.unwrap();
+        assert_eq!(got.filenames.len(), 8);
+        assert_eq!(
+            got.more,
+            Remainder::AtLeast(TAIL_K - 8),
+            "at tail capacity the count is a lower bound, not exact"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_ops_delete_prunes_the_notes_tail() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        for name in ["a.md", "b.md", "c.md"] {
+            write_note(&fs, name).await;
+        }
+        fs.apply_ops(vec![FsOp::DeleteFile {
+            path: "notes/b.md".into(),
+        }])
+        .await
+        .unwrap();
+        let got = fs.recent_note_filenames(8).await.unwrap();
+        assert_eq!(
+            got.filenames,
+            vec!["c.md", "a.md"],
+            "a deleted note must drop out of the recency tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_ops_rewrite_bumps_note_recency() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        write_note(&fs, "a.md").await;
+        write_note(&fs, "b.md").await;
+        // Re-writing a.md should move it back to the front of recency.
+        write_note(&fs, "a.md").await;
+        let got = fs.recent_note_filenames(8).await.unwrap();
+        assert_eq!(
+            got.filenames,
+            vec!["a.md", "b.md"],
+            "rewriting a note bumps it to most-recent without duplicating it"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_ops_rejects_writes_to_the_reserved_notes_tail_sidecar() {
+        let (tmp, fs, _m) = fresh_fs().await;
+        let err = fs
+            .apply_ops(vec![
+                FsOp::WriteFile {
+                    path: "notes/good.md".into(),
+                    content: "ok".into(),
+                },
+                FsOp::WriteFile {
+                    path: "notes/_tail.json".into(),
+                    content: "forged-index".into(),
+                },
+            ])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<FsError>().unwrap(),
+                FsError::ReservedNotesPath(_)
+            ),
+            "writing the recency sidecar must be rejected"
+        );
+        // Atomic: the good op in the same batch must not have landed.
+        assert!(!tmp.path().join("notes").join("good.md").exists());
+    }
+
+    #[tokio::test]
+    async fn notes_tail_reconciles_after_a_lagging_write() {
+        let tmp = TempDir::new().unwrap();
+        let mandate = Mandate::new("reconcile-notes", Duration::from_millis(100), Some(1));
+        {
+            let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+                .await
+                .unwrap();
+            write_note(&fs, "a.md").await;
+        }
+        // Out-of-band note write that never updated the tail (crash mid-PUT).
+        let storage = Arc::new(LocalStorage::new(tmp.path().to_path_buf()).unwrap());
+        storage
+            .put("notes/orphan.md", Bytes::from_static(b"orphan"))
+            .await
+            .unwrap();
+        // Re-open: open-time reconcile rebuilds the notes tail from the LIST.
+        let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
+            .await
+            .unwrap();
+        let got = fs.recent_note_filenames(8).await.unwrap();
+        assert!(
+            got.filenames.iter().any(|f| f == "orphan.md"),
+            "an orphan note must surface after open-time reconcile; got {:?}",
+            got.filenames
+        );
+        assert!(got.filenames.iter().any(|f| f == "a.md"));
+    }
+
+    #[tokio::test]
+    async fn recent_note_filenames_falls_back_to_list_when_tail_absent() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        write_note(&fs, "a.md").await;
+        write_note(&fs, "b.md").await;
+        // Delete the sidecar without reopening, forcing the LIST fallback.
+        fs.storage().delete("notes/_tail.json").await.unwrap();
+        let got = fs.recent_note_filenames(8).await.unwrap();
+        let mut names = got.filenames.clone();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["a.md", "b.md"],
+            "the LIST fallback must recover the full note set"
+        );
+        assert_eq!(got.more, Remainder::None);
+    }
+
+    #[tokio::test]
+    async fn file_exists_reports_presence() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        assert!(!fs.file_exists("notes/STATUS.md").await.unwrap());
+        write_note(&fs, "STATUS.md").await;
+        assert!(fs.file_exists("notes/STATUS.md").await.unwrap());
     }
 
     #[tokio::test]

@@ -396,6 +396,42 @@ pub struct FsIndex {
     /// Filenames under `outputs/`, most-recent-first.
     #[serde(default)]
     pub outputs: Vec<String>,
+    /// How many `notes/` files exist beyond `notes` — the index is a recency
+    /// window, not the whole directory, so the model should `list`/`search` to
+    /// reach the rest.
+    #[serde(default)]
+    pub notes_more: Remainder,
+    /// How many `outputs/` files exist beyond `outputs`.
+    #[serde(default)]
+    pub outputs_more: Remainder,
+}
+
+/// How many files lie beyond a surfaced index window. Exact while the recency
+/// index is sub-capacity (the count is in hand); a lower bound once it is at
+/// capacity (the true total would need a full listing we decline to pay).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Remainder {
+    /// The window is the complete set; nothing lies beyond it.
+    #[default]
+    None,
+    /// Exactly this many files lie beyond the window.
+    Exactly(usize),
+    /// At least this many files lie beyond the window.
+    AtLeast(usize),
+}
+
+impl Remainder {
+    /// One fewer file now lies beyond the window — e.g. a pinned file that was
+    /// counted as overflow is now surfaced. `Exactly(1)` collapses to `None`.
+    pub fn decremented(self) -> Remainder {
+        match self {
+            Remainder::None => Remainder::None,
+            Remainder::Exactly(k) if k <= 1 => Remainder::None,
+            Remainder::Exactly(k) => Remainder::Exactly(k - 1),
+            Remainder::AtLeast(k) => Remainder::AtLeast(k.saturating_sub(1)),
+        }
+    }
 }
 
 /// The accumulating in-cycle context the model reasons over: the orienting
@@ -540,6 +576,27 @@ mod tests {
     use super::*;
     use crate::evidence::EvidenceId;
     use serde_json::json;
+
+    #[test]
+    fn fs_index_deserializes_pre_signpost_payload_with_defaults() {
+        // A seed serialized before the `*_has_more` fields existed (e.g. an
+        // in-flight carryover or journaled `build_seed` output) must still
+        // deserialize, defaulting the new flags to false.
+        let old = json!({ "notes": ["a.md"], "outputs": ["b.json"] });
+        let idx: FsIndex = serde_json::from_value(old).unwrap();
+        assert_eq!(idx.notes, vec!["a.md".to_string()]);
+        assert_eq!(idx.outputs, vec!["b.json".to_string()]);
+        assert_eq!(idx.notes_more, Remainder::None);
+        assert_eq!(idx.outputs_more, Remainder::None);
+    }
+
+    #[test]
+    fn remainder_decremented_consumes_one_overflow() {
+        assert_eq!(Remainder::None.decremented(), Remainder::None);
+        assert_eq!(Remainder::Exactly(1).decremented(), Remainder::None);
+        assert_eq!(Remainder::Exactly(3).decremented(), Remainder::Exactly(2));
+        assert_eq!(Remainder::AtLeast(56).decremented(), Remainder::AtLeast(55));
+    }
 
     #[test]
     fn call_tools_single_call_round_trip() {

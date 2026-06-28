@@ -16,7 +16,7 @@
 //! with the default `BTreeMap`-backed `serde_json::Map`, emitting keys in
 //! sorted order. That stability is what makes the snapshot tests viable.
 
-use crate::decision::{Decision, FsIndex, ReconcileSource, Seed, Session, Step};
+use crate::decision::{Decision, FsIndex, ReconcileSource, Remainder, Seed, Session, Step};
 use crate::mandate::Mandate;
 use crate::model_client::Message;
 use crate::trigger::Trigger;
@@ -31,7 +31,7 @@ use crate::trigger::Trigger;
 const INVARIANTS: &str = "\
 Invariants:
 1. Provenance. Every `emit_output` must cite `evidence` ids that resolve in your evidence store. The runtime rejects outputs whose evidence does not resolve.
-2. Pull what you need. You are given an index of your files by name, not their contents. Use `read`, `list`, and `search` to fetch what a step needs; nothing is handed to you unasked.
+2. Pull what you need. Your file index lists only your most recent files by name, not their contents, and not necessarily all of them. Use `read`, `list`, and `search` to fetch what a step needs and to reach files beyond the index; nothing is handed to you unasked.
 3. One step per turn. Reply by calling exactly one decision tool (`read`, `list`, `search`, `emit_output`, `rewrite_fs`, `idle`) OR one or more `call_tool` blocks dispatched together as a single parallel batch. After each step you see its result and choose the next step.
 4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` steps can cite.
 5. Idle ends the work. When you have finished this unit of work — produced or refreshed your Output — call `idle` to wait for your next wake. `idle` is the only step that ends the cycle.
@@ -137,24 +137,31 @@ fn render_triggers(triggers: &[Trigger]) -> String {
 /// Render the FS index: filenames only (pointers), never bodies. This is the
 /// orienting surface the model navigates from — it `read`s what it needs.
 fn render_index(index: &FsIndex) -> String {
-    let notes = if index.notes.is_empty() {
-        "(none)".to_string()
-    } else {
-        index.notes.join(", ")
-    };
-    let outputs = if index.outputs.is_empty() {
-        "(none)".to_string()
-    } else {
-        index.outputs.join(", ")
-    };
+    let notes = render_index_bucket(&index.notes, index.notes_more, "notes/");
+    let outputs = render_index_bucket(&index.outputs, index.outputs_more, "outputs/");
     format!(
         "# Your files (index)\n\
          \n\
          notes/: {notes}\n\
          outputs/: {outputs}\n\
          \n\
-         These are filenames only. Use `read` to fetch a file's contents, `list` to browse a directory, or `search` to find a string across files."
+         This index lists only your most recent files by name, not their contents, and not necessarily all of them. Use `read` to fetch a file, `list` a directory to see everything in it, or `search` to find a string across files. When something you need isn't listed here, explore for it — it has not been deleted, just not surfaced."
     )
+}
+
+/// Render one index bucket: comma-joined filenames (or `(none)`), with a count
+/// of the files beyond the window when there are any. `+N` is an exact count,
+/// `N+` a lower bound (the recency index was at capacity).
+fn render_index_bucket(files: &[String], more: Remainder, dir: &str) -> String {
+    if files.is_empty() {
+        return "(none)".to_string();
+    }
+    let joined = files.join(", ");
+    match more {
+        Remainder::None => joined,
+        Remainder::Exactly(k) => format!("{joined} (+{k} more — `list {dir}` for the full set)"),
+        Remainder::AtLeast(k) => format!("{joined} ({k}+ more — `list {dir}` for the full set)"),
+    }
 }
 
 /// Render the steps taken so far this cycle as a numbered history of
@@ -291,6 +298,7 @@ mod tests {
             FsIndex {
                 notes: vec!["plan.md".into()],
                 outputs: vec!["abc.json".into()],
+                ..Default::default()
             },
         ));
         session.push(
@@ -323,7 +331,7 @@ mod tests {
              \n\
              Invariants:\n\
              1. Provenance. Every `emit_output` must cite `evidence` ids that resolve in your evidence store. The runtime rejects outputs whose evidence does not resolve.\n\
-             2. Pull what you need. You are given an index of your files by name, not their contents. Use `read`, `list`, and `search` to fetch what a step needs; nothing is handed to you unasked.\n\
+             2. Pull what you need. Your file index lists only your most recent files by name, not their contents, and not necessarily all of them. Use `read`, `list`, and `search` to fetch what a step needs and to reach files beyond the index; nothing is handed to you unasked.\n\
              3. One step per turn. Reply by calling exactly one decision tool (`read`, `list`, `search`, `emit_output`, `rewrite_fs`, `idle`) OR one or more `call_tool` blocks dispatched together as a single parallel batch. After each step you see its result and choose the next step.\n\
              4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` steps can cite.\n\
              5. Idle ends the work. When you have finished this unit of work — produced or refreshed your Output — call `idle` to wait for your next wake. `idle` is the only step that ends the cycle.\n\
@@ -353,7 +361,7 @@ mod tests {
              notes/: (none)\n\
              outputs/: (none)\n\
              \n\
-             These are filenames only. Use `read` to fetch a file's contents, `list` to browse a directory, or `search` to find a string across files."
+             This index lists only your most recent files by name, not their contents, and not necessarily all of them. Use `read` to fetch a file, `list` a directory to see everything in it, or `search` to find a string across files. When something you need isn't listed here, explore for it — it has not been deleted, just not surfaced."
         );
     }
 
@@ -364,6 +372,7 @@ mod tests {
             FsIndex {
                 notes: vec!["plan.md".into(), "scratch.md".into()],
                 outputs: vec!["deadbeef.json".into()],
+                ..Default::default()
             },
         ));
         let msgs = render(&session);
@@ -374,7 +383,51 @@ mod tests {
              notes/: plan.md, scratch.md\n\
              outputs/: deadbeef.json\n\
              \n\
-             These are filenames only. Use `read` to fetch a file's contents, `list` to browse a directory, or `search` to find a string across files."
+             This index lists only your most recent files by name, not their contents, and not necessarily all of them. Use `read` to fetch a file, `list` a directory to see everything in it, or `search` to find a string across files. When something you need isn't listed here, explore for it — it has not been deleted, just not surfaced."
+        );
+    }
+
+    #[test]
+    fn snapshot_index_signposts_count_when_a_bucket_is_truncated() {
+        let session = Session::new(seed_with(
+            vec![],
+            FsIndex {
+                notes: vec!["STATUS.md".into(), "recent.md".into()],
+                outputs: vec!["deadbeef.json".into()],
+                notes_more: Remainder::Exactly(3),
+                outputs_more: Remainder::None,
+            },
+        ));
+        let msgs = render(&session);
+        let body = text(&msgs[1]);
+        assert!(
+            body.contains(
+                "notes/: STATUS.md, recent.md (+3 more — `list notes/` for the full set)"
+            ),
+            "an exact overflow renders as `+N more`; got:\n{body}"
+        );
+        assert!(
+            body.contains("outputs/: deadbeef.json\n"),
+            "a complete bucket must not signpost more; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn render_index_uses_plus_notation_for_a_lower_bound() {
+        let session = Session::new(seed_with(
+            vec![],
+            FsIndex {
+                notes: vec!["a.md".into()],
+                outputs: vec![],
+                notes_more: Remainder::AtLeast(56),
+                outputs_more: Remainder::None,
+            },
+        ));
+        let msgs = render(&session);
+        let body = text(&msgs[1]);
+        assert!(
+            body.contains("notes/: a.md (56+ more — `list notes/` for the full set)"),
+            "a lower bound renders as `N+ more`; got:\n{body}"
         );
     }
 
@@ -586,6 +639,7 @@ mod tests {
             FsIndex {
                 notes: vec!["a.md".into()],
                 outputs: vec![],
+                ..Default::default()
             },
         ));
         session.push(
