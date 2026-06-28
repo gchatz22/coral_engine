@@ -21,7 +21,7 @@
 
 use crate::agent_ref::{AgentId, GraphId};
 use crate::conflict::ConflictRecord;
-use crate::decision::{ConflictId, FsOp};
+use crate::decision::{ConflictId, FsOp, Remainder};
 use crate::evidence::{EvidenceId, EvidenceRecord};
 use crate::mandate::{Mandate, Output, OutputId};
 use crate::storage::{AgentStorage, LocalStorage, PutOutcome};
@@ -88,15 +88,15 @@ fn is_note_record(filename: &str) -> bool {
 }
 
 /// A recency-ordered window of bare filenames under one indexed prefix, plus
-/// whether the prefix holds more files than were surfaced. Built for the cycle
-/// seed's pointer index: `has_more` lets the seed tell the model the view is
-/// partial so it explores (`list`/`search`) for the rest.
+/// how many files lie beyond it. Built for the cycle seed's pointer index:
+/// `more` lets the seed tell the model the view is partial (and by how much)
+/// so it explores (`list`/`search`) for the rest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecentWindow {
     /// Up to `n` filenames, most-recent-first.
     pub filenames: Vec<String>,
-    /// True when files exist under the prefix beyond those in `filenames`.
-    pub has_more: bool,
+    /// How many files exist under the prefix beyond those in `filenames`.
+    pub more: Remainder,
 }
 
 /// Typed errors the `AgentFs` raises. The run loop matches on these to
@@ -926,12 +926,12 @@ impl AgentFs {
         self.recent_window(NOTES_TAIL_SUFFIX, "notes/", n).await
     }
 
-    /// Up to `n` filenames under `indexed_prefix`, most-recent-first, plus
-    /// whether more exist beyond the window. Recency comes from the
-    /// `_tail.json` sidecar; a missing or torn tail falls back to a
-    /// lexicographic LIST — which loses strict recency but never the set
-    /// (and still reports `has_more` exactly). `has_more` lets the seed
-    /// signpost a partial view so the model explores for the rest.
+    /// Up to `n` filenames under `indexed_prefix`, most-recent-first, plus how
+    /// many lie beyond the window. Recency comes from the `_tail.json` sidecar;
+    /// a missing or torn tail falls back to a lexicographic LIST — which loses
+    /// strict recency but never the set. The `more` count is exact while the
+    /// tail is sub-capacity (it is then the complete set) and a lower bound at
+    /// capacity, so we never pay a full LIST just to count.
     async fn recent_window(
         &self,
         tail_suffix: &str,
@@ -941,7 +941,7 @@ impl AgentFs {
         if n == 0 {
             return Ok(RecentWindow {
                 filenames: Vec::new(),
-                has_more: false,
+                more: Remainder::None,
             });
         }
         let tail_key = self.key(tail_suffix);
@@ -957,23 +957,33 @@ impl AgentFs {
                     .iter()
                     .map(|e| e.filename.clone())
                     .collect();
-                // More exist if the tail itself holds more than we surfaced,
-                // or it is at capacity (older files may have fallen off it).
-                let has_more = tail.entries.len() > take || tail.entries.len() == TAIL_K;
-                return Ok(RecentWindow {
-                    filenames,
-                    has_more,
-                });
+                let more = if tail.entries.len() == TAIL_K {
+                    // At capacity: the (TAIL_K - take) tail entries past the
+                    // window are a hard floor, and older files may exist on
+                    // disk beyond the tail — a lower bound, no LIST.
+                    Remainder::AtLeast(TAIL_K - take)
+                } else {
+                    // Sub-capacity: the tail is the complete set, so exact.
+                    match tail.entries.len() - take {
+                        0 => Remainder::None,
+                        k => Remainder::Exactly(k),
+                    }
+                };
+                return Ok(RecentWindow { filenames, more });
             }
         }
+        // LIST fallback already pays the listing, so the count is exact here.
         let mut all = self.list_dir(indexed_prefix).await?;
         let total = all.len();
         let start = total.saturating_sub(n);
         all.drain(..start);
-        let has_more = total > all.len();
+        let more = match total - all.len() {
+            0 => Remainder::None,
+            k => Remainder::Exactly(k),
+        };
         Ok(RecentWindow {
             filenames: all,
-            has_more,
+            more,
         })
     }
 
@@ -1732,13 +1742,29 @@ mod tests {
             vec!["c.md", "b.md", "a.md"],
             "notes must surface most-recent-first"
         );
-        assert!(!all.has_more, "the whole set fits the window");
+        assert_eq!(all.more, Remainder::None, "the whole set fits the window");
 
         let windowed = fs.recent_note_filenames(2).await.unwrap();
         assert_eq!(windowed.filenames, vec!["c.md", "b.md"]);
-        assert!(
-            windowed.has_more,
-            "a window smaller than the set must signpost more"
+        assert_eq!(
+            windowed.more,
+            Remainder::Exactly(1),
+            "a sub-capacity tail yields an exact overflow count"
+        );
+    }
+
+    #[tokio::test]
+    async fn notes_recency_window_reports_a_lower_bound_at_tail_capacity() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        for i in 0..(TAIL_K + 3) {
+            write_note(&fs, &format!("n-{i:03}.md")).await;
+        }
+        let got = fs.recent_note_filenames(8).await.unwrap();
+        assert_eq!(got.filenames.len(), 8);
+        assert_eq!(
+            got.more,
+            Remainder::AtLeast(TAIL_K - 8),
+            "at tail capacity the count is a lower bound, not exact"
         );
     }
 
@@ -1847,7 +1873,7 @@ mod tests {
             vec!["a.md", "b.md"],
             "the LIST fallback must recover the full note set"
         );
-        assert!(!got.has_more);
+        assert_eq!(got.more, Remainder::None);
     }
 
     #[tokio::test]

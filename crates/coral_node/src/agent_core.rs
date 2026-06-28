@@ -156,7 +156,7 @@ pub struct ToolFailure {
 pub async fn build_seed(fs: &AgentFs, triggers: Vec<Trigger>, cfg: &Mandate) -> Result<Seed> {
     let RecentWindow {
         filenames: mut notes,
-        has_more: mut notes_has_more,
+        more: mut notes_more,
     } = fs.recent_note_filenames(SEED_INDEX_NOTES).await?;
     // Pin the standing status note so it stays visible even after it ages out
     // of the recency window — precisely when a long-running monitor most needs
@@ -164,15 +164,14 @@ pub async fn build_seed(fs: &AgentFs, triggers: Vec<Trigger>, cfg: &Mandate) -> 
     // freshly-written note is already in the window.
     if !notes.iter().any(|n| n == STATUS_NOTE) && fs.file_exists(STATUS_NOTE_PATH).await? {
         notes.insert(0, STATUS_NOTE.to_string());
-        // It aged out of the window, so the directory held more than the window
-        // surfaced; keep the signpost on. Conservative at the exact boundary
-        // where the pinned note was the only overflow — at worst one extra
-        // `list` — which is the safe direction for a "did I miss something" cue.
-        notes_has_more = true;
+        // The pin surfaces one file that was counted as overflow, so the
+        // remaining count drops by one — Exactly(1) collapses to None at the
+        // boundary where the pinned note was the only file past the window.
+        notes_more = notes_more.decremented();
     }
     let RecentWindow {
         filenames: outputs,
-        has_more: outputs_has_more,
+        more: outputs_more,
     } = fs.recent_output_filenames(SEED_INDEX_OUTPUTS).await?;
     debug!(
         notes = notes.len(),
@@ -186,8 +185,8 @@ pub async fn build_seed(fs: &AgentFs, triggers: Vec<Trigger>, cfg: &Mandate) -> 
         FsIndex {
             notes,
             outputs,
-            notes_has_more,
-            outputs_has_more,
+            notes_more,
+            outputs_more,
         },
     ))
 }
@@ -456,7 +455,7 @@ mod tests {
     //! reshaped `Agent::run`.
 
     use super::*;
-    use crate::decision::{ClaimSeed, FsOp, MockDecide};
+    use crate::decision::{ClaimSeed, FsOp, MockDecide, Remainder};
     use crate::evidence::{EvidenceId, EvidenceRecord};
     use crate::fs::AgentFs;
     use crate::storage::{AgentStorage, MemoryStorage};
@@ -655,14 +654,15 @@ mod tests {
             vec!["gamma.md", "beta.md", "alpha.md"],
             "notes index is recency-ordered, not lexicographic"
         );
-        assert!(
-            !seed.index.notes_has_more,
+        assert_eq!(
+            seed.index.notes_more,
+            Remainder::None,
             "the whole note set fits the window"
         );
     }
 
     #[tokio::test]
-    async fn build_seed_flags_more_when_notes_exceed_the_window() {
+    async fn build_seed_counts_the_overflow_when_notes_exceed_the_window() {
         let (fs, m) = fixture().await;
         for i in 0..(SEED_INDEX_NOTES + 3) {
             fs.apply_ops(vec![FsOp::WriteFile {
@@ -674,9 +674,38 @@ mod tests {
         }
         let seed = build_seed(&fs, vec![], &m).await.unwrap();
         assert_eq!(seed.index.notes.len(), SEED_INDEX_NOTES);
-        assert!(
-            seed.index.notes_has_more,
-            "a truncated note set must flag that more exist"
+        assert_eq!(
+            seed.index.notes_more,
+            Remainder::Exactly(3),
+            "a sub-capacity overflow is reported exactly"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_seed_pin_consumes_the_sole_overflow_so_no_more_remains() {
+        let (fs, m) = fixture().await;
+        // Status note first (oldest), then exactly a window's worth of newer
+        // notes — so the status note is the *only* file past the window.
+        fs.apply_ops(vec![FsOp::WriteFile {
+            path: STATUS_NOTE_PATH.into(),
+            content: "outlook".into(),
+        }])
+        .await
+        .unwrap();
+        for i in 0..SEED_INDEX_NOTES {
+            fs.apply_ops(vec![FsOp::WriteFile {
+                path: format!("notes/n-{i:03}.md"),
+                content: "x".into(),
+            }])
+            .await
+            .unwrap();
+        }
+        let seed = build_seed(&fs, vec![], &m).await.unwrap();
+        assert!(seed.index.notes.iter().any(|n| n == STATUS_NOTE));
+        assert_eq!(
+            seed.index.notes_more,
+            Remainder::None,
+            "pinning the only overflow file leaves nothing beyond the window"
         );
     }
 

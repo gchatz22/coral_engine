@@ -16,7 +16,7 @@
 //! with the default `BTreeMap`-backed `serde_json::Map`, emitting keys in
 //! sorted order. That stability is what makes the snapshot tests viable.
 
-use crate::decision::{Decision, FsIndex, ReconcileSource, Seed, Session, Step};
+use crate::decision::{Decision, FsIndex, ReconcileSource, Remainder, Seed, Session, Step};
 use crate::mandate::Mandate;
 use crate::model_client::Message;
 use crate::trigger::Trigger;
@@ -137,8 +137,8 @@ fn render_triggers(triggers: &[Trigger]) -> String {
 /// Render the FS index: filenames only (pointers), never bodies. This is the
 /// orienting surface the model navigates from — it `read`s what it needs.
 fn render_index(index: &FsIndex) -> String {
-    let notes = render_index_bucket(&index.notes, index.notes_has_more, "notes/");
-    let outputs = render_index_bucket(&index.outputs, index.outputs_has_more, "outputs/");
+    let notes = render_index_bucket(&index.notes, index.notes_more, "notes/");
+    let outputs = render_index_bucket(&index.outputs, index.outputs_more, "outputs/");
     format!(
         "# Your files (index)\n\
          \n\
@@ -149,17 +149,18 @@ fn render_index(index: &FsIndex) -> String {
     )
 }
 
-/// Render one index bucket: comma-joined filenames (or `(none)`), with a
-/// `more exist` nudge when the directory holds files beyond the window.
-fn render_index_bucket(files: &[String], has_more: bool, dir: &str) -> String {
+/// Render one index bucket: comma-joined filenames (or `(none)`), with a count
+/// of the files beyond the window when there are any. `+N` is an exact count,
+/// `N+` a lower bound (the recency index was at capacity).
+fn render_index_bucket(files: &[String], more: Remainder, dir: &str) -> String {
     if files.is_empty() {
         return "(none)".to_string();
     }
     let joined = files.join(", ");
-    if has_more {
-        format!("{joined} (more exist — `list {dir}` for the full set)")
-    } else {
-        joined
+    match more {
+        Remainder::None => joined,
+        Remainder::Exactly(k) => format!("{joined} (+{k} more — `list {dir}` for the full set)"),
+        Remainder::AtLeast(k) => format!("{joined} ({k}+ more — `list {dir}` for the full set)"),
     }
 }
 
@@ -387,27 +388,46 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_index_signposts_more_when_a_bucket_is_truncated() {
+    fn snapshot_index_signposts_count_when_a_bucket_is_truncated() {
         let session = Session::new(seed_with(
             vec![],
             FsIndex {
                 notes: vec!["STATUS.md".into(), "recent.md".into()],
                 outputs: vec!["deadbeef.json".into()],
-                notes_has_more: true,
-                outputs_has_more: false,
+                notes_more: Remainder::Exactly(3),
+                outputs_more: Remainder::None,
             },
         ));
         let msgs = render(&session);
         let body = text(&msgs[1]);
         assert!(
             body.contains(
-                "notes/: STATUS.md, recent.md (more exist — `list notes/` for the full set)"
+                "notes/: STATUS.md, recent.md (+3 more — `list notes/` for the full set)"
             ),
-            "truncated notes bucket must signpost more; got:\n{body}"
+            "an exact overflow renders as `+N more`; got:\n{body}"
         );
         assert!(
             body.contains("outputs/: deadbeef.json\n"),
             "a complete bucket must not signpost more; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn render_index_uses_plus_notation_for_a_lower_bound() {
+        let session = Session::new(seed_with(
+            vec![],
+            FsIndex {
+                notes: vec!["a.md".into()],
+                outputs: vec![],
+                notes_more: Remainder::AtLeast(56),
+                outputs_more: Remainder::None,
+            },
+        ));
+        let msgs = render(&session);
+        let body = text(&msgs[1]);
+        assert!(
+            body.contains("notes/: a.md (56+ more — `list notes/` for the full set)"),
+            "a lower bound renders as `N+ more`; got:\n{body}"
         );
     }
 
