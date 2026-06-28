@@ -1,10 +1,11 @@
 //! Render a `Session` into a `Vec<Message>` the model can consume.
 //!
-//! Layout: one `system` message (mandate text + tool catalog + standing
-//! invariants); one `user` message per non-empty seed window (triggers, the
-//! FS index); and, once the cycle has taken steps, one `user` message
-//! summarizing the `(action, observation)` history so far. Empty windows are
-//! dropped to keep the prompt budget tight.
+//! Layout: one `system` message (the standing prompt — identity, principles,
+//! and rules — with the mandate and tool catalog interpolated in); one `user`
+//! message per non-empty seed window (triggers, the FS index); and, once the
+//! cycle has taken steps, one `user` message summarizing the
+//! `(action, observation)` history so far. Empty windows are dropped to keep
+//! the prompt budget tight.
 //!
 //! This is the *pull* surface: the seed carries an index of filenames, not
 //! file bodies. The model fetches contents with `read`/`list`/`search`, and
@@ -21,23 +22,10 @@ use crate::mandate::Mandate;
 use crate::model_client::Message;
 use crate::trigger::Trigger;
 
-/// Standing invariants shared by every agent.
-///
-/// Reworked for the cycle/pull model: the agent takes one step per turn,
-/// pulls the files it needs by name, and ends a cycle by idling. The list is
-/// split into short, single-purpose clauses rather than dense paragraphs —
-/// empirically, models follow numbered unconditional rules far better than
-/// rules buried mid-paragraph.
-const INVARIANTS: &str = "\
-Invariants:
-1. Provenance. Every `emit_output` must cite `evidence` ids that resolve in your evidence store. The runtime rejects outputs whose evidence does not resolve.
-2. Pull what you need. Your file index lists only your most recent files by name, not their contents, and not necessarily all of them. Use `read`, `list`, and `search` to fetch what a step needs and to reach files beyond the index; nothing is handed to you unasked.
-3. One step per turn. Reply by calling exactly one decision tool (`read`, `list`, `search`, `emit_output`, `rewrite_fs`, `idle`) OR one or more `call_tool` blocks dispatched together as a single parallel batch. After each step you see its result and choose the next step.
-4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` steps can cite.
-5. Idle ends the work. When you have finished this unit of work — produced or refreshed your Output — call `idle` to wait for your next wake. `idle` is the only step that ends the cycle.
-6. Refresh, don't stop. On each wake, re-research and emit an updated Output reflecting what changed since the last one. There is no self-terminate step: the runtime stops you only via a retirement signal or your budget. Keep cycling: research -> emit_output -> idle -> refresh.
-7. Fold child reports as they arrive. When a child reports an output (a `ChildOutput` trigger), reconcile the cited output, then emit a refreshed consolidated report that incorporates it and cites its evidence. When a child you have already folded reports again, reconcile its newer output rather than re-reconciling the one you already used.
-8. Keep a status note. Maintain `notes/STATUS.md` with your standing progress and current outlook on the mandate — key conclusions, what you are investigating, what is still open. It is the durable memory you carry across wakes and is always pinned in your file index, so a current note lets your next wake start from your own synthesis instead of a cold re-read. Create it if it does not exist yet.";
+/// The standing system prompt — agent identity, operating principles, and the
+/// hard rules — authored as markdown in `system_prompt.md`. `{{MANDATE}}` and
+/// `{{TOOLS}}` are interpolation slots filled per agent by [`render_system`].
+const SYSTEM_TEMPLATE: &str = include_str!("system_prompt.md");
 
 /// Render a `Session` into the message list a `ModelClient::complete` call
 /// should send.
@@ -64,30 +52,30 @@ pub fn render(session: &Session) -> Vec<Message> {
     out
 }
 
-/// Build the system-message body: mandate text, tool catalog, invariants.
+/// Build the system message: the standing template with the per-agent mandate
+/// and tool catalog interpolated into it.
 ///
-/// The mandate text is interpolated verbatim. Sanitization is the
-/// maintainer's concern at mandate-creation time; the kernel treats the
-/// mandate string as already-trusted input.
+/// The mandate text is interpolated verbatim — the kernel treats it as
+/// already-trusted input, sanitized at mandate-creation time. `{{TOOLS}}` is
+/// filled before `{{MANDATE}}` so a sentinel appearing in the mandate text is
+/// left untouched.
 fn render_system(m: &Mandate) -> String {
-    let catalog = render_tool_catalog(&m.tools);
-    format!(
-        "You are an agent operating under the following mandate:\n\n{}\n\n{catalog}{INVARIANTS}",
-        m.text
-    )
+    SYSTEM_TEMPLATE
+        .replace("{{TOOLS}}", &render_tool_catalog(&m.tools))
+        .replace("{{MANDATE}}", &m.text)
 }
 
 /// Render the per-agent tool catalog: the tool *definitions* the agent is
 /// assigned. Assignment is enforced at dispatch — a call to a tool outside
 /// this set is rejected — so the catalog states the boundary. The FS-nav
 /// steps (`read`/`list`/`search`) are always available and are not listed
-/// here. Trailing blank line so it composes ahead of the invariants.
+/// here.
 fn render_tool_catalog(tools: &[String]) -> String {
     if tools.is_empty() {
-        return "You have no tools assigned; you cannot call any tool (but `read`, `list`, and `search` over your own files are always available).\n\n".to_string();
+        return "You have no tools assigned; you cannot call any tool (but `read`, `list`, and `search` over your own files are always available).".to_string();
     }
     format!(
-        "You may call only these assigned tools: {}. Each may expose one or more named operations.\n\n",
+        "You may call only these assigned tools: {}. Each may expose one or more named operations.",
         tools.join(", ")
     )
 }
@@ -211,9 +199,11 @@ fn action_label(action: &Decision) -> String {
 mod tests {
     //! Snapshot tests for `render`.
     //!
-    //! These lock the prompt wording verbatim. A diff to the rendered string
-    //! must be a *deliberate* edit to one of the constants or per-window
-    //! helpers, never a side effect of an unrelated change.
+    //! The per-window helpers (triggers, index, steps) are locked verbatim
+    //! here. The system prose lives in `system_prompt.md` — that file is the
+    //! reviewable artifact and nothing but `render_system` touches it, so the
+    //! system-message test asserts structure and the interpolation seams
+    //! rather than re-pasting the whole prompt.
 
     use super::*;
     use crate::agent_ref::{AgentId, AgentRef};
@@ -284,9 +274,7 @@ mod tests {
         // system + index (no triggers, no steps).
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, Role::System);
-        assert!(
-            text(&msgs[0]).starts_with("You are an agent operating under the following mandate:")
-        );
+        assert!(text(&msgs[0]).starts_with("# You are a Coral agent"));
         assert_eq!(msgs[1].role, Role::User);
         assert!(text(&msgs[1]).starts_with("# Your files (index)"));
     }
@@ -319,33 +307,48 @@ mod tests {
 
     #[test]
     fn snapshot_system_message() {
-        let msgs = render(&bare_session());
-        assert_eq!(msgs[0].role, Role::System);
-        assert_eq!(
-            text(&msgs[0]),
-            "You are an agent operating under the following mandate:\n\
-             \n\
-             Watch the FDA holds list and report drug-program risk.\n\
-             \n\
-             You have no tools assigned; you cannot call any tool (but `read`, `list`, and `search` over your own files are always available).\n\
-             \n\
-             Invariants:\n\
-             1. Provenance. Every `emit_output` must cite `evidence` ids that resolve in your evidence store. The runtime rejects outputs whose evidence does not resolve.\n\
-             2. Pull what you need. Your file index lists only your most recent files by name, not their contents, and not necessarily all of them. Use `read`, `list`, and `search` to fetch what a step needs and to reach files beyond the index; nothing is handed to you unasked.\n\
-             3. One step per turn. Reply by calling exactly one decision tool (`read`, `list`, `search`, `emit_output`, `rewrite_fs`, `idle`) OR one or more `call_tool` blocks dispatched together as a single parallel batch. After each step you see its result and choose the next step.\n\
-             4. Evidence comes from tool calls. Each `call_tool` result becomes a fresh evidence record that later `emit_output` steps can cite.\n\
-             5. Idle ends the work. When you have finished this unit of work — produced or refreshed your Output — call `idle` to wait for your next wake. `idle` is the only step that ends the cycle.\n\
-             6. Refresh, don't stop. On each wake, re-research and emit an updated Output reflecting what changed since the last one. There is no self-terminate step: the runtime stops you only via a retirement signal or your budget. Keep cycling: research -> emit_output -> idle -> refresh.\n\
-             7. Fold child reports as they arrive. When a child reports an output (a `ChildOutput` trigger), reconcile the cited output, then emit a refreshed consolidated report that incorporates it and cites its evidence. When a child you have already folded reports again, reconcile its newer output rather than re-reconciling the one you already used.\n\
-             8. Keep a status note. Maintain `notes/STATUS.md` with your standing progress and current outlook on the mandate — key conclusions, what you are investigating, what is still open. It is the durable memory you carry across wakes and is always pinned in your file index, so a current note lets your next wake start from your own synthesis instead of a cold re-read. Create it if it does not exist yet."
+        let sys = render_system(&mandate());
+        assert!(
+            sys.starts_with("# You are a Coral agent"),
+            "system message must open with the identity header, got: {sys}"
         );
+        assert!(
+            sys.contains(
+                "## Your mandate\n\nWatch the FDA holds list and report drug-program risk.\n\n## Your tools\n\n"
+            ),
+            "the mandate must be interpolated between its header and the tools section, got: {sys}"
+        );
+        assert!(
+            sys.contains(
+                "You have no tools assigned; you cannot call any tool (but `read`, `list`, and `search` over your own files are always available).\n\n## What a good Output is"
+            ),
+            "the tool catalog must be interpolated ahead of the Output section, got: {sys}"
+        );
+        assert!(
+            !sys.contains("{{"),
+            "no interpolation slot may be left unfilled, got: {sys}"
+        );
+        for rule in [
+            "One step per turn.",
+            "Pull what you need.",
+            "Cite your evidence.",
+            "Refresh, don't stop.",
+            "Idle ends the cycle.",
+            "Fold child reports",
+            "Keep your status note current.",
+        ] {
+            assert!(
+                sys.contains(rule),
+                "missing operating rule {rule:?}, got: {sys}"
+            );
+        }
     }
 
     #[test]
-    fn invariants_name_the_pinned_status_note_path() {
+    fn system_prompt_names_the_pinned_status_note_path() {
         assert!(
-            INVARIANTS.contains(crate::agent_core::STATUS_NOTE_PATH),
-            "the status-note invariant must reference the pinned path so the prompt and the seed pin cannot drift"
+            SYSTEM_TEMPLATE.contains(crate::agent_core::STATUS_NOTE_PATH),
+            "the status-note rule must reference the pinned path so the prompt and the seed pin cannot drift"
         );
     }
 
