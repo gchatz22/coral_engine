@@ -71,3 +71,6 @@ serde_json = "1"
 # runtime graph; the hermetic tests plant `EvidenceRecord`s whose constructor
 # takes a `chrono::DateTime<Utc>`.
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# Test-only scratch dir for the closeout test that drives the real on-disk
+# `PerAgentGitStorage` (commit-per-tick + `read_at`) end-to-end.
+tempfile = "3"

@@ -292,6 +292,7 @@ dependencies = [
  "futures-util",
  "serde",
  "serde_json",
+ "tempfile",
  "temporalio-client",
  "temporalio-common",
  "temporalio-macros",
