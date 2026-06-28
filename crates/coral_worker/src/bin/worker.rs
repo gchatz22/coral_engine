@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use coral_graph::GraphStore;
-use coral_node::storage::PerAgentGitStorage;
+use coral_node::storage::{PerAgentGitStorage, VersionedStorage};
 use coral_worker::tool_provider::DbToolRegistryProvider;
 use sqlx::postgres::PgPoolOptions;
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
@@ -36,8 +36,8 @@ use tracing::info;
 
 use coral_temporal::worker::{
     build_decide_from_env, build_worker, install_agent_storage, install_decide,
-    install_structural_db_store, install_tool_registry_provider, StructuralDbStore,
-    DEFAULT_TASK_QUEUE,
+    install_structural_db_store, install_tool_registry_provider, install_versioned_storage,
+    StructuralDbStore, DEFAULT_TASK_QUEUE,
 };
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
@@ -91,6 +91,10 @@ async fn main() -> Result<()> {
         PerAgentGitStorage::new(fs_root_path.clone())
             .with_context(|| format!("opening PerAgentGitStorage at {fs_root}"))?,
     );
+    // One backend object, installed under both handles: the data plane
+    // (put/get/list) and the versioning plane (the cycle-boundary `commit_tick`
+    // activity commits through `agent_versioned_storage_opt()`).
+    install_versioned_storage(Arc::clone(&storage) as Arc<dyn VersionedStorage>);
     install_agent_storage(storage);
     info!(
         fs_root = fs_root.as_str(),

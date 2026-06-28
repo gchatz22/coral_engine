@@ -10,7 +10,6 @@ use std::io;
 use thiserror::Error;
 
 pub mod git;
-pub use git::GitStorage;
 
 pub mod local;
 pub use local::LocalStorage;
@@ -172,9 +171,10 @@ impl BlobSha {
     /// Compute a file's `BlobSha` from its bytes, without a repository.
     ///
     /// Delegates to libgit2's object hasher, so the result is identical to
-    /// the sha [`GitStorage`](super::GitStorage)'s `commit` records for the
-    /// same bytes — letting a reference be pinned at write time (DB) and
-    /// resolved later (git) by the same address. That equality is asserted
+    /// the sha [`PerAgentGitStorage`](super::PerAgentGitStorage)'s `commit`
+    /// records for the same bytes — letting a reference be pinned at write
+    /// time (DB) and resolved later (git) by the same address. That equality
+    /// is asserted
     /// by a guard test; if it ever drifts (e.g. an `autocrlf`/filter config
     /// crept in) staleness detection silently breaks.
     pub fn of_bytes(bytes: &[u8]) -> Self {
@@ -195,22 +195,25 @@ impl std::fmt::Display for BlobSha {
     }
 }
 
-/// Versioning layered on [`AgentStorage`]: a content-addressed,
-/// commit-per-tick history scoped to exactly two operations. There is
-/// deliberately no branch / checkout / merge / rebase / history-rewrite
-/// surface — the working tree always reflects HEAD, and historical reads
-/// resolve a blob sha directly without ever moving HEAD.
+/// Per-agent versioning layered on [`AgentStorage`]: a content-addressed,
+/// commit-per-tick history scoped to exactly two operations, each addressing
+/// one agent by its FS prefix. There is deliberately no branch / checkout /
+/// merge / rebase / history-rewrite surface — the working tree always
+/// reflects HEAD, and historical reads resolve a blob sha directly without
+/// ever moving HEAD.
 ///
 /// As a supertrait, one `dyn VersionedStorage` handle exposes both the data
 /// plane (put/get/list) and versioning (commit/read-at-sha), which the
-/// write-path consistency activity needs together. Git is the local
-/// implementation ([`GitStorage`]); keeping the surface on the trait — not
-/// the impl — is the long-term commitment so an object-store backend can
-/// offer the same two operations later.
+/// cycle-boundary commit activity needs together. Git is the local
+/// implementation ([`PerAgentGitStorage`]); keeping the surface on the trait
+/// — not the impl — is the long-term commitment so an object-store backend
+/// can offer the same two operations later.
 #[async_trait]
 pub trait VersionedStorage: AgentStorage {
-    /// Commit the current working tree as one tick and return the
-    /// `(path, blob_sha)` manifest of every file in the committed tree.
+    /// Commit one agent's working tree (the subtree under `agent_prefix`) as a
+    /// single tick and return the `(path, blob_sha)` manifest of every file in
+    /// the committed tree (paths relative to the prefix, e.g.
+    /// `outputs/output.md`).
     ///
     /// Idempotent: a clean tree (identical to HEAD) is a no-op that still
     /// returns the current manifest, so a Temporal retry of an already-
@@ -218,13 +221,17 @@ pub trait VersionedStorage: AgentStorage {
     /// returned sha names a durably committed object, resolvable by
     /// [`VersionedStorage::read_at`] across restarts — so a caller can pin a
     /// returned sha knowing it will always read back.
-    async fn commit(&self, message: &str) -> StorageResult<Vec<(String, BlobSha)>>;
+    async fn commit(
+        &self,
+        agent_prefix: &str,
+        message: &str,
+    ) -> StorageResult<Vec<(String, BlobSha)>>;
 
-    /// Resolve a blob sha to its bytes. Path-independent — the sha *is* the
-    /// content address — and read-only: it never mutates HEAD or the working
-    /// tree. Returns `Ok(None)` when no such blob exists in the object
-    /// database (or the sha is malformed).
-    async fn read_at(&self, sha: &BlobSha) -> StorageResult<Option<Bytes>>;
+    /// Resolve a blob sha to its bytes within one agent's repo. The sha *is*
+    /// the content address; the call is read-only and never mutates HEAD or
+    /// the working tree. Returns `Ok(None)` when no such blob exists in that
+    /// agent's object database (or the sha is malformed).
+    async fn read_at(&self, agent_prefix: &str, sha: &BlobSha) -> StorageResult<Option<Bytes>>;
 }
 
 #[cfg(test)]

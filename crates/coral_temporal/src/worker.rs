@@ -28,7 +28,7 @@ use coral_node::model_client::CompleteOptions;
 use coral_node::model_client::ModelClient;
 #[cfg(any(feature = "llm-anthropic", feature = "llm-cohere"))]
 use coral_node::model_client::ModelRegistry;
-use coral_node::storage::{AgentStorage, BlobSha};
+use coral_node::storage::{AgentStorage, BlobSha, VersionedStorage};
 use coral_node::tools::ToolRegistry;
 use temporalio_client::Client;
 use temporalio_sdk::{Worker, WorkerOptions};
@@ -68,6 +68,29 @@ pub fn agent_storage() -> Arc<dyn AgentStorage> {
         .get()
         .cloned()
         .expect("agent_storage() accessed before install_agent_storage()")
+}
+
+/// Process-wide [`VersionedStorage`] backend the cycle-boundary `commit_tick`
+/// activity commits through. Production installs the same `PerAgentGitStorage`
+/// here and in [`AGENT_STORAGE`]; hermetic tests that install only a
+/// non-versioned `MemoryStorage` leave this unset.
+static AGENT_VERSIONED_STORAGE: OnceLock<Arc<dyn VersionedStorage>> = OnceLock::new();
+
+/// Install the process-wide [`VersionedStorage`] backend. Panics on double
+/// install.
+pub fn install_versioned_storage(storage: Arc<dyn VersionedStorage>) {
+    AGENT_VERSIONED_STORAGE
+        .set(storage)
+        .map_err(|_| ())
+        .expect("install_versioned_storage called twice; one process, one versioned backend");
+}
+
+/// Access the installed [`VersionedStorage`] backend, or `None` if none was
+/// installed. Returns `Option` (not panic) on purpose: a non-versioned
+/// backend is a valid configuration, and the boundary commit no-ops when no
+/// versioned backend is present.
+pub fn agent_versioned_storage_opt() -> Option<Arc<dyn VersionedStorage>> {
+    AGENT_VERSIONED_STORAGE.get().cloned()
 }
 
 /// Process-wide [`Decide`] implementation used by the

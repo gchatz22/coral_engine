@@ -60,7 +60,7 @@ use coral_graph::yaml::{
     yaml_seed_triggers, GraphYaml,
 };
 use coral_graph::{GraphStore, GraphStoreError, MIGRATOR};
-use coral_node::storage::{AgentStorage, PerAgentGitStorage};
+use coral_node::storage::{AgentStorage, PerAgentGitStorage, VersionedStorage};
 use coral_temporal::worker::DEFAULT_TASK_QUEUE;
 use coral_temporal::workflow::AgentWorkflow;
 
@@ -226,7 +226,7 @@ async fn run() -> Result<()> {
     // graph; the commit itself is a clean-tree no-op if somehow re-reached.)
     for start in &starts {
         storage
-            .commit_agent(&start.input.fs_handle.prefix, "seed: coral apply")
+            .commit(&start.input.fs_handle.prefix, "seed: coral apply")
             .await
             .with_context(|| format!("committing seed FS for {}", start.input.fs_handle.prefix))?;
     }
