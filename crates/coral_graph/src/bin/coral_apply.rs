@@ -60,7 +60,7 @@ use coral_graph::yaml::{
     yaml_seed_triggers, GraphYaml,
 };
 use coral_graph::{GraphStore, GraphStoreError, MIGRATOR};
-use coral_node::storage::{AgentStorage, LocalStorage};
+use coral_node::storage::{AgentStorage, PerAgentGitStorage};
 use coral_temporal::worker::DEFAULT_TASK_QUEUE;
 use coral_temporal::workflow::AgentWorkflow;
 
@@ -205,25 +205,35 @@ async fn run() -> Result<()> {
         .context("yaml_seed_triggers (post-validate runtime guard)")?;
 
     // ---- Materialize each agent's FS (eager bootstrap) ----------------
-    // Stand up the SAME storage backend the worker reads (LocalStorage at
-    // the shared AGENT_FS_ROOT) and write each agent's `mandate.md` now, so
-    // the graph's FS is inspectable immediately rather than only after each
-    // agent first wakes. The worker's lazy first-tick open is the
-    // idempotent fallback for anything this misses. Runs before the
-    // Temporal client connect so a misconfigured FS root fails the
+    // Stand up the SAME storage backend the worker reads (per-agent
+    // git-versioned, at the shared AGENT_FS_ROOT) and write each agent's
+    // `mandate.md` now, so the graph's FS is inspectable immediately rather
+    // than only after each agent first wakes. The worker's lazy first-tick
+    // open is the idempotent fallback for anything this misses. Runs before
+    // the Temporal client connect so a misconfigured FS root fails the
     // bootstrap without dispatching half a graph.
     let fs_root = env::var("AGENT_FS_ROOT").unwrap_or_else(|_| DEFAULT_FS_ROOT.into());
-    let storage: Arc<dyn AgentStorage> = Arc::new(
-        LocalStorage::new(&fs_root)
-            .with_context(|| format!("opening LocalStorage at AGENT_FS_ROOT ({fs_root})"))?,
+    let storage = Arc::new(
+        PerAgentGitStorage::new(&fs_root)
+            .with_context(|| format!("opening PerAgentGitStorage at AGENT_FS_ROOT ({fs_root})"))?,
     );
-    materialize_agent_fs(storage, &starts)
+    materialize_agent_fs(Arc::clone(&storage) as Arc<dyn AgentStorage>, &starts)
         .await
         .context("materializing agent FS (mandate.md per agent)")?;
+    // Commit each agent's seed tree so tick 0 is a real git baseline the
+    // running engine's per-tick commits build on, and a pinned mandate.md
+    // blob sha resolves back. (Apply is CREATE-only, so this runs once per
+    // graph; the commit itself is a clean-tree no-op if somehow re-reached.)
+    for start in &starts {
+        storage
+            .commit_agent(&start.input.fs_handle.prefix, "seed: coral apply")
+            .await
+            .with_context(|| format!("committing seed FS for {}", start.input.fs_handle.prefix))?;
+    }
     info!(
         agent_count = starts.len(),
         fs_root = fs_root.as_str(),
-        "materialized agent FS (mandate.md per agent)"
+        "materialized + committed agent FS (mandate.md per agent)"
     );
 
     let client = build_client().await?;

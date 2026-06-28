@@ -210,6 +210,13 @@ impl AgentStorage for LocalStorage {
                 let path = entry.path();
                 let file_type = entry.file_type().map_err(StorageError::from_io)?;
                 if file_type.is_dir() {
+                    // A `.git/` directory is the versioning backend's private
+                    // object store (a per-agent repo roots its `.git` inside the
+                    // agent's prefix), not part of the content keyspace. Walking
+                    // into it would surface git internals as keys.
+                    if entry.file_name() == ".git" {
+                        continue;
+                    }
                     stack.push(path);
                     continue;
                 }
@@ -510,6 +517,30 @@ mod tests {
                 "notes/sub/b.md".to_string(),
                 "notes/sub/deeper/c.md".to_string(),
             ]
+        );
+    }
+
+    /// A `.git/` directory in the tree (the per-agent versioning backend's
+    /// object store) must never surface as keys — listing the directory that
+    /// contains it skips the whole subtree.
+    #[tokio::test]
+    async fn local_list_skips_dot_git_subtree() {
+        let (tmp, storage) = fresh_local();
+        storage
+            .put("mandate.md", Bytes::from_static(b"watch"))
+            .await
+            .unwrap();
+        // Simulate a repo's object store sitting alongside the content.
+        std::fs::create_dir_all(tmp.path().join(".git/objects/ab")).unwrap();
+        std::fs::write(tmp.path().join(".git/HEAD"), b"ref: refs/heads/main").unwrap();
+        std::fs::write(tmp.path().join(".git/objects/ab/cd"), b"blobdata").unwrap();
+
+        let page = storage.list("", None, 100).await.unwrap();
+        assert_eq!(page.keys, vec!["mandate.md".to_string()]);
+        assert!(
+            !page.keys.iter().any(|k| k.contains(".git")),
+            "git internals must not appear as keys: {:?}",
+            page.keys
         );
     }
 

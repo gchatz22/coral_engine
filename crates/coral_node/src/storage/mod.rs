@@ -15,6 +15,9 @@ pub use git::GitStorage;
 pub mod local;
 pub use local::LocalStorage;
 
+pub mod per_agent_git;
+pub use per_agent_git::PerAgentGitStorage;
+
 #[cfg(any(test, feature = "memory-storage"))]
 pub mod memory;
 
@@ -395,6 +398,60 @@ mod tests {
     #[tokio::test]
     async fn memory_list_empty_prefix_lists_everything() {
         verify_list_empty_prefix_lists_everything(fresh_memory()).await;
+    }
+
+    // ---- PerAgentGitStorage runs ----------------------------------------
+    // The production backend's data plane must behave byte-identically to a
+    // plain backend; running the same conformance suite against it proves the
+    // git-versioning layer adds no data-plane drift. The `TempDir` is bound so
+    // it outlives the storage handle for the test's duration.
+
+    fn fresh_per_agent_git() -> (tempfile::TempDir, Arc<dyn AgentStorage>) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Arc::new(PerAgentGitStorage::new(tmp.path()).unwrap());
+        (tmp, storage)
+    }
+
+    #[tokio::test]
+    async fn per_agent_git_put_get_round_trip() {
+        let (_t, s) = fresh_per_agent_git();
+        verify_put_get_round_trip(s).await;
+    }
+
+    #[tokio::test]
+    async fn per_agent_git_get_absent_returns_none() {
+        let (_t, s) = fresh_per_agent_git();
+        verify_get_absent_returns_none(s).await;
+    }
+
+    #[tokio::test]
+    async fn per_agent_git_put_if_absent_semantics() {
+        let (_t, s) = fresh_per_agent_git();
+        verify_put_if_absent_semantics(s).await;
+    }
+
+    #[tokio::test]
+    async fn per_agent_git_get_many_preserves_order_and_missing_slots() {
+        let (_t, s) = fresh_per_agent_git();
+        verify_get_many_preserves_order_and_missing_slots(s).await;
+    }
+
+    #[tokio::test]
+    async fn per_agent_git_delete_idempotent() {
+        let (_t, s) = fresh_per_agent_git();
+        verify_delete_idempotent(s).await;
+    }
+
+    #[tokio::test]
+    async fn per_agent_git_list_prefix_and_pagination() {
+        let (_t, s) = fresh_per_agent_git();
+        verify_list_prefix_and_pagination(s).await;
+    }
+
+    #[tokio::test]
+    async fn per_agent_git_list_empty_prefix_lists_everything() {
+        let (_t, s) = fresh_per_agent_git();
+        verify_list_empty_prefix_lists_everything(s).await;
     }
 
     /// The trait must be object-safe: this fails to compile if a future

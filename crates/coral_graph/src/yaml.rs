@@ -878,9 +878,10 @@ pub fn yaml_seed_triggers(
 /// therefore inspectable immediately after `coral apply` instead of only
 /// after each agent first wakes.
 ///
-/// `storage` must be the **same backend the worker reads** — a
-/// `LocalStorage` rooted at the shared `AGENT_FS_ROOT` — or apply writes a
-/// tree the worker never sees.
+/// `storage` must be the **same backend the worker reads** — rooted at the
+/// shared `AGENT_FS_ROOT` — or apply writes a tree the worker never sees.
+/// Backend-agnostic by design: production passes the per-agent git-versioned
+/// backend, tests pass a plain on-disk or in-memory one.
 ///
 /// Idempotent: [`AgentFs::new_with_storage`] writes `mandate.md` only when
 /// absent, so a re-run, or the worker's lazy first-tick open, is a no-op.
@@ -2159,6 +2160,57 @@ seed:
         assert_ne!(
             starts[0].input.fs_handle.prefix, starts[1].input.fs_handle.prefix,
             "root and child must materialize at distinct prefixes",
+        );
+    }
+
+    /// Mirrors the `coral apply` FS path on the production backend:
+    /// materialize each agent's `mandate.md`, then commit a per-agent seed
+    /// baseline. Asserts each agent gets its own committed repo whose
+    /// `mandate.md` blob sha resolves back.
+    #[tokio::test]
+    async fn materialize_then_seed_commit_versions_each_agent_independently() {
+        use coral_node::storage::{BlobSha, PerAgentGitStorage};
+
+        let g = parse_and_validate(TREE_YAML).expect("tree fixture validates");
+        let applied = synthetic_applied_tree(&g);
+        let starts = build_workflow_starts(&g, &applied);
+        assert_eq!(starts.len(), 2);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Arc::new(PerAgentGitStorage::new(tmp.path()).unwrap());
+        materialize_agent_fs(Arc::clone(&storage) as Arc<dyn AgentStorage>, &starts)
+            .await
+            .expect("materialize tree");
+
+        for start in &starts {
+            let prefix = &start.input.fs_handle.prefix;
+            let manifest = storage
+                .commit_agent(prefix, "seed: coral apply")
+                .await
+                .expect("seed commit");
+            let sha: &BlobSha = &manifest
+                .iter()
+                .find(|(p, _)| p == "mandate.md")
+                .expect("mandate.md in the committed manifest")
+                .1;
+            let bytes = storage
+                .read_agent_at(prefix, sha)
+                .await
+                .unwrap()
+                .expect("seed mandate.md blob resolves by sha");
+            assert_eq!(
+                std::str::from_utf8(&bytes).unwrap(),
+                start.input.mandate.text,
+                "committed mandate.md must carry the agent's standing instruction"
+            );
+            assert!(
+                tmp.path().join(prefix).join(".git").exists(),
+                "each agent has its own repo at its prefix"
+            );
+        }
+        assert!(
+            !tmp.path().join(".git").exists(),
+            "no shared repo at the FS root"
         );
     }
 }

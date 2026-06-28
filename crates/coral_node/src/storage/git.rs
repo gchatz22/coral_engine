@@ -96,7 +96,7 @@ fn manifest_from_tree(tree: &git2::Tree) -> Vec<(String, BlobSha)> {
     out
 }
 
-fn commit_blocking(root: &Path, message: &str) -> StorageResult<Vec<(String, BlobSha)>> {
+pub(crate) fn commit_blocking(root: &Path, message: &str) -> StorageResult<Vec<(String, BlobSha)>> {
     let repo = open_or_init(root).map_err(map_git_err)?;
     let mut index = repo.index().map_err(map_git_err)?;
 
@@ -143,7 +143,7 @@ fn signature() -> Result<Signature<'static>, git2::Error> {
     Signature::now("coral", "coral@localhost")
 }
 
-fn read_at_blocking(root: &Path, sha: &str) -> StorageResult<Option<Bytes>> {
+pub(crate) fn read_at_blocking(root: &Path, sha: &str) -> StorageResult<Option<Bytes>> {
     let repo = open_or_init(root).map_err(map_git_err)?;
     let oid = match Oid::from_str(sha) {
         Ok(oid) => oid,
@@ -157,7 +157,7 @@ fn read_at_blocking(root: &Path, sha: &str) -> StorageResult<Option<Bytes>> {
     result
 }
 
-fn join_err(err: tokio::task::JoinError) -> StorageError {
+pub(crate) fn join_err(err: tokio::task::JoinError) -> StorageError {
     StorageError::Other(anyhow::Error::from(err))
 }
 
