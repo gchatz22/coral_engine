@@ -5,7 +5,7 @@ an agent boots with `LlmDecide` over a real `ModelClient` (Anthropic **or**
 Cohere), the registry auto-registers every tool that
 `@modelcontextprotocol/server-everything` advertises, and the model itself
 chooses to call `get-sum`, observes the result as an evidence record, and
-emits an `Output` that cites that evidence id.
+emits an `Output` that cites that evidence path.
 
 The runbook acceptance is: *smoke fixture exercises a non-trivial
 decision path: model is asked, emits `CallTool`, runtime executes,
@@ -84,7 +84,7 @@ the mandate text to:
 1. Call `get-sum` with `{"a": 2, "b": 3}` via the `call_tool` decision.
 2. Once the tool result arrives, write the output via `write_output` whose
    `content` mentions the sum and whose `citations` array cites the
-   evidence id minted by step 1.
+   evidence path minted by step 1.
 3. Retire.
 
 A typical successful run takes 3–5 ticks (1 for the tool call, 1 for

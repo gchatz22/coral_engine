@@ -109,16 +109,15 @@ fn example_graph_path() -> PathBuf {
 ///   Never retires; only `step_cap` stops it.
 struct CyclingDecide;
 
-/// Recover an evidence file path from a `List { path: "evidence/" }`
-/// observation (newline-joined filenames) — the handle the parent cites.
-/// The parent never calls a tool, so its `evidence/` dir holds only the
-/// synthetic reconcile records — any entry is a valid reconcile path to cite.
-fn first_evidence_id(list_observation: &str) -> Option<String> {
-    list_observation
-        .lines()
-        .map(|name| name.trim())
-        .find(|name| name.ends_with(".json"))
-        .map(|name| format!("evidence/{name}"))
+/// Recover the synthetic evidence path the reconcile step minted, by reading
+/// it out of the reconcile observation (which names each `evidence/` path) —
+/// the handle the parent cites in its consolidated report.
+fn first_evidence_id(reconcile_observation: &str) -> Option<String> {
+    reconcile_observation
+        .split_whitespace()
+        .map(|t| t.trim_end_matches([',', '.']))
+        .find(|t| t.starts_with("evidence/") && t.ends_with(".json"))
+        .map(|t| t.to_string())
 }
 
 #[async_trait]
@@ -132,16 +131,10 @@ impl Decide for CyclingDecide {
             // Parent. Drive the cycle off the steps taken so far.
             let last = session.steps.last();
             match last.map(|s| &s.action) {
-                // Just reconciled: list the parent's own evidence/ to find
-                // the synthetic reconcile id to cite.
+                // Just reconciled: the reconcile observation names the
+                // synthetic evidence path directly — cite it and emit a
+                // refreshed consolidated report (no List of evidence/ needed).
                 Some(Decision::ReconcileChildren { .. }) => {
-                    return Ok(Decision::List {
-                        path: "evidence/".into(),
-                    });
-                }
-                // Listing done: cite the discovered reconcile id and emit a
-                // refreshed consolidated report.
-                Some(Decision::List { .. }) => {
                     let observation = &last.expect("last is Some in this arm").observation;
                     if let Some(cite) = first_evidence_id(&observation.content) {
                         return Ok(Decision::WriteOutput {

@@ -376,15 +376,15 @@ async fn execute_call_tools(
 
     // Step 3+4: classify each result, persist successful evidence in
     // input order, collect failures into a batch outcome. The observation
-    // summarises both: what succeeded and what failed.
+    // names each minted evidence path so the model can cite it in the same
+    // cycle's `write_output` without listing `evidence/` first.
     let mut failures: Vec<ToolFailure> = Vec::new();
-    let mut succeeded = 0usize;
+    let mut recorded: Vec<String> = Vec::new();
     for (i, result) in results.into_iter().enumerate() {
         let call = &calls[i];
         match result {
             Ok(ev) => {
-                fs.record_evidence(ev, &call.claim_seed.0).await?;
-                succeeded += 1;
+                recorded.push(fs.record_evidence(ev, &call.claim_seed.0).await?);
             }
             Err(e) => {
                 failures.push(ToolFailure {
@@ -398,7 +398,9 @@ async fn execute_call_tools(
 
     if failures.is_empty() {
         Ok(StepOutcome::ok(format!(
-            "{succeeded} tool call(s) succeeded; evidence recorded"
+            "{} tool call(s) succeeded; cite this evidence: {}",
+            recorded.len(),
+            recorded.join(", ")
         )))
     } else {
         Ok(StepOutcome::tool_error(failures))
@@ -982,6 +984,41 @@ mod tests {
             }
             other => panic!("expected NeedsCorrection, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn execute_call_tools_observation_names_the_minted_evidence_path() {
+        let (fs, _m) = fixture().await;
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(Arc::new(crate::tools::EchoTool))
+            .expect("register echo");
+        let outcome = execute_step(
+            &fs,
+            &tools,
+            &Decision::CallTools {
+                calls: vec![ToolCall::new(
+                    "echo",
+                    json!({"msg": "hi"}),
+                    ClaimSeed::new("probe seed"),
+                )],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(outcome.observation.ok);
+        // The observation surfaces the minted path so the model can cite it in
+        // the same cycle without listing evidence/ first.
+        let path = outcome
+            .observation
+            .content
+            .split_whitespace()
+            .map(|t| t.trim_end_matches([',', '.']))
+            .find(|t| t.starts_with("evidence/") && t.ends_with(".json"))
+            .expect("observation must name the minted evidence path");
+        assert!(path.starts_with("evidence/probe-seed-"), "got {path}");
+        // And that surfaced path is a real, citable evidence record.
+        fs.evidence_must_exist(path).await.unwrap();
     }
 
     #[tokio::test]
