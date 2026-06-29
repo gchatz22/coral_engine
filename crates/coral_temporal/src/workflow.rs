@@ -941,7 +941,7 @@ async fn write_output(
     ctx: &WorkflowContext<AgentWorkflow>,
     input: &AgentInput,
     body: String,
-    citations: Vec<coral_node::evidence::EvidenceId>,
+    citations: Vec<String>,
 ) -> WorkflowResult<()> {
     let output_id = ctx
         .start_activity(
@@ -1404,10 +1404,10 @@ async fn retire_child(ctx: &WorkflowContext<AgentWorkflow>, child_ref: &AgentRef
 ///
 /// Calls the `reconcile_children` activity (which opens the parent's FS +
 /// each child's FS read-only, writes one synthetic evidence record per
-/// source into the parent's `evidence/`, and returns the freshly-minted
-/// `EvidenceId`s). The parent pulls the synthetic records on a later step
-/// via `List`/`Read` of `evidence/` to cite them in a subsequent
-/// `WriteOutput` — no workflow-state slot is needed.
+/// source into the parent's `evidence/`, and returns their paths). The
+/// parent pulls the synthetic records on a later step via `List`/`Read` of
+/// `evidence/` to cite them in a subsequent `WriteOutput` — no workflow-state
+/// slot is needed.
 ///
 /// Errors do NOT propagate via `?` — that would fail the whole workflow on
 /// a single bad source. Instead the typed activity failure is returned as a
@@ -2310,9 +2310,7 @@ mod tests {
 
         let s = decision_summary(&Decision::WriteOutput {
             body: "claim".into(),
-            citations: vec![coral_node::evidence::EvidenceId::from_hex(
-                "0123456789abcdef",
-            )],
+            citations: vec!["evidence/claim-0123456789abcdef.json".to_string()],
         });
         assert!(s.contains("WriteOutput"), "got: {s}");
         assert!(s.contains("citations: 1"), "got: {s}");

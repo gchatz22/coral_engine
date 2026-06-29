@@ -335,7 +335,6 @@ mod tests {
 
     use super::*;
     use crate::decision::{ClaimSeed, FsIndex, Seed, ToolCall as DecisionToolCall};
-    use crate::evidence::EvidenceId;
     use crate::mandate::Mandate;
     use crate::model_client::{CompleteResponse, ToolCall, Usage, Vendor};
     use serde_json::json;
@@ -847,11 +846,9 @@ mod tests {
     async fn retry_does_not_blow_away_write_output_evidence_correlation() {
         // Sanity: when the corrective fixes the issue and the second
         // attempt is `write_output`, the parsed `Decision` carries the
-        // evidence id verbatim. This pins one of the more error-prone
+        // citation path verbatim. This pins one of the more error-prone
         // variants through the retry path.
-        let ev = EvidenceId::from_hex(
-            "1d6a153a000000000000000000000000000000000000000000000000abcdef00",
-        );
+        let cite = "evidence/the-answer-abcdef00.json";
         let mock = MockModelClient::new(vec![
             MockOutcome::Resp(resp_with_tool_calls(vec![malformed_unknown_tool()])),
             MockOutcome::Resp(resp_with_tool_calls(vec![ToolCall {
@@ -859,7 +856,7 @@ mod tests {
                 name: "write_output".into(),
                 arguments: json!({
                     "body": "the answer",
-                    "citations": [ev.as_str()],
+                    "citations": [cite],
                 }),
             }])),
         ]);
@@ -869,7 +866,7 @@ mod tests {
         match dec {
             Decision::WriteOutput { body, citations } => {
                 assert_eq!(body, "the answer");
-                assert_eq!(citations, vec![ev]);
+                assert_eq!(citations, vec![cite.to_string()]);
             }
             other => panic!("expected WriteOutput, got {other:?}"),
         }

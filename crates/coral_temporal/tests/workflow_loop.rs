@@ -207,12 +207,15 @@ async fn run_live_test() -> Result<()> {
         .await
         .context("open planting AgentFs")?;
     let planted_id = plant_fs
-        .record_evidence(EvidenceRecord::new(
-            "tool_seed",
-            serde_json::json!({"k": "v"}),
-            serde_json::json!({"hit": true}),
-            Utc::now(),
-        ))
+        .record_evidence(
+            EvidenceRecord::new(
+                "tool_seed",
+                serde_json::json!({"k": "v"}),
+                serde_json::json!({"hit": true}),
+                Utc::now(),
+            ),
+            "tool seed",
+        )
         .await
         .context("plant evidence for WriteOutput")?;
 

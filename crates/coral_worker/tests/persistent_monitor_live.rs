@@ -45,7 +45,7 @@ use coral_graph::yaml::{build_workflow_starts, parse_and_validate, yaml_seed_tri
 use coral_graph::{GraphStore, MIGRATOR};
 use coral_node::agent_ref::GraphId;
 use coral_node::decision::{Decide, Decision, ReconcileSource, Session};
-use coral_node::evidence::{EvidenceId, EvidenceRecord};
+use coral_node::evidence::EvidenceRecord;
 use coral_node::fs::AgentFs;
 use coral_node::mandate::Mandate;
 use coral_node::storage::{AgentStorage, MemoryStorage};
@@ -68,7 +68,7 @@ const PARENT_MARKER: &str = "coordinate two researchers";
 /// Evidence id the children cite, planted identically on each child's FS so
 /// the same content-addressed id resolves under either prefix. Set before
 /// the worker starts.
-static CHILD_EVIDENCE: OnceLock<EvidenceId> = OnceLock::new();
+static CHILD_EVIDENCE: OnceLock<String> = OnceLock::new();
 
 /// Serializes the single live test against the process-wide installs.
 static LIVE_GUARD: Mutex<()> = Mutex::new(());
@@ -109,15 +109,16 @@ fn example_graph_path() -> PathBuf {
 ///   Never retires; only `step_cap` stops it.
 struct CyclingDecide;
 
-/// Parse a `<hex>.json` evidence filename out of a `List { path: "evidence/" }`
-/// observation (newline-joined bare filenames) into the id the parent cites.
+/// Recover an evidence file path from a `List { path: "evidence/" }`
+/// observation (newline-joined filenames) — the handle the parent cites.
 /// The parent never calls a tool, so its `evidence/` dir holds only the
-/// synthetic reconcile records — any entry is a valid reconcile id to cite.
-fn first_evidence_id(list_observation: &str) -> Option<EvidenceId> {
+/// synthetic reconcile records — any entry is a valid reconcile path to cite.
+fn first_evidence_id(list_observation: &str) -> Option<String> {
     list_observation
         .lines()
-        .find_map(|name| name.strip_suffix(".json"))
-        .map(EvidenceId::from_hex)
+        .map(|name| name.trim())
+        .find(|name| name.ends_with(".json"))
+        .map(|name| format!("evidence/{name}"))
 }
 
 #[async_trait]
@@ -284,7 +285,7 @@ async fn run_smoke(database_url: &str) -> Result<()> {
 
     // ---- Plant the evidence the children cite (identical ⇒ same id) ----
     let plant_mandate = Mandate::new("plant", Duration::from_millis(0), None);
-    let mut planted: Option<EvidenceId> = None;
+    let mut planted: Option<String> = None;
     for operator_id in ["researcher-alpha", "researcher-beta"] {
         let agent = applied
             .agents
@@ -300,12 +301,15 @@ async fn run_smoke(database_url: &str) -> Result<()> {
         .await
         .with_context(|| format!("open child FS for {operator_id}"))?;
         let id = fs
-            .record_evidence(EvidenceRecord::new(
+            .record_evidence(
+                EvidenceRecord::new(
+                    "echo",
+                    serde_json::json!({"seed": "persistent-monitor"}),
+                    serde_json::json!({"ok": true}),
+                    chrono::Utc::now(),
+                ),
                 "echo",
-                serde_json::json!({"seed": "persistent-monitor"}),
-                serde_json::json!({"ok": true}),
-                chrono::Utc::now(),
-            ))
+            )
             .await
             .context("plant child evidence")?;
         match &planted {

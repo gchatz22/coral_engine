@@ -61,7 +61,7 @@ use coral_node::conflict::ConflictKind;
 use coral_node::decision::{
     ConflictAlternative, ConflictRecordIntent, Decide, Decision, ReconcileSource, Session,
 };
-use coral_node::evidence::{EvidenceId, EvidenceRecord};
+use coral_node::evidence::EvidenceRecord;
 use coral_node::fs::AgentFs;
 use coral_node::mandate::{Mandate, OutputId};
 use coral_node::storage::{AgentStorage, BlobSha, MemoryStorage};
@@ -399,14 +399,14 @@ fn synthesize_reconcile_or_wait() -> anyhow::Result<Decision> {
 /// Synthesize `Decision::WriteOutput { body, citations }` from the
 /// synthetic evidence records the reconcile activity wrote into the
 /// parent's `evidence/` directory earlier in this same cycle. The
-/// reconcile activity's observation does not carry the minted
-/// `EvidenceId`s, so the script interposes a `List { path: "evidence/" }`
-/// step between reconcile and emit; this synthesizer recovers the ids by
-/// parsing that step's observation (one `<evidence_id>.json` per line).
-/// The parent calls no tools, so every file under `evidence/` is a
-/// reconcile record. If the `List` step hasn't run yet in this cycle (or
-/// returned fewer than 2 ids), push the placeholder back and idle so a
-/// later cycle retries.
+/// reconcile activity's observation does not carry the minted evidence
+/// paths, so the script interposes a `List { path: "evidence/" }` step
+/// between reconcile and emit; this synthesizer recovers the paths by
+/// reading that step's observation (one filename per line) and prefixing
+/// `evidence/`. The parent calls no tools, so every file under `evidence/`
+/// is a reconcile record. If the `List` step hasn't run yet in this cycle
+/// (or returned fewer than 2 records), push the placeholder back and idle so
+/// a later cycle retries.
 fn synthesize_emit_or_wait(session: &Session) -> anyhow::Result<Decision> {
     let listing = session
         .steps
@@ -417,10 +417,11 @@ fn synthesize_emit_or_wait(session: &Session) -> anyhow::Result<Decision> {
             _ => None,
         })
         .unwrap_or_default();
-    let synthetic_ids: Vec<EvidenceId> = listing
+    let synthetic_ids: Vec<String> = listing
         .lines()
-        .filter_map(|line| line.trim().strip_suffix(".json"))
-        .map(EvidenceId::from_hex)
+        .map(|line| line.trim())
+        .filter(|line| line.ends_with(".json"))
+        .map(|line| format!("evidence/{line}"))
         .collect();
     // Need exactly 2 — one per source. Tolerate "not yet" (0 or 1) by
     // putting the placeholder back; intolerable > 2 panics rather
@@ -612,12 +613,15 @@ async fn run_end_to_end() -> Result<()> {
         .await
         .expect("open planting AgentFs for child-a");
     let planted_a_id = plant_fs_a
-        .record_evidence(EvidenceRecord::new(
-            "echo",
-            serde_json::json!({"child": "a"}),
-            serde_json::json!({"hit": true}),
-            chrono::Utc::now(),
-        ))
+        .record_evidence(
+            EvidenceRecord::new(
+                "echo",
+                serde_json::json!({"child": "a"}),
+                serde_json::json!({"hit": true}),
+                chrono::Utc::now(),
+            ),
+            "echo child a",
+        )
         .await
         .expect("plant evidence for child-a WriteOutput");
     let plant_storage_b: Arc<dyn AgentStorage> = storage.clone();
@@ -625,12 +629,15 @@ async fn run_end_to_end() -> Result<()> {
         .await
         .expect("open planting AgentFs for child-b");
     let planted_b_id = plant_fs_b
-        .record_evidence(EvidenceRecord::new(
-            "echo",
-            serde_json::json!({"child": "b"}),
-            serde_json::json!({"hit": true}),
-            chrono::Utc::now(),
-        ))
+        .record_evidence(
+            EvidenceRecord::new(
+                "echo",
+                serde_json::json!({"child": "b"}),
+                serde_json::json!({"hit": true}),
+                chrono::Utc::now(),
+            ),
+            "echo child b",
+        )
         .await
         .expect("plant evidence for child-b WriteOutput");
 

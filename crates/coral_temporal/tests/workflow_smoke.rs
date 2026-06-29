@@ -149,12 +149,15 @@ async fn run_smoke() -> Result<()> {
         .await
         .context("open planting AgentFs")?;
     let planted_id = plant_fs
-        .record_evidence(EvidenceRecord::new(
+        .record_evidence(
+            EvidenceRecord::new(
+                TOOL_NAME,
+                serde_json::json!({"k": "v"}),
+                serde_json::json!({"hit": true}),
+                Utc::now(),
+            ),
             TOOL_NAME,
-            serde_json::json!({"k": "v"}),
-            serde_json::json!({"hit": true}),
-            Utc::now(),
-        ))
+        )
         .await
         .context("plant evidence for WriteOutput")?;
 

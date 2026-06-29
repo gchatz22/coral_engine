@@ -249,8 +249,11 @@ pub async fn execute_step(
                     Some(FsError::EmptyEvidence) => Ok(StepOutcome::needs_correction(
                         "write_output: citations list is empty (provenance contract)",
                     )),
-                    Some(FsError::EvidenceNotFound(id)) => Ok(StepOutcome::needs_correction(
-                        format!("write_output: cited evidence {id} not found on disk"),
+                    Some(FsError::EvidenceNotFound(path)) => Ok(StepOutcome::needs_correction(
+                        format!("write_output: cited evidence {path} not found on disk"),
+                    )),
+                    Some(FsError::CitationNotEvidence(path)) => Ok(StepOutcome::needs_correction(
+                        format!("write_output: citation {path} is not under evidence/"),
                     )),
                     _ => Err(e),
                 },
@@ -380,7 +383,7 @@ async fn execute_call_tools(
         let call = &calls[i];
         match result {
             Ok(ev) => {
-                fs.record_evidence(ev).await?;
+                fs.record_evidence(ev, &call.claim_seed.0).await?;
                 succeeded += 1;
             }
             Err(e) => {
@@ -456,7 +459,7 @@ mod tests {
 
     use super::*;
     use crate::decision::{ClaimSeed, FsOp, MockDecide, Remainder};
-    use crate::evidence::{EvidenceId, EvidenceRecord};
+    use crate::evidence::EvidenceRecord;
     use crate::fs::AgentFs;
     use crate::storage::{AgentStorage, MemoryStorage};
     use crate::tools::ToolRegistry;
@@ -490,12 +493,10 @@ mod tests {
     /// filename (always the canonical `output.md`).
     async fn seed_one_output(fs: &AgentFs) -> String {
         let ev = fs
-            .record_evidence(EvidenceRecord::new(
-                "echo",
-                json!({"k": 1}),
-                json!({"v": 1}),
-                ts(),
-            ))
+            .record_evidence(
+                EvidenceRecord::new("echo", json!({"k": 1}), json!({"v": 1}), ts()),
+                "echo k",
+            )
             .await
             .unwrap();
         let _ = fs.persist_output("a claim", &[ev]).await.unwrap();
@@ -794,12 +795,10 @@ mod tests {
     async fn execute_write_output_with_resolvable_evidence_succeeds() {
         let (fs, _m) = fixture().await;
         let ev_id = fs
-            .record_evidence(EvidenceRecord::new(
-                "echo",
-                json!({"k": 1}),
-                json!({"v": 1}),
-                ts(),
-            ))
+            .record_evidence(
+                EvidenceRecord::new("echo", json!({"k": 1}), json!({"v": 1}), ts()),
+                "echo k",
+            )
             .await
             .unwrap();
         let tools = ToolRegistry::new();
@@ -989,7 +988,7 @@ mod tests {
     async fn execute_write_output_with_unresolved_evidence_needs_correction() {
         let (fs, _m) = fixture().await;
         let tools = ToolRegistry::new();
-        let bogus = EvidenceId::new("echo", &json!({"never": "written"}), &json!({"x": 0}));
+        let bogus = "evidence/never-written-00000000.json".to_string();
         let outcome = execute_step(
             &fs,
             &tools,
