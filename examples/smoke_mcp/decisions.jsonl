@@ -1,14 +1,16 @@
 # Scripted decisions for the @modelcontextprotocol/server-everything smoke.
 # Step 1 (cycle 0): call the server's `get-sum` tool with two ints (a=2, b=3).
-# Step 2 (cycle 0): emit an output backed by the evidence id of that call.
+# Step 2 (cycle 0): emit an output citing the evidence path of that call.
 # Step 3 (cycle 0): idle; the Mandate's step_cap=1 cap ends the cycle; the step_cap (1) retires the agent.
 #
-# The evidence id below is sha256(canonical_json) of the (tool, args, result)
-# triple that `tools/call get-sum {a: 2, b: 3}` produces, where `result` is
-# the JSON-serialized CallToolResult the server returns. Recompute with the
-# `compute-evidence-id` binary if the canonical-JSON rules in
+# The citation path below is evidence/<slug(claim_seed)>-<first 8 hex of
+# EvidenceId>.json — here evidence/seed-1-10c78548.json (slug "seed-1"; the
+# EvidenceId is sha256(canonical_json) of the (tool, args, result) triple that
+# `tools/call get-sum {a: 2, b: 3}` produces, where `result` is the
+# JSON-serialized CallToolResult the server returns). Recompute the suffix with
+# the `compute-evidence-id` binary if the canonical-JSON rules in
 # src/evidence.rs ever change, or if the server's reply shape drifts (e.g.
 # server-everything bumps its content envelope).
 {"type":"call_tools","calls":[{"name":"get-sum","args":{"a":2,"b":3},"claim_seed":"seed-1"}]}
-{"type":"write_output","body":"get-sum(2, 3) via MCP server-everything","citations":["10c7854829677f9d39acaafa5aa5ae4e9fa59ae5cba2a1dafc941c4c9f4938de"]}
+{"type":"write_output","body":"get-sum(2, 3) via MCP server-everything","citations":["evidence/seed-1-10c78548.json"]}
 {"type":"idle","next_after":50}

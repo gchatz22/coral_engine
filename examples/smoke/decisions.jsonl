@@ -1,12 +1,15 @@
 # Three scripted decisions for the smoke fixture. The Mandate caps the loop
 # at step_cap = 1, so the agent retires cleanly after this one cycle (three steps) executes.
 #
-# Step 1 (cycle 0): invoke the echo tool. Produces an evidence record on disk whose id
-# is sha256(canonical_json({"args":{"hello":"smoke"},"result":{"echoed":{"hello":"smoke"}},"tool":"echo"})).
-# Computed offline; recompute with `EvidenceId::new("echo", json!({"hello":"smoke"}), json!({"echoed":{"hello":"smoke"}}))`
-# if the canonical-JSON rules in src/evidence.rs ever change.
+# Step 1 (cycle 0): invoke the echo tool. Produces an evidence record on disk at
+# evidence/<slug(claim_seed)>-<first 8 hex of EvidenceId>.json — here
+# evidence/seed-1-1d6a153a.json (slug "seed-1"; EvidenceId =
+# sha256(canonical_json({"args":{"hello":"smoke"},"result":{"echoed":{"hello":"smoke"}},"tool":"echo"}))
+# = 1d6a153a...). Recompute the suffix with `EvidenceId::new(...)` and the path
+# with `coral_node::fs::evidence_relpath("seed-1", &id)` if the canonical-JSON
+# rules in src/evidence.rs ever change.
 {"type":"call_tools","calls":[{"name":"echo","args":{"hello":"smoke"},"claim_seed":"seed-1"}]}
-# Step 2 (cycle 0): write the canonical output backed by that evidence id.
-{"type":"write_output","body":"smoke test passed","citations":["1d6a153a69d110156ca44ed281f859ca09d9875747e3ed16b9964c52632fd96e"]}
+# Step 2 (cycle 0): write the canonical output citing that evidence path.
+{"type":"write_output","body":"smoke test passed","citations":["evidence/seed-1-1d6a153a.json"]}
 # Step 3 (cycle 0): idle. The loop's step_cap=1 cap ends the cycle; the step_cap (1) retires the agent.
 {"type":"idle","next_after":50}
