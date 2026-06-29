@@ -17,7 +17,7 @@ use coral_node::decision::{
     ConflictId, ConflictRecordIntent, Decide, Decision, FsOp, Observation, ReconcileSource, Seed,
     Session, ToolCall,
 };
-use coral_node::evidence::{EvidenceId, EvidenceRecord};
+use coral_node::evidence::EvidenceRecord;
 use coral_node::fs::{AgentFs, FsError, CANONICAL_OUTPUT};
 use coral_node::mandate::{Mandate, OutputId};
 use coral_node::model_client::ModelError;
@@ -145,7 +145,7 @@ pub struct ExecuteToolInput {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ToolCallOutcome {
-    Success { evidence_id: EvidenceId },
+    Success { evidence_path: String },
     Failure { failure: ToolCallFailure },
 }
 
@@ -170,7 +170,9 @@ pub struct PersistOutputInput {
     /// `citing`/self-`cited` ends of every citation written for this output.
     pub agent_id: AgentId,
     pub body: String,
-    pub citations: Vec<EvidenceId>,
+    /// `evidence/` paths the output cites — the handles the model copied from
+    /// its tool-call and reconcile observations.
+    pub citations: Vec<String>,
 }
 
 /// Input to [`AgentActivities::apply_fs_ops`].
@@ -286,17 +288,16 @@ pub struct ReconcileChildrenInput {
 
 /// Output of the `reconcile_children` activity.
 ///
-/// `synthetic_evidence[i]` is the freshly-minted `EvidenceId` for the
-/// `sources[i]` cross-agent fold (written into the parent's
-/// `evidence/<id>.json`). The parent pulls these on a later step via
-/// `List`/`Read` of `evidence/` to cite them in a subsequent
-/// `WriteOutput` — no workflow-state slot involved.
+/// `synthetic_evidence[i]` is the `evidence/` path of the freshly-minted
+/// record for the `sources[i]` cross-agent fold. The reconcile observation
+/// surfaces these paths directly, so the parent cites them in a subsequent
+/// `WriteOutput` without listing `evidence/` first.
 ///
 /// `conflict_id` is `Some` iff `input.conflict.is_some()` and the
 /// activity wrote the conflict record successfully.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReconcileChildrenOutput {
-    pub synthetic_evidence: Vec<EvidenceId>,
+    pub synthetic_evidence: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict_id: Option<ConflictId>,
 }
@@ -458,7 +459,7 @@ pub(crate) async fn persist_output_impl(
     agent_id: AgentId,
     prefix: &str,
     body: &str,
-    citations: &[EvidenceId],
+    citations: &[String],
 ) -> anyhow::Result<OutputId> {
     // Placeholder mandate: `AgentFs` only writes `mandate.md` when
     // absent, so the real mandate persisted by an earlier
@@ -476,8 +477,8 @@ pub(crate) async fn persist_output_impl(
     let output_sha = BlobSha::of_bytes(body.as_bytes());
     db.set_file_version(agent_id, CANONICAL_OUTPUT, &output_sha)
         .await?;
-    for cid in citations {
-        let (cited_agent, cited_path, cited_sha) = resolve_cited(&fs, agent_id, cid).await?;
+    for cited in citations {
+        let (cited_agent, cited_path, cited_sha) = resolve_cited(&fs, agent_id, cited).await?;
         db.add_citation(
             agent_id,
             CANONICAL_OUTPUT,
@@ -500,9 +501,9 @@ pub(crate) async fn persist_output_impl(
 async fn resolve_cited(
     fs: &AgentFs,
     self_agent_id: AgentId,
-    cid: &EvidenceId,
+    cited_path: &str,
 ) -> anyhow::Result<(AgentId, String, BlobSha)> {
-    let bytes = fs.read_evidence_bytes(cid).await?;
+    let bytes = fs.read_evidence_bytes(cited_path).await?;
     let record: EvidenceRecord = serde_json::from_slice(&bytes)?;
     if record.tool == "reconcile" {
         let child_agent_id: AgentId = serde_json::from_value(
@@ -525,7 +526,7 @@ async fn resolve_cited(
     } else {
         Ok((
             self_agent_id,
-            format!("evidence/{}.json", cid.as_str()),
+            cited_path.to_string(),
             BlobSha::of_bytes(&bytes),
         ))
     }
@@ -739,10 +740,13 @@ impl AgentActivities {
                 )
                 .await
                 .map_err(|e| ActivityError::from(anyhow::anyhow!("agent_fs open failed: {e:#}")))?;
-                let evidence_id = fs.record_evidence(record).await.map_err(|e| {
-                    ActivityError::from(anyhow::anyhow!("record_evidence failed: {e:#}"))
-                })?;
-                Ok(ToolCallOutcome::Success { evidence_id })
+                let evidence_path = fs
+                    .record_evidence(record, &input.call.claim_seed.0)
+                    .await
+                    .map_err(|e| {
+                        ActivityError::from(anyhow::anyhow!("record_evidence failed: {e:#}"))
+                    })?;
+                Ok(ToolCallOutcome::Success { evidence_path })
             }
             Err(e) => Ok(ToolCallOutcome::Failure {
                 failure: ToolCallFailure {
@@ -1107,8 +1111,9 @@ pub async fn reconcile_children_impl(
         });
         let result = serde_json::to_value(child_output)?;
         let record = EvidenceRecord::new("reconcile", args, result, now);
-        let ev_id = parent_fs.record_evidence(record).await?;
-        synthetic_evidence.push(ev_id);
+        let slug_seed = format!("reconcile {}", source.child_ref.workflow_id);
+        let ev_path = parent_fs.record_evidence(record, &slug_seed).await?;
+        synthetic_evidence.push(ev_path);
     }
 
     // Persist the conflict record (if any). The record is
@@ -1326,9 +1331,8 @@ mod tests {
 
     #[test]
     fn tool_call_outcome_round_trips_through_json() {
-        let id = EvidenceId::new("t", &json!({"a": 1}), &json!({"r": 1}));
         let oc = ToolCallOutcome::Success {
-            evidence_id: id.clone(),
+            evidence_path: "evidence/t-aabbccdd.json".to_string(),
         };
         let s = serde_json::to_string(&oc).unwrap();
         assert!(s.contains("\"outcome\":\"success\""), "wire shape: {s}");
@@ -1366,7 +1370,6 @@ mod tests {
 
     #[test]
     fn persist_output_input_round_trips_through_json() {
-        let id = EvidenceId::new("t", &json!({}), &json!({}));
         let i = PersistOutputInput {
             cfg: AgentConfig::default(),
             fs_handle: FsHandle {
@@ -1374,7 +1377,7 @@ mod tests {
             },
             agent_id: AgentId::new(uuid::Uuid::from_u128(0xa1)),
             body: "claim".into(),
-            citations: vec![id],
+            citations: vec!["evidence/t-aabbccdd.json".to_string()],
         };
         let s = serde_json::to_string(&i).unwrap();
         let _back: PersistOutputInput = serde_json::from_str(&s).unwrap();
@@ -1688,16 +1691,17 @@ mod tests {
         tool: &str,
         args: serde_json::Value,
         result: serde_json::Value,
-    ) -> EvidenceId {
+    ) -> String {
         // Same storage Arc + prefix the activity will open against —
         // `MemoryStorage` is in-process state, not a connected backend,
-        // so a separate instance would not share evidence.
+        // so a separate instance would not share evidence. Returns the
+        // `evidence/` path — the handle a citation names.
         let mandate = Mandate::new("plant", Duration::from_millis(0), None);
         let fs = AgentFs::new_with_storage(storage, prefix, &mandate)
             .await
             .expect("open planting AgentFs");
         let rec = EvidenceRecord::new(tool, args, result, Utc::now());
-        fs.record_evidence(rec).await.expect("plant evidence")
+        fs.record_evidence(rec, tool).await.expect("plant evidence")
     }
 
     #[tokio::test]
@@ -1761,7 +1765,7 @@ mod tests {
         );
         let cites = db.citations();
         assert_eq!(cites.len(), 2, "one citation per cited evidence");
-        for (cid, cite) in [&id_a, &id_b].iter().zip(cites.iter()) {
+        for (cited_path, cite) in [&id_a, &id_b].iter().zip(cites.iter()) {
             assert_eq!(cite.citing_agent, agent_id);
             assert_eq!(cite.citing_path, CANONICAL_OUTPUT);
             assert_eq!(cite.citing_sha, output_sha);
@@ -1769,8 +1773,8 @@ mod tests {
                 cite.cited_agent, agent_id,
                 "own tool-call evidence is a within-agent edge"
             );
-            assert_eq!(cite.cited_path, format!("evidence/{}.json", cid.as_str()));
-            let ev_bytes = fs.read_evidence_bytes(cid).await.unwrap();
+            assert_eq!(&cite.cited_path, *cited_path);
+            let ev_bytes = fs.read_evidence_bytes(cited_path).await.unwrap();
             assert_eq!(
                 cite.cited_sha,
                 BlobSha::of_bytes(&ev_bytes),
@@ -1784,9 +1788,9 @@ mod tests {
         let storage: Arc<dyn coral_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
         let prefix = "graphs/g1/agents/a-missing/";
 
-        // Reference an evidence id that was never planted — the
+        // Reference an evidence path that was never planted — the
         // `AgentFs::persist_output` provenance check fires.
-        let bogus = EvidenceId::new("tool_x", &json!({}), &json!({"never": "written"}));
+        let bogus = "evidence/tool-x-deadbeef.json".to_string();
         let db = Arc::new(MemoryStructuralDbStore::new());
         let agent_id = AgentId::new(uuid::Uuid::from_u128(0xa2));
         let err = persist_output_impl(
@@ -1798,7 +1802,7 @@ mod tests {
             &[bogus.clone()],
         )
         .await
-        .expect_err("must fail on unresolved evidence id");
+        .expect_err("must fail on unresolved evidence path");
         let typed = err.downcast_ref::<FsError>().expect("typed FsError");
         match typed {
             FsError::EvidenceNotFound(missing) => assert_eq!(missing, &bogus),
@@ -2489,19 +2493,22 @@ mod tests {
         graph_id: GraphId,
         child_agent_id: AgentId,
         content: &str,
-    ) -> (String, OutputId, EvidenceId) {
+    ) -> (String, OutputId, String) {
         let child_prefix = format!("graphs/{graph_id}/agents/{child_agent_id}/");
         let mandate = Mandate::new("child", Duration::from_millis(0), None);
         let fs = AgentFs::new_with_storage(storage.clone(), &child_prefix, &mandate)
             .await
             .expect("open child FS");
         let ev = fs
-            .record_evidence(EvidenceRecord::new(
+            .record_evidence(
+                EvidenceRecord::new(
+                    "echo",
+                    json!({"q": content}),
+                    json!({"r": "child result"}),
+                    fixed_now(),
+                ),
                 "echo",
-                json!({"q": content}),
-                json!({"r": "child result"}),
-                fixed_now(),
-            ))
+            )
             .await
             .expect("plant child evidence");
         let out = fs
@@ -3153,11 +3160,7 @@ mod tests {
     #[test]
     fn reconcile_children_output_round_trips_through_json() {
         let o = ReconcileChildrenOutput {
-            synthetic_evidence: vec![EvidenceId::new(
-                "reconcile",
-                &json!({"k": "v"}),
-                &json!({"r": 1}),
-            )],
+            synthetic_evidence: vec!["evidence/reconcile-aabbccdd.json".to_string()],
             conflict_id: None,
         };
         let s = serde_json::to_string(&o).unwrap();

@@ -172,7 +172,10 @@ async fn write_output_with_valid_evidence_writes_canonical_output() {
         json!({"echoed": {"msg": "hi"}}),
         chrono::Utc::now(),
     );
-    let ev_id: EvidenceId = fs.record_evidence(rec).await.expect("seed evidence");
+    let ev_id = fs
+        .record_evidence(rec, "echo hi")
+        .await
+        .expect("seed evidence");
 
     // One cycle: write the output, then idle (the terminal step).
     let script = vec![
@@ -218,13 +221,16 @@ async fn never_cadence_fires_first_cycle_then_waits_for_triggers() {
     let fs = AgentFs::open(tmp.path().to_path_buf(), &mandate)
         .await
         .expect("open fs");
-    let ev_id: EvidenceId = fs
-        .record_evidence(EvidenceRecord::new(
-            "echo",
-            json!({"msg": "hi"}),
-            json!({"echoed": {"msg": "hi"}}),
-            chrono::Utc::now(),
-        ))
+    let ev_id = fs
+        .record_evidence(
+            EvidenceRecord::new(
+                "echo",
+                json!({"msg": "hi"}),
+                json!({"echoed": {"msg": "hi"}}),
+                chrono::Utc::now(),
+            ),
+            "echo hi",
+        )
         .await
         .expect("seed evidence");
     // Two scripted cycles, each a write + idle. A correct `never` node
@@ -318,6 +324,7 @@ async fn call_tool_records_evidence_and_write_output_consumes_it_in_one_cycle() 
     let args = json!({"msg": "hi"});
     let result = json!({"echoed": {"msg": "hi"}});
     let expected_ev = EvidenceId::new("echo", &args, &result);
+    let expected_path = coral_node::fs::evidence_relpath("seed-1", &expected_ev);
 
     let script = vec![
         Decision::CallTools {
@@ -329,7 +336,7 @@ async fn call_tool_records_evidence_and_write_output_consumes_it_in_one_cycle() 
         },
         Decision::WriteOutput {
             body: "echoed".into(),
-            citations: vec![expected_ev.clone()],
+            citations: vec![expected_path.clone()],
         },
         idle(),
     ];
@@ -349,10 +356,7 @@ async fn call_tool_records_evidence_and_write_output_consumes_it_in_one_cycle() 
         .expect("run ok");
 
     // Evidence file written by the CallTool step.
-    let ev_path = tmp
-        .path()
-        .join("evidence")
-        .join(format!("{}.json", expected_ev));
+    let ev_path = tmp.path().join(&expected_path);
     assert!(ev_path.is_file(), "expected evidence file at {ev_path:?}");
 
     // Canonical Output written by the WriteOutput step.
@@ -378,6 +382,7 @@ async fn multi_step_cycle_counts_as_one_cycle() {
     .expect("seed note");
     let args = json!({"msg": "go"});
     let expected_ev = EvidenceId::new("echo", &args, &json!({"echoed": {"msg": "go"}}));
+    let expected_path = coral_node::fs::evidence_relpath("s", &expected_ev);
 
     let script = vec![
         Decision::Read {
@@ -388,7 +393,7 @@ async fn multi_step_cycle_counts_as_one_cycle() {
         },
         Decision::WriteOutput {
             body: "did the work".into(),
-            citations: vec![expected_ev],
+            citations: vec![expected_path],
         },
         idle(),
     ];
@@ -580,7 +585,7 @@ async fn write_output_with_empty_evidence_is_recoverable_in_cycle() {
 async fn write_output_with_unknown_evidence_is_recoverable_in_cycle() {
     let (tmp, fs, mut mandate) = fresh_fs(Duration::from_millis(50)).await;
     mandate.step_cap = Some(1);
-    let bogus = EvidenceId::from_hex("deadbeef".repeat(8));
+    let bogus = "evidence/lying-deadbeef.json".to_string();
     let script = vec![
         Decision::WriteOutput {
             body: "lying about provenance".into(),
@@ -1246,12 +1251,10 @@ async fn seed_index_reaches_the_run_loop() {
     .await
     .expect("seed note");
     let ev_id = fs
-        .record_evidence(EvidenceRecord::new(
-            "echo",
-            json!({"k": 1}),
-            json!({"v": 1}),
-            Utc::now(),
-        ))
+        .record_evidence(
+            EvidenceRecord::new("echo", json!({"k": 1}), json!({"v": 1}), Utc::now()),
+            "echo k",
+        )
         .await
         .expect("record evidence");
     let _out_id = fs
@@ -1309,6 +1312,9 @@ async fn parallel_call_tools_k3_all_succeed_persists_evidence() {
     let ev_a = EvidenceId::new("echo", &args_a, &json!({"echoed": args_a}));
     let ev_b = EvidenceId::new("echo", &args_b, &json!({"echoed": args_b}));
     let ev_c = EvidenceId::new("echo", &args_c, &json!({"echoed": args_c}));
+    let path_a = coral_node::fs::evidence_relpath("seed-a", &ev_a);
+    let path_b = coral_node::fs::evidence_relpath("seed-b", &ev_b);
+    let path_c = coral_node::fs::evidence_relpath("seed-c", &ev_c);
 
     let script = vec![
         // Step 1: K=3 parallel call_tool batch — all echo, distinct args.
@@ -1337,7 +1343,7 @@ async fn parallel_call_tools_k3_all_succeed_persists_evidence() {
         // Step 2: cite all three.
         Decision::WriteOutput {
             body: "synthesized from 3 reads".into(),
-            citations: vec![ev_a.clone(), ev_b.clone(), ev_c.clone()],
+            citations: vec![path_a.clone(), path_b.clone(), path_c.clone()],
         },
         idle(),
     ];
@@ -1364,8 +1370,8 @@ async fn parallel_call_tools_k3_all_succeed_persists_evidence() {
         .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
         .collect();
     assert_eq!(evs.len(), 3, "expected 3 evidence files, got: {evs:?}");
-    for id in [&ev_a, &ev_b, &ev_c] {
-        let name = format!("{}.json", id);
+    for path in [&path_a, &path_b, &path_c] {
+        let name = path.strip_prefix("evidence/").unwrap().to_string();
         assert!(
             evs.contains(&name),
             "evidence {name} not on disk; got: {evs:?}"
@@ -1455,6 +1461,14 @@ async fn parallel_call_tools_k3_partial_failure_persists_successes_and_observes_
     // "don't unwind on partial failure" property).
     let echo_a_id = EvidenceId::new("echo", &json!({"k": "a"}), &json!({"echoed": {"k": "a"}}));
     let echo_c_id = EvidenceId::new("echo", &json!({"k": "c"}), &json!({"echoed": {"k": "c"}}));
+    let echo_a_name = coral_node::fs::evidence_relpath("seed-a", &echo_a_id)
+        .strip_prefix("evidence/")
+        .unwrap()
+        .to_string();
+    let echo_c_name = coral_node::fs::evidence_relpath("seed-c", &echo_c_id)
+        .strip_prefix("evidence/")
+        .unwrap()
+        .to_string();
     let evidence_dir = tmp.path().join("evidence");
     let evs: Vec<String> = agent_record_files(&evidence_dir)
         .into_iter()
@@ -1466,11 +1480,11 @@ async fn parallel_call_tools_k3_partial_failure_persists_successes_and_observes_
         "two successful echo calls should persist evidence even when sibling failed; got: {evs:?}"
     );
     assert!(
-        evs.contains(&format!("{}.json", echo_a_id)),
+        evs.contains(&echo_a_name),
         "evidence for echo(k=a) missing; got: {evs:?}"
     );
     assert!(
-        evs.contains(&format!("{}.json", echo_c_id)),
+        evs.contains(&echo_c_name),
         "evidence for echo(k=c) missing; got: {evs:?}"
     );
 

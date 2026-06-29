@@ -186,6 +186,10 @@ async fn run_smoke(database_url: &str) -> Result<()> {
         .context("probe: call get-sum")?;
     probe.shutdown().await.context("probe: shutdown")?;
     let evidence_id = EvidenceId::new(TOOL_NAME, &tool_args, &probe_result);
+    // The agent's scripted call uses claim_seed "mcp-smoke-seed", so the
+    // record lands at this interpretable path — the handle the WriteOutput
+    // cites and the key the assertion checks.
+    let evidence_path = coral_node::fs::evidence_relpath("mcp-smoke-seed", &evidence_id);
 
     // ---- Install the production wiring under test ----
     let storage = Arc::new(MemoryStorage::new());
@@ -211,7 +215,7 @@ async fn run_smoke(database_url: &str) -> Result<()> {
         },
         Decision::WriteOutput {
             body: "mcp_graph_live: get-sum via server-everything".into(),
-            citations: vec![evidence_id.clone()],
+            citations: vec![evidence_path.clone()],
         },
         Decision::Idle {
             next_after: Duration::from_millis(50),
@@ -234,7 +238,7 @@ async fn run_smoke(database_url: &str) -> Result<()> {
 
     let driver_task_queue = task_queue.clone();
     let driver_prefix = agent_prefix.clone();
-    let driver_evidence = evidence_id.clone();
+    let driver_evidence = evidence_path.clone();
     let driver = tokio::spawn(async move {
         let workflow_id = format!(
             "{}-{suffix}",
@@ -280,7 +284,7 @@ async fn drive(
     graph_id: GraphId,
     root_agent_id: coral_node::agent_ref::AgentId,
     agent_prefix: &str,
-    evidence_id: EvidenceId,
+    evidence_path: String,
     storage: Arc<MemoryStorage>,
 ) -> Result<()> {
     let mut input = AgentInput::new_for_test(graph_id, root_agent_id, "root");
@@ -331,7 +335,7 @@ async fn drive(
     );
 
     // The evidence record itself must be on disk (provenance resolves).
-    let key = format!("{agent_prefix}/evidence/{evidence_id}.json");
+    let key = format!("{agent_prefix}/{evidence_path}");
     assert!(
         storage
             .get(&key)
@@ -340,6 +344,6 @@ async fn drive(
             .is_some(),
         "evidence record absent at {key} — the MCP tool call did not persist"
     );
-    eprintln!("mcp_graph_live: output cites MCP evidence id {evidence_id}");
+    eprintln!("mcp_graph_live: output cites MCP evidence path {evidence_path}");
     Ok(())
 }

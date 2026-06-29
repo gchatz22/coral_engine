@@ -941,7 +941,7 @@ async fn write_output(
     ctx: &WorkflowContext<AgentWorkflow>,
     input: &AgentInput,
     body: String,
-    citations: Vec<coral_node::evidence::EvidenceId>,
+    citations: Vec<String>,
 ) -> WorkflowResult<()> {
     let output_id = ctx
         .start_activity(
@@ -1192,16 +1192,18 @@ async fn dispatch_call_tools(
     let results = temporalio_sdk::workflows::join_all(futures).await;
 
     let mut failures: Vec<ToolCallFailure> = Vec::new();
-    let mut succeeded = 0usize;
+    let mut recorded: Vec<String> = Vec::new();
     for r in results {
         match r? {
-            ToolCallOutcome::Success { .. } => succeeded += 1,
+            ToolCallOutcome::Success { evidence_path } => recorded.push(evidence_path),
             ToolCallOutcome::Failure { failure } => failures.push(failure),
         }
     }
     if failures.is_empty() {
         Ok(Observation::ok(format!(
-            "{succeeded} tool call(s) succeeded; evidence recorded"
+            "{} tool call(s) succeeded; cite this evidence: {}",
+            recorded.len(),
+            recorded.join(", ")
         )))
     } else {
         Ok(Observation::err(format_correction(&failures)))
@@ -1404,10 +1406,10 @@ async fn retire_child(ctx: &WorkflowContext<AgentWorkflow>, child_ref: &AgentRef
 ///
 /// Calls the `reconcile_children` activity (which opens the parent's FS +
 /// each child's FS read-only, writes one synthetic evidence record per
-/// source into the parent's `evidence/`, and returns the freshly-minted
-/// `EvidenceId`s). The parent pulls the synthetic records on a later step
-/// via `List`/`Read` of `evidence/` to cite them in a subsequent
-/// `WriteOutput` — no workflow-state slot is needed.
+/// source into the parent's `evidence/`, and returns their paths). The
+/// parent pulls the synthetic records on a later step via `List`/`Read` of
+/// `evidence/` to cite them in a subsequent `WriteOutput` — no workflow-state
+/// slot is needed.
 ///
 /// Errors do NOT propagate via `?` — that would fail the whole workflow on
 /// a single bad source. Instead the typed activity failure is returned as a
@@ -1434,8 +1436,9 @@ async fn reconcile_children(
         )
         .await
     {
-        Ok(_out) => Ok(Observation::ok(format!(
-            "reconciled {source_count} child source(s); synthetic evidence recorded"
+        Ok(out) => Ok(Observation::ok(format!(
+            "reconciled {source_count} child source(s); cite this evidence: {}",
+            out.synthetic_evidence.join(", ")
         ))),
         // The activity returned an `ApplicationFailure` carrying either a
         // typed `ReconciliationError` (non-retryable, structural) or a wrapped
@@ -2310,9 +2313,7 @@ mod tests {
 
         let s = decision_summary(&Decision::WriteOutput {
             body: "claim".into(),
-            citations: vec![coral_node::evidence::EvidenceId::from_hex(
-                "0123456789abcdef",
-            )],
+            citations: vec!["evidence/claim-0123456789abcdef.json".to_string()],
         });
         assert!(s.contains("WriteOutput"), "got: {s}");
         assert!(s.contains("citations: 1"), "got: {s}");

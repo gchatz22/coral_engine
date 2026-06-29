@@ -45,7 +45,7 @@ use coral_graph::yaml::{build_workflow_starts, parse_and_validate, yaml_seed_tri
 use coral_graph::{GraphStore, MIGRATOR};
 use coral_node::agent_ref::GraphId;
 use coral_node::decision::{Decide, Decision, ReconcileSource, Session};
-use coral_node::evidence::{EvidenceId, EvidenceRecord};
+use coral_node::evidence::EvidenceRecord;
 use coral_node::fs::AgentFs;
 use coral_node::mandate::Mandate;
 use coral_node::storage::{AgentStorage, MemoryStorage};
@@ -68,7 +68,7 @@ const PARENT_MARKER: &str = "coordinate two researchers";
 /// Evidence id the children cite, planted identically on each child's FS so
 /// the same content-addressed id resolves under either prefix. Set before
 /// the worker starts.
-static CHILD_EVIDENCE: OnceLock<EvidenceId> = OnceLock::new();
+static CHILD_EVIDENCE: OnceLock<String> = OnceLock::new();
 
 /// Serializes the single live test against the process-wide installs.
 static LIVE_GUARD: Mutex<()> = Mutex::new(());
@@ -109,15 +109,15 @@ fn example_graph_path() -> PathBuf {
 ///   Never retires; only `step_cap` stops it.
 struct CyclingDecide;
 
-/// Parse a `<hex>.json` evidence filename out of a `List { path: "evidence/" }`
-/// observation (newline-joined bare filenames) into the id the parent cites.
-/// The parent never calls a tool, so its `evidence/` dir holds only the
-/// synthetic reconcile records — any entry is a valid reconcile id to cite.
-fn first_evidence_id(list_observation: &str) -> Option<EvidenceId> {
-    list_observation
-        .lines()
-        .find_map(|name| name.strip_suffix(".json"))
-        .map(EvidenceId::from_hex)
+/// Recover the synthetic evidence path the reconcile step minted, by reading
+/// it out of the reconcile observation (which names each `evidence/` path) —
+/// the handle the parent cites in its consolidated report.
+fn first_evidence_id(reconcile_observation: &str) -> Option<String> {
+    reconcile_observation
+        .split_whitespace()
+        .map(|t| t.trim_end_matches([',', '.']))
+        .find(|t| t.starts_with("evidence/") && t.ends_with(".json"))
+        .map(|t| t.to_string())
 }
 
 #[async_trait]
@@ -131,16 +131,10 @@ impl Decide for CyclingDecide {
             // Parent. Drive the cycle off the steps taken so far.
             let last = session.steps.last();
             match last.map(|s| &s.action) {
-                // Just reconciled: list the parent's own evidence/ to find
-                // the synthetic reconcile id to cite.
+                // Just reconciled: the reconcile observation names the
+                // synthetic evidence path directly — cite it and emit a
+                // refreshed consolidated report (no List of evidence/ needed).
                 Some(Decision::ReconcileChildren { .. }) => {
-                    return Ok(Decision::List {
-                        path: "evidence/".into(),
-                    });
-                }
-                // Listing done: cite the discovered reconcile id and emit a
-                // refreshed consolidated report.
-                Some(Decision::List { .. }) => {
                     let observation = &last.expect("last is Some in this arm").observation;
                     if let Some(cite) = first_evidence_id(&observation.content) {
                         return Ok(Decision::WriteOutput {
@@ -284,7 +278,7 @@ async fn run_smoke(database_url: &str) -> Result<()> {
 
     // ---- Plant the evidence the children cite (identical ⇒ same id) ----
     let plant_mandate = Mandate::new("plant", Duration::from_millis(0), None);
-    let mut planted: Option<EvidenceId> = None;
+    let mut planted: Option<String> = None;
     for operator_id in ["researcher-alpha", "researcher-beta"] {
         let agent = applied
             .agents
@@ -300,12 +294,15 @@ async fn run_smoke(database_url: &str) -> Result<()> {
         .await
         .with_context(|| format!("open child FS for {operator_id}"))?;
         let id = fs
-            .record_evidence(EvidenceRecord::new(
+            .record_evidence(
+                EvidenceRecord::new(
+                    "echo",
+                    serde_json::json!({"seed": "persistent-monitor"}),
+                    serde_json::json!({"ok": true}),
+                    chrono::Utc::now(),
+                ),
                 "echo",
-                serde_json::json!({"seed": "persistent-monitor"}),
-                serde_json::json!({"ok": true}),
-                chrono::Utc::now(),
-            ))
+            )
             .await
             .context("plant child evidence")?;
         match &planted {

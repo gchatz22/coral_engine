@@ -279,12 +279,15 @@ async fn run_smoke() -> Result<()> {
         .await
         .context("open planting AgentFs")?;
     let planted_id = plant_fs
-        .record_evidence(EvidenceRecord::new(
+        .record_evidence(
+            EvidenceRecord::new(
+                TOOL_NAME,
+                serde_json::json!({"k": "v"}),
+                serde_json::json!({"hit": true}),
+                Utc::now(),
+            ),
             TOOL_NAME,
-            serde_json::json!({"k": "v"}),
-            serde_json::json!({"hit": true}),
-            Utc::now(),
-        ))
+        )
         .await
         .context("plant evidence for WriteOutput")?;
 
@@ -422,7 +425,7 @@ async fn drive(
     triggers: Vec<coral_node::trigger::Trigger>,
     agent_prefix: &str,
     storage: Arc<MemoryStorage>,
-    _planted_id: coral_node::evidence::EvidenceId,
+    _planted_id: String,
 ) -> Result<()> {
     let handle = client
         .start_workflow(

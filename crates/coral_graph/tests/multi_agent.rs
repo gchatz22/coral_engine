@@ -61,7 +61,7 @@ use coral_node::conflict::ConflictKind;
 use coral_node::decision::{
     ConflictAlternative, ConflictRecordIntent, Decide, Decision, ReconcileSource, Session,
 };
-use coral_node::evidence::{EvidenceId, EvidenceRecord};
+use coral_node::evidence::EvidenceRecord;
 use coral_node::fs::AgentFs;
 use coral_node::mandate::{Mandate, OutputId};
 use coral_node::storage::{AgentStorage, BlobSha, MemoryStorage};
@@ -95,12 +95,6 @@ const GRAPH_YAML_REL: &str = "../../examples/smoke_multi_agent/graph.yaml";
 const CHILD_A_CONTENT: &str = "claim-A says X";
 const CHILD_B_CONTENT: &str = "claim-B says NOT-X";
 const PARENT_OUTPUT_CONTENT: &str = "reconciled: held open";
-
-/// The parent's `evidence/` directory, listed between the reconcile and
-/// emit steps so the synthetic evidence ids can be recovered for the
-/// `WriteOutput` citation. Used both in the parent script's `List` step and
-/// in the matcher that recovers the ids from that step's observation.
-const EVIDENCE_DIR: &str = "evidence/";
 
 /// Shared in-memory storage backend: parent + child workflows all run
 /// their activities against this. The test driver also opens views
@@ -216,8 +210,8 @@ fn ensure_installed() -> Arc<MemoryStorage> {
 ///   carries (once per cycle); synthesizes a `Decision::ReconcileChildren`
 ///   from the first observed `ChildOutput` triggers (one per child) when
 ///   the script pops the `reconcile_placeholder` sentinel; synthesizes a
-///   `Decision::WriteOutput` citing the synthetic evidence ids recovered
-///   from a prior `List { path: "evidence/" }` step in this cycle's
+///   `Decision::WriteOutput` citing the synthetic evidence paths recovered
+///   from the prior `ReconcileChildren` step's observation in this cycle's
 ///   session when the script pops the `emit_with_synthetic_placeholder`
 ///   sentinel.
 /// - Children A / B: pop from their own per-role script FIFO. Empty
@@ -396,31 +390,28 @@ fn synthesize_reconcile_or_wait() -> anyhow::Result<Decision> {
     Ok(Decision::ReconcileChildren { sources, conflict })
 }
 
-/// Synthesize `Decision::WriteOutput { body, citations }` from the
-/// synthetic evidence records the reconcile activity wrote into the
-/// parent's `evidence/` directory earlier in this same cycle. The
-/// reconcile activity's observation does not carry the minted
-/// `EvidenceId`s, so the script interposes a `List { path: "evidence/" }`
-/// step between reconcile and emit; this synthesizer recovers the ids by
-/// parsing that step's observation (one `<evidence_id>.json` per line).
-/// The parent calls no tools, so every file under `evidence/` is a
-/// reconcile record. If the `List` step hasn't run yet in this cycle (or
-/// returned fewer than 2 ids), push the placeholder back and idle so a
+/// Synthesize `Decision::WriteOutput { body, citations }` from the synthetic
+/// evidence the reconcile step produced earlier in this same cycle. The
+/// reconcile observation names each minted `evidence/` path directly, so the
+/// parent recovers them straight from that step's observation — no `List` of
+/// `evidence/` needed. If the reconcile step hasn't run yet in this cycle (or
+/// fewer than 2 paths are present), push the placeholder back and idle so a
 /// later cycle retries.
 fn synthesize_emit_or_wait(session: &Session) -> anyhow::Result<Decision> {
-    let listing = session
+    let observation = session
         .steps
         .iter()
         .rev()
         .find_map(|s| match &s.action {
-            Decision::List { path } if path == EVIDENCE_DIR => Some(s.observation.content.clone()),
+            Decision::ReconcileChildren { .. } => Some(s.observation.content.clone()),
             _ => None,
         })
         .unwrap_or_default();
-    let synthetic_ids: Vec<EvidenceId> = listing
-        .lines()
-        .filter_map(|line| line.trim().strip_suffix(".json"))
-        .map(EvidenceId::from_hex)
+    let synthetic_ids: Vec<String> = observation
+        .split_whitespace()
+        .map(|t| t.trim_end_matches([',', '.']))
+        .filter(|t| t.starts_with("evidence/") && t.ends_with(".json"))
+        .map(|t| t.to_string())
         .collect();
     // Need exactly 2 — one per source. Tolerate "not yet" (0 or 1) by
     // putting the placeholder back; intolerable > 2 panics rather
@@ -612,12 +603,15 @@ async fn run_end_to_end() -> Result<()> {
         .await
         .expect("open planting AgentFs for child-a");
     let planted_a_id = plant_fs_a
-        .record_evidence(EvidenceRecord::new(
-            "echo",
-            serde_json::json!({"child": "a"}),
-            serde_json::json!({"hit": true}),
-            chrono::Utc::now(),
-        ))
+        .record_evidence(
+            EvidenceRecord::new(
+                "echo",
+                serde_json::json!({"child": "a"}),
+                serde_json::json!({"hit": true}),
+                chrono::Utc::now(),
+            ),
+            "echo child a",
+        )
         .await
         .expect("plant evidence for child-a WriteOutput");
     let plant_storage_b: Arc<dyn AgentStorage> = storage.clone();
@@ -625,12 +619,15 @@ async fn run_end_to_end() -> Result<()> {
         .await
         .expect("open planting AgentFs for child-b");
     let planted_b_id = plant_fs_b
-        .record_evidence(EvidenceRecord::new(
-            "echo",
-            serde_json::json!({"child": "b"}),
-            serde_json::json!({"hit": true}),
-            chrono::Utc::now(),
-        ))
+        .record_evidence(
+            EvidenceRecord::new(
+                "echo",
+                serde_json::json!({"child": "b"}),
+                serde_json::json!({"hit": true}),
+                chrono::Utc::now(),
+            ),
+            "echo child b",
+        )
         .await
         .expect("plant evidence for child-b WriteOutput");
 
@@ -667,13 +664,7 @@ async fn run_end_to_end() -> Result<()> {
             citations: vec![planted_b_id.clone()],
         },
     ];
-    let parent_script = vec![
-        reconcile_placeholder(),
-        Decision::List {
-            path: EVIDENCE_DIR.into(),
-        },
-        emit_with_synthetic_placeholder(),
-    ];
+    let parent_script = vec![reconcile_placeholder(), emit_with_synthetic_placeholder()];
     install_role_scripts(parent_script, child_a_script, child_b_script);
 
     // ---- 4. Worker + driver ------------------------------------------

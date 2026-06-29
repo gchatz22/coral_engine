@@ -249,8 +249,11 @@ pub async fn execute_step(
                     Some(FsError::EmptyEvidence) => Ok(StepOutcome::needs_correction(
                         "write_output: citations list is empty (provenance contract)",
                     )),
-                    Some(FsError::EvidenceNotFound(id)) => Ok(StepOutcome::needs_correction(
-                        format!("write_output: cited evidence {id} not found on disk"),
+                    Some(FsError::EvidenceNotFound(path)) => Ok(StepOutcome::needs_correction(
+                        format!("write_output: cited evidence {path} not found on disk"),
+                    )),
+                    Some(FsError::CitationNotEvidence(path)) => Ok(StepOutcome::needs_correction(
+                        format!("write_output: citation {path} is not under evidence/"),
                     )),
                     _ => Err(e),
                 },
@@ -373,15 +376,15 @@ async fn execute_call_tools(
 
     // Step 3+4: classify each result, persist successful evidence in
     // input order, collect failures into a batch outcome. The observation
-    // summarises both: what succeeded and what failed.
+    // names each minted evidence path so the model can cite it in the same
+    // cycle's `write_output` without listing `evidence/` first.
     let mut failures: Vec<ToolFailure> = Vec::new();
-    let mut succeeded = 0usize;
+    let mut recorded: Vec<String> = Vec::new();
     for (i, result) in results.into_iter().enumerate() {
         let call = &calls[i];
         match result {
             Ok(ev) => {
-                fs.record_evidence(ev).await?;
-                succeeded += 1;
+                recorded.push(fs.record_evidence(ev, &call.claim_seed.0).await?);
             }
             Err(e) => {
                 failures.push(ToolFailure {
@@ -395,7 +398,9 @@ async fn execute_call_tools(
 
     if failures.is_empty() {
         Ok(StepOutcome::ok(format!(
-            "{succeeded} tool call(s) succeeded; evidence recorded"
+            "{} tool call(s) succeeded; cite this evidence: {}",
+            recorded.len(),
+            recorded.join(", ")
         )))
     } else {
         Ok(StepOutcome::tool_error(failures))
@@ -456,7 +461,7 @@ mod tests {
 
     use super::*;
     use crate::decision::{ClaimSeed, FsOp, MockDecide, Remainder};
-    use crate::evidence::{EvidenceId, EvidenceRecord};
+    use crate::evidence::EvidenceRecord;
     use crate::fs::AgentFs;
     use crate::storage::{AgentStorage, MemoryStorage};
     use crate::tools::ToolRegistry;
@@ -490,12 +495,10 @@ mod tests {
     /// filename (always the canonical `output.md`).
     async fn seed_one_output(fs: &AgentFs) -> String {
         let ev = fs
-            .record_evidence(EvidenceRecord::new(
-                "echo",
-                json!({"k": 1}),
-                json!({"v": 1}),
-                ts(),
-            ))
+            .record_evidence(
+                EvidenceRecord::new("echo", json!({"k": 1}), json!({"v": 1}), ts()),
+                "echo k",
+            )
             .await
             .unwrap();
         let _ = fs.persist_output("a claim", &[ev]).await.unwrap();
@@ -794,12 +797,10 @@ mod tests {
     async fn execute_write_output_with_resolvable_evidence_succeeds() {
         let (fs, _m) = fixture().await;
         let ev_id = fs
-            .record_evidence(EvidenceRecord::new(
-                "echo",
-                json!({"k": 1}),
-                json!({"v": 1}),
-                ts(),
-            ))
+            .record_evidence(
+                EvidenceRecord::new("echo", json!({"k": 1}), json!({"v": 1}), ts()),
+                "echo k",
+            )
             .await
             .unwrap();
         let tools = ToolRegistry::new();
@@ -986,10 +987,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_call_tools_observation_names_the_minted_evidence_path() {
+        let (fs, _m) = fixture().await;
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(Arc::new(crate::tools::EchoTool))
+            .expect("register echo");
+        let outcome = execute_step(
+            &fs,
+            &tools,
+            &Decision::CallTools {
+                calls: vec![ToolCall::new(
+                    "echo",
+                    json!({"msg": "hi"}),
+                    ClaimSeed::new("probe seed"),
+                )],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(outcome.observation.ok);
+        // The observation surfaces the minted path so the model can cite it in
+        // the same cycle without listing evidence/ first.
+        let path = outcome
+            .observation
+            .content
+            .split_whitespace()
+            .map(|t| t.trim_end_matches([',', '.']))
+            .find(|t| t.starts_with("evidence/") && t.ends_with(".json"))
+            .expect("observation must name the minted evidence path");
+        assert!(path.starts_with("evidence/probe-seed-"), "got {path}");
+        // And that surfaced path is a real, citable evidence record.
+        fs.evidence_must_exist(path).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn execute_write_output_with_unresolved_evidence_needs_correction() {
         let (fs, _m) = fixture().await;
         let tools = ToolRegistry::new();
-        let bogus = EvidenceId::new("echo", &json!({"never": "written"}), &json!({"x": 0}));
+        let bogus = "evidence/never-written-00000000.json".to_string();
         let outcome = execute_step(
             &fs,
             &tools,

@@ -22,7 +22,7 @@ tools:
 agents:
   - id: root
     mandate:
-      text: "Your task: call the `get-sum` tool exactly once with arguments {\"a\": 2, \"b\": 3}, then on the next tick emit an Output via the `write_output` decision whose `body` is a short summary citing the resulting evidence id, then retire. Do not call any other tool; do not loop; do not idle except as a last resort."
+      text: "Your task: call the `get-sum` tool exactly once with arguments {\"a\": 2, \"b\": 3}, then on the next tick emit an Output via the `write_output` decision whose `body` is a short summary citing the resulting evidence path (returned in the call's observation), then retire. Do not call any other tool; do not loop; do not idle except as a last resort."
       idle_period: 1s
     tools: [everything]
 seed:

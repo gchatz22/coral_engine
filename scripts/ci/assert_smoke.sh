@@ -35,10 +35,16 @@ got_state=$(jq -r '.state' "$fs_root/health.json")
 [[ "$got_state" == "Healthy" ]] \
     || fail "health.state: expected 'Healthy', got '$got_state'"
 
-# 3. evidence/<sha>.json — content-addressed, deterministic when the canonical
-#    triple in the fixture matches what the tool returned.
-ev_file="$fs_root/evidence/$sha.json"
-[[ -f "$ev_file" ]] || fail "missing evidence/$sha.json — canonical triple drifted?"
+# 3. evidence/<slug>-<hash>.json — interpretable slug filename; assert on the
+#    record's content, not its name (there is exactly one record — the single
+#    scripted tool call — so glob it). The `id` field still carries the full
+#    content sha, so the canonical-triple check stays exact and deterministic.
+ev_file=$(find "$fs_root/evidence" -maxdepth 1 -type f -name '*.json' \
+    ! -name '_tail.json' | head -n1)
+[[ -n "$ev_file" && -f "$ev_file" ]] || fail "missing evidence record under evidence/"
+got_id=$(jq -r '.id' "$ev_file")
+[[ "$got_id" == "$sha" ]] \
+    || fail "evidence.id: expected '$sha', got '$got_id' — canonical triple drifted?"
 got_tool=$(jq -r '.tool' "$ev_file")
 [[ "$got_tool" == "$tool" ]] \
     || fail "evidence.tool: expected '$tool', got '$got_tool'"

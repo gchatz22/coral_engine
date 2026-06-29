@@ -54,7 +54,6 @@
 //! file written).
 
 use crate::agent_ref::AgentRef;
-use crate::evidence::EvidenceId;
 use crate::mandate::{Mandate, OutputId};
 use crate::trigger::Trigger;
 use anyhow::anyhow;
@@ -83,12 +82,13 @@ pub enum Decision {
     CallTools { calls: Vec<ToolCall> },
     /// Write the agent's single, kept-current Output: the prose `body` is
     /// persisted to the canonical `outputs/output.md` (overwriting the prior
-    /// cycle's), and `citations` records the evidence the output rests on. The
+    /// cycle's), and `citations` lists the `evidence/` paths the output rests
+    /// on (the handles returned in tool-call and reconcile observations). The
     /// run loop refuses to persist an output whose citations don't all resolve
     /// to runtime-authored evidence.
     WriteOutput {
         body: String,
-        citations: Vec<EvidenceId>,
+        citations: Vec<String>,
     },
     /// Mutate the per-agent filesystem.
     RewriteFs { ops: Vec<FsOp> },
@@ -181,8 +181,9 @@ impl Decision {
 /// `reconcile_children` activity reads the child's single canonical
 /// `outputs/output.md` and writes one synthetic evidence record per source
 /// into the parent's `evidence/` directory; the parent's subsequent
-/// `WriteOutput { citations: [..] }` then cites those synthetic ids, so
-/// cross-agent provenance becomes a normal evidence trail. `output_id` is
+/// `WriteOutput { citations: [..] }` then cites those synthetic records by
+/// path, so cross-agent provenance becomes a normal evidence trail.
+/// `output_id` is
 /// the version the parent observed at decide time; the activity reads the
 /// child's current canonical output (kept-current semantics).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -579,7 +580,6 @@ impl Decide for MockDecide {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evidence::EvidenceId;
     use serde_json::json;
 
     #[test]
@@ -661,17 +661,17 @@ mod tests {
 
     #[test]
     fn write_output_round_trip_non_empty_citations() {
-        let ev1 = EvidenceId::new("echo", &json!({"a": 1}), &json!({"r": 1}));
-        let ev2 = EvidenceId::new("echo", &json!({"a": 2}), &json!({"r": 2}));
+        let p1 = "evidence/alpha-aabbccdd.json".to_string();
+        let p2 = "evidence/beta-11223344.json".to_string();
         let d = Decision::WriteOutput {
             body: "hello".into(),
-            citations: vec![ev1.clone(), ev2.clone()],
+            citations: vec![p1.clone(), p2.clone()],
         };
         let s = serde_json::to_string(&d).unwrap();
         let back: Decision = serde_json::from_str(&s).unwrap();
         assert_eq!(d, back);
         if let Decision::WriteOutput { citations, .. } = back {
-            assert_eq!(citations, vec![ev1, ev2]);
+            assert_eq!(citations, vec![p1, p2]);
         } else {
             panic!("expected WriteOutput");
         }

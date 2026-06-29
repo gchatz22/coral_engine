@@ -6,7 +6,7 @@
 //! ```text
 //! mandate.md             — standing instruction (pure prose; no metadata)
 //! outputs/output.md      — the single, kept-current Output (pure prose, overwritten each cycle)
-//! evidence/<sha256>.json — raw tool-call record, content-addressed, dedup via put_if_absent
+//! evidence/<slug>-<hash>.json — raw tool-call record; interpretable slug name, content-hash suffix
 //! notes/                 — mutable private working memory
 //! claims/<slug>.json     — claim_seed registry
 //! conflicts/<id>.json    — parent-reconciled disagreement record
@@ -15,7 +15,7 @@
 //!
 //! The single canonical Output is the deliverable a parent or auditor reads;
 //! [`AgentFs::persist_output`] overwrites it each cycle and enforces that
-//! every cited evidence id resolves (via [`FsError::EmptyEvidence`] /
+//! every cited evidence path resolves (via [`FsError::EmptyEvidence`] /
 //! [`FsError::EvidenceNotFound`]). A stable path (not a content-addressed
 //! name) is what lets a parent pin the output's version across refreshes.
 //! `notes/` is private scratch that [`AgentFs::apply_ops`] writes to,
@@ -111,12 +111,17 @@ pub struct RecentWindow {
 /// failures, so adding variants is a breaking change for that consumer.
 #[derive(Debug, Error)]
 pub enum FsError {
-    /// `persist_output` was called with an empty evidence slice.
-    #[error("output rejected: evidence list is empty (provenance contract)")]
+    /// `persist_output` was called with an empty citation slice.
+    #[error("output rejected: citation list is empty (provenance contract)")]
     EmptyEvidence,
-    /// `persist_output` referenced an evidence id with no record on disk.
-    #[error("output rejected: evidence {0} not found on disk")]
-    EvidenceNotFound(EvidenceId),
+    /// A citation named an evidence path with no record on disk.
+    #[error("output rejected: evidence path {0} not found on disk")]
+    EvidenceNotFound(String),
+    /// A citation named a path outside the runtime-authored `evidence/`
+    /// directory. Citations must point at real evidence records, so the
+    /// writer refuses a path the model could have hand-authored elsewhere.
+    #[error("citation rejected: {0} is not under evidence/")]
+    CitationNotEvidence(String),
     /// [`AgentFs::read_output`] found no canonical Output on disk — the
     /// agent has not emitted one yet. Typed so the reconcile path can fold
     /// it into a correction context.
@@ -256,6 +261,28 @@ pub fn claim_slug(seed: &str) -> String {
         suffix
     } else {
         format!("{body}-{suffix}")
+    }
+}
+
+/// Build the `evidence/` relative path for one record: the interpretable
+/// [`slug`] of `slug_seed` (the model's `claim_seed`, or a runtime label for
+/// synthetic records) plus a `-<first 8 hex of the content hash>` suffix.
+///
+/// Unlike [`claim_slug`], the suffix is keyed on the record's *content* (the
+/// `EvidenceId`), not the seed — so different content always gets a distinct
+/// path even under the same seed, and identical content is idempotent. When
+/// the slug body is empty the path is just the suffix.
+///
+/// Public because it is the citation-resolution contract: given a record's
+/// `claim_seed` and `EvidenceId`, this yields the exact path a later citation
+/// must name.
+pub fn evidence_relpath(slug_seed: &str, id: &EvidenceId) -> String {
+    let body = slug(slug_seed);
+    let suffix = &id.as_str()[..8];
+    if body.is_empty() {
+        format!("evidence/{suffix}.json")
+    } else {
+        format!("evidence/{body}-{suffix}.json")
     }
 }
 
@@ -487,16 +514,27 @@ impl AgentFs {
         &self.prefix
     }
 
-    /// Persist an `EvidenceRecord` under `<prefix>evidence/<id>.json`.
+    /// Persist an `EvidenceRecord` under an interpretable, content-
+    /// disambiguated path and return that path — the handle the model
+    /// cites in a later `WriteOutput`.
     ///
-    /// Writing the same record twice is a no-op: the file is content-
-    /// addressed by `record.id` (sha256 of `(tool, args, result)`), so
-    /// a duplicate write would produce identical bytes.
-    /// [`crate::storage::AgentStorage::put_if_absent`] makes the dedup
-    /// race-free against retried activities.
-    pub async fn record_evidence(&self, record: EvidenceRecord) -> anyhow::Result<EvidenceId> {
-        let id = record.id.clone();
-        let key = self.evidence_key(&id);
+    /// The filename is `evidence/<slug(slug_seed)>-<short content hash>.json`:
+    /// the body is the human-readable [`slug`] of the model's `claim_seed`
+    /// (or a runtime label for synthetic records), and the suffix is the
+    /// first 8 hex of the record's content hash. So different content always
+    /// lands at a distinct path (no collision detection), while the same
+    /// content under the same seed resolves to the same path — making the
+    /// write idempotent under retries via
+    /// [`crate::storage::AgentStorage::put_if_absent`]. Two unrelated seeds
+    /// that produce byte-identical content get two files: cross-content dedup
+    /// lives in the DB index, not in the filename.
+    pub async fn record_evidence(
+        &self,
+        record: EvidenceRecord,
+        slug_seed: &str,
+    ) -> anyhow::Result<String> {
+        let relpath = evidence_relpath(slug_seed, &record.id);
+        let key = self.key(&relpath);
         let bytes = serde_json::to_vec_pretty(&record)?;
         let outcome: PutOutcome = self
             .storage
@@ -507,16 +545,22 @@ impl AgentFs {
         // otherwise shuffle the entry to the front, polluting recency
         // with retry artefacts.
         if matches!(outcome, PutOutcome::Created) {
-            let filename = format!("{}.json", id);
+            let filename = relpath
+                .strip_prefix("evidence/")
+                .unwrap_or(&relpath)
+                .to_string();
             self.append_to_tail(EVIDENCE_TAIL_SUFFIX, filename).await?;
         }
-        Ok(id)
+        Ok(relpath)
     }
 
-    /// Return `Ok(())` if `id` resolves to an evidence record,
-    /// otherwise `Err(FsError::EvidenceNotFound)`.
-    pub async fn evidence_must_exist(&self, id: &EvidenceId) -> anyhow::Result<()> {
-        let key = self.evidence_key(id);
+    /// Return `Ok(())` if `path` is a citable evidence record (under
+    /// `evidence/` and present on disk). `Err(FsError::CitationNotEvidence)`
+    /// for a path outside `evidence/`, `Err(FsError::EvidenceNotFound)` when
+    /// it resolves to nothing.
+    pub async fn evidence_must_exist(&self, path: &str) -> anyhow::Result<()> {
+        let rel = self.evidence_relpath_checked(path)?;
+        let key = self.key(&rel);
         let got = self
             .storage
             .get(&key)
@@ -525,23 +569,38 @@ impl AgentFs {
         if got.is_some() {
             Ok(())
         } else {
-            Err(FsError::EvidenceNotFound(id.clone()).into())
+            Err(FsError::EvidenceNotFound(path.to_string()).into())
         }
     }
 
     /// Read an evidence record's raw on-disk bytes (the stored `.json`).
     /// The bytes — not a re-serialization — are what callers hash for the
     /// blob sha (so it matches what git would commit) and parse for the
-    /// `tool`/`args` discriminator. `Err(FsError::EvidenceNotFound)` if `id`
+    /// `tool`/`args` discriminator. `Err(FsError::CitationNotEvidence)` for a
+    /// path outside `evidence/`, `Err(FsError::EvidenceNotFound)` when it
     /// does not resolve.
-    pub async fn read_evidence_bytes(&self, id: &EvidenceId) -> anyhow::Result<Bytes> {
-        let key = self.evidence_key(id);
+    pub async fn read_evidence_bytes(&self, path: &str) -> anyhow::Result<Bytes> {
+        let rel = self.evidence_relpath_checked(path)?;
+        let key = self.key(&rel);
         let got = self
             .storage
             .get(&key)
             .await
             .map_err(|e| FsError::storage(&key, e))?;
-        got.ok_or_else(|| FsError::EvidenceNotFound(id.clone()).into())
+        got.ok_or_else(|| FsError::EvidenceNotFound(path.to_string()).into())
+    }
+
+    /// Clean a model-supplied citation path and confirm it is a citable
+    /// `evidence/` record. Traversal is rejected by [`Self::clean_relpath`]; a
+    /// clean path outside `evidence/`, or the runtime-owned `_tail.json`
+    /// sidecar (which is not an evidence record), is rejected as
+    /// [`FsError::CitationNotEvidence`].
+    fn evidence_relpath_checked(&self, path: &str) -> anyhow::Result<String> {
+        let rel = self.clean_relpath(path)?;
+        if rel == "evidence" || !rel.starts_with("evidence/") || rel == EVIDENCE_TAIL_SUFFIX {
+            return Err(FsError::CitationNotEvidence(path.to_string()).into());
+        }
+        Ok(rel)
     }
 
     /// Persist the agent's single, kept-current Output as pure prose at the
@@ -551,7 +610,7 @@ impl AgentFs {
     /// it is later refreshed — see [`CANONICAL_OUTPUT`].
     ///
     /// Enforces the provenance contract: at least one citation, and every
-    /// cited evidence id must resolve to a record on disk. Only the body is
+    /// cited path must resolve to a record under `evidence/`. Only the body is
     /// written to the FS — citations live in the DB reference graph, never in
     /// the file (A1: content in the FS, provenance in the DB). Returns the
     /// [`OutputId`] fingerprint of the body for the `ChildOutput` signal.
@@ -559,14 +618,14 @@ impl AgentFs {
     pub async fn persist_output(
         &self,
         body: &str,
-        citations: &[EvidenceId],
+        citations: &[String],
     ) -> anyhow::Result<OutputId> {
         if citations.is_empty() {
             return Err(FsError::EmptyEvidence.into());
         }
-        // Verify every cited evidence id before the write.
-        for id in citations {
-            self.evidence_must_exist(id).await?;
+        // Verify every cited path is a real evidence record before the write.
+        for path in citations {
+            self.evidence_must_exist(path).await?;
         }
         let key = self.key(CANONICAL_OUTPUT);
         self.storage
@@ -1057,10 +1116,6 @@ impl AgentFs {
         self.key(&format!("claims/{}.json", claim_slug(seed)))
     }
 
-    fn evidence_key(&self, id: &EvidenceId) -> String {
-        self.key(&format!("evidence/{}.json", id))
-    }
-
     fn conflict_key(&self, id: &ConflictId) -> String {
         self.key(&format!("conflicts/{}.json", id))
     }
@@ -1440,43 +1495,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_evidence_is_content_addressed_and_dedup_safe() {
+    async fn record_evidence_uses_interpretable_path_and_is_dedup_safe() {
         let (tmp, fs, _m) = fresh_fs().await;
         let rec = record("echo", json!({"msg": "hi"}), json!({"echoed": "hi"}));
-        let id = fs.record_evidence(rec.clone()).await.unwrap();
+        let path = fs.record_evidence(rec.clone(), "TSMC CoWoS").await.unwrap();
 
-        // Filename matches the id.
-        let path = tmp.path().join("evidence").join(format!("{}.json", id));
-        assert!(path.is_file());
+        // The returned handle is an interpretable slug under evidence/ with a
+        // content-hash suffix — not a bare sha filename.
+        assert!(path.starts_with("evidence/tsmc-cowos-"), "got {path}");
+        assert!(path.ends_with(".json"), "got {path}");
+        assert!(tmp.path().join(&path).is_file());
 
-        // Second write of an identical record is a no-op — same id, no
-        // duplicate, and the directory still has exactly one entry.
-        let id2 = fs.record_evidence(rec.clone()).await.unwrap();
-        assert_eq!(id, id2);
+        // Second write of an identical record under the same seed is a
+        // no-op — same path, no duplicate, one entry.
+        let path2 = fs.record_evidence(rec.clone(), "TSMC CoWoS").await.unwrap();
+        assert_eq!(path, path2);
 
         // Count evidence record files only — `_tail.json` is the
         // tail-index sidecar, not an evidence record.
-        let evidence_files: Vec<_> = std::fs::read_dir(tmp.path().join("evidence"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-            .filter(|n| n != "_tail.json")
-            .collect();
+        let count = |tmp: &tempfile::TempDir| {
+            std::fs::read_dir(tmp.path().join("evidence"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .filter(|n| n != "_tail.json")
+                .count()
+        };
         assert_eq!(
-            evidence_files.len(),
+            count(&tmp),
             1,
-            "duplicate evidence write created extra file: {evidence_files:?}"
+            "duplicate evidence write created extra file"
         );
 
-        // A different record produces a different id and a second file.
+        // Different content under the SAME seed disambiguates by the content
+        // hash suffix — a distinct path, a second file (no silent overwrite).
         let other = record("echo", json!({"msg": "bye"}), json!({"echoed": "bye"}));
-        let other_id = fs.record_evidence(other).await.unwrap();
-        assert_ne!(id, other_id);
-        let evidence_files: Vec<_> = std::fs::read_dir(tmp.path().join("evidence"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-            .filter(|n| n != "_tail.json")
-            .collect();
-        assert_eq!(evidence_files.len(), 2);
+        let other_path = fs.record_evidence(other, "TSMC CoWoS").await.unwrap();
+        assert_ne!(path, other_path);
+        assert!(
+            other_path.starts_with("evidence/tsmc-cowos-"),
+            "got {other_path}"
+        );
+        assert_eq!(count(&tmp), 2);
+    }
+
+    #[tokio::test]
+    async fn record_evidence_falls_back_to_hash_when_seed_has_no_slug() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        let rec = record("echo", json!({"msg": "hi"}), json!({"echoed": "hi"}));
+        // A seed with no alphanumerics yields an empty slug body, so the
+        // path is just the content-hash suffix — still under evidence/.
+        let path = fs.record_evidence(rec, "!!! ---").await.unwrap();
+        assert!(path.starts_with("evidence/"), "got {path}");
+        assert!(path.ends_with(".json"), "got {path}");
+        assert!(!path.starts_with("evidence/-"), "no leading dash: {path}");
     }
 
     #[tokio::test]
@@ -1488,9 +1559,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_output_rejects_unknown_evidence_id() {
+    async fn persist_output_rejects_unknown_citation_path() {
         let (tmp, fs, _m) = fresh_fs().await;
-        let bogus = EvidenceId::from_hex("deadbeef".repeat(8)); // 64 hex chars
+        let bogus = "evidence/never-written-deadbeef.json".to_string();
         let err = fs
             .persist_output("hello", &[bogus.clone()])
             .await
@@ -1510,12 +1581,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persist_output_rejects_citation_outside_evidence() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        // A citation must point at a runtime-authored evidence record. A path
+        // the model could hand-write itself (under notes/) is rejected even
+        // when the file exists.
+        fs.apply_ops(vec![FsOp::WriteFile {
+            path: "notes/forged.md".into(),
+            content: "fake".into(),
+        }])
+        .await
+        .unwrap();
+        let err = fs
+            .persist_output("hello", &["notes/forged.md".to_string()])
+            .await
+            .unwrap_err();
+        let downcast = err.downcast_ref::<FsError>().expect("typed FsError");
+        assert!(matches!(downcast, FsError::CitationNotEvidence(_)));
+    }
+
+    #[tokio::test]
+    async fn persist_output_rejects_citation_to_evidence_tail_sidecar() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        // The recency sidecar lives under evidence/ but is not an evidence
+        // record — citing it is rejected at the gate, not deferred to a parse
+        // failure downstream.
+        fs.record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})), "echo")
+            .await
+            .unwrap();
+        let err = fs
+            .persist_output("hello", &["evidence/_tail.json".to_string()])
+            .await
+            .unwrap_err();
+        let downcast = err.downcast_ref::<FsError>().expect("typed FsError");
+        assert!(matches!(downcast, FsError::CitationNotEvidence(_)));
+    }
+
+    #[tokio::test]
     async fn persist_output_writes_canonical_file_referencing_evidence() {
         let (tmp, fs, _m) = fresh_fs().await;
         let rec = record("echo", json!({"msg": "hi"}), json!({"echoed": "hi"}));
-        let id = fs.record_evidence(rec).await.unwrap();
+        let path = fs.record_evidence(rec, "echo hi").await.unwrap();
 
-        let out_id = fs.persist_output("hello", &[id.clone()]).await.unwrap();
+        let out_id = fs.persist_output("hello", &[path.clone()]).await.unwrap();
         assert_eq!(out_id, OutputId::new("hello"));
 
         // The single canonical Output lands at the stable path.
@@ -1531,7 +1639,7 @@ mod tests {
     async fn read_output_returns_persisted_body() {
         let (_tmp, fs, _m) = fresh_fs().await;
         let rec = record("echo", json!({"q": "k"}), json!({"r": "v"}));
-        let ev = fs.record_evidence(rec).await.unwrap();
+        let ev = fs.record_evidence(rec, "echo k").await.unwrap();
         let _ = fs.persist_output("the claim", &[ev.clone()]).await.unwrap();
 
         let back = fs.read_output().await.unwrap();
@@ -1573,11 +1681,8 @@ mod tests {
         // Writing evidence under this prefix and reading it back
         // works — cross-agent reads use exactly this shape.
         let rec = record("echo", json!({"x": 1}), json!({"y": 2}));
-        let id = fs.record_evidence(rec.clone()).await.unwrap();
-        let key = format!(
-            "graphs/{}/agents/{}/evidence/{}.json",
-            graph_id, agent_id, id,
-        );
+        let relpath = fs.record_evidence(rec.clone(), "echo x").await.unwrap();
+        let key = format!("graphs/{}/agents/{}/{}", graph_id, agent_id, relpath);
         assert!(
             storage.get(&key).await.unwrap().is_some(),
             "evidence must land at the prefixed key",
@@ -1604,7 +1709,10 @@ mod tests {
             .await
             .unwrap();
         let ev = child_fs
-            .record_evidence(record("echo", json!({"q": "child"}), json!({"r": 1})))
+            .record_evidence(
+                record("echo", json!({"q": "child"}), json!({"r": 1})),
+                "child q",
+            )
             .await
             .unwrap();
         let _ = child_fs
@@ -1929,20 +2037,19 @@ mod tests {
     async fn authorship_boundary_runtime_writes_evidence_and_model_reads_it() {
         let (_tmp, fs, _m) = fresh_fs().await;
         // The runtime tool-observation path writes evidence...
-        let id = fs
-            .record_evidence(record(
-                "web_search",
-                json!({"q": "cowos"}),
-                json!({"hits": 1}),
-            ))
+        let path = fs
+            .record_evidence(
+                record("web_search", json!({"q": "cowos"}), json!({"hits": 1})),
+                "cowos search",
+            )
             .await
             .unwrap();
-        fs.evidence_must_exist(&id).await.unwrap();
+        fs.evidence_must_exist(&path).await.unwrap();
 
         // ...and the model's read surface returns it (reads are ungated).
         let recent = fs.list_recent_evidence(8).await.unwrap();
         assert!(
-            recent.iter().any(|r| r.id == id),
+            recent.iter().any(|r| path.contains(&r.id.as_str()[..8])),
             "model must be able to read runtime-authored evidence"
         );
     }
@@ -1954,17 +2061,17 @@ mod tests {
     #[tokio::test]
     async fn persist_output_keeps_one_canonical_output_overwritten_in_place() {
         let (tmp, fs, _m) = fresh_fs().await;
-        let id = fs
-            .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
+        let cite = fs
+            .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})), "echo k")
             .await
             .unwrap();
 
         let first = fs
-            .persist_output("the same claim", &[id.clone()])
+            .persist_output("the same claim", &[cite.clone()])
             .await
             .unwrap();
         let second = fs
-            .persist_output("the same claim", &[id.clone()])
+            .persist_output("the same claim", &[cite.clone()])
             .await
             .unwrap();
 
@@ -1982,7 +2089,7 @@ mod tests {
         // A *different* body overwrites the same file (still one), and
         // mints a fresh id.
         let third = fs
-            .persist_output("a different claim", &[id.clone()])
+            .persist_output("a different claim", &[cite.clone()])
             .await
             .unwrap();
         assert_ne!(third, first);
@@ -1998,17 +2105,23 @@ mod tests {
     async fn list_recent_evidence_returns_window_in_filename_order() {
         let (_tmp, fs, _m) = fresh_fs().await;
         for i in 0..10 {
-            fs.record_evidence(record("echo", json!({ "i": i }), json!({ "i": i })))
+            fs.record_evidence(record("echo", json!({ "i": i }), json!({ "i": i })), "echo")
                 .await
                 .unwrap();
         }
         let recent = fs.list_recent_evidence(8).await.unwrap();
         assert_eq!(recent.len(), 8);
 
-        let ids: Vec<_> = recent.iter().map(|r| r.id.as_str().to_string()).collect();
-        let mut sorted = ids.clone();
+        // Filenames are `echo-<first 8 hex of id>.json`; their order is the
+        // first-8-hex order, which (for distinct prefixes) matches sorting the
+        // full ids — the window stays deterministic.
+        let prefixes: Vec<_> = recent
+            .iter()
+            .map(|r| r.id.as_str()[..8].to_string())
+            .collect();
+        let mut sorted = prefixes.clone();
         sorted.sort();
-        assert_eq!(ids, sorted, "evidence not returned in filename order");
+        assert_eq!(prefixes, sorted, "evidence not returned in filename order");
     }
 
     #[tokio::test]
@@ -2403,12 +2516,12 @@ mod tests {
         // resolves. `put_if_absent` is delegated straight to inner so
         // this is unaffected by the put-failure counter.
         let rec = record("echo", json!({"k": "v"}), json!({"r": "v"}));
-        let id = fs.record_evidence(rec).await.unwrap();
+        let cite = fs.record_evidence(rec, "echo kv").await.unwrap();
 
         // The flaky counter was already exhausted on the pre-seed put;
         // verify a normal write succeeds. Then exhaust a new flaky
         // storage on an isolated AgentFs.
-        let _ = fs.persist_output("ok", &[id]).await.unwrap();
+        let _ = fs.persist_output("ok", &[cite]).await.unwrap();
 
         // Independent verification: a fresh flaky storage produces an
         // FsError::Storage whose inner StorageError is Transient.
@@ -2467,8 +2580,8 @@ mod tests {
         assert_eq!(fs.prefix(), "graphs/g1/agents/a1/");
 
         let rec = record("t", json!({}), json!({}));
-        let id = fs.record_evidence(rec).await.unwrap();
-        let out_id = fs.persist_output("hello", &[id]).await.unwrap();
+        let cite = fs.record_evidence(rec, "t").await.unwrap();
+        let out_id = fs.persist_output("hello", &[cite]).await.unwrap();
         assert_eq!(out_id, OutputId::new("hello"));
         assert_eq!(fs.read_output().await.unwrap(), "hello");
     }
@@ -2482,7 +2595,7 @@ mod tests {
     async fn tail_index_evidence_is_written_on_each_put() {
         let (tmp, fs, _m) = fresh_fs().await;
         let _id = fs
-            .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})))
+            .record_evidence(record("echo", json!({"k": 1}), json!({"v": 1})), "echo")
             .await
             .unwrap();
 
@@ -2501,11 +2614,11 @@ mod tests {
     async fn list_recent_evidence_recovers_via_list_when_tail_object_absent() {
         let (_tmp, fs, _m) = fresh_fs().await;
         let _id_a = fs
-            .record_evidence(record("echo", json!({"a": 1}), json!({"r": 1})))
+            .record_evidence(record("echo", json!({"a": 1}), json!({"r": 1})), "echo a")
             .await
             .unwrap();
         let _id_b = fs
-            .record_evidence(record("echo", json!({"b": 2}), json!({"r": 2})))
+            .record_evidence(record("echo", json!({"b": 2}), json!({"r": 2})), "echo b")
             .await
             .unwrap();
         fs.storage().delete("evidence/_tail.json").await.unwrap();

@@ -242,12 +242,15 @@ async fn run_happy_path() -> Result<()> {
         .await
         .context("open planting AgentFs for child")?;
     let planted_id = plant_fs
-        .record_evidence(EvidenceRecord::new(
+        .record_evidence(
+            EvidenceRecord::new(
+                "echo",
+                serde_json::json!({"k": "v"}),
+                serde_json::json!({"hit": true}),
+                Utc::now(),
+            ),
             "echo",
-            serde_json::json!({"k": "v"}),
-            serde_json::json!({"hit": true}),
-            Utc::now(),
-        ))
+        )
         .await
         .context("plant evidence for child WriteOutput")?;
 
@@ -538,12 +541,15 @@ async fn run_failure_path() -> Result<()> {
         .await
         .context("open planting AgentFs for child (failure path)")?;
     let planted_id = plant_fs
-        .record_evidence(EvidenceRecord::new(
+        .record_evidence(
+            EvidenceRecord::new(
+                "echo",
+                serde_json::json!({"k": "vv"}),
+                serde_json::json!({"hit": true}),
+                Utc::now(),
+            ),
             "echo",
-            serde_json::json!({"k": "vv"}),
-            serde_json::json!({"hit": true}),
-            Utc::now(),
-        ))
+        )
         .await
         .context("plant evidence for child WriteOutput (failure path)")?;
 

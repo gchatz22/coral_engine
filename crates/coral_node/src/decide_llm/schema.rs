@@ -74,8 +74,9 @@ pub fn decision_tools() -> Vec<ToolSpec> {
         ToolSpec {
             name: "write_output".into(),
             description: "Write your single, kept-current Output. `body` (prose) replaces \
-                 your canonical output; `citations` are the evidence ids it rests on. \
-                 Every id in `citations` must resolve in your evidence store; the \
+                 your canonical output; `citations` are the evidence file paths it rests \
+                 on — the handles returned in your tool-call and reconcile observations. \
+                 Every path in `citations` must be an existing file under `evidence/`; the \
                  runtime will refuse to persist the output otherwise."
                 .into(),
             input_schema: json!({
@@ -85,7 +86,8 @@ pub fn decision_tools() -> Vec<ToolSpec> {
                     "citations": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Hex-encoded evidence ids the output cites."
+                        "description": "Evidence file paths the output cites, e.g. \
+                            \"evidence/tsmc-cowos-a1b2c3d4.json\"."
                     }
                 },
                 "required": ["body", "citations"]
@@ -496,7 +498,6 @@ fn serde_path_or(_e: &serde_json::Error) -> String {
 mod tests {
     use super::*;
     use crate::decision::{ClaimSeed, FsOp, ToolCall as DecisionToolCall};
-    use crate::evidence::EvidenceId;
     use serde_json::json;
     use std::time::Duration;
 
@@ -613,12 +614,12 @@ mod tests {
 
     #[test]
     fn parse_write_output_round_trips() {
-        let ev = EvidenceId::new("echo", &json!({"a": 1}), &json!({"r": 1}));
+        let cite = "evidence/echo-aabbccdd.json";
         let tc = call(
             "write_output",
             json!({
                 "body": "hello",
-                "citations": [ev.as_str()]
+                "citations": [cite]
             }),
         );
         let d = parse_decision(&[tc]).unwrap();
@@ -626,7 +627,7 @@ mod tests {
             d,
             Decision::WriteOutput {
                 body: "hello".into(),
-                citations: vec![ev],
+                citations: vec![cite.to_string()],
             }
         );
     }
