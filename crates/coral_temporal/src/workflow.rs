@@ -1192,16 +1192,18 @@ async fn dispatch_call_tools(
     let results = temporalio_sdk::workflows::join_all(futures).await;
 
     let mut failures: Vec<ToolCallFailure> = Vec::new();
-    let mut succeeded = 0usize;
+    let mut recorded: Vec<String> = Vec::new();
     for r in results {
         match r? {
-            ToolCallOutcome::Success { .. } => succeeded += 1,
+            ToolCallOutcome::Success { evidence_path } => recorded.push(evidence_path),
             ToolCallOutcome::Failure { failure } => failures.push(failure),
         }
     }
     if failures.is_empty() {
         Ok(Observation::ok(format!(
-            "{succeeded} tool call(s) succeeded; evidence recorded"
+            "{} tool call(s) succeeded; cite this evidence: {}",
+            recorded.len(),
+            recorded.join(", ")
         )))
     } else {
         Ok(Observation::err(format_correction(&failures)))
@@ -1434,8 +1436,9 @@ async fn reconcile_children(
         )
         .await
     {
-        Ok(_out) => Ok(Observation::ok(format!(
-            "reconciled {source_count} child source(s); synthetic evidence recorded"
+        Ok(out) => Ok(Observation::ok(format!(
+            "reconciled {source_count} child source(s); cite this evidence: {}",
+            out.synthetic_evidence.join(", ")
         ))),
         // The activity returned an `ApplicationFailure` carrying either a
         // typed `ReconciliationError` (non-retryable, structural) or a wrapped

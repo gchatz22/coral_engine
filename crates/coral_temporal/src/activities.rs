@@ -289,9 +289,9 @@ pub struct ReconcileChildrenInput {
 /// Output of the `reconcile_children` activity.
 ///
 /// `synthetic_evidence[i]` is the `evidence/` path of the freshly-minted
-/// record for the `sources[i]` cross-agent fold. The parent cites these paths
-/// in a subsequent `WriteOutput`; it discovers them by `List`/`Read` of
-/// `evidence/` (no workflow-state slot involved).
+/// record for the `sources[i]` cross-agent fold. The reconcile observation
+/// surfaces these paths directly, so the parent cites them in a subsequent
+/// `WriteOutput` without listing `evidence/` first.
 ///
 /// `conflict_id` is `Some` iff `input.conflict.is_some()` and the
 /// activity wrote the conflict record successfully.

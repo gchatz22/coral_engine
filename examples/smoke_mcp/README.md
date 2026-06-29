@@ -42,7 +42,7 @@ The agent runs three scripted steps in one cycle under a `step_cap = 1` cap:
 1. **Step 1** — `CallTool { name: "get-sum", args: {"a": 2, "b": 3} }`.
    Dispatched through `ToolRegistry::call`, which forwards into the
    MCP client and writes an `EvidenceRecord` to disk.
-2. **Step 2** — `WriteOutput` referencing the evidence id from step 1.
+2. **Step 2** — `WriteOutput` referencing the evidence path from step 1.
 3. **Step 3** — `Idle`. The mandate's `step_cap` retires the
    agent at the end of this tick.
 
@@ -77,26 +77,29 @@ The `13` tool count is what server-everything advertises today
 (`echo`, `get-sum`, `get-tiny-image`, etc.); the count and tool names
 will drift if the server's release bumps its tool surface.
 
-## Recomputing the evidence id
+## Recomputing the evidence path
 
-`decisions.jsonl` hardcodes the sha256 hex of the
-`(tool="get-sum", args={"a":2,"b":3}, result=<CallToolResult>)` triple
-that the server returns. If the canonical-JSON encoder in
-`src/evidence.rs` ever changes — or if the server's `CallToolResult`
-envelope drifts — the hash goes stale and the `WriteOutput` tick will
-fail with `evidence <id> not found on disk`.
+`decisions.jsonl` cites the evidence by its on-disk path,
+`evidence/<slug(claim_seed)>-<first 8 hex of EvidenceId>.json`. The suffix is
+the sha256 hex of the
+`(tool="get-sum", args={"a":2,"b":3}, result=<CallToolResult>)` triple that the
+server returns. If the canonical-JSON encoder in `src/evidence.rs` ever
+changes — or if the server's `CallToolResult` envelope drifts — the suffix goes
+stale and the `WriteOutput` tick will fail with `evidence path <path> not found
+on disk`.
 
 To recompute:
 
 ```bash
-# 1. Run the smoke with the placeholder hash; the call_tool tick still
-#    succeeds and writes the real evidence file.
-# 2. Read the actual id from the filename under `evidence/`.
-# 3. Paste it back into decisions.jsonl.
+# 1. Run the smoke with the stale path; the call_tool tick still succeeds and
+#    writes the real evidence file (its filename is the correct path).
+# 2. Read the actual filename under `evidence/` and prefix it with `evidence/`.
+# 3. Paste that path back into decisions.jsonl.
 ```
 
-Alternatively, capture the `(args, result)` triple and feed it to
-`cargo run --bin compute-evidence-id -- get-sum '<args-json>' '<result-json>'`.
+Alternatively, capture the `(args, result)` triple, feed it to
+`cargo run --bin compute-evidence-id -- get-sum '<args-json>' '<result-json>'`,
+and build the path with `coral_node::fs::evidence_relpath("seed-1", &id)`.
 
 ## Cleanup
 
@@ -128,8 +131,8 @@ This is the gate the test prints when it is skipped.
   `.github/workflows/ci.yml` pin
   `@modelcontextprotocol/server-everything` via the workflow-level
   `MCP_SERVER_EVERYTHING_VERSION` env var; bumping that version
-  requires recomputing the evidence id hardcoded in
-  `decisions.jsonl` (see "Recomputing the evidence id" above) and
+  requires recomputing the evidence path cited in
+  `decisions.jsonl` (see "Recomputing the evidence path" above) and
   updating the `assert_smoke.sh` expectation in the same PR.
 * **Stale npm cache permissions.** A long-lived dev environment can
   end up with `~/.npm/_cacache/content-v2/sha512/<xx>/` directories

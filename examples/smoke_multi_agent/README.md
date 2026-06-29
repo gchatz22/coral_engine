@@ -6,7 +6,7 @@ deliberately-conflicting outputs, the parent reconciles them through
 the `reconcile_children` activity (which writes synthetic evidence
 records into the parent's `evidence/` directory and a `ConflictRecord`
 into the parent's `conflicts/` directory), and the parent then emits
-one final output citing the synthetic evidence ids before retiring.
+one final output citing the synthetic evidence paths before retiring.
 
 ## What this fixture proves
 
@@ -22,7 +22,7 @@ transitively:
   carries the right `(child_agent_id, child_workflow_id,
   source_output_id)` triple.
 - Parent's `outputs/` contains exactly 1 reconciled output citing both
-  synthetic evidence ids.
+  synthetic evidence paths.
 - Parent's `conflicts/` contains exactly 1 `ConflictRecord` of `kind
   == "held_open"` with 2 alternatives whose `source_child` +
   `source_output_id` match the children's emitted outputs.
